@@ -505,7 +505,8 @@ fn unlock_vault(state: State<AppState>, passphrase: String) -> Result<(), String
     let master_key = crypto::derive_master_key(&passphrase, &salt);
     if !crypto::check_verifier(&master_key, &verifier) {
         // Record failed attempt
-        return Err(lockout.record_failure());
+        lockout.record_failure()?;
+        return Err("密码错误".to_string());
     }
 
     // Decrypt DEK with master_key
