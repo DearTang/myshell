@@ -7,11 +7,19 @@ echo   MyShell Production Build
 echo ========================================
 echo.
 
+:: Add Rust to PATH (default installation location)
+set "CARGO_PATH=%USERPROFILE%\.cargo\bin"
+if exist "%CARGO_PATH%\cargo.exe" (
+    set "PATH=%CARGO_PATH%;%PATH%"
+    echo [INFO] Added Rust to PATH: %CARGO_PATH%
+)
+
 :: Check Rust
 where cargo >/dev/null 2>&1
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] Rust/Cargo not found. Please install Rust first.
     echo Download: https://rustup.rs/
+    pause
     exit /b 1
 )
 
@@ -19,6 +27,7 @@ if %ERRORLEVEL% neq 0 (
 where node >/dev/null 2>&1
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] Node.js not found. Please install Node.js first.
+    pause
     exit /b 1
 )
 
@@ -35,6 +44,7 @@ if not exist "node_modules" (
     call npm install
     if %ERRORLEVEL% neq 0 (
         echo [ERROR] npm install failed
+        pause
         exit /b 1
     )
 ) else (
@@ -61,6 +71,7 @@ call npm run tauri:build
 if %ERRORLEVEL% neq 0 (
     echo.
     echo [ERROR] Build failed
+    pause
     exit /b 1
 )
 
