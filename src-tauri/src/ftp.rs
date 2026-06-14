@@ -9,6 +9,7 @@
 //! can pick `ftp_tls=none` and proceed.
 
 use crate::{ConnectionConfig, FileEntry};
+use crate::proxy;
 use std::time::SystemTime;
 use suppaftp::list::File as FtpFile;
 use suppaftp::tokio::AsyncFtpStream;
@@ -24,9 +25,30 @@ pub async fn connect(cfg: &ConnectionConfig) -> Result<FtpSession, String> {
     }
 
     let port = if cfg.port == 0 { 21 } else { cfg.port };
-    let mut stream = AsyncFtpStream::connect(format!("{}:{}", cfg.host, port))
-        .await
-        .map_err(|e| format!("FTP connect failed: {}", e))?;
+
+    // Branch on proxy config. FTP TLS + proxy is intentionally unsupported
+    // (FTP TLS itself is a stub — see module doc). Plain FTP through a
+    // proxy works by handing the upgraded stream to suppaftp's
+    // connect_with_stream variant.
+    let mut stream = match proxy::ProxyConfig::from_config(cfg)? {
+        Some(proxy_cfg) => {
+            eprintln!(
+                "[ftp] connecting via {} proxy {}:{} → {}:{}",
+                cfg.proxy_type,
+                proxy_cfg.host(),
+                proxy_cfg.port(),
+                cfg.host,
+                port
+            );
+            let stream = proxy::connect_via_proxy(&proxy_cfg, &cfg.host, port).await?;
+            AsyncFtpStream::connect_with_stream(stream)
+                .await
+                .map_err(|e| format!("FTP connect via proxy failed: {}", e))?
+        }
+        None => AsyncFtpStream::connect(format!("{}:{}", cfg.host, port))
+            .await
+            .map_err(|e| format!("FTP connect failed: {}", e))?,
+    };
 
     // Caller (ftp_connect command) is expected to pre-resolve the password
     // from keyring into cfg.password. If absent (anonymous FTP) we fall

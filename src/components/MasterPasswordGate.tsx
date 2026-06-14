@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { setupVault, unlockVault } from "../api";
+import { setupVault, unlockVault, getLockoutInfo } from "../api";
+import type { LockoutInfo } from "../api";
 
 interface Props {
   mode: "setup" | "unlock";
   onSuccess: () => void;
 }
 
-const MIN_LEN = 12;
+const MIN_LEN = 6;
 
 function strengthHint(p: string): { label: string; color: string } {
   let classes = 0;
@@ -14,7 +15,8 @@ function strengthHint(p: string): { label: string; color: string } {
   if (/[A-Z]/.test(p)) classes++;
   if (/[0-9]/.test(p)) classes++;
   if (/[^A-Za-z0-9]/.test(p)) classes++;
-  if (p.length < MIN_LEN) return { label: "至少 12 个字符", color: "var(--error)" };
+  if (p.length < MIN_LEN) return { label: "至少 6 个字符", color: "var(--error)" };
+  if (p.length < 8) return { label: "简单", color: "var(--warning)" };
   if (classes <= 2) return { label: "弱", color: "var(--error)" };
   if (classes === 3) return { label: "中", color: "var(--warning)" };
   return { label: "强", color: "var(--success)" };
@@ -25,11 +27,21 @@ export function MasterPasswordGate({ mode, onSuccess }: Props) {
   const [confirm, setConfirm] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [lockoutInfo, setLockoutInfo] = useState<LockoutInfo | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  // Fetch lockout info on mount for unlock mode
+  useEffect(() => {
+    if (mode === "unlock") {
+      getLockoutInfo()
+        .then(setLockoutInfo)
+        .catch(() => {});
+    }
+  }, [mode]);
 
   const isSetup = mode === "setup";
   const hint = strengthHint(pass);
@@ -54,8 +66,26 @@ export function MasterPasswordGate({ mode, onSuccess }: Props) {
       setBusy(false);
       setPass("");
       if (isSetup) setConfirm("");
+      // Refresh lockout info after failure
+      if (!isSetup) {
+        getLockoutInfo()
+          .then(setLockoutInfo)
+          .catch(() => {});
+      }
       requestAnimationFrame(() => inputRef.current?.focus());
     }
+  }
+
+  // Format timestamp to readable time
+  function formatTime(timestamp: number | null): string {
+    if (!timestamp) return "";
+    const date = new Date(timestamp * 1000);
+    return date.toLocaleString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
   }
 
   return (
@@ -83,7 +113,7 @@ export function MasterPasswordGate({ mode, onSuccess }: Props) {
         <div style={{ textAlign: "center", marginBottom: 20 }}>
           <div style={{ fontSize: 42, opacity: 0.6, marginBottom: 10 }}>🔐</div>
           <div style={{ fontSize: 17, fontWeight: 600 }}>
-            {isSetup ? "设置主密码" : "解锁 MyShell"}
+            {isSetup ? "设置登录密码" : "解锁 MyShell"}
           </div>
           <div
             style={{
@@ -95,7 +125,7 @@ export function MasterPasswordGate({ mode, onSuccess }: Props) {
           >
             {isSetup ? (
               <>
-                主密码用于加密所有连接信息（host/账号/私钥/密码）。
+                设置登录密码用于保护您的连接数据。
                 <br />
                 <b style={{ color: "var(--warning)" }}>遗忘后将无法找回，所有数据彻底丢失。</b>
                 <br />
@@ -103,15 +133,26 @@ export function MasterPasswordGate({ mode, onSuccess }: Props) {
               </>
             ) : (
               <>
-                输入主密码解锁 vault。
+                输入登录密码解锁应用。
                 <br />
-                连续 5 次错误后建议重置 vault（会清空所有连接）。
+                密码错误不会锁定账户，请放心尝试。
+                {lockoutInfo && lockoutInfo.dailyFailures > 0 && (
+                  <>
+                    <br />
+                    <span style={{ color: "var(--warning)" }}>
+                      今日已错 {lockoutInfo.dailyFailures} 次
+                      {lockoutInfo.lastFailureTime && (
+                        <>，上次错误：{formatTime(lockoutInfo.lastFailureTime)}</>
+                      )}
+                    </span>
+                  </>
+                )}
               </>
             )}
           </div>
         </div>
 
-        <label style={labelStyle}>主密码</label>
+        <label style={labelStyle}>登录密码</label>
         <input
           ref={inputRef}
           type="password"
@@ -120,7 +161,7 @@ export function MasterPasswordGate({ mode, onSuccess }: Props) {
           onKeyDown={(e) => {
             if (e.key === "Enter" && !isSetup) submit();
           }}
-          placeholder="至少 12 个字符"
+          placeholder="至少 6 个字符"
           style={{
             ...inputStyle,
             borderColor: tooShort ? "var(--error)" : "var(--border)",
@@ -140,7 +181,7 @@ export function MasterPasswordGate({ mode, onSuccess }: Props) {
               onKeyDown={(e) => {
                 if (e.key === "Enter") submit();
               }}
-              placeholder="确认主密码"
+              placeholder="确认登录密码"
               style={{
                 ...inputStyle,
                 borderColor: mismatch ? "var(--error)" : "var(--border)",

@@ -51,3 +51,49 @@ pub fn delete_password(id: &str) -> Result<(), String> {
         Err(e) => Err(format!("keyring delete: {}", e)),
     }
 }
+
+// ============ Proxy credentials ============
+//
+// Same scheme as the SSH/FTP password above, but keyed under a separate
+// account name so a connection can have both at once. Stored as ciphertext
+// with the same master_key, so a keyring compromise alone yields nothing.
+
+/// Account suffix appended to the connection id to namespace proxy
+/// credentials. Resulting keyring account: `{conn_id}.myshell.proxy`.
+fn proxy_account(id: &str) -> String {
+    format!("{}.myshell.proxy", id)
+}
+
+pub fn set_proxy_password(id: &str, password: &str, key: &[u8; 32]) -> Result<(), String> {
+    if password.is_empty() {
+        return delete_proxy_password(id);
+    }
+    let blob = crypto::encrypt_with_key(key, password.as_bytes())?;
+    let account = proxy_account(id);
+    Entry::new(SERVICE, &account)
+        .map_err(|e| format!("keyring entry: {}", e))?
+        .set_password(&blob)
+        .map_err(|e| format!("keyring set proxy: {}", e))
+}
+
+pub fn get_proxy_password(id: &str, key: &[u8; 32]) -> Result<Option<String>, String> {
+    let account = proxy_account(id);
+    let entry = Entry::new(SERVICE, &account).map_err(|e| format!("keyring entry: {}", e))?;
+    match entry.get_password() {
+        Ok(blob) => {
+            let pt = crypto::decrypt_with_key(key, &blob)?;
+            String::from_utf8(pt).map(Some).map_err(|e| format!("proxy password utf8: {}", e))
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("keyring get proxy: {}", e)),
+    }
+}
+
+pub fn delete_proxy_password(id: &str) -> Result<(), String> {
+    let account = proxy_account(id);
+    let entry = Entry::new(SERVICE, &account).map_err(|e| format!("keyring entry: {}", e))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("keyring delete proxy: {}", e)),
+    }
+}

@@ -57,10 +57,23 @@ export function TabBar({
                 position: "relative",
               }}
             >
-              <span style={{ fontSize: 13, opacity: 0.85 }}>
+              <span
+                style={{
+                  fontSize: 13,
+                  opacity: 0.85,
+                }}
+              >
                 {tab.connType === "ftp" ? "📤" : tab.connType === "sftp" ? "📁" : "🖥"}
               </span>
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{tab.name}</span>
+              <span
+                style={{
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  color: isBroadcast ? "var(--success)" : undefined,
+                }}
+              >
+                {tab.name}
+              </span>
               {canBroadcast && (
                 <span
                   onClick={(e) => {
@@ -74,17 +87,12 @@ export function TabBar({
                   }
                   style={{
                     fontSize: 12,
-                    opacity: isBroadcast ? 1 : 0.35,
+                    opacity: 1,
                     cursor: "pointer",
                     padding: "0 2px",
-                    color: isBroadcast ? "var(--accent)" : "var(--text-muted)",
-                    textShadow: isBroadcast ? "0 0 6px var(--accent)" : "none",
+                    color: isBroadcast ? "var(--success)" : "var(--error)",
                     transition: "opacity 0.15s, color 0.15s",
                   }}
-                  onMouseEnter={(e) => (e.currentTarget.style.opacity = "1")}
-                  onMouseLeave={(e) =>
-                    (e.currentTarget.style.opacity = isBroadcast ? "1" : "0.35")
-                  }
                 >
                   📡
                 </span>

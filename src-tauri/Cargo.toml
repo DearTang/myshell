@@ -23,9 +23,11 @@ env_logger = "0.11"
 dirs = "5"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 suppaftp = { version = "8", features = ["tokio", "async-secure", "tokio-rustls-ring"] }
+tokio-socks = "0.5"
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
+chrono = "0.4"

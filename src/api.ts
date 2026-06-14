@@ -7,6 +7,8 @@ export type ConnType = "ssh" | "sftp" | "ftp";
 
 export type FtpTls = "none" | "implicit" | "explicit";
 
+export type ProxyType = "none" | "socks5" | "http";
+
 export interface ConnectionConfig {
   id: string;
   name: string;
@@ -22,6 +24,17 @@ export interface ConnectionConfig {
   group_path?: string;
   ftp_tls?: FtpTls;
   ftp_passive?: boolean;
+  /** Proxy type. "none" = direct. Backend reads proxy_* fields only when
+   * this is "socks5" or "http". Default "none" for migrated connections. */
+  proxy_type?: ProxyType;
+  /** Proxy server host (encrypted at rest via proxy_host_enc). */
+  proxy_host?: string;
+  proxy_port?: number;
+  proxy_username?: string;
+  /** Transient plaintext. Stored in OS keyring under `{conn_id}.myshell.proxy`
+   * when non-empty — never persisted to SQLite. Empty on edit means "keep
+   * existing keyring value"; backend reads from keyring at connect time. */
+  proxy_password?: string;
   created_at: string;
 }
 
@@ -41,6 +54,10 @@ export interface Tab {
   type: "terminal" | "sftp" | "ftp";
   connType?: ConnType;
   ftpSessionId?: string;
+  /** ConnectionConfig.id this tab was opened from. Stable across reconnects
+   * (unlike sessionId which is a fresh UUID each connect). Used as the key
+   * for command_history persistence so history survives tab close/reopen. */
+  connectionId?: string;
   /** When true, this tab is part of the broadcast group: any keystroke in
    * any broadcast-group tab is mirrored to all other broadcast-group tabs
    * (must be terminal-type SSH tabs). SFTP/FTP tabs are excluded. */
@@ -79,6 +96,62 @@ export async function unlockVault(passphrase: string): Promise<void> {
 
 export async function lockVault(): Promise<void> {
   await invoke("lock_vault");
+}
+
+export async function changeMasterPassword(
+  oldPassphrase: string,
+  newPassphrase: string
+): Promise<void> {
+  await invoke("change_master_password", { oldPassphrase, newPassphrase });
+}
+
+export async function verifyPassword(passphrase: string): Promise<boolean> {
+  return await invoke("verify_password", { passphrase });
+}
+
+export interface LockoutInfo {
+  consecutiveFailures: number;
+  dailyFailures: number;
+  lastFailureTime: number | null;
+  lockoutRemaining: number | null;
+  isLocked: boolean;
+}
+
+export async function getLockoutInfo(): Promise<LockoutInfo> {
+  return await invoke("get_lockout_info");
+}
+
+export async function getConnectionPassword(id: string): Promise<string | null> {
+  return await invoke("get_connection_password", { id });
+}
+
+export async function getConnectionProxyPassword(id: string): Promise<string | null> {
+  return await invoke("get_connection_proxy_password", { id });
+}
+
+// ============ Backup API ============
+
+export interface BackupInfo {
+  version: string;
+  timestamp: number;
+  files: string[];
+  timestampStr: string;
+}
+
+export async function listBackups(): Promise<BackupInfo[]> {
+  return await invoke("list_backups");
+}
+
+export async function rollbackBackup(version: string): Promise<string> {
+  return await invoke("rollback_backup", { version });
+}
+
+export async function getAppVersion(): Promise<string> {
+  return await invoke("get_app_version");
+}
+
+export async function getPreviousVersion(): Promise<string | null> {
+  return await invoke("get_previous_version");
 }
 
 export async function saveConnection(config: ConnectionConfig): Promise<void> {
@@ -124,6 +197,40 @@ export async function deleteFolder(path: string): Promise<void> {
 
 export async function renameFolder(oldPath: string, newPath: string): Promise<void> {
   await invoke("rename_folder", { oldPath, newPath });
+}
+
+// ============ Command History API ============
+//
+// Per-connection shell command history with optional pinning. Pinned
+// entries bypass the 50-row rolling window and surface at the top of the
+// list returned by listCommandHistory. History is keyed by ConnectionConfig
+// id (not sessionId) so it survives reconnects.
+
+export interface CommandHistoryItem {
+  id: number;
+  command: string;
+  pinned: boolean;
+  createdAt: string;
+}
+
+export async function addCommandHistory(connectionId: string, command: string): Promise<number> {
+  return await invoke("add_command_history", { connectionId, command });
+}
+
+export async function listCommandHistory(connectionId: string): Promise<CommandHistoryItem[]> {
+  return await invoke("list_command_history", { connectionId });
+}
+
+export async function setCommandHistoryPinned(id: number, pinned: boolean): Promise<void> {
+  await invoke("set_command_history_pinned", { id, pinned });
+}
+
+export async function deleteCommandHistory(id: number): Promise<void> {
+  await invoke("delete_command_history", { id });
+}
+
+export async function clearCommandHistory(connectionId: string, includePinned: boolean): Promise<void> {
+  await invoke("clear_command_history", { connectionId, includePinned });
 }
 
 // ============ Server Info API ============

@@ -11,13 +11,21 @@ import {
   onZmodemStart,
   onZmodemRaw,
   onZmodemEnd,
+  addCommandHistory,
 } from "../api";
 import { ZmodemBridge, type ZmodemStatus } from "../zmodem-bridge";
 import { ZmodemProgressOverlay } from "./ZmodemProgressOverlay";
+import { CommandBar } from "./CommandBar";
+import { recordKeystroke } from "../utils/cmd-buffer";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props {
   sessionId: string;
+  /** ConnectionConfig.id this session belongs to. Used as the persistence
+   * key for command history — survives reconnect (sessionId changes each
+   * connect, connectionId doesn't). Empty for sessions without a backing
+   * connection row (shouldn't normally happen). */
+  connectionId: string;
   /** When non-empty (and contains more than just this tab's own sessionId),
    * every keystroke is mirrored to all listed sessions in addition to the
    * local one. The list is read live from a ref so toggling broadcast on/
@@ -30,19 +38,34 @@ interface Props {
 }
 
 /**
- * Shell init sequence injected right after the PTY comes up. Enables ANSI
- * color on common GNU/BSD coreutils (ls, grep) and re-sources the user's
- * bashrc so PS1 + custom aliases are picked up. Designed to fail silently
- * on sh/dash/fish — the `2>/dev/null` swallow means the user still gets a
- * working terminal, just without color.
+ * Shell init sequence injected right after the PTY comes up.
+ *
+ * We wrap the entire sequence in a subshell with output silenced so it
+ * doesn't echo to the terminal. This is more reliable than `stty -echo`
+ * which may not take effect in time on some systems.
+ *
+ * Why these env vars:
+ *  - FORCE_COLOR / CLICOLOR / CLICOLOR_FORCE — enable color output.
+ *  - LS_COLORS — GNU ls file-type color spec.
+ *  - LSCOLORS — BSD ls (macOS) equivalent.
+ *  - GREP_COLORS — grep highlighting.
+ *  - GCC_COLORS — gcc/clang diagnostic colors.
+ *  - LESS=-R — let `less` pass through ANSI.
  */
 const SHELL_INIT_SEQ =
-  "export FORCE_COLOR=1; export CLICOLOR=1; " +
-  "alias ls='ls --color=auto' grep='grep --color=auto' 2>/dev/null; " +
-  "[ -n \"$BASH_VERSION\" ] && . ~/.bashrc 2>/dev/null; " +
-  "clear;\n";
+  "( " +
+  "export FORCE_COLOR=1 CLICOLOR=1 CLICOLOR_FORCE=1; " +
+  "export LESS='-R -F -X'; " +
+  "export LS_COLORS='rs=0:di=01;34:ln=01;36:mh=00:pi=33:so=01;35:do=01;35:bd=01;33:cd=01;33:or=01;31:mi=00:su=37;41:sg=30;43:ca=00:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.zip=01;31:*.7z=01;31:*.rar=01;31:*.gz=01;31:*.bz2=01;31:*.xz=01;31:*.jpg=01;35:*.jpeg=01;35:*.png=01;35:*.gif=01;35:*.bmp=01;35:*.svg=01;35:*.pdf=00;33:*.doc=00;33:*.xls=00;33:*.ppt=00;33:*.md=00;33:*.sh=01;32:*.py=00;32:*.js=00;33:*.ts=00;33:*.c=00;36:*.h=00;36:*.cpp=00;36:*.cc=00;36:*.hpp=00;36:*.go=00;36:*.rs=00;36:*.java=00;31:*.json=00;33:*.yml=00;33:*.yaml=00;33:*.conf=00;33:*.log=00;90'; " +
+  "export LSCOLORS='ExGxFxDxCxDxDxaccxaeux'; " +
+  "export GREP_COLORS='ms=01;31:mc=01;31:sl=:cx=:fn=01;35:ln=01;32:bn=01;32:se=36'; " +
+  "export GCC_COLORS='error=01;31:warning=01;35:note=01;36:caret=01;32:locus=01:quote=01'; " +
+  "alias ls='ls --color=auto' dir='dir --color=auto' vdir='vdir --color=auto' " +
+  "grep='grep --color=auto' egrep='egrep --color=auto' fgrep='fgrep --color=auto' " +
+  "diff='diff --color=auto' ip='ip --color=auto' 2>/dev/null; " +
+  ") >/dev/null 2>&1; clear;\n";
 
-export function TerminalPanel({ sessionId, broadcastTargets, active = true }: Props) {
+export function TerminalPanel({ sessionId, connectionId, broadcastTargets, active = true }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -51,10 +74,20 @@ export function TerminalPanel({ sessionId, broadcastTargets, active = true }: Pr
   const bridgeRef = useRef<ZmodemBridge | null>(null);
   const isZmodemRef = useRef(false);
   const abortTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Command-history keystroke buffer. These refs are NOT React state —
+  // we don't want every keystroke to trigger a re-render. The buffer is
+  // flushed on Enter and the resulting command is sent to the backend.
+  const cmdBufRef = useRef<string>("");
+  const ansiEscRef = useRef<boolean>(false);
+  const connectionIdRef = useRef(connectionId);
+  // Callback registered by CommandBar on mount so we can trigger a history
+  // list refresh after recording a new command.
+  const refreshHistoryRef = useRef<(() => void) | null>(null);
 
   // Keep the live ref in sync with the latest prop so onData (bound once at
   // mount) sees updates without rebinding.
   broadcastRef.current = broadcastTargets || [];
+  connectionIdRef.current = connectionId;
 
   const [zmodemStatus, setZmodemStatus] = useState<ZmodemStatus>({
     active: false,
@@ -135,15 +168,57 @@ export function TerminalPanel({ sessionId, broadcastTargets, active = true }: Pr
           }
         });
       });
+
+      // Record keystrokes for command-history. This runs AFTER the send
+      // so we don't block the critical path. We only record for the
+      // local tab's connectionId (not broadcast targets) — each tab
+      // records its own perspective.
+      if (connectionIdRef.current) {
+        recordKeystroke(data, cmdBufRef, ansiEscRef, (cmd) => {
+          addCommandHistory(connectionIdRef.current, cmd)
+            .then(() => {
+              refreshHistoryRef.current?.();
+            })
+            .catch(() => {
+              // Silently ignore history-write failures (not critical).
+            });
+        });
+      }
     });
 
     const resizeObserver = new ResizeObserver(() => {
-      fitAddon.fit();
+      // Guard against transient zero/tiny container sizes. We've seen the
+      // terminal cols collapse mid-session (ls going from multi-column to
+      // one-per-line, PS1 truncated to "argus@fn-na") — symptom of fit()
+      // reading a momentarily-collapsed container (Sidebar collapse
+      // animation, ServerInfoPanel mount transition, HMR re-render, etc.)
+      // and shrinking cols to garbage. Skip the fit entirely when the
+      // container is implausibly small rather than poison the shell.
+      const container = containerRef.current;
+      if (!container) return;
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      if (w < 80 || h < 40) {
+        console.warn(
+          `[TerminalPanel] skipping fit — container too small (${w}x${h})`
+        );
+        return;
+      }
+      const prevCols = term.cols;
+      try {
+        fitAddon.fit();
+      } catch (e) {
+        console.warn("[TerminalPanel] fit() threw:", e);
+        return;
+      }
+      // Log suspicious shrinkage for diagnosis. Normal fits don't drop cols
+      // by more than a few; a 60→11 drop is the bug we're hunting.
+      if (term.cols < prevCols - 10) {
+        console.warn(
+          `[TerminalPanel] cols shrank ${prevCols}→${term.cols} at container ${w}x${h}`
+        );
+      }
       sshResize(sessionIdRef.current, term.cols, term.rows).catch(() => {});
-      // Broadcast group: mirror cols to other members so every shell outputs
-      // in the same column width. Without this, an inactive tab's shell keeps
-      // its stale cols (ResizeObserver only fires on visible containers) and
-      // commands like `ls` render with a different layout per tab.
       for (const sid of broadcastRef.current) {
         if (sid !== sessionIdRef.current) {
           sshResize(sid, term.cols, term.rows).catch(() => {});
@@ -278,48 +353,81 @@ export function TerminalPanel({ sessionId, broadcastTargets, active = true }: Pr
   // we get when the user toggles 📡 — ResizeObserver won't fire because
   // nothing resized, but the shells still need to align before the next
   // broadcast keystroke lands.
+  //
+  // CRITICAL: gate on `active`. An inactive tab's term.cols is a stale/
+  // possibly-zero value (its container is display:none — ResizeObserver
+  // saw a 0x0 size transition and may have poisoned cols). Letting it push
+  // that zero to other members collapses everyone's COLUMNS and turns ls
+  // output into one-file-per-line. Only the active (visible, freshly-fit)
+  // tab is a reliable source of truth for cols.
   const targets = broadcastTargets ?? [];
   const broadcastKey = targets.join(",");
   useEffect(() => {
+    if (!active) return;
     const term = termRef.current;
     if (!term) return;
+    // Defensive: if our own cols is implausibly small, don't push it —
+    // we'd just propagate garbage.
+    if (term.cols < 20) return;
     for (const sid of targets) {
       if (sid !== sessionIdRef.current) {
         sshResize(sid, term.cols, term.rows).catch(() => {});
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [broadcastKey]);
+  }, [broadcastKey, active]);
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "100%" }}>
-      <div
-        ref={containerRef}
-        style={{
-          width: "100%",
-          height: "100%",
-          background: "#1e1e2e",
-          padding: 4,
-        }}
-      />
-      <ZmodemProgressOverlay
-        status={zmodemStatus}
-        onCancel={() => {
-          bridgeRef.current?.abort();
-          // 5s safety net: if the backend doesn't emit zmodem_end (Rust state
-          // machine stuck, network dropped mid-ZFIN), force the bridge back to
-          // a clean state so the user can resume typing.
-          if (abortTimeoutRef.current) clearTimeout(abortTimeoutRef.current);
-          abortTimeoutRef.current = setTimeout(() => {
-            bridgeRef.current?.reset();
-            isZmodemRef.current = false;
-            termRef.current?.write(
-              "\r\n\x1b[33m[abort 超时 5s — 强制重置]\x1b[0m\r\n"
-            );
-            abortTimeoutRef.current = null;
-          }, 5000);
-        }}
-      />
+    <div
+      style={{
+        position: "relative",
+        width: "100%",
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      {/* xterm container — flex:1 so it takes all space above CommandBar */}
+      <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
+        <div
+          ref={containerRef}
+          style={{
+            width: "100%",
+            height: "100%",
+            background: "#1e1e2e",
+            padding: 4,
+          }}
+        />
+        <ZmodemProgressOverlay
+          status={zmodemStatus}
+          onCancel={() => {
+            bridgeRef.current?.abort();
+            // 5s safety net: if the backend doesn't emit zmodem_end (Rust state
+            // machine stuck, network dropped mid-ZFIN), force the bridge back to
+            // a clean state so the user can resume typing.
+            if (abortTimeoutRef.current) clearTimeout(abortTimeoutRef.current);
+            abortTimeoutRef.current = setTimeout(() => {
+              bridgeRef.current?.reset();
+              isZmodemRef.current = false;
+              termRef.current?.write(
+                "\r\n\x1b[33m[abort 超时 5s — 强制重置]\x1b[0m\r\n"
+              );
+              abortTimeoutRef.current = null;
+            }, 5000);
+          }}
+        />
+      </div>
+      {/* CommandBar — only for SSH terminal tabs (connectionId provided) */}
+      {connectionId && (
+        <CommandBar
+          sessionId={sessionId}
+          connectionId={connectionId}
+          broadcastTargets={broadcastTargets}
+          onRegisterRefresh={(fn) => {
+            refreshHistoryRef.current = fn;
+          }}
+        />
+      )}
     </div>
   );
 }

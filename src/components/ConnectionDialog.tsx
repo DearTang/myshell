@@ -1,8 +1,9 @@
 import { useState, useRef } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { saveConnection } from "../api";
-import type { ConnectionConfig, ConnType, FtpTls } from "../api";
+import { saveConnection, getConnectionPassword, getConnectionProxyPassword } from "../api";
+import type { ConnectionConfig, ConnType, FtpTls, ProxyType } from "../api";
+import { PasswordVerifyDialog } from "./PasswordVerifyDialog";
 
 interface Props {
   config: ConnectionConfig | null;
@@ -38,7 +39,24 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
   const [groupPath, setGroupPath] = useState((config?.group_path || "/").slice(1));
   const [ftpTls, setFtpTls] = useState<FtpTls>(config?.ftp_tls || "none");
   const [ftpPassive, setFtpPassive] = useState(config?.ftp_passive ?? true);
+  const [proxyType, setProxyType] = useState<ProxyType>(
+    (config?.proxy_type as ProxyType) || "none"
+  );
+  const [proxyHost, setProxyHost] = useState(config?.proxy_host || "");
+  const [proxyPort, setProxyPort] = useState(
+    String(config?.proxy_port || (config?.proxy_type === "http" ? 8080 : 1080))
+  );
+  const [proxyUsername, setProxyUsername] = useState(config?.proxy_username || "");
+  // proxy_password is NEVER echoed back from the backend on edit (it lives in
+  // the OS keyring, not SQLite). Empty input = "keep existing keyring value";
+  // backend distinguishes by reading keyring at connect time.
+  const [proxyPassword, setProxyPassword] = useState("");
   const [saving, setSaving] = useState(false);
+
+  // Password visibility state
+  const [showPassword, setShowPassword] = useState(false);
+  const [showProxyPassword, setShowProxyPassword] = useState(false);
+  const [passwordVerifyTarget, setPasswordVerifyTarget] = useState<"password" | "proxy" | null>(null);
 
   // Tracks whether the user manually edited the name field. Until they do,
   // the name auto-syncs to host (per spec: "主机地址填了后连接名默认跟主机地址一致").
@@ -83,6 +101,22 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
       return;
     }
 
+    // Proxy validation — only enforce when a proxy type is selected. Host is
+    // mandatory; port must be a valid 1-65535 integer (default by type).
+    let proxyPortNum: number | undefined;
+    if (proxyType !== "none") {
+      if (!proxyHost.trim()) {
+        alert("代理主机地址不能为空");
+        return;
+      }
+      const pp = parseInt(proxyPort, 10);
+      if (!Number.isInteger(pp) || pp < 1 || pp > 65535) {
+        alert("代理端口必须为 1-65535 之间的整数");
+        return;
+      }
+      proxyPortNum = pp;
+    }
+
     setSaving(true);
     try {
       const passwordToSend =
@@ -104,6 +138,18 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
         group_path: trimmedGroup ? `/${trimmedGroup}` : "/",
         ftp_tls: connType === "ftp" ? ftpTls : "none",
         ftp_passive: connType === "ftp" ? ftpPassive : true,
+        proxy_type: proxyType,
+        proxy_host: proxyType !== "none" ? proxyHost.trim() : undefined,
+        proxy_port: proxyPortNum,
+        proxy_username:
+          proxyType !== "none" && proxyUsername.trim()
+            ? proxyUsername.trim()
+            : undefined,
+        // Send undefined (not "") when type=none so backend deletes the
+        // keyring entry; undefined when type!=none + empty input means
+        // "keep existing keyring value" — backend handles both.
+        proxy_password:
+          proxyType !== "none" && proxyPassword ? proxyPassword : undefined,
         created_at: config?.created_at || new Date().toISOString(),
       };
       await saveConnection(conn);
@@ -209,13 +255,35 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
             </FormField>
             {authMethod === "password" ? (
               <FormField label="密码">
-                <Input
-                  value={password}
-                  onChange={setPassword}
-                  type="password"
-                  placeholder={config ? "留空保持不变" : "••••••"}
-                  accent="warning"
-                />
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <div style={{ flex: 1 }}>
+                    <Input
+                      value={password}
+                      onChange={setPassword}
+                      type={showPassword ? "text" : "password"}
+                      placeholder={config ? "留空保持不变" : "••••••"}
+                      accent="warning"
+                    />
+                  </div>
+                  {config && (
+                    <button
+                      type="button"
+                      onClick={() => setPasswordVerifyTarget("password")}
+                      title={showPassword ? "隐藏密码" : "查看密码"}
+                      style={{
+                        padding: "7px 10px",
+                        background: "var(--bg-input)",
+                        border: "1px solid var(--border)",
+                        borderRadius: 6,
+                        fontSize: 14,
+                        cursor: "pointer",
+                        color: showPassword ? "var(--success)" : "var(--text-muted)",
+                      }}
+                    >
+                      {showPassword ? "👁" : "👁‍🗨"}
+                    </button>
+                  )}
+                </div>
               </FormField>
             ) : (
               <FormField label="私钥文件">
@@ -264,6 +332,87 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
             </FieldGroup>
           )}
 
+          <FieldGroup label="代理">
+            <FormField label="代理类型">
+              <Select
+                value={proxyType}
+                onChange={(v) => setProxyType(v as ProxyType)}
+                options={[
+                  { value: "none", label: "不使用代理（直连）" },
+                  { value: "socks5", label: "SOCKS5" },
+                  { value: "http", label: "HTTP CONNECT" },
+                ]}
+              />
+            </FormField>
+            {proxyType !== "none" && (
+              <>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <div style={{ flex: 2 }}>
+                    <FormField label="代理主机">
+                      <Input
+                        value={proxyHost}
+                        onChange={setProxyHost}
+                        placeholder="127.0.0.1"
+                      />
+                    </FormField>
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <FormField label="端口">
+                      <Input
+                        value={proxyPort}
+                        onChange={setProxyPort}
+                        placeholder={proxyType === "http" ? "8080" : "1080"}
+                      />
+                    </FormField>
+                  </div>
+                </div>
+                <FormField label="代理用户名（可选）">
+                  <Input
+                    value={proxyUsername}
+                    onChange={setProxyUsername}
+                    placeholder="anonymous"
+                  />
+                </FormField>
+                <FormField label="代理密码（可选）">
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <div style={{ flex: 1 }}>
+                      <Input
+                        value={proxyPassword}
+                        onChange={setProxyPassword}
+                        type={showProxyPassword ? "text" : "password"}
+                        placeholder={config?.proxy_type && config.proxy_type !== "none" ? "留空保持不变" : "••••••"}
+                        accent="warning"
+                      />
+                    </div>
+                    {config?.proxy_type && config.proxy_type !== "none" && (
+                      <button
+                        type="button"
+                        onClick={() => setPasswordVerifyTarget("proxy")}
+                        title={showProxyPassword ? "隐藏密码" : "查看密码"}
+                        style={{
+                          padding: "7px 10px",
+                          background: "var(--bg-input)",
+                          border: "1px solid var(--border)",
+                          borderRadius: 6,
+                          fontSize: 14,
+                          cursor: "pointer",
+                          color: showProxyPassword ? "var(--success)" : "var(--text-muted)",
+                        }}
+                      >
+                        {showProxyPassword ? "👁" : "👁‍🗨"}
+                      </button>
+                    )}
+                  </div>
+                </FormField>
+                {connType === "ftp" && ftpTls !== "none" && (
+                  <div style={{ fontSize: 11, color: "var(--warning)", lineHeight: 1.4 }}>
+                    注意：FTPS（TLS）当前版本暂不支持，连接时会报错。如需走代理，请把 TLS 模式切回「不加密」。
+                  </div>
+                )}
+              </>
+            )}
+          </FieldGroup>
+
           <FieldGroup label="分组">
             <FormField label="文件夹路径（用 / 分隔）">
               <Input
@@ -291,6 +440,37 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
           </button>
         </div>
       </div>
+
+      {/* Password verify dialog */}
+      {passwordVerifyTarget && (
+        <PasswordVerifyDialog
+          onSuccess={async () => {
+            if (passwordVerifyTarget === "password" && config?.id) {
+              try {
+                const pw = await getConnectionPassword(config.id);
+                if (pw) {
+                  setPassword(pw);
+                  setShowPassword(true);
+                }
+              } catch {
+                alert("获取密码失败");
+              }
+            } else if (passwordVerifyTarget === "proxy" && config?.id) {
+              try {
+                const pw = await getConnectionProxyPassword(config.id);
+                if (pw) {
+                  setProxyPassword(pw);
+                  setShowProxyPassword(true);
+                }
+              } catch {
+                alert("获取代理密码失败");
+              }
+            }
+            setPasswordVerifyTarget(null);
+          }}
+          onClose={() => setPasswordVerifyTarget(null)}
+        />
+      )}
     </div>
   );
 }

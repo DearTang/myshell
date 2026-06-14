@@ -1,4 +1,5 @@
 use crate::{AppState, ConnectionConfig};
+use crate::proxy;
 use russh::client::{self, Handle, Msg};
 use russh::{Channel, ChannelMsg};
 use std::collections::HashMap;
@@ -239,9 +240,32 @@ pub async fn connect(
         host: config.host.clone(),
     };
 
-    let mut handle = client::connect(ssh_config, (config.host.as_str(), config.port), handler)
-        .await
-        .map_err(|e| format!("SSH connect failed: {}", e))?;
+    // Branch on proxy config: if proxy_type is set, dial the proxy first
+    // and hand the upgraded stream to russh's connect_stream variant. SFTP
+    // reuses this same session (sftp.rs) so the proxy choice covers SFTP
+    // automatically without a separate code path.
+    let mut handle = match proxy::ProxyConfig::from_config(&config)? {
+        Some(proxy_cfg) => {
+            eprintln!(
+                "[ssh:{}] connecting via {} proxy {}:{} → {}:{}",
+                sid,
+                config.proxy_type,
+                proxy_cfg.host(),
+                proxy_cfg.port(),
+                config.host,
+                config.port
+            );
+            let stream = proxy::connect_via_proxy(&proxy_cfg, &config.host, config.port).await?;
+            client::connect_stream(ssh_config, stream, handler)
+                .await
+                .map_err(|e| format!("SSH connect via proxy failed: {}", e))?
+        }
+        None => {
+            client::connect(ssh_config, (config.host.as_str(), config.port), handler)
+                .await
+                .map_err(|e| format!("SSH connect failed: {}", e))?
+        }
+    };
 
     // Authenticate
     let auth_result = match config.auth_method.as_str() {

@@ -17,6 +17,8 @@ mod secrets;
 mod ftp;
 mod crypto;
 mod vault;
+mod proxy;
+mod backup;
 
 // ============ Connection Config ============
 
@@ -48,6 +50,25 @@ pub struct ConnectionConfig {
     /// FTP passive mode toggle. True by default (NAT-friendly).
     #[serde(default = "default_ftp_passive")]
     pub ftp_passive: bool,
+    /// Proxy type: "none" | "socks5" | "http". Stored plaintext (not
+    /// sensitive — knowing you use SOCKS5 doesn't compromise anything).
+    #[serde(default = "default_proxy_type")]
+    pub proxy_type: String,
+    /// Proxy host (transient plaintext in memory; encrypted at rest as
+    /// `proxy_host_enc`). Surfaces internal network topology, treated as
+    /// same-sensitivity as `host`.
+    #[serde(default)]
+    pub proxy_host: Option<String>,
+    /// Proxy port. Small int, not sensitive — stored plaintext.
+    #[serde(default)]
+    pub proxy_port: Option<u16>,
+    /// Proxy auth username. Stored plaintext in DB (not a secret on its own).
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    /// Proxy auth password (transient). Resolved from keyring at connect
+    /// time, written to keyring at save time. Same scheme as `password`.
+    #[serde(default)]
+    pub proxy_password: Option<String>,
     pub created_at: String,
 }
 
@@ -63,6 +84,10 @@ fn default_ftp_passive() -> bool {
     true
 }
 
+fn default_proxy_type() -> String {
+    "none".to_string()
+}
+
 // ============ SFTP File Entry ============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +100,16 @@ pub struct FileEntry {
     pub modified: String,
 }
 
+// ============ Command History Entry ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandHistoryItem {
+    pub id: i64,
+    pub command: String,
+    pub pinned: bool,
+    pub created_at: String,
+}
+
 // ============ App State ============
 
 pub struct AppState {
@@ -84,11 +119,10 @@ pub struct AppState {
     pub ssh_sessions: Arc<Mutex<std::collections::HashMap<String, ssh::SshSession>>>,
     pub ftp_sessions: Arc<Mutex<std::collections::HashMap<String, ftp::FtpSession>>>,
     pub zmodem_files: Mutex<HashMap<String, ZmodemFileHandle>>,
-    /// Master key derived from the user's passphrase + persisted salt.
-    /// `None` until `unlock_vault` / `setup_vault` populates it; cleared by
-    /// `lock_vault`. All db / secrets calls that touch encrypted columns
-    /// take this and return a "vault 未解锁" error if it's None.
-    pub master_key: Arc<Mutex<Option<[u8; 32]>>>,
+    /// Data Encryption Key (DEK) — random 32-byte key for encrypting all
+    /// database columns and keyring entries. Derived once at setup and
+    /// stored encrypted by the login password. `None` until unlocked.
+    pub dek: Arc<Mutex<Option<[u8; 32]>>>,
 }
 
 /// Track open file handles for streaming ZMODEM file IO. Each transfer is
@@ -115,14 +149,14 @@ pub enum ZmodemFileKind {
 
 #[tauri::command]
 fn get_connections(state: State<AppState>) -> Result<Vec<ConnectionConfig>, String> {
-    let key = require_master_key(&state)?;
+    let key = require_dek(&state)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db::get_all_connections(&db, &key).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn save_connection(state: State<AppState>, mut config: ConnectionConfig) -> Result<(), String> {
-    let key = require_master_key(&state)?;
+    let key = require_dek(&state)?;
     // Move the password out of the in-memory config before persisting so the
     // plaintext value never lands in SQLite. The keyring is the only store.
     let pw = config.password.take();
@@ -136,6 +170,27 @@ fn save_connection(state: State<AppState>, mut config: ConnectionConfig) -> Resu
         secrets::delete_password(&config.id)?;
     }
 
+    // Proxy password: same pattern. An empty proxy_password means "leave the
+    // existing keyring entry alone" (UI leaves the field blank when editing
+    // a connection that already has a proxy password). A non-empty value
+    // overwrites; switching proxy_type to "none" deletes the entry.
+    let proxy_pw = config.proxy_password.take();
+    match config.proxy_type.as_str() {
+        "none" | "" => {
+            // Clear any stale proxy credential so flipping type back doesn't
+            // reuse a forgotten secret.
+            let _ = secrets::delete_proxy_password(&config.id);
+        }
+        _ => {
+            if let Some(p) = proxy_pw.as_ref().filter(|s| !s.is_empty()) {
+                secrets::set_proxy_password(&config.id, p, &key)?;
+            }
+            // Empty proxy_pw on save: leave existing entry intact (edit flow
+            // doesn't re-collect password). The connect path resolves from
+            // keyring, so a stale None here just means "no auth attempted".
+        }
+    }
+
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db::save_connection(&db, &key, &config).map_err(|e| e.to_string())
 }
@@ -145,6 +200,7 @@ fn delete_connection(state: State<AppState>, id: String) -> Result<(), String> {
     // Best-effort keyring cleanup — the DB row is the source of truth for
     // existence, so a missing credential is not a failure.
     let _ = secrets::delete_password(&id);
+    let _ = secrets::delete_proxy_password(&id);
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db::delete_connection(&db, &id).map_err(|e| e.to_string())
 }
@@ -155,7 +211,7 @@ fn delete_connection(state: State<AppState>, id: String) -> Result<(), String> {
 /// copy is connectable without re-entering the password.
 #[tauri::command]
 fn copy_connection(state: State<AppState>, src_id: String) -> Result<ConnectionConfig, String> {
-    let key = require_master_key(&state)?;
+    let key = require_dek(&state)?;
     let new_id = uuid::Uuid::new_v4().to_string();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -193,6 +249,14 @@ fn copy_connection(state: State<AppState>, src_id: String) -> Result<ConnectionC
         if let Some(pw) = secrets::get_password(&src_id, &key).map_err(|e| e.to_string())? {
             secrets::set_password(&new_id, &pw, &key)?;
             cfg.password = Some(pw);
+        }
+    }
+    // Same treatment for the proxy password — copy it under the new id so
+    // the duplicated connection can dial through the same proxy.
+    if cfg.proxy_type != "none" {
+        if let Some(pw) = secrets::get_proxy_password(&src_id, &key).map_err(|e| e.to_string())? {
+            secrets::set_proxy_password(&new_id, &pw, &key)?;
+            cfg.proxy_password = Some(pw);
         }
     }
 
@@ -247,7 +311,7 @@ fn export_connections(
     passphrase: String,
     path: String,
 ) -> Result<usize, String> {
-    let key = require_master_key(&state)?;
+    let key = require_dek(&state)?;
     let (connections, folders) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let mut conns = db::get_all_connections(&db, &key).map_err(|e| e.to_string())?;
@@ -257,6 +321,9 @@ fn export_connections(
         for c in conns.iter_mut() {
             if c.auth_method == "password" {
                 c.password = secrets::get_password(&c.id, &key).ok().flatten();
+            }
+            if c.proxy_type != "none" {
+                c.proxy_password = secrets::get_proxy_password(&c.id, &key).ok().flatten();
             }
         }
         let folders = db::list_folders(&db).map_err(|e| e.to_string())?;
@@ -290,7 +357,7 @@ fn import_connections(
     passphrase: String,
     path: String,
 ) -> Result<usize, String> {
-    let key = require_master_key(&state)?;
+    let key = require_dek(&state)?;
     let envelope = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path, e))?;
     let plaintext = crypto::decrypt(&envelope, &passphrase)?;
     let dump: ConnectionDump =
@@ -320,9 +387,16 @@ fn import_connections(
                     secrets::set_password(&new_id, pw, &key)?;
                 }
             }
+            // Same for proxy password — write under new id, clear from config.
+            if c.proxy_type != "none" {
+                if let Some(pw) = c.proxy_password.as_ref() {
+                    secrets::set_proxy_password(&new_id, pw, &key)?;
+                }
+            }
             c.id = new_id;
             c.created_at = now.clone();
             c.password = None;
+            c.proxy_password = None;
             db::save_connection(&db, &key, &c).map_err(|e| e.to_string())?;
         }
     }
@@ -337,12 +411,12 @@ fn import_connections(
 // end with master_key populated, after which the connection commands
 // can run.
 
-/// Extract the master key from AppState or surface a friendly error if the
+/// Extract the DEK from AppState or surface a friendly error if the
 /// vault is locked. Every command that touches encrypted columns calls this
 /// first — there's no implicit unlock.
-fn require_master_key(state: &State<AppState>) -> Result<[u8; 32], String> {
+fn require_dek(state: &State<AppState>) -> Result<[u8; 32], String> {
     state
-        .master_key
+        .dek
         .lock()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Vault 未解锁".to_string())
@@ -358,73 +432,237 @@ struct VaultStatus {
 fn vault_status(state: State<AppState>) -> VaultStatus {
     let initialized = vault::is_initialized();
     let unlocked = state
-        .master_key
+        .dek
         .lock()
         .map(|k| k.is_some())
         .unwrap_or(false);
     VaultStatus { initialized, unlocked }
 }
 
-/// First-time setup: random salt → derive key → make verifier → write
-/// files → populate AppState → migrate any existing plaintext DB rows.
-/// Returns Err if a vault already exists (frontend shouldn't offer setup
-/// in that case, but defense-in-depth).
+/// First-time setup:
+/// 1. Generate random salt for password derivation
+/// 2. Derive master_key from passphrase
+/// 3. Generate random DEK (data encryption key)
+/// 4. Encrypt DEK with master_key and store
+/// 5. Create verifier for password verification
+/// 6. Migrate any existing plaintext DB rows
 #[tauri::command]
 fn setup_vault(state: State<AppState>, passphrase: String) -> Result<(), String> {
-    if passphrase.len() < 12 {
-        return Err("主密码至少 12 个字符".into());
+    if passphrase.len() < 6 {
+        return Err("主密码至少 6 个字符".into());
     }
     if vault::is_initialized() {
         return Err("Vault 已初始化，请使用解锁".into());
     }
 
-    // Generate salt + derived key + verifier, then persist.
+    // Generate salt + derive master_key from passphrase
     let mut salt = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut salt);
-    let key = crypto::derive_master_key(&passphrase, &salt);
-    let verifier = crypto::make_verifier(&key)?;
-    vault::write_vault_files(&salt, &verifier)?;
+    let master_key = crypto::derive_master_key(&passphrase, &salt);
 
-    // Populate master_key before triggering DB migration — migrate needs
-    // the key to encrypt existing plaintext rows in place.
+    // Generate random DEK (32 bytes)
+    let mut dek = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut dek);
+
+    // Encrypt DEK with master_key
+    let encrypted_dek = crypto::encrypt_with_key(&master_key, &dek)?;
+
+    // Create verifier for password verification
+    let verifier = crypto::make_verifier(&master_key)?;
+
+    // Persist salt + verifier + encrypted_dek
+    vault::write_vault_files(&salt, &verifier)?;
+    vault::write_encrypted_dek(&encrypted_dek)?;
+
+    // Populate dek before triggering DB migration
     {
-        let mut slot = state.master_key.lock().map_err(|e| e.to_string())?;
-        *slot = Some(key);
+        let mut slot = state.dek.lock().map_err(|e| e.to_string())?;
+        *slot = Some(dek);
     }
 
-    // Migrate any pre-vault DB content (legacy host/username columns →
-    // host_enc/username_enc etc.). New installs have nothing to migrate.
+    // Migrate any pre-vault DB content
     let mut conn = state.db.lock().map_err(|e| e.to_string())?;
-    if let Err(e) = db::migrate_to_vault(&mut conn, &key) {
-        // Migration failure is fatal: leave vault files in place so the
-        // user gets a clean error and can decide whether to wipe + retry.
+    if let Err(e) = db::migrate_to_vault(&mut conn, &dek) {
         return Err(format!("数据迁移失败: {}", e));
     }
     Ok(())
 }
 
-/// Subsequent launches: read salt + verifier, derive key from supplied
-/// passphrase, check verifier. On success populate AppState.master_key.
+/// Unlock: verify passphrase and decrypt DEK
 #[tauri::command]
 fn unlock_vault(state: State<AppState>, passphrase: String) -> Result<(), String> {
+    // Check lockout status first
+    let mut lockout = vault::LockoutState::load();
+    if let Some(remaining) = lockout.check_lockout() {
+        return Err(format!("密码错误次数过多，请等待 {} 秒后重试", remaining));
+    }
+
     let salt = vault::read_salt().ok_or_else(|| "Vault 未初始化".to_string())?;
     let verifier = vault::read_verifier().ok_or_else(|| "Vault 未初始化".to_string())?;
-    let key = crypto::derive_master_key(&passphrase, &salt);
-    if !crypto::check_verifier(&key, &verifier) {
-        return Err("主密码错误".into());
+    let encrypted_dek = vault::read_encrypted_dek().ok_or_else(|| "Vault 未初始化".to_string())?;
+
+    // Derive master_key from passphrase and verify
+    let master_key = crypto::derive_master_key(&passphrase, &salt);
+    if !crypto::check_verifier(&master_key, &verifier) {
+        // Record failed attempt
+        return Err(lockout.record_failure());
     }
-    let mut slot = state.master_key.lock().map_err(|e| e.to_string())?;
-    *slot = Some(key);
+
+    // Decrypt DEK with master_key
+    let dek_bytes = crypto::decrypt_with_key(&master_key, &encrypted_dek)?;
+    let dek: [u8; 32] = dek_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "DEK 长度错误".to_string())?;
+
+    // Success - reset failure counters
+    lockout.record_success();
+
+    let mut slot = state.dek.lock().map_err(|e| e.to_string())?;
+    *slot = Some(dek);
     Ok(())
 }
 
-/// Drop the in-memory master_key. The on-disk vault files stay; user can
-/// unlock again. Useful when stepping away from the keyboard.
+/// Lock: drop the in-memory DEK
 #[tauri::command]
 fn lock_vault(state: State<AppState>) -> Result<(), String> {
-    let mut slot = state.master_key.lock().map_err(|e| e.to_string())?;
+    let mut slot = state.dek.lock().map_err(|e| e.to_string())?;
     *slot = None;
     Ok(())
+}
+
+/// Verify login password (for viewing plaintext passwords in UI)
+#[tauri::command]
+fn verify_password(passphrase: String) -> Result<bool, String> {
+    let salt = vault::read_salt().ok_or_else(|| "Vault 未初始化".to_string())?;
+    let verifier = vault::read_verifier().ok_or_else(|| "Vault 未初始化".to_string())?;
+
+    let master_key = crypto::derive_master_key(&passphrase, &salt);
+    Ok(crypto::check_verifier(&master_key, &verifier))
+}
+
+/// Get lockout status info for the UI
+#[derive(Serialize)]
+struct LockoutInfo {
+    /// Current consecutive failure count
+    consecutive_failures: u32,
+    /// Daily failure count
+    daily_failures: u32,
+    /// Last failure time as Unix timestamp
+    last_failure_time: Option<u64>,
+    /// Seconds remaining in lockout (if locked)
+    lockout_remaining: Option<u64>,
+    /// Is currently locked out
+    is_locked: bool,
+}
+
+#[tauri::command]
+fn get_lockout_info() -> LockoutInfo {
+    let mut lockout = vault::LockoutState::load();
+    let lockout_remaining = lockout.check_lockout();
+
+    LockoutInfo {
+        consecutive_failures: lockout.consecutive_failures,
+        daily_failures: lockout.daily_failures,
+        last_failure_time: lockout.last_failure_time,
+        lockout_remaining,
+        is_locked: lockout_remaining.is_some(),
+    }
+}
+
+/// Change login password:
+/// 1. Verify old passphrase
+/// 2. Re-encrypt DEK with new passphrase
+/// 3. Update verifier
+#[tauri::command]
+fn change_master_password(
+    state: State<AppState>,
+    old_passphrase: String,
+    new_passphrase: String,
+) -> Result<(), String> {
+    if new_passphrase.len() < 6 {
+        return Err("新密码至少 6 个字符".into());
+    }
+
+    let salt = vault::read_salt().ok_or_else(|| "Vault 未初始化".to_string())?;
+    let verifier = vault::read_verifier().ok_or_else(|| "Vault 未初始化".to_string())?;
+    let encrypted_dek = vault::read_encrypted_dek().ok_or_else(|| "Vault 未初始化".to_string())?;
+
+    // Verify old passphrase
+    let old_master_key = crypto::derive_master_key(&old_passphrase, &salt);
+    if !crypto::check_verifier(&old_master_key, &verifier) {
+        return Err("原密码错误".into());
+    }
+
+    // Decrypt DEK with old master_key
+    let dek_bytes = crypto::decrypt_with_key(&old_master_key, &encrypted_dek)?;
+    let dek: [u8; 32] = dek_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "DEK 长度错误".to_string())?;
+
+    // Derive new master_key and re-encrypt DEK
+    let new_master_key = crypto::derive_master_key(&new_passphrase, &salt);
+    let new_encrypted_dek = crypto::encrypt_with_key(&new_master_key, &dek)?;
+    let new_verifier = crypto::make_verifier(&new_master_key)?;
+
+    // Persist
+    vault::write_encrypted_dek(&new_encrypted_dek)?;
+    vault::write_vault_files(&salt, &new_verifier)?;
+
+    // Update in-memory DEK (should already be set, but ensure it's correct)
+    {
+        let mut slot = state.dek.lock().map_err(|e| e.to_string())?;
+        *slot = Some(dek);
+    }
+
+    Ok(())
+}
+
+// ============ Backup Commands ============
+
+/// Backup info for UI
+#[derive(Serialize, Clone)]
+struct BackupInfoUi {
+    version: String,
+    timestamp: u64,
+    files: Vec<String>,
+    timestamp_str: String,
+}
+
+/// Get list of available backups
+#[tauri::command]
+fn list_backups() -> Result<Vec<BackupInfoUi>, String> {
+    let backups = backup::list_backups()?;
+    Ok(backups.into_iter().map(|b| {
+        let datetime = chrono::DateTime::from_timestamp(b.timestamp as i64, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| b.timestamp.to_string());
+        BackupInfoUi {
+            version: b.version,
+            timestamp: b.timestamp,
+            files: b.files,
+            timestamp_str: datetime,
+        }
+    }).collect())
+}
+
+/// Rollback to a specific version
+#[tauri::command]
+fn rollback_backup(version: String) -> Result<String, String> {
+    backup::rollback(&version)
+}
+
+/// Get current app version
+#[tauri::command]
+fn get_app_version() -> String {
+    backup::APP_VERSION.to_string()
+}
+
+/// Get previous version available for quick rollback
+#[tauri::command]
+fn get_previous_version() -> Option<String> {
+    backup::get_previous_version()
 }
 
 /// Read a text file (PEM, etc.) at an absolute path. Used by the private-
@@ -434,6 +672,21 @@ fn lock_vault(state: State<AppState>) -> Result<(), String> {
 #[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("读取 {} 失败: {}", path, e))
+}
+
+/// Get the plaintext password for a connection (requires DEK).
+/// Used for viewing passwords in the UI after verification.
+#[tauri::command]
+fn get_connection_password(state: State<AppState>, id: String) -> Result<Option<String>, String> {
+    let key = require_dek(&state)?;
+    secrets::get_password(&id, &key)
+}
+
+/// Get the plaintext proxy password for a connection (requires DEK).
+#[tauri::command]
+fn get_connection_proxy_password(state: State<AppState>, id: String) -> Result<Option<String>, String> {
+    let key = require_dek(&state)?;
+    secrets::get_proxy_password(&id, &key)
 }
 
 // ============ Folder Management Commands ============
@@ -487,6 +740,79 @@ fn rename_folder(
     db::rename_folder(&db, &old, &new).map_err(|e| e.to_string())
 }
 
+// ============ Command History Commands ============
+
+#[tauri::command]
+fn add_command_history(
+    state: State<AppState>,
+    connection_id: String,
+    command: String,
+) -> Result<i64, String> {
+    if command.trim().is_empty() {
+        return Ok(0);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::add_command_history(&db, &connection_id, &command, &now).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_command_history(
+    state: State<AppState>,
+    connection_id: String,
+) -> Result<Vec<CommandHistoryItem>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let rows = db::list_command_history(&db, &connection_id).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, command, pinned, created_at)| CommandHistoryItem {
+            id,
+            command,
+            pinned,
+            created_at,
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn set_command_history_pinned(
+    state: State<AppState>,
+    id: i64,
+    pinned: bool,
+) -> Result<(), String> {
+    let pinned_at = if pinned {
+        Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_else(|_| "0".to_string()),
+        )
+    } else {
+        None
+    };
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::set_command_history_pinned(&db, id, pinned, pinned_at.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_command_history(state: State<AppState>, id: i64) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::delete_command_history(&db, id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clear_command_history(
+    state: State<AppState>,
+    connection_id: String,
+    include_pinned: bool,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::clear_command_history(&db, &connection_id, include_pinned).map_err(|e| e.to_string())
+}
+
 /// Normalize a folder path: trim, ensure leading slash, collapse duplicate
 /// slashes, strip trailing slash (except root).
 fn normalize_folder_path(input: &str) -> String {
@@ -516,8 +842,15 @@ async fn ssh_connect(
     // doesn't need to know about the vault. Key auth uses private_key_pem
     // which is already in the config (populated by get_connections).
     if config.auth_method != "key" && config.password.is_none() {
-        let key = require_master_key(&state)?;
+        let key = require_dek(&state)?;
         config.password = secrets::get_password(&config.id, &key)?;
+    }
+    // Same for proxy password: pull from keyring so ssh.rs sees a complete
+    // proxy config and can hand it to proxy.rs without knowing about the
+    // vault.
+    if config.proxy_type != "none" && config.proxy_password.is_none() {
+        let key = require_dek(&state)?;
+        config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
     }
     ssh::connect(state, window, config).await
 }
@@ -849,8 +1182,12 @@ async fn sftp_rename(
 async fn ftp_connect(mut config: ConnectionConfig, state: State<'_, AppState>) -> Result<String, String> {
     // Resolve password from keyring here (same pattern as ssh_connect).
     if config.password.is_none() {
-        let key = require_master_key(&state)?;
+        let key = require_dek(&state)?;
         config.password = secrets::get_password(&config.id, &key)?;
+    }
+    if config.proxy_type != "none" && config.proxy_password.is_none() {
+        let key = require_dek(&state)?;
+        config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
     }
     let session = ftp::connect(&config).await?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -1207,6 +1544,11 @@ pub fn run() {
     #[cfg(not(debug_assertions))]
     setup_file_logging();
 
+    // Check for version upgrade and backup if needed
+    if let Err(e) = backup::check_and_backup() {
+        eprintln!("[startup] backup check failed: {}", e);
+    }
+
     let conn = db::init_db().expect("Failed to initialize database");
     // v0.1 → v0.2 schema migration (group_name rename, conn_type/ftp_*
     // columns, drop plaintext password column). v0.2 → vault migration
@@ -1221,7 +1563,7 @@ pub fn run() {
         ssh_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         ftp_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         zmodem_files: Mutex::new(HashMap::new()),
-        master_key: Arc::new(Mutex::new(None)),
+        dek: Arc::new(Mutex::new(None)),
     };
 
     let app = tauri::Builder::default()
@@ -1233,7 +1575,16 @@ pub fn run() {
             setup_vault,
             unlock_vault,
             lock_vault,
+            verify_password,
+            get_lockout_info,
+            change_master_password,
             read_text_file,
+            get_connection_password,
+            get_connection_proxy_password,
+            list_backups,
+            rollback_backup,
+            get_app_version,
+            get_previous_version,
             get_connections,
             save_connection,
             delete_connection,
@@ -1244,6 +1595,11 @@ pub fn run() {
             save_folder,
             delete_folder,
             rename_folder,
+            add_command_history,
+            list_command_history,
+            set_command_history_pinned,
+            delete_command_history,
+            clear_command_history,
             ssh_connect,
             ssh_send,
             ssh_resize,

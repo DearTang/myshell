@@ -34,6 +34,10 @@ pub fn init_db() -> Result<Connection> {
             group_path TEXT NOT NULL DEFAULT '/',
             ftp_tls TEXT NOT NULL DEFAULT 'none',
             ftp_passive INTEGER NOT NULL DEFAULT 1,
+            proxy_type TEXT NOT NULL DEFAULT 'none',
+            proxy_host_enc TEXT,
+            proxy_port INTEGER,
+            proxy_username TEXT,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS known_hosts (
@@ -45,7 +49,17 @@ pub fn init_db() -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS folders (
             path TEXT PRIMARY KEY,
             created_at TEXT NOT NULL
-        );"
+        );
+        CREATE TABLE IF NOT EXISTS command_history (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            connection_id TEXT    NOT NULL,
+            command       TEXT    NOT NULL,
+            pinned        INTEGER NOT NULL DEFAULT 0,
+            created_at    TEXT    NOT NULL,
+            pinned_at     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_cmd_history_conn ON command_history(connection_id);
+        CREATE INDEX IF NOT EXISTS idx_cmd_history_pinned ON command_history(connection_id, pinned, pinned_at DESC);"
     )?;
     Ok(conn)
 }
@@ -106,6 +120,31 @@ pub fn migrate_legacy_schema(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "connections", "ftp_passive") {
         conn.execute(
             "ALTER TABLE connections ADD COLUMN ftp_passive INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+
+    // Proxy support columns (v0.2 → v0.3). Idempotent — existing installs
+    // get the columns added with safe defaults; new installs have them via
+    // init_db's CREATE TABLE.
+    if !column_exists(conn, "connections", "proxy_type") {
+        conn.execute(
+            "ALTER TABLE connections ADD COLUMN proxy_type TEXT NOT NULL DEFAULT 'none'",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "connections", "proxy_host_enc") {
+        conn.execute(
+            "ALTER TABLE connections ADD COLUMN proxy_host_enc TEXT",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "connections", "proxy_port") {
+        conn.execute("ALTER TABLE connections ADD COLUMN proxy_port INTEGER", [])?;
+    }
+    if !column_exists(conn, "connections", "proxy_username") {
+        conn.execute(
+            "ALTER TABLE connections ADD COLUMN proxy_username TEXT",
             [],
         )?;
     }
@@ -276,7 +315,8 @@ pub fn set_known_host(
 pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<ConnectionConfig>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
-                private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive, created_at
+                private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
+                proxy_type, proxy_host_enc, proxy_port, proxy_username, created_at
          FROM connections ORDER BY group_path, name"
     )?;
 
@@ -296,18 +336,25 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
             row.get::<_, String>(9)?,                       // group_path
             row.get::<_, String>(10)?,                      // ftp_tls
             row.get::<_, i64>(11)?,                         // ftp_passive
-            row.get::<_, String>(12)?,                      // created_at
+            row.get::<_, String>(12)?,                      // proxy_type
+            row.get::<_, Option<String>>(13)?,              // proxy_host_enc
+            row.get::<_, Option<i64>>(14)?,                 // proxy_port
+            row.get::<_, Option<String>>(15)?,              // proxy_username
+            row.get::<_, String>(16)?,                      // created_at
         ))
     })?;
 
     let mut configs = Vec::new();
     for row in rows {
         let (id, name, host_enc, port_i, user_enc, auth_method, pem_enc,
-             conn_type, group_path, ftp_tls, ftp_passive, created_at) = row?;
+             conn_type, group_path, ftp_tls, ftp_passive,
+             proxy_type, proxy_host_enc, proxy_port_i, proxy_username, created_at) = row?;
         let host = decrypt_field(key, host_enc)?.unwrap_or_default();
         let username = decrypt_field(key, user_enc)?.unwrap_or_default();
         let private_key_pem = decrypt_field(key, pem_enc)?;
+        let proxy_host = decrypt_field(key, proxy_host_enc)?;
         let port: u16 = port_i.try_into().unwrap_or(0);
+        let proxy_port = proxy_port_i.and_then(|p| p.try_into().ok());
         configs.push(ConnectionConfig {
             id,
             name,
@@ -321,6 +368,11 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
             group_path,
             ftp_tls,
             ftp_passive: ftp_passive != 0,
+            proxy_type,
+            proxy_host,
+            proxy_port,
+            proxy_username,
+            proxy_password: None, // resolved from keyring by caller
             created_at,
         });
     }
@@ -339,12 +391,22 @@ pub fn save_connection(conn: &Connection, key: &[u8; 32], config: &ConnectionCon
         ),
         _ => None,
     };
+    // Proxy host encryption — same scheme as host. Empty proxy_host is stored
+    // as NULL (proxy_type='none' case usually).
+    let proxy_host_enc = match config.proxy_host.as_ref() {
+        Some(h) if !h.is_empty() => Some(
+            crypto::encrypt_with_key(key, h.as_bytes())
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?,
+        ),
+        _ => None,
+    };
 
     conn.execute(
         "INSERT OR REPLACE INTO connections
             (id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
-             private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12)",
+             private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
+             proxy_type, proxy_host_enc, proxy_port, proxy_username, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             config.id,
             config.name,
@@ -357,6 +419,10 @@ pub fn save_connection(conn: &Connection, key: &[u8; 32], config: &ConnectionCon
             config.group_path,
             config.ftp_tls,
             config.ftp_passive as i64,
+            config.proxy_type,
+            proxy_host_enc,
+            config.proxy_port.map(|p| p as i64),
+            config.proxy_username,
             config.created_at,
         ],
     )?;
@@ -366,7 +432,8 @@ pub fn save_connection(conn: &Connection, key: &[u8; 32], config: &ConnectionCon
 pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Option<ConnectionConfig>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
-                private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive, created_at
+                private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
+                proxy_type, proxy_host_enc, proxy_port, proxy_username, created_at
          FROM connections WHERE id = ?1"
     )?;
     let mut rows = stmt.query_map(params![id], |row| {
@@ -382,16 +449,23 @@ pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Opt
             row.get::<_, String>(9)?,
             row.get::<_, String>(10)?,
             row.get::<_, i64>(11)?,
-            row.get::<_, String>(12)?,
+            row.get::<_, String>(12)?,                       // proxy_type
+            row.get::<_, Option<String>>(13)?,               // proxy_host_enc
+            row.get::<_, Option<i64>>(14)?,                  // proxy_port
+            row.get::<_, Option<String>>(15)?,               // proxy_username
+            row.get::<_, String>(16)?,                       // created_at
         ))
     })?;
     match rows.next() {
         Some(Ok((id, name, host_enc, port_i, user_enc, auth_method, pem_enc,
-                 conn_type, group_path, ftp_tls, ftp_passive, created_at))) => {
+                 conn_type, group_path, ftp_tls, ftp_passive,
+                 proxy_type, proxy_host_enc, proxy_port_i, proxy_username, created_at))) => {
             let host = decrypt_field(key, host_enc)?.unwrap_or_default();
             let username = decrypt_field(key, user_enc)?.unwrap_or_default();
             let private_key_pem = decrypt_field(key, pem_enc)?;
+            let proxy_host = decrypt_field(key, proxy_host_enc)?;
             let port: u16 = port_i.try_into().unwrap_or(0);
+            let proxy_port = proxy_port_i.and_then(|p| p.try_into().ok());
             Ok(Some(ConnectionConfig {
                 id,
                 name,
@@ -405,6 +479,11 @@ pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Opt
                 group_path,
                 ftp_tls,
                 ftp_passive: ftp_passive != 0,
+                proxy_type,
+                proxy_host,
+                proxy_port,
+                proxy_username,
+                proxy_password: None,
                 created_at,
             }))
         }
@@ -483,6 +562,121 @@ pub fn folder_has_children(conn: &Connection, path: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(folder_count > 0)
+}
+
+// ============ Command History ============
+//
+// Per-connection shell command history with pin support. Pinned entries
+// survive the 50-row trim and surface at the top of list_command_history.
+// Created_at is an epoch-seconds string (same scheme as `folders`); we
+// additionally order by `id DESC` as a stable tiebreaker for sub-second
+// bursts (rapid-fire pastes, scripted `ssh_send` from broadcast).
+
+pub fn add_command_history(conn: &Connection, connection_id: &str, command: &str, created_at: &str) -> Result<i64> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.unchecked_transaction()?;
+
+    // Delete any existing entry with the same command (dedup across all history).
+    // The new insert will place it at the top (most recent).
+    tx.execute(
+        "DELETE FROM command_history WHERE connection_id = ?1 AND command = ?2",
+        params![connection_id, trimmed],
+    )?;
+
+    tx.execute(
+        "INSERT INTO command_history (connection_id, command, pinned, created_at, pinned_at)
+         VALUES (?1, ?2, 0, ?3, NULL)",
+        params![connection_id, trimmed, created_at],
+    )?;
+    let new_id = tx.last_insert_rowid();
+
+    // Trim unpinned entries beyond the most recent 50.
+    tx.execute(
+        "DELETE FROM command_history
+         WHERE connection_id = ?1
+           AND pinned = 0
+           AND id NOT IN (
+             SELECT id FROM command_history
+             WHERE connection_id = ?1 AND pinned = 0
+             ORDER BY created_at DESC, id DESC
+             LIMIT 50
+           )",
+        params![connection_id],
+    )?;
+    tx.commit()?;
+    Ok(new_id)
+}
+
+pub fn list_command_history(conn: &Connection, connection_id: &str) -> Result<Vec<(i64, String, bool, String)>> {
+    // Pinned first (by pinned_at DESC — most recently pinned wins top spot,
+    // falling back to id DESC when pinned_at ties or is null), then up to 50
+    // most-recent unpinned. We select all columns needed for sorting and let
+    // the outer ORDER BY reference them.
+    let mut stmt = conn.prepare(
+        "SELECT id, command, pinned, created_at, pinned_at FROM (
+            SELECT id, command, pinned, created_at, pinned_at FROM command_history
+             WHERE connection_id = ?1 AND pinned = 1
+             ORDER BY pinned_at DESC, id DESC
+         )
+         UNION ALL
+         SELECT id, command, pinned, created_at, pinned_at FROM (
+            SELECT id, command, pinned, created_at, pinned_at FROM command_history
+             WHERE connection_id = ?1 AND pinned = 0
+             ORDER BY created_at DESC, id DESC
+             LIMIT 50
+         )
+         ORDER BY pinned DESC, pinned_at DESC NULLS LAST, created_at DESC, id DESC"
+    )?;
+    let rows = stmt.query_map(params![connection_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? != 0,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn set_command_history_pinned(conn: &Connection, id: i64, pinned: bool, pinned_at: Option<&str>) -> Result<()> {
+    match pinned {
+        true => conn.execute(
+            "UPDATE command_history SET pinned = 1, pinned_at = ?2 WHERE id = ?1",
+            params![id, pinned_at],
+        )?,
+        false => conn.execute(
+            "UPDATE command_history SET pinned = 0, pinned_at = NULL WHERE id = ?1",
+            params![id],
+        )?,
+    };
+    Ok(())
+}
+
+pub fn delete_command_history(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM command_history WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn clear_command_history(conn: &Connection, connection_id: &str, include_pinned: bool) -> Result<()> {
+    match include_pinned {
+        true => conn.execute(
+            "DELETE FROM command_history WHERE connection_id = ?1",
+            params![connection_id],
+        )?,
+        false => conn.execute(
+            "DELETE FROM command_history WHERE connection_id = ?1 AND pinned = 0",
+            params![connection_id],
+        )?,
+    };
+    Ok(())
 }
 
 // ============ Helpers ============

@@ -1,15 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { open, save } from "@tauri-apps/plugin-dialog";
 import type { ConnectionConfig, ConnType } from "../api";
 import {
   saveFolder,
   deleteFolder,
   renameFolder,
   copyConnection,
-  exportConnections,
-  importConnections,
 } from "../api";
-import { PassphraseDialog } from "./PassphraseDialog";
 
 interface Props {
   connections: ConnectionConfig[];
@@ -19,6 +15,7 @@ interface Props {
   onDelete: (id: string) => void;
   onAddNew: (initialType?: ConnType) => void;
   onRefresh: () => void;
+  onOpenSettings: () => void;
   /** When true, the sidebar collapses to a narrow strip showing only an
    * "expand" button. Clicking it flips back to the full 220px panel. */
   collapsed?: boolean;
@@ -99,6 +96,7 @@ export function Sidebar({
   onDelete,
   onAddNew,
   onRefresh,
+  onOpenSettings,
   collapsed = false,
   onToggleCollapsed,
 }: Props) {
@@ -108,10 +106,6 @@ export function Sidebar({
     | { x: number; y: number; kind: "blank" | "folder"; folderPath?: string }
     | null
   >(null);
-  const [passDialog, setPassDialog] = useState<{ mode: "export" | "import" } | null>(null);
-  // Ref so the dialog's onSubmit (created before file picked) can read the
-  // current path without re-render churn.
-  const exportPathRef = useRef<string | null>(null);
 
   const tree = useMemo(() => buildTree(connections, folders), [connections, folders]);
 
@@ -163,50 +157,6 @@ export function Sidebar({
       onRefresh();
     } catch (e) {
       window.alert(`删除失败: ${e}`);
-    }
-  }
-
-  // Export flow: ⬆ → set passphrase → pick save path → write.
-  // Import flow: ⬇ → pick file → enter passphrase → read.
-  // Asymmetric because export is "I'm creating this, I decide the password"
-  // while import is "I have a file, I need to recall the password."
-  async function startExport() {
-    if (connections.length === 0) {
-      window.alert("暂无连接可导出");
-      return;
-    }
-    setPassDialog({ mode: "export" });
-  }
-
-  async function startImport() {
-    const selected = await open({
-      multiple: false,
-      filters: [{ name: "MyShell Encrypted Dump", extensions: ["json"] }],
-    });
-    if (!selected || Array.isArray(selected)) return;
-    exportPathRef.current = selected;
-    setPassDialog({ mode: "import" });
-  }
-
-  async function handleExportOrImport(pass: string) {
-    if (passDialog?.mode === "export") {
-      // Password is set — now ask where to write.
-      const path = await save({
-        defaultPath: `myshell-export-${new Date().toISOString().slice(0, 10)}.json`,
-        filters: [{ name: "MyShell Encrypted Dump", extensions: ["json"] }],
-      });
-      if (!path) return; // user cancelled the save dialog; keep passphrase dialog open
-      const n = await exportConnections(pass, path);
-      window.alert(`已导出 ${n} 个连接到\n${path}`);
-      setPassDialog(null);
-    } else {
-      const path = exportPathRef.current;
-      if (!path) throw new Error("未选择文件");
-      const n = await importConnections(pass, path);
-      window.alert(`已导入 ${n} 个连接`);
-      onRefresh();
-      setPassDialog(null);
-      exportPathRef.current = null;
     }
   }
 
@@ -358,9 +308,7 @@ export function Sidebar({
       }}
     >
       {/* Header — title + compact icon toolbar.
-          All three buttons share dimensions so the row reads as a single
-          toolbar rather than a mix of pill buttons. New-connection is the
-          primary action (filled accent); import/export are ghost siblings. */}
+          New-connection is the primary action; settings is secondary. */}
       <div
         style={{
           padding: "8px 10px",
@@ -375,11 +323,8 @@ export function Sidebar({
           连接管理
         </span>
         <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
-          <IconBtn title="从加密文件导入" onClick={startImport}>
-            📥
-          </IconBtn>
-          <IconBtn title="加密导出全部连接" onClick={startExport}>
-            📤
+          <IconBtn title="设置" onClick={onOpenSettings}>
+            ⚙️
           </IconBtn>
           <button
             onClick={() => onAddNew()}
@@ -510,17 +455,6 @@ export function Sidebar({
         </div>
       )}
       {toggleBtn}
-      {passDialog && (
-        <PassphraseDialog
-          mode={passDialog.mode}
-          count={connections.length}
-          onSubmit={handleExportOrImport}
-          onClose={() => {
-            setPassDialog(null);
-            exportPathRef.current = null;
-          }}
-        />
-      )}
     </div>
   );
 }

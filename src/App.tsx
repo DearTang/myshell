@@ -6,6 +6,7 @@ import { SftpPanel } from "./components/SftpPanel";
 import { ServerInfoPanel } from "./components/ServerInfoPanel";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 import { MasterPasswordGate } from "./components/MasterPasswordGate";
+import { SettingsPanel } from "./components/SettingsPanel";
 import {
   getConnections,
   listFolders,
@@ -26,6 +27,7 @@ export default function App() {
   const [editConfig, setEditConfig] = useState<ConnectionConfig | null>(null);
   const [initialConnType, setInitialConnType] = useState<ConnType | undefined>(undefined);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   // Vault gate: null = checking, "setup" = no vault yet, "unlock" = vault
   // exists but locked, "ready" = master key loaded. Render the gate until
@@ -110,6 +112,7 @@ export default function App() {
           type: "ftp",
           connType: "ftp",
           ftpSessionId: ftpId,
+          connectionId: config.id,
         };
         setTabs((prev) => [...prev, newTab]);
         setActiveTabId(ftpId);
@@ -122,6 +125,7 @@ export default function App() {
         sessionId,
         type: connType === "sftp" ? "sftp" : "terminal",
         connType,
+        connectionId: config.id,
       };
       setTabs((prev) => [...prev, newTab]);
       setActiveTabId(sessionId);
@@ -214,6 +218,7 @@ export default function App() {
         }}
         onAddNew={handleAddNew}
         onRefresh={reload}
+        onOpenSettings={() => setShowSettings(true)}
         collapsed={sidebarCollapsed}
         onToggleCollapsed={() => setSidebarCollapsed((v) => !v)}
       />
@@ -232,6 +237,7 @@ export default function App() {
             display: "flex",
             flexDirection: "column",
             overflow: "hidden",
+            position: "relative",
           }}
         >
           {tabs.length === 0 ? (
@@ -240,12 +246,24 @@ export default function App() {
             tabs.map((tab) => {
               if (!tab.sessionId) return null;
               const isActive = tab.id === activeTabId;
+              // Use position:absolute + visibility:hidden instead of
+              // display:none so every tab's container keeps a real size
+              // at all times. xterm's renderer breaks when its container
+              // collapses to 0x0 (RenderService throws "Cannot read
+              // properties of undefined (reading 'dimensions')"), and the
+              // FitAddon would otherwise read 0 cols/rows during the
+              // hidden transition — which then propagates through the
+              // broadcast sync as COLUMNS=0 and turns `ls` output into
+              // one-file-per-line. Stacking tabs absolutely means the
+              // ResizeObserver always sees the parent's full geometry.
               return (
                 <div
                   key={tab.id}
                   style={{
-                    display: isActive ? "flex" : "none",
-                    flex: 1,
+                    position: "absolute",
+                    inset: 0,
+                    visibility: isActive ? "visible" : "hidden",
+                    display: "flex",
                     flexDirection: "column",
                     overflow: "hidden",
                   }}
@@ -253,6 +271,7 @@ export default function App() {
                   {tab.type === "terminal" ? (
                     <TerminalPanel
                       sessionId={tab.sessionId}
+                      connectionId={tab.connectionId || ""}
                       broadcastTargets={getBroadcastTargets(tab)}
                       active={isActive}
                     />
@@ -263,7 +282,11 @@ export default function App() {
                       fullHeight
                     />
                   ) : (
-                    <TerminalPanel sessionId={tab.sessionId} active={isActive} />
+                    <TerminalPanel
+                      sessionId={tab.sessionId}
+                      connectionId={tab.connectionId || ""}
+                      active={isActive}
+                    />
                   )}
                 </div>
               );
@@ -295,6 +318,13 @@ export default function App() {
             setInitialConnType(undefined);
             reload();
           }}
+        />
+      )}
+      {showSettings && (
+        <SettingsPanel
+          onClose={() => setShowSettings(false)}
+          onRefresh={reload}
+          connectionCount={connections.length}
         />
       )}
     </div>

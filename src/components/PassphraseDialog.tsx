@@ -7,7 +7,7 @@ interface Props {
   onClose: () => void;
 }
 
-const MIN_LEN = 12;
+const MIN_LEN = 6;
 
 // Character pools for strong-password generation. Each pool is sampled at
 // least once per password so the output always clears our 3-class strength
@@ -47,7 +47,8 @@ function strengthHint(p: string): { label: string; color: string } {
   if (/[A-Z]/.test(p)) classes++;
   if (/[0-9]/.test(p)) classes++;
   if (/[^A-Za-z0-9]/.test(p)) classes++;
-  if (p.length < MIN_LEN) return { label: "至少 12 个字符", color: "var(--error)" };
+  if (p.length < MIN_LEN) return { label: "至少 6 个字符", color: "var(--error)" };
+  if (p.length < 8) return { label: "简单", color: "var(--warning)" };
   if (classes <= 2) return { label: "弱", color: "var(--error)" };
   if (classes === 3) return { label: "中", color: "var(--warning)" };
   return { label: "强", color: "var(--success)" };
