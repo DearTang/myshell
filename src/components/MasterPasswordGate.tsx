@@ -137,7 +137,7 @@ export function MasterPasswordGate({ mode, onSuccess }: Props) {
               <>
                 输入登录密码解锁应用。
                 <br />
-                密码错误不会锁定账户，请放心尝试。
+                  密码错误锁定机制（3 次错误锁定 5 分钟，每日最多 30 次）
                 {lockoutInfo && lockoutInfo.dailyFailures > 0 && (
                   <>
                     <br />

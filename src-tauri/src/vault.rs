@@ -157,16 +157,6 @@ pub fn write_encrypted_dek(encrypted_dek: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Wipe all vault files. Used by the "reset vault" flow.
-pub fn wipe_vault_files() -> Result<(), String> {
-    let _ = std::fs::remove_file(salt_path());
-    let _ = std::fs::remove_file(verifier_path());
-    let _ = std::fs::remove_file(dek_path());
-    let _ = std::fs::remove_file(kdf_path());
-    let _ = std::fs::remove_file(lockout_path());
-    Ok(())
-}
-
 // ============ Lockout Management ============
 
 #[derive(Serialize, Deserialize, Default, Clone)]

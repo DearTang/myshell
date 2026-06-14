@@ -515,7 +515,13 @@ fn unlock_vault(state: State<AppState>, passphrase: String) -> Result<(), String
 
     let salt = vault::read_salt().ok_or_else(|| "Vault 未初始化".to_string())?;
     let verifier = vault::read_verifier().ok_or_else(|| "Vault 未初始化".to_string())?;
-    let encrypted_dek = vault::read_encrypted_dek().ok_or_else(|| "Vault 未初始化".to_string())?;
+    // dek.enc may be missing on vaults created by a pre-DEK build (before
+    // commit bd530e6). Those builds encrypted column data directly with the
+    // PBKDF2-derived master_key, so if the verifier passes we can recover
+    // by reusing master_key as the DEK — existing rows stay readable. We
+    // persist a freshly-encrypted dek.enc below so future unlocks go through
+    // the normal path.
+    let encrypted_dek_opt = vault::read_encrypted_dek();
 
     // Pick the iteration count to derive with. Vaults created after the
     // 200k→600k bump ship a `vault.kdf` metadata file; older vaults don't,
@@ -533,12 +539,23 @@ fn unlock_vault(state: State<AppState>, passphrase: String) -> Result<(), String
         return Err("密码错误".to_string());
     }
 
-    // Decrypt DEK with master_key
-    let dek_bytes = crypto::decrypt_with_key(&master_key, &encrypted_dek)?;
-    let dek: [u8; 32] = dek_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "DEK 长度错误".to_string())?;
+    // Recover DEK. New vaults: decrypt dek.enc with master_key. Legacy
+    // pre-DEK vaults (dek.enc missing): master_key IS the dek — the old
+    // build used it directly to encrypt columns, so reusing it preserves
+    // existing rows without re-encrypting the whole DB.
+    let dek: [u8; 32] = match encrypted_dek_opt {
+        Some(blob) => {
+            let bytes = crypto::decrypt_with_key(&master_key, &blob)?;
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| "DEK 长度错误".to_string())?
+        }
+        None => {
+            eprintln!("[vault] legacy pre-DEK vault detected — reusing master_key as DEK");
+            master_key
+        }
+    };
 
     // Success - reset failure counters
     lockout.record_success();

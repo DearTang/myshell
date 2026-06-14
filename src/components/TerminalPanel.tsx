@@ -37,34 +37,6 @@ interface Props {
   active?: boolean;
 }
 
-/**
- * Shell init sequence injected right after the PTY comes up.
- *
- * We wrap the entire sequence in a subshell with output silenced so it
- * doesn't echo to the terminal. This is more reliable than `stty -echo`
- * which may not take effect in time on some systems.
- *
- * Why these env vars:
- *  - FORCE_COLOR / CLICOLOR / CLICOLOR_FORCE — enable color output.
- *  - LS_COLORS — GNU ls file-type color spec.
- *  - LSCOLORS — BSD ls (macOS) equivalent.
- *  - GREP_COLORS — grep highlighting.
- *  - GCC_COLORS — gcc/clang diagnostic colors.
- *  - LESS=-R — let `less` pass through ANSI.
- */
-const SHELL_INIT_SEQ =
-  "( " +
-  "export FORCE_COLOR=1 CLICOLOR=1 CLICOLOR_FORCE=1; " +
-  "export LESS='-R -F -X'; " +
-  "export LS_COLORS='rs=0:di=01;34:ln=01;36:mh=00:pi=33:so=01;35:do=01;35:bd=01;33:cd=01;33:or=01;31:mi=00:su=37;41:sg=30;43:ca=00:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.zip=01;31:*.7z=01;31:*.rar=01;31:*.gz=01;31:*.bz2=01;31:*.xz=01;31:*.jpg=01;35:*.jpeg=01;35:*.png=01;35:*.gif=01;35:*.bmp=01;35:*.svg=01;35:*.pdf=00;33:*.doc=00;33:*.xls=00;33:*.ppt=00;33:*.md=00;33:*.sh=01;32:*.py=00;32:*.js=00;33:*.ts=00;33:*.c=00;36:*.h=00;36:*.cpp=00;36:*.cc=00;36:*.hpp=00;36:*.go=00;36:*.rs=00;36:*.java=00;31:*.json=00;33:*.yml=00;33:*.yaml=00;33:*.conf=00;33:*.log=00;90'; " +
-  "export LSCOLORS='ExGxFxDxCxDxDxaccxaeux'; " +
-  "export GREP_COLORS='ms=01;31:mc=01;31:sl=:cx=:fn=01;35:ln=01;32:bn=01;32:se=36'; " +
-  "export GCC_COLORS='error=01;31:warning=01;35:note=01;36:caret=01;32:locus=01:quote=01'; " +
-  "alias ls='ls --color=auto' dir='dir --color=auto' vdir='vdir --color=auto' " +
-  "grep='grep --color=auto' egrep='egrep --color=auto' fgrep='fgrep --color=auto' " +
-  "diff='diff --color=auto' ip='ip --color=auto' 2>/dev/null; " +
-  ") >/dev/null 2>&1; clear;\n";
-
 export function TerminalPanel({ sessionId, connectionId, broadcastTargets, active = true }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -151,9 +123,6 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
     setTimeout(() => {
       fitAddon.fit();
       sshResize(sessionIdRef.current, term.cols, term.rows).catch(() => {});
-      // Inject the color-enabling init sequence once the PTY is sized. Catches
-      // are silent — failures (rare) leave the terminal monochrome but usable.
-      sshSend(sessionIdRef.current, SHELL_INIT_SEQ).catch(() => {});
     }, 100);
 
     // Handle user input. In ZMODEM mode, swallow keystrokes so the user

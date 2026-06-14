@@ -1,5 +1,5 @@
 @echo off
-chcp 65001 >/dev/null
+chcp 65001 >NUL
 setlocal EnableDelayedExpansion
 
 echo ========================================
@@ -15,7 +15,7 @@ if exist "%CARGO_PATH%\cargo.exe" (
 )
 
 :: Check Rust
-where cargo >/dev/null 2>&1
+where cargo >NUL 2>&1
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] Rust/Cargo not found. Please install Rust first.
     echo Download: https://rustup.rs/
@@ -24,7 +24,7 @@ if %ERRORLEVEL% neq 0 (
 )
 
 :: Check Node.js
-where node >/dev/null 2>&1
+where node >NUL 2>&1
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] Node.js not found. Please install Node.js first.
     pause
@@ -86,7 +86,7 @@ echo.
 :: List generated files
 if exist "src-tauri\target\release\bundle\nsis" (
     echo NSIS installer:
-    dir /b "src-tauri\target\release\bundle\nsis\*.exe" 2>/dev/null
+    dir /b "src-tauri\target\release\bundle\nsis\*.exe" 2>NUL
 )
 
 echo.
