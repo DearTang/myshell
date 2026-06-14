@@ -122,6 +122,7 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount }: Props) {
     try {
       const n = await exportConnections(exportPass, path);
       setShowExportDialog(false);
+      setExportPass("");
       alert(`已导出 ${n} 个连接到\n${path}`);
     } catch (e) {
       setIoErr(String(e));
@@ -154,6 +155,7 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount }: Props) {
       const n = await importConnections(importPass, importPath);
       setShowImportDialog(false);
       setImportPath(null);
+      setImportPass("");
       alert(`已导入 ${n} 个连接`);
       onRefresh();
     } catch (e) {

@@ -141,6 +141,13 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
     term.loadAddon(webLinksAddon);
     term.open(containerRef.current);
 
+    // Block OSC 52 clipboard writes from the remote side. Without this,
+    // a malicious SSH server can silently replace the user's clipboard
+    // (e.g., swap a wallet address) by emitting the OSC 52 escape sequence.
+    // Returning true tells xterm the sequence is fully handled — no
+    // clipboard mutation occurs.
+    term.parser.registerOscHandler(52, () => true);
+
     setTimeout(() => {
       fitAddon.fit();
       sshResize(sessionIdRef.current, term.cols, term.rows).catch(() => {});

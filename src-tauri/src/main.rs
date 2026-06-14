@@ -198,9 +198,15 @@ fn save_connection(state: State<AppState>, mut config: ConnectionConfig) -> Resu
 #[tauri::command]
 fn delete_connection(state: State<AppState>, id: String) -> Result<(), String> {
     // Best-effort keyring cleanup — the DB row is the source of truth for
-    // existence, so a missing credential is not a failure.
-    let _ = secrets::delete_password(&id);
-    let _ = secrets::delete_proxy_password(&id);
+    // existence, so a missing credential is not a failure. We log unexpected
+    // errors (not "not found") so a leaked credential isn't silently left
+    // in the OS keyring when the user thought they'd deleted the connection.
+    if let Err(e) = secrets::delete_password(&id) {
+        eprintln!("[delete_connection] keyring delete password failed for {}: {}", id, e);
+    }
+    if let Err(e) = secrets::delete_proxy_password(&id) {
+        eprintln!("[delete_connection] keyring delete proxy password failed for {}: {}", id, e);
+    }
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db::delete_connection(&db, &id).map_err(|e| e.to_string())
 }
@@ -363,6 +369,14 @@ fn import_connections(
     let dump: ConnectionDump =
         serde_json::from_slice(&plaintext).map_err(|e| format!("decode dump: {}", e))?;
 
+    const MAX_IMPORT: usize = 5000;
+    if dump.connections.len() > MAX_IMPORT {
+        return Err(format!("导入条目过多（{} > {}）", dump.connections.len(), MAX_IMPORT));
+    }
+    if dump.folders.len() > 1000 {
+        return Err("文件夹数量过多".to_string());
+    }
+
     let count = dump.connections.len();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -455,7 +469,8 @@ fn setup_vault(state: State<AppState>, passphrase: String) -> Result<(), String>
         return Err("Vault 已初始化，请使用解锁".into());
     }
 
-    // Generate salt + derive master_key from passphrase
+    // Generate salt + derive master_key from passphrase at the current
+    // default iteration count (600k as of this build).
     let mut salt = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut salt);
     let master_key = crypto::derive_master_key(&passphrase, &salt);
@@ -470,9 +485,10 @@ fn setup_vault(state: State<AppState>, passphrase: String) -> Result<(), String>
     // Create verifier for password verification
     let verifier = crypto::make_verifier(&master_key)?;
 
-    // Persist salt + verifier + encrypted_dek
+    // Persist salt + verifier + encrypted_dek + KDF metadata.
     vault::write_vault_files(&salt, &verifier)?;
     vault::write_encrypted_dek(&encrypted_dek)?;
+    vault::write_kdf_meta(&vault::default_kdf_meta())?;
 
     // Populate dek before triggering DB migration
     {
@@ -501,8 +517,16 @@ fn unlock_vault(state: State<AppState>, passphrase: String) -> Result<(), String
     let verifier = vault::read_verifier().ok_or_else(|| "Vault 未初始化".to_string())?;
     let encrypted_dek = vault::read_encrypted_dek().ok_or_else(|| "Vault 未初始化".to_string())?;
 
-    // Derive master_key from passphrase and verify
-    let master_key = crypto::derive_master_key(&passphrase, &salt);
+    // Pick the iteration count to derive with. Vaults created after the
+    // 200k→600k bump ship a `vault.kdf` metadata file; older vaults don't,
+    // and we fall back to the legacy 200k count so we can still authenticate
+    // them. On a successful unlock of an old vault we transparently re-KDF
+    // and re-encrypt everything under 600k (see below).
+    let (iterations, kdf_meta_present) = match vault::read_kdf_meta() {
+        Some(meta) => (meta.iterations, true),
+        None => (crypto::LEGACY_PBKDF2_ITERATIONS, false),
+    };
+    let master_key = crypto::derive_master_key_with_iterations(&passphrase, &salt, iterations);
     if !crypto::check_verifier(&master_key, &verifier) {
         // Record failed attempt
         lockout.record_failure()?;
@@ -519,6 +543,27 @@ fn unlock_vault(state: State<AppState>, passphrase: String) -> Result<(), String
     // Success - reset failure counters
     lockout.record_success();
 
+    // Legacy migration: if the vault predates the KDF metadata file, the
+    // verifier + DEK are still derived at the old 200k count. Re-derive a
+    // fresh 600k master_key from the same passphrase/salt and re-encrypt
+    // both blobs in place. From the next launch onward, unlock reads the
+    // metadata and goes straight to 600k.
+    if !kdf_meta_present {
+        let new_master_key = crypto::derive_master_key(&passphrase, &salt);
+        match crypto::encrypt_with_key(&new_master_key, &dek) {
+            Ok(new_encrypted_dek) => {
+                if let Err(e) = vault::write_encrypted_dek(&new_encrypted_dek) {
+                    eprintln!("[vault] KDF migration: failed to re-encrypt DEK: {}", e);
+                } else if let Ok(new_verifier) = crypto::make_verifier(&new_master_key) {
+                    let _ = vault::write_vault_files(&salt, &new_verifier);
+                    let _ = vault::write_kdf_meta(&vault::default_kdf_meta());
+                    eprintln!("[vault] KDF migration: re-derived at 600k iterations");
+                }
+            }
+            Err(e) => eprintln!("[vault] KDF migration skipped: {}", e),
+        }
+    }
+
     let mut slot = state.dek.lock().map_err(|e| e.to_string())?;
     *slot = Some(dek);
     Ok(())
@@ -532,14 +577,36 @@ fn lock_vault(state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// Verify login password (for viewing plaintext passwords in UI)
+/// Verify login password (for viewing plaintext passwords in UI).
+/// Applies the same lockout policy as `unlock_vault` — otherwise a malicious
+/// script could brute-force the password by repeatedly calling this command,
+/// since it used to bypass the failure counter entirely.
 #[tauri::command]
 fn verify_password(passphrase: String) -> Result<bool, String> {
+    let mut lockout = vault::LockoutState::load();
+    if let Some(remaining) = lockout.check_lockout() {
+        return Err(format!("密码错误次数过多，请等待 {} 秒后重试", remaining));
+    }
+
     let salt = vault::read_salt().ok_or_else(|| "Vault 未初始化".to_string())?;
     let verifier = vault::read_verifier().ok_or_else(|| "Vault 未初始化".to_string())?;
 
-    let master_key = crypto::derive_master_key(&passphrase, &salt);
-    Ok(crypto::check_verifier(&master_key, &verifier))
+    // Match unlock_vault's iteration-count logic: prefer vault.kdf metadata,
+    // fall back to legacy 200k for old vaults.
+    let iterations = match vault::read_kdf_meta() {
+        Some(meta) => meta.iterations,
+        None => crypto::LEGACY_PBKDF2_ITERATIONS,
+    };
+    let master_key = crypto::derive_master_key_with_iterations(&passphrase, &salt, iterations);
+    let ok = crypto::check_verifier(&master_key, &verifier);
+    if ok {
+        lockout.record_success();
+        return Ok(true);
+    }
+    // record_failure always returns Err with a friendly message — covers
+    // both the "this attempt failed" case and the lockout / daily-limit
+    // caps. We surface it so the UI can show "locked for N seconds".
+    Err(lockout.record_failure().err().unwrap_or_else(|| "密码错误".to_string()))
 }
 
 /// Get lockout status info for the UI
@@ -572,8 +639,8 @@ fn get_lockout_info() -> LockoutInfo {
 }
 
 /// Change login password:
-/// 1. Verify old passphrase
-/// 2. Re-encrypt DEK with new passphrase
+/// 1. Verify old passphrase (using whichever KDF iteration count is current)
+/// 2. Re-encrypt DEK with new passphrase at the current default iteration count
 /// 3. Update verifier
 #[tauri::command]
 fn change_master_password(
@@ -589,8 +656,13 @@ fn change_master_password(
     let verifier = vault::read_verifier().ok_or_else(|| "Vault 未初始化".to_string())?;
     let encrypted_dek = vault::read_encrypted_dek().ok_or_else(|| "Vault 未初始化".to_string())?;
 
-    // Verify old passphrase
-    let old_master_key = crypto::derive_master_key(&old_passphrase, &salt);
+    // Verify old passphrase — match unlock_vault's iteration-count logic.
+    let old_iterations = match vault::read_kdf_meta() {
+        Some(meta) => meta.iterations,
+        None => crypto::LEGACY_PBKDF2_ITERATIONS,
+    };
+    let old_master_key =
+        crypto::derive_master_key_with_iterations(&old_passphrase, &salt, old_iterations);
     if !crypto::check_verifier(&old_master_key, &verifier) {
         return Err("原密码错误".into());
     }
@@ -602,7 +674,9 @@ fn change_master_password(
         .try_into()
         .map_err(|_| "DEK 长度错误".to_string())?;
 
-    // Derive new master_key and re-encrypt DEK
+    // Derive new master_key at the current default iteration count (600k)
+    // and re-encrypt DEK. This implicitly migrates an old 200k vault to
+    // the new KDF when the user changes their password.
     let new_master_key = crypto::derive_master_key(&new_passphrase, &salt);
     let new_encrypted_dek = crypto::encrypt_with_key(&new_master_key, &dek)?;
     let new_verifier = crypto::make_verifier(&new_master_key)?;
@@ -610,6 +684,7 @@ fn change_master_password(
     // Persist
     vault::write_encrypted_dek(&new_encrypted_dek)?;
     vault::write_vault_files(&salt, &new_verifier)?;
+    vault::write_kdf_meta(&vault::default_kdf_meta())?;
 
     // Update in-memory DEK (should already be set, but ensure it's correct)
     {
@@ -666,13 +741,43 @@ fn get_previous_version() -> Option<String> {
     backup::get_previous_version()
 }
 
-/// Read a text file (PEM, etc.) at an absolute path. Used by the private-
+/// Read a PEM-formatted text file at an absolute path. Used by the private-
 /// key picker in ConnectionDialog: the user picks a path via the dialog
 /// plugin, and this reads the content so we can stash it (encrypted) in
 /// the vault rather than keeping a reference to a plaintext file on disk.
+///
+/// Security: historically this command accepted any path and returned any
+/// file's contents to the frontend, which combined with `csp: null` made it
+/// a complete arbitrary-file-read primitive (e.g. `~/.ssh/id_rsa`,
+/// `%APPDATA%\myshell\dek.enc`). We now constrain it:
+///   1. Size cap of 1 MiB — PEM keys are <100 KB, anything bigger is suspect.
+///   2. Content must start with the PEM armor marker `-----BEGIN`.
+///   3. NUL bytes in the path are rejected (block PATH-truncation tricks).
+///   4. Error messages are uniform — we never echo the OS error string or
+///      the path back to the frontend, so this can't double as a file
+///      existence oracle.
 #[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
-    std::fs::read_to_string(&path).map_err(|e| format!("读取 {} 失败: {}", path, e))
+    if path.bytes().any(|b| b == 0) {
+        return Err("无效路径".to_string());
+    }
+    if path.len() > 4096 {
+        return Err("路径过长".to_string());
+    }
+    let meta = std::fs::metadata(&path).map_err(|_| "读取文件失败".to_string())?;
+    if !meta.is_file() {
+        return Err("读取文件失败".to_string());
+    }
+    const MAX_PEM_BYTES: u64 = 1024 * 1024;
+    if meta.len() > MAX_PEM_BYTES {
+        return Err("文件过大".to_string());
+    }
+    let content = std::fs::read(&path).map_err(|_| "读取文件失败".to_string())?;
+    let text = String::from_utf8(content).map_err(|_| "文件编码无效".to_string())?;
+    if !text.trim_start().starts_with("-----BEGIN") {
+        return Err("文件格式无效".to_string());
+    }
+    Ok(text)
 }
 
 /// Get the plaintext password for a connection (requires DEK).
@@ -831,6 +936,49 @@ fn normalize_folder_path(input: &str) -> String {
     format!("/{}", segments.join("/"))
 }
 
+/// Reject writes to system-critical locations. Defense-in-depth for
+/// `sz_open_write` — even though the path should originate from a save
+/// dialog, the cost of an over-broad check is low while the cost of an
+/// over-write into `%APPDATA%\...\Startup\` or `/etc/` is high.
+///
+/// The check is prefix-based (case-insensitive on Windows) so it's
+/// intentionally conservative — if a real save target falls under one of
+/// these prefixes, the user will have to pick another folder.
+fn is_protected_write_path(path: &str) -> bool {
+    let p = path.replace('\\', "/");
+    let lower = p.to_lowercase();
+
+    // Windows startup / system locations.
+    let win_blocks = [
+        "/startup/",
+        "/start menu/programs/startup/",
+        "/windows/system32/",
+        "/windows/system/",
+        "/boot/",
+        "/program files/",
+        "/program files (x86)/",
+    ];
+    if lower.contains(':') {
+        for b in win_blocks {
+            if lower.contains(b) {
+                return true;
+            }
+        }
+    }
+
+    // Unix system locations.
+    let unix_blocks = [
+        "/etc/", "/usr/", "/boot/", "/bin/", "/sbin/", "/lib/", "/lib64/",
+        "/proc/", "/sys/", "/dev/",
+    ];
+    for b in unix_blocks {
+        if p.starts_with(b) {
+            return true;
+        }
+    }
+    false
+}
+
 // ============ SSH Commands ============
 
 #[tauri::command]
@@ -858,6 +1006,14 @@ async fn ssh_connect(
 
 #[tauri::command]
 async fn ssh_send(state: State<'_, AppState>, session_id: String, data: String) -> Result<(), String> {
+    // Cap per-call input. Normal typing is a few bytes; even a deliberate
+    // paste is rarely >64 KiB. A 100 MB blob from a compromised renderer
+    // would otherwise sit in the unbounded command channel and balloon
+    // process memory.
+    const MAX_INPUT_BYTES: usize = 256 * 1024;
+    if data.len() > MAX_INPUT_BYTES {
+        return Err("输入数据过大".to_string());
+    }
     ssh::send_input(&state, &session_id, data.as_bytes()).await
 }
 
@@ -882,6 +1038,10 @@ async fn ssh_send_zmodem(
     session_id: String,
     data: Vec<u8>,
 ) -> Result<(), String> {
+    const MAX_ZMODEM_BYTES: usize = 16 * 1024 * 1024;
+    if data.len() > MAX_ZMODEM_BYTES {
+        return Err("数据块过大".to_string());
+    }
     ssh::zmodem_send_bytes(&state, &session_id, &data).await
 }
 
@@ -1307,11 +1467,19 @@ struct ZmodemReadOpenResult {
 
 /// Open a local file for ZMODEM upload (rz). Returns a transfer ID + size
 /// that the frontend feeds into zmodem.js's offer.
+///
+/// Security: errors are intentionally generic — we never echo the path or
+/// the OS error string back to the frontend, so this command can't be used
+/// as a file-existence oracle. Path must be NUL-free and ≤ 4096 bytes to
+/// block PATH-truncation tricks.
 #[tauri::command]
 fn rz_open_read(path: String, state: State<'_, AppState>) -> Result<ZmodemReadOpenResult, String> {
-    let meta = std::fs::metadata(&path).map_err(|e| format!("stat {}: {}", path, e))?;
+    if path.bytes().any(|b| b == 0) || path.len() > 4096 {
+        return Err("无效路径".to_string());
+    }
+    let meta = std::fs::metadata(&path).map_err(|_| "无法读取文件".to_string())?;
     if !meta.is_file() {
-        return Err(format!("Not a regular file: {}", path));
+        return Err("无法读取文件".to_string());
     }
     let size = meta.len();
     let mtime = meta
@@ -1321,7 +1489,7 @@ fn rz_open_read(path: String, state: State<'_, AppState>) -> Result<ZmodemReadOp
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let file = std::fs::File::open(&path).map_err(|e| format!("open {}: {}", path, e))?;
+    let file = std::fs::File::open(&path).map_err(|_| "无法读取文件".to_string())?;
     let id = uuid::Uuid::new_v4().to_string();
     {
         let mut files = state.zmodem_files.lock().map_err(|e| e.to_string())?;
@@ -1383,14 +1551,47 @@ struct ZmodemWriteOpenResult {
 /// Open (or reuse) a file for ZMODEM download (sz). Returns the transfer
 /// ID and the current file size (0 if new) so the frontend can negotiate
 /// resume via ZRPOS if it wants.
+///
+/// Security: this is the highest-risk IPC primitive in the app — it can
+/// create or overwrite files at arbitrary paths. Mitigations:
+///   1. Reject NUL bytes and over-long paths (block PATH-truncation).
+///   2. Reject paths inside system-critical locations (Windows boot/startup
+///      dirs, `/etc`, `/usr`, `/boot` on Unix). The frontend is expected to
+///      have called a save dialog, but defense-in-depth applies.
+///   3. Refuse to follow symlinks at the leaf — the destination could
+///      point anywhere, and a save dialog return is no guarantee against
+///      pre-planted links.
+///   4. Cap pre-existing size at 4 GiB; anything bigger is suspicious and
+///      would let a malicious offer exhaust disk.
+///   5. Uniform error strings — no path or OS-error echo, so this can't
+///      serve as a write-target oracle.
 #[tauri::command]
 fn sz_open_write(path: String, state: State<'_, AppState>) -> Result<ZmodemWriteOpenResult, String> {
+    if path.bytes().any(|b| b == 0) || path.len() > 4096 {
+        return Err("无效路径".to_string());
+    }
+    if is_protected_write_path(&path) {
+        return Err("目标路径受保护".to_string());
+    }
+    // Reject if the leaf itself is a symlink. We can't fully prevent
+    // directory-component symlinks without canonicalize (which itself
+    // follows links), but the dialog flow normally lands on real paths.
+    if std::fs::symlink_metadata(&path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err("目标路径受保护".to_string());
+    }
     let existing_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    const MAX_EXISTING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    if existing_size > MAX_EXISTING_BYTES {
+        return Err("目标文件过大".to_string());
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .open(&path)
-        .map_err(|e| format!("open {}: {}", path, e))?;
+        .map_err(|_| "无法写入文件".to_string())?;
     let id = uuid::Uuid::new_v4().to_string();
     {
         let mut files = state.zmodem_files.lock().map_err(|e| e.to_string())?;
@@ -1412,6 +1613,11 @@ fn sz_open_write(path: String, state: State<'_, AppState>) -> Result<ZmodemWrite
 /// non-zero offset to seek before writing, or pass the running append
 /// offset for normal sequential transfers. The handle must have been
 /// opened via `sz_open_write`.
+///
+/// Security: single-chunk cap is 16 MiB (ZMODEM frame payloads are
+/// normally 1 KB; anything bigger is abuse). Cumulative size per handle
+/// is capped at 8 GiB to prevent disk-exhaustion via a long-running
+/// malicious transfer.
 #[tauri::command]
 fn sz_write_chunk(
     id: String,
@@ -1420,6 +1626,15 @@ fn sz_write_chunk(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     use std::io::{Seek, SeekFrom, Write};
+    const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+    if bytes.len() > MAX_CHUNK_BYTES {
+        return Err("数据块过大".to_string());
+    }
+    let end = offset.checked_add(bytes.len() as u64).ok_or("offset 溢出")?;
+    if end > MAX_TOTAL_BYTES {
+        return Err("超过最大文件大小".to_string());
+    }
     let mut files = state.zmodem_files.lock().map_err(|e| e.to_string())?;
     let handle = files
         .get_mut(&id)
@@ -1429,9 +1644,8 @@ fn sz_write_chunk(
     }
     let file = handle.writer.as_mut().ok_or("File closed")?;
     file.seek(SeekFrom::Start(offset))
-        .map_err(|e| format!("seek: {}", e))?;
-    file.write_all(&bytes).map_err(|e| format!("write: {}", e))?;
-    let end = offset + bytes.len() as u64;
+        .map_err(|_| "写入失败".to_string())?;
+    file.write_all(&bytes).map_err(|_| "写入失败".to_string())?;
     if end > handle.size {
         handle.size = end;
     }
@@ -1635,11 +1849,17 @@ pub fn run() {
     });
 }
 
-/// Fire `Disconnect` on every live SSH session and drop all FTP sessions,
-/// then give them a brief grace period to close their TCP connections
-/// cleanly. Without this, app close leaks open sockets — they sit in the
-/// OS's TIME_WAIT until reaped. Called once on `ExitRequested`; safe to
-/// call when no sessions exist.
+/// Fire `Disconnect` on every live SSH session and drop all FTP sessions
+/// so reader tasks can flush a graceful channel close before the process
+/// dies. Called once on `ExitRequested`.
+///
+/// Why we no longer `thread::sleep` here: the previous implementation
+/// blocked the Tauri main event loop for 500ms during exit, freezing the
+/// window-close flow. Tauri's runtime will continue draining pending
+/// async tasks (the channel reader coroutines) even after this callback
+/// returns, and any still-open TCP sockets are reclaimed by the OS when
+/// the process actually exits. The sleep traded UI responsiveness for a
+/// marginal reduction in TIME_WAIT sockets that wasn't worth the freeze.
 fn drain_all_sessions(app_handle: &tauri::AppHandle) {
     let Some(state) = app_handle.try_state::<AppState>() else {
         return;
@@ -1675,10 +1895,6 @@ fn drain_all_sessions(app_handle: &tauri::AppHandle) {
     for tx in &senders {
         let _ = tx.send(ssh::SessionCommand::Disconnect);
     }
-    // Brief synchronous wait so the reader tasks can flush a graceful channel
-    // close + EOF before the process dies. Tauri's exit is gated on this
-    // callback returning, so the sleep is bounded and intentional.
-    std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
 fn main() {

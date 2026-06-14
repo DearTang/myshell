@@ -33,14 +33,18 @@ pub struct SshSession {
 pub struct SshClient {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub host: String,
+    pub port: u16,
 }
 
 impl client::Handler for SshClient {
     type Error = russh::Error;
 
     /// Validate the server's public key against the local known_hosts table.
-    /// First connection to a host: persist the fingerprint, accept. Subsequent
-    /// connections: reject if the fingerprint changed (MITM defense).
+    /// First connection to a (host, port): persist the fingerprint, accept.
+    /// Subsequent connections: reject if the fingerprint changed (MITM
+    /// defense). The key is scoped to the port so the same hostname on two
+    /// different ports (e.g. 22 internal + 2222 jump host) doesn't silently
+    /// overwrite each other's trust anchor.
     async fn check_server_key(
         &mut self,
         server_public_key: &russh::keys::PublicKey,
@@ -58,20 +62,20 @@ impl client::Handler for SshClient {
                     // Fail closed — accepting here would mean trusting a host
                     // without ever checking the fingerprint store.
                     eprintln!(
-                        "[ssh] known_hosts mutex poisoned; rejecting key for {}",
-                        self.host
+                        "[ssh] known_hosts mutex poisoned; rejecting key for {}:{}",
+                        self.host, self.port
                     );
                     return Ok(false);
                 }
             };
-            match crate::db::get_known_host(&db, &self.host) {
+            match crate::db::get_known_host(&db, &self.host, self.port) {
                 Ok(Some((known_fp, _))) => {
                     if known_fp == fingerprint {
                         true
                     } else {
                         eprintln!(
-                            "[ssh] host key mismatch for {}: stored={} got={}",
-                            self.host, known_fp, fingerprint
+                            "[ssh] host key mismatch for {}:{}: stored={} got={}",
+                            self.host, self.port, known_fp, fingerprint
                         );
                         false
                     }
@@ -84,6 +88,7 @@ impl client::Handler for SshClient {
                     if let Err(e) = crate::db::set_known_host(
                         &db,
                         &self.host,
+                        self.port,
                         &fingerprint,
                         &key_type,
                         &now,
@@ -101,8 +106,8 @@ impl client::Handler for SshClient {
                     // an unreadable store, even though the read failure is
                     // likely transient.
                     eprintln!(
-                        "[ssh] known_hosts query failed for {}: {} — rejecting",
-                        self.host, e
+                        "[ssh] known_hosts query failed for {}:{}: {} — rejecting",
+                        self.host, self.port, e
                     );
                     return Ok(false);
                 }
@@ -233,11 +238,21 @@ pub async fn connect(
     let session_id = uuid::Uuid::new_v4().to_string();
     let sid = session_id.clone();
 
-    let ssh_config = Arc::new(client::Config::default());
+    // Configure the russh client. `inactivity_timeout` ensures that a
+    // server which goes silent (NAT timeout, suspended VM, dead WiFi) is
+    // detected within ~3 minutes instead of holding the session in
+    // `AppState::ssh_sessions` forever — without it, the frontend's
+    // `ssh_closed` event never fires and the UI shows "connected but
+    // unresponsive" indefinitely. The 3-minute window is long enough that
+    // idle interactive shells won't trip it during normal use.
+    let mut ssh_config = client::Config::default();
+    ssh_config.inactivity_timeout = Some(Duration::from_secs(180));
+    let ssh_config = Arc::new(ssh_config);
 
     let handler = SshClient {
         db: Arc::clone(&state.db),
         host: config.host.clone(),
+        port: config.port,
     };
 
     // Branch on proxy config: if proxy_type is set, dial the proxy first
@@ -371,6 +386,21 @@ async fn channel_reader(
     // switches back to Normal on ZFIN, so the trailing OO would otherwise
     // render as visible glyphs on the terminal.
     let mut oo_eaten: u8 = 2; // start saturated = "not eating"
+
+    // Cancel-safety note: `channel.wait()` is awaited inside `tokio::select!`.
+    // We previously attempted to move Data bytes onto a dedicated reader task
+    // via `channel.make_reader()`, but russh 0.50's `make_reader` borrows the
+    // channel mutably and the spawned task requires `'static`, which makes the
+    // borrow last for the task's lifetime and starves every other `channel.*`
+    // call in this loop. The Channel itself is not Send, so we can't move the
+    // whole channel into the reader task either.
+    //
+    // In practice `wait()` is backed by an internal tokio mpsc::Receiver,
+    // whose `recv()` is cancel-safe — cancellation between polls leaves the
+    // pending message in the channel for the next call. If we ever observe
+    // dropped bytes under high traffic, the fix is to upstream a Send-wrapping
+    // variant of Channel in russh or migrate to a fork that exposes the
+    // underlying Receiver directly.
 
     loop {
         tokio::select! {

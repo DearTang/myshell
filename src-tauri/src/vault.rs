@@ -9,7 +9,14 @@
 //! - `vault.salt` — 16 random bytes for PBKDF2
 //! - `vault.verifier` — AES-256-GCM(master_key, VAULT_MAGIC) for password verification
 //! - `dek.enc` — AES-256-GCM(master_key, dek) for storing encrypted DEK
+//! - `vault.kdf` — JSON recording the PBKDF2 algorithm + iteration count
 //! - `lockout.json` — failed attempt tracking for rate limiting
+//!
+//! KDF migration: pre-0.x vaults were derived with 200k iterations; the
+//! current default is 600k. The unlock path detects old vaults (missing
+//! `vault.kdf`), derives with 200k to authenticate, then transparently
+//! re-encrypts the verifier + DEK under a freshly-derived 600k key and
+//! writes `vault.kdf`. From then on it always uses 600k.
 
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
@@ -17,6 +24,7 @@ use serde::{Deserialize, Serialize};
 const SALT_FILE: &str = "vault.salt";
 const VERIFIER_FILE: &str = "vault.verifier";
 const DEK_FILE: &str = "dek.enc";
+const KDF_FILE: &str = "vault.kdf";
 const LOCKOUT_FILE: &str = "lockout.json";
 
 // Lockout policy constants
@@ -45,8 +53,51 @@ fn dek_path() -> PathBuf {
     vault_dir().join(DEK_FILE)
 }
 
+fn kdf_path() -> PathBuf {
+    vault_dir().join(KDF_FILE)
+}
+
 fn lockout_path() -> PathBuf {
     vault_dir().join(LOCKOUT_FILE)
+}
+
+/// On-disk KDF parameters. Persisted so future unlock attempts use the same
+/// iteration count the verifier was derived with — without this, bumping the
+/// default iteration count would silently invalidate every existing vault.
+#[derive(Serialize, Deserialize)]
+pub struct KdfMeta {
+    pub algorithm: String,
+    pub iterations: u32,
+}
+
+/// Default KDF params for newly-created vaults. Mirrors `crypto::PBKDF2_ITERATIONS`
+/// but exposed here so vault setup can write the metadata without crossing
+/// module privacy.
+pub fn default_kdf_meta() -> KdfMeta {
+    KdfMeta {
+        algorithm: "pbkdf2-hmac-sha256".to_string(),
+        iterations: 600_000,
+    }
+}
+
+/// Read the persisted KDF params. Returns None when the file is missing —
+/// that includes both fresh installs (no vault yet) and pre-0.x vaults that
+/// predate the KDF metadata. Callers must fall back to [`LEGACY_PBKDF2_ITERATIONS`]
+/// in the latter case so old verifiers can still be decrypted.
+pub fn read_kdf_meta() -> Option<KdfMeta> {
+    let text = std::fs::read_to_string(kdf_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Persist KDF params atomically.
+pub fn write_kdf_meta(meta: &KdfMeta) -> Result<(), String> {
+    let dir = vault_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
+    let json = serde_json::to_string_pretty(meta)
+        .map_err(|e| format!("serialize kdf meta: {}", e))?;
+    let tmp = dir.join(format!("{}.tmp", KDF_FILE));
+    std::fs::write(&tmp, json).map_err(|e| format!("write kdf tmp: {}", e))?;
+    std::fs::rename(&tmp, kdf_path()).map_err(|e| format!("rename kdf: {}", e))
 }
 
 /// True iff vault files exist (salt + verifier). DEK may not exist yet
@@ -111,6 +162,7 @@ pub fn wipe_vault_files() -> Result<(), String> {
     let _ = std::fs::remove_file(salt_path());
     let _ = std::fs::remove_file(verifier_path());
     let _ = std::fs::remove_file(dek_path());
+    let _ = std::fs::remove_file(kdf_path());
     let _ = std::fs::remove_file(lockout_path());
     Ok(())
 }
@@ -156,18 +208,12 @@ impl LockoutState {
             .unwrap_or(0)
     }
 
-    /// Get today's date string (YYYY-MM-DD)
+    /// Get today's date string (YYYY-MM-DD) in UTC. Uses chrono (already a
+    /// dependency) so we don't reimplement the Gregorian calendar by hand —
+    /// the previous hand-rolled formula produced strings like `2026-day-165`
+    /// that broke the daily-failure reset check.
     fn today() -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Simple date calculation (days since epoch)
-        let days = secs / 86400;
-        let year = 1970 + (days * 400 + 146097 - 1) / 146097 * 100;
-        let remaining_days = days - ((year - 1970) as u64 * 365 + (year - 1970) as u64 / 4 - (year - 1970) as u64 / 100 + (year - 1970) as u64 / 400);
-        format!("{}-day-{}", year, remaining_days)
+        chrono::Utc::now().format("%Y-%m-%d").to_string()
     }
 
     /// Check if currently locked out. Returns Some(remaining_seconds) if locked.

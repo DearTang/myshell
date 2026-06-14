@@ -24,6 +24,29 @@ const SKIP_PATTERNS = [
   /^exit$/,         // exit (don't pollute history with exit)
   /^clear$/,        // clear
   /^cd\s*$/,        // cd without args
+  // Password-bearing commands — record only the command name, never the
+  // argument that contains the secret. We refuse to record the whole line
+  // because the password prompt form is varied: `-p Secret`, `--password=x`,
+  // `url:user:pass`, etc.
+  /\bpasswd\b/,                       // passwd (interactive, next inputs are password)
+  /^sudo\b/,                          // sudo may prompt for password
+  /^su\b/,                            // su prompts for password
+  /\bmysql\s+.*-p[\s=]/,              // mysql -pSECRET or mysql -p SECRET
+  /\bpsql\s+.*\bPGPASSWORD=/,         // PGPASSWORD=... psql
+  /\bredis-cli\s+.*-a\b/,             // redis-cli -a PASSWORD
+  /\bmongo\b.*-p\b/,                  // mongo -p
+  /\bcurl\s+.*-u\s+\S+:\S+/,          // curl -u user:pass
+  /\bwget\s+.*--(user|password)=/,    // wget creds
+  /\bgit\s+(push|pull|clone)\s+https?:\/\/\S+:\S+@/, // git URL with embedded creds
+  /\bssh\s+-i\b/,                     // ssh -i (private key path)
+  /\bscp\s+-i\b/,                     // scp -i
+  /\brsync\s+.*-e\s+["']?ssh/,        // rsync over ssh with custom opts
+  // Generic secret-bearing tokens often found inline.
+  /\bpassword\s*=\s*\S+/i,
+  /\btoken\s*=\s*\S+/i,
+  /\bsecret\s*=\s*\S+/i,
+  /\bapi[_-]?key\s*=\s*\S+/i,
+  /\bauthorization:\s*\S+/i,
 ];
 
 /** Check if a command should be skipped from history recording. */

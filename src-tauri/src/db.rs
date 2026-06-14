@@ -41,10 +41,12 @@ pub fn init_db() -> Result<Connection> {
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS known_hosts (
-            host TEXT PRIMARY KEY,
+            host TEXT NOT NULL,
+            port INTEGER NOT NULL DEFAULT 22,
             fingerprint TEXT NOT NULL,
             key_type TEXT NOT NULL,
-            first_seen TEXT NOT NULL
+            first_seen TEXT NOT NULL,
+            PRIMARY KEY (host, port)
         );
         CREATE TABLE IF NOT EXISTS folders (
             path TEXT PRIMARY KEY,
@@ -82,43 +84,45 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 
 /// v0.1 → v0.2 schema upgrade. Drops plaintext `password` column (already
 /// migrated to keyring), renames `group_name` → `group_path` with leading
-/// slash, adds conn_type/ftp_tls/ftp_passive. Idempotent.
+/// slash, adds conn_type/ftp_tls/ftp_passive. Idempotent. Wrapped in a
+/// transaction so a mid-migration crash leaves the schema consistent.
 pub fn migrate_legacy_schema(conn: &Connection) -> Result<()> {
-    if column_exists(conn, "connections", "password") {
-        conn.execute("ALTER TABLE connections DROP COLUMN password", [])?;
+    let tx = conn.unchecked_transaction()?;
+    if column_exists(&tx, "connections", "password") {
+        tx.execute("ALTER TABLE connections DROP COLUMN password", [])?;
         eprintln!("[db] dropped legacy password column");
     }
 
-    if column_exists(conn, "connections", "group_name") {
-        conn.execute(
+    if column_exists(&tx, "connections", "group_name") {
+        tx.execute(
             "ALTER TABLE connections ADD COLUMN group_path_new TEXT NOT NULL DEFAULT '/'",
             [],
         )?;
-        conn.execute(
+        tx.execute(
             "UPDATE connections SET group_path_new = \
              CASE WHEN group_name IS NULL OR group_name = '' THEN '/' \
              ELSE '/' || group_name END",
             [],
         )?;
-        conn.execute("ALTER TABLE connections DROP COLUMN group_name", [])?;
-        conn.execute("ALTER TABLE connections RENAME COLUMN group_path_new TO group_path", [])?;
+        tx.execute("ALTER TABLE connections DROP COLUMN group_name", [])?;
+        tx.execute("ALTER TABLE connections RENAME COLUMN group_path_new TO group_path", [])?;
         eprintln!("[db] migrated group_name -> group_path");
     }
 
-    if !column_exists(conn, "connections", "conn_type") {
-        conn.execute(
+    if !column_exists(&tx, "connections", "conn_type") {
+        tx.execute(
             "ALTER TABLE connections ADD COLUMN conn_type TEXT NOT NULL DEFAULT 'ssh'",
             [],
         )?;
     }
-    if !column_exists(conn, "connections", "ftp_tls") {
-        conn.execute(
+    if !column_exists(&tx, "connections", "ftp_tls") {
+        tx.execute(
             "ALTER TABLE connections ADD COLUMN ftp_tls TEXT NOT NULL DEFAULT 'none'",
             [],
         )?;
     }
-    if !column_exists(conn, "connections", "ftp_passive") {
-        conn.execute(
+    if !column_exists(&tx, "connections", "ftp_passive") {
+        tx.execute(
             "ALTER TABLE connections ADD COLUMN ftp_passive INTEGER NOT NULL DEFAULT 1",
             [],
         )?;
@@ -127,32 +131,58 @@ pub fn migrate_legacy_schema(conn: &Connection) -> Result<()> {
     // Proxy support columns (v0.2 → v0.3). Idempotent — existing installs
     // get the columns added with safe defaults; new installs have them via
     // init_db's CREATE TABLE.
-    if !column_exists(conn, "connections", "proxy_type") {
-        conn.execute(
+    if !column_exists(&tx, "connections", "proxy_type") {
+        tx.execute(
             "ALTER TABLE connections ADD COLUMN proxy_type TEXT NOT NULL DEFAULT 'none'",
             [],
         )?;
     }
-    if !column_exists(conn, "connections", "proxy_host_enc") {
-        conn.execute(
+    if !column_exists(&tx, "connections", "proxy_host_enc") {
+        tx.execute(
             "ALTER TABLE connections ADD COLUMN proxy_host_enc TEXT",
             [],
         )?;
     }
-    if !column_exists(conn, "connections", "proxy_port") {
-        conn.execute("ALTER TABLE connections ADD COLUMN proxy_port INTEGER", [])?;
+    if !column_exists(&tx, "connections", "proxy_port") {
+        tx.execute("ALTER TABLE connections ADD COLUMN proxy_port INTEGER", [])?;
     }
-    if !column_exists(conn, "connections", "proxy_username") {
-        conn.execute(
+    if !column_exists(&tx, "connections", "proxy_username") {
+        tx.execute(
             "ALTER TABLE connections ADD COLUMN proxy_username TEXT",
             [],
         )?;
     }
 
-    conn.execute(
+    tx.execute(
         "CREATE TABLE IF NOT EXISTS folders (path TEXT PRIMARY KEY, created_at TEXT NOT NULL)",
         [],
     )?;
+
+    // known_hosts: the original schema used `host` as the sole primary key,
+    // so the same hostname reachable on two different ports (e.g. 22 internal
+    // + 2222 jump host) shared one fingerprint slot — swapping ports
+    // silently invalidated the trusted entry, opening a MITM window. Rebuild
+    // the table with a composite (host, port) PK when upgrading from the old
+    // shape. Existing rows default to port 22.
+    if !column_exists(&tx, "known_hosts", "port") {
+        tx.execute_batch(
+            "ALTER TABLE known_hosts RENAME TO known_hosts_old_v1;
+             CREATE TABLE known_hosts (
+                 host TEXT NOT NULL,
+                 port INTEGER NOT NULL DEFAULT 22,
+                 fingerprint TEXT NOT NULL,
+                 key_type TEXT NOT NULL,
+                 first_seen TEXT NOT NULL,
+                 PRIMARY KEY (host, port)
+             );
+             INSERT INTO known_hosts (host, port, fingerprint, key_type, first_seen)
+                 SELECT host, 22, fingerprint, key_type, first_seen FROM known_hosts_old_v1;
+             DROP TABLE known_hosts_old_v1;",
+        )?;
+        eprintln!("[db] known_hosts: rebuilt with (host, port) primary key");
+    }
+
+    tx.commit()?;
     Ok(())
 }
 
@@ -277,11 +307,11 @@ pub fn migrate_to_vault(conn: &mut Connection, key: &[u8; 32]) -> Result<usize> 
 
 // ============ known_hosts ============
 
-pub fn get_known_host(conn: &Connection, host: &str) -> Result<Option<(String, String)>> {
+pub fn get_known_host(conn: &Connection, host: &str, port: u16) -> Result<Option<(String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT fingerprint, key_type FROM known_hosts WHERE host = ?1",
+        "SELECT fingerprint, key_type FROM known_hosts WHERE host = ?1 AND port = ?2",
     )?;
-    let mut rows = stmt.query_map(params![host], |row| {
+    let mut rows = stmt.query_map(params![host, port], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
     match rows.next() {
@@ -293,14 +323,15 @@ pub fn get_known_host(conn: &Connection, host: &str) -> Result<Option<(String, S
 pub fn set_known_host(
     conn: &Connection,
     host: &str,
+    port: u16,
     fingerprint: &str,
     key_type: &str,
     first_seen: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO known_hosts (host, fingerprint, key_type, first_seen)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![host, fingerprint, key_type, first_seen],
+        "INSERT OR REPLACE INTO known_hosts (host, port, fingerprint, key_type, first_seen)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![host, port, fingerprint, key_type, first_seen],
     )?;
     Ok(())
 }

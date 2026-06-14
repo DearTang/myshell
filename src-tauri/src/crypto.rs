@@ -1,6 +1,6 @@
 //! AES-256-GCM + PBKDF2-HMAC-SHA256 envelope for encrypting connection
 //! dumps. The user supplies a passphrase; we derive a 256-bit key via PBKDF2
-//! (200k iterations, 16-byte random salt) and use it with AES-GCM (12-byte
+//! (600k iterations, 16-byte random salt) and use it with AES-GCM (12-byte
 //! random nonce). Output is JSON with base64-encoded salt/nonce/ciphertext
 //! so dumps are safe to email or paste into chat.
 //!
@@ -16,10 +16,18 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-/// PBKDF2 iteration count. 200k strikes a balance: ~80ms derive on a modern
-/// CPU (tolerable for an interactive open/save), expensive enough to make
-/// offline brute force annoying.
-const PBKDF2_ITERATIONS: u32 = 200_000;
+/// PBKDF2 iteration count for new vaults / dumps. OWASP 2023 recommends
+/// ≥600k for PBKDF2-HMAC-SHA256 to make offline brute-force expensive on
+/// modern GPUs. ~250ms derive on a fast laptop — acceptable for an
+/// interactive unlock (once per session) but costly across many decrypts,
+/// which is why vault field encryption uses a cached DEK instead.
+const PBKDF2_ITERATIONS: u32 = 600_000;
+
+/// Legacy iteration count for vaults created before the 200k → 600k bump.
+/// Used only by the vault-unlock path to read pre-existing verifiers; new
+/// vaults always use [`PBKDF2_ITERATIONS`].
+pub const LEGACY_PBKDF2_ITERATIONS: u32 = 200_000;
+
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
@@ -123,13 +131,18 @@ pub fn decrypt(envelope_str: &str, passphrase: &str) -> Result<Vec<u8>, String> 
 /// PBKDF2-HMAC-SHA256(passphrase, salt, iterations) → 32-byte AES key.
 /// `pbkdf2_hmac` from the pbkdf2 crate writes directly into the output buf.
 fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; KEY_LEN] {
+    derive_key_with_iterations(passphrase, salt, PBKDF2_ITERATIONS)
+}
+
+/// Same as [`derive_key`] but lets the caller pick the iteration count.
+/// Used by the vault-unlock path to support legacy 200k verifiers.
+pub fn derive_key_with_iterations(
+    passphrase: &str,
+    salt: &[u8],
+    iterations: u32,
+) -> [u8; KEY_LEN] {
     let mut key = [0u8; KEY_LEN];
-    pbkdf2_hmac::<Sha256>(
-        passphrase.as_bytes(),
-        salt,
-        PBKDF2_ITERATIONS,
-        &mut key,
-    );
+    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, iterations, &mut key);
     key
 }
 
@@ -186,6 +199,17 @@ pub fn decrypt_with_key(key: &[u8; KEY_LEN], blob: &str) -> Result<Vec<u8>, Stri
 /// dump format, but caller owns the salt lifecycle.
 pub fn derive_master_key(passphrase: &str, salt: &[u8]) -> [u8; KEY_LEN] {
     derive_key(passphrase, salt)
+}
+
+/// Variant that lets the caller pick the iteration count. Used by the
+/// vault-unlock path to support legacy 200k verifiers; new code should
+/// prefer [`derive_master_key`].
+pub fn derive_master_key_with_iterations(
+    passphrase: &str,
+    salt: &[u8],
+    iterations: u32,
+) -> [u8; KEY_LEN] {
+    derive_key_with_iterations(passphrase, salt, iterations)
 }
 
 /// Generate a verifier blob from a derived master key. Stored on disk so

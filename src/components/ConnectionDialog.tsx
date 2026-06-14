@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { saveConnection, getConnectionPassword, getConnectionProxyPassword } from "../api";
@@ -61,6 +61,19 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
   // Tracks whether the user manually edited the name field. Until they do,
   // the name auto-syncs to host (per spec: "主机地址填了后连接名默认跟主机地址一致").
   const nameTouchedRef = useRef(!!config?.name);
+
+  // Wipe all credential state on unmount — passwords fetched from the
+  // backend (via getConnectionPassword) shouldn't linger in React state
+  // after the dialog closes. Catches save, cancel, and click-outside.
+  useEffect(() => {
+    return () => {
+      setPassword("");
+      setPrivateKeyPem(undefined);
+      setProxyPassword("");
+      setShowPassword(false);
+      setShowProxyPassword(false);
+    };
+  }, []);
 
   function handleHostChange(v: string) {
     setHost(v);

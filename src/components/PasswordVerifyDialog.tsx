@@ -27,6 +27,7 @@ export function PasswordVerifyDialog({ onSuccess, onClose }: Props) {
     try {
       const valid = await verifyPassword(pass);
       if (valid) {
+        setPass("");
         onSuccess();
       } else {
         setErr("密码错误");

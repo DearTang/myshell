@@ -60,6 +60,8 @@ export function MasterPasswordGate({ mode, onSuccess }: Props) {
       } else {
         await unlockVault(pass);
       }
+      setPass("");
+      setConfirm("");
       onSuccess();
     } catch (e) {
       setErr(String(e));
