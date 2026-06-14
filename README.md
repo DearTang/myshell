@@ -33,8 +33,14 @@
 ### 安全特性
 - 应用启动密码保护
 - 登录密码与数据加密密钥（DEK）分离
-- PBKDF2-HMAC-SHA256 密钥派生
+- PBKDF2-HMAC-SHA256 密钥派生（600k 迭代，OWASP 2023 推荐；旧 vault 首次解锁时透明迁移）
 - AES-256-GCM 数据加密
+- SSH 主机键 TOFU 验证（按 `(host, port)` 隔离，指纹变更自动拒绝）
+- 严格 CSP 白名单（关闭 XSS 暴露面）
+- OSC 52 剪贴板劫持防护
+- 命令历史敏感命令过滤（passwd/sudo/密钥参数等不入库）
+- Tauri 命令加固：PEM 头校验、文件大小上限、路径校验、错误脱敏
+- ZMODEM 写入路径保护（拒绝软链与系统目录）
 - 密码错误锁定机制（3 次错误锁定 5 分钟，每日最多 30 次）
 - 敏感信息存储于 OS Keyring
 
@@ -156,6 +162,7 @@ npm run test:compile
 | `vault.salt` | 密钥派生盐值 |
 | `vault.verifier` | 密码验证数据 |
 | `dek.enc` | 加密的 DEK（数据加密密钥） |
+| `vault.kdf` | KDF 算法与迭代数元数据（旧版本缺失，首次解锁自动生成） |
 | `lockout.json` | 密码错误锁定状态 |
 | `backups/` | 版本备份目录 |
 
