@@ -573,6 +573,8 @@ function ErrorState({
           lineHeight: 1.6,
         }}
       >
+        请确认下ip端口等是否填写错误!
+        <br />
         {message}
       </div>
       <div style={{ display: "flex", gap: 12 }}>

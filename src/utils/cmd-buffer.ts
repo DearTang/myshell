@@ -7,13 +7,14 @@
  * backspace/del/Ctrl-C/Ctrl-D so the recorded command approximates what
  * the user intended to run.
  *
- * Limitations (accepted by product design):
+ * IMPORTANT LIMITATIONS:
  * - Tab completion: the accumulated literal may not match the expanded
  *   command the shell actually executed (e.g., `ls --ta[Tab]` records as
  *   `ls --ta` instead of `ls --table`).
  * - Arrow-key history navigation: shell replaces the line, but we only
  *   see the literal characters typed before the arrow key.
  * - Multi-line paste: we record each line as a separate command.
+ * - Shell aliases: we record what user types, not the expanded command.
  */
 
 /** Commands that should NOT be recorded to history. */
@@ -29,8 +30,6 @@ const SKIP_PATTERNS = [
   // because the password prompt form is varied: `-p Secret`, `--password=x`,
   // `url:user:pass`, etc.
   /\bpasswd\b/,                       // passwd (interactive, next inputs are password)
-  // Note: removed /^sudo\b/ - sudo commands are useful to record
-  // (the password prompt is separate and won't be captured)
   /^su\b/,                            // su prompts for password
   /\bmysql\s+.*-p[\s=]/,              // mysql -pSECRET or mysql -p SECRET
   /\bpsql\s+.*\bPGPASSWORD=/,         // PGPASSWORD=... psql
@@ -54,7 +53,7 @@ const SKIP_PATTERNS = [
 function shouldSkip(cmd: string): boolean {
   const trimmed = cmd.trim();
   if (trimmed.length === 0) return true;
-  if (trimmed.length > 1000) return true; // Very long commands (pasted scripts)
+  if (trimmed.length > 2000) return true; // Very long commands (pasted scripts)
   for (const pattern of SKIP_PATTERNS) {
     if (pattern.test(trimmed)) return true;
   }
@@ -83,7 +82,8 @@ export function recordKeystroke(
   // This prevents a 200-line script paste from creating 200 history entries.
   const newlineCount = (data.match(/\n/g) || []).length;
   if (newlineCount >= 2 && data.length > 64) {
-    const firstLine = data.split(/\n/)[0]?.trim();
+    const lines = data.split(/\n/);
+    const firstLine = lines[0]?.trim();
     if (firstLine && firstLine.length > 0 && !shouldSkip(firstLine)) {
       flush(firstLine);
     }
@@ -92,45 +92,45 @@ export function recordKeystroke(
     return;
   }
 
+  // Process each character
   for (let i = 0; i < data.length; i++) {
     const ch = data[i];
     const code = ch.charCodeAt(0);
 
+    // Handle ANSI escape sequences
     if (ansiEscRef.current) {
-      // Inside an ANSI escape sequence. Most CSI sequences (ESC [ ... letter)
-      // terminate with a letter in the range A-Z or a-z. We swallow ALL bytes
-      // until we see a letter that terminates the sequence.
-      // IMPORTANT: Only letters (A-Z, a-z) terminate, NOT all bytes >= 0x40.
-      // This prevents recording 'A' from arrow keys (ESC [ A).
-      if ((code >= 0x41 && code <= 0x5A) || (code >= 0x61 && code <= 0x7A)) {
+      // CSI sequences (ESC [ ... final_byte)
+      // Final byte is 0x40-0x7E (@A-Z[\]^_`a-z{|}~)
+      // We specifically only terminate on letters to be safe
+      if (code >= 0x40 && code <= 0x7E) {
         ansiEscRef.current = false;
       }
-      // Otherwise swallow the byte (part of the sequence).
+      // Swallow all bytes in the sequence
       continue;
     }
 
+    // ESC starts an ANSI escape sequence
     if (code === 0x1b) {
-      // ESC starts an ANSI escape sequence (e.g., "\x1b[A" = up arrow).
       ansiEscRef.current = true;
       continue;
     }
 
+    // Backspace (0x08) or Del (0x7f) — delete last char from buffer
     if (code === 0x08 || code === 0x7f) {
-      // Backspace (0x08) or Del (0x7f) — delete last char from buffer.
       if (bufRef.current.length > 0) {
         bufRef.current = bufRef.current.slice(0, -1);
       }
       continue;
     }
 
+    // Ctrl+C (0x03) or Ctrl+D (0x04) — abort current buffer
     if (code === 0x03 || code === 0x04) {
-      // Ctrl+C (0x03) or Ctrl+D (0x04) — abort current buffer.
       bufRef.current = "";
       continue;
     }
 
+    // CR (0x0d) or LF (0x0a) — flush the buffer
     if (code === 0x0d || code === 0x0a) {
-      // CR (0x0d) or LF (0x0a) — flush the buffer.
       const cmd = bufRef.current.trim();
       bufRef.current = "";
       if (cmd.length > 0 && !shouldSkip(cmd)) {
@@ -139,12 +139,13 @@ export function recordKeystroke(
       continue;
     }
 
-    // Printable ASCII (0x20-0x7e) or high-byte UTF-8 lead (>= 0x80).
-    // We accept UTF-8 multibyte sequences as-is; JavaScript strings are
-    // UTF-16 so each code unit is either ASCII or a surrogate pair.
-    // Skip control chars below 0x20 (except those handled above).
-    // Fixed: proper condition for printable characters
-    if ((code >= 0x20 && code <= 0x7e) || code >= 0x80) {
+    // Skip other control characters (0x00-0x1F except those handled above)
+    if (code < 0x20) {
+      continue;
+    }
+
+    // Printable ASCII (0x20-0x7E) or high-byte UTF-8 (>= 0x80)
+    if ((code >= 0x20 && code <= 0x7E) || code >= 0x80) {
       bufRef.current += ch;
     }
   }
