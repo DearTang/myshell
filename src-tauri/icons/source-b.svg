@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- MyShell — Concept B "Cascade" (`>>>`) — fast / streaming shell -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="b-base" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#15151b"/>
+      <stop offset="1" stop-color="#070708"/>
+    </linearGradient>
+    <radialGradient id="b-indigo" cx="22%" cy="16%" r="62%">
+      <stop offset="0" stop-color="#6366f1" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#6366f1" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="b-cyan" cx="84%" cy="88%" r="56%">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.40"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="b-mark" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <linearGradient id="b-sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.26"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.03"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="b-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="14" result="bb"/>
+      <feMerge>
+        <feMergeNode in="bb"/>
+        <feMergeNode in="bb"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="b-clip"><rect width="1024" height="1024" rx="228"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#b-clip)">
+    <rect width="1024" height="1024" fill="url(#b-base)"/>
+    <rect width="1024" height="1024" fill="url(#b-indigo)"/>
+    <rect width="1024" height="1024" fill="url(#b-cyan)"/>
+  </g>
+
+  <rect x="3" y="3" width="1018" height="1018" rx="225" fill="url(#b-sheen)"/>
+  <rect x="2" y="2" width="1020" height="1020" rx="226" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="3"/>
+
+  <g filter="url(#b-glow)" fill="none" stroke="url(#b-mark)" stroke-width="56" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M150,330 L330,512 L150,694" transform="translate(250,0)" opacity="0.40"/>
+    <path d="M150,330 L330,512 L150,694" transform="translate(380,0)" opacity="0.70"/>
+    <path d="M150,330 L330,512 L150,694" transform="translate(510,0)" opacity="1.0"/>
+  </g>
+</svg>

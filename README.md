@@ -2,7 +2,7 @@
 
 一款基于 Tauri v2 构建的跨平台 SSH/SFTP/FTP 桌面客户端，灵感来自 FinalShell。
 
-![Version](https://img.shields.io/badge/version-0.3.0-blue)
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-green)
 ![React](https://img.shields.io/badge/React-18-blue)
 ![Rust](https://img.shields.io/badge/Rust-1.70+-orange)
