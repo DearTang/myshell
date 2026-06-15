@@ -8,6 +8,7 @@ import { ConnectionDialog } from "./components/ConnectionDialog";
 import { MasterPasswordGate } from "./components/MasterPasswordGate";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { QuickCommandsPanel } from "./components/QuickCommandsPanel";
+import { BrandLogo } from "./components/BrandLogo";
 import {
   getConnections,
   listFolders,
@@ -512,8 +513,8 @@ function WelcomeScreen() {
         gap: 16,
       }}
     >
-      <div style={{ fontSize: 48, opacity: 0.3 }}>⚡</div>
-      <div style={{ fontSize: 20, fontWeight: 600 }}>MyShell</div>
+      <BrandLogo size={72} glow />
+      <div style={{ fontSize: 20, fontWeight: 600, color: "var(--text-secondary)" }}>MyShell</div>
       <div style={{ fontSize: 13 }}>点击左侧连接列表开始新会话</div>
     </div>
   );

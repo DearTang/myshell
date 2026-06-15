@@ -7,6 +7,7 @@ import {
   copyConnection,
 } from "../api";
 import { useTheme } from "../hooks/useTheme";
+import { BrandLogo } from "./BrandLogo";
 
 interface Props {
   connections: ConnectionConfig[];
@@ -366,7 +367,7 @@ export function Sidebar({
   if (collapsed) {
     return (
       <div style={styles.collapsed}>
-        <span style={{ fontSize: 18, opacity: 0.5 }}>⚡</span>
+        <BrandLogo size={26} />
         <span
           style={{
             fontSize: 10,
