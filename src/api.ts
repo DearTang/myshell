@@ -62,6 +62,12 @@ export interface Tab {
    * any broadcast-group tab is mirrored to all other broadcast-group tabs
    * (must be terminal-type SSH tabs). SFTP/FTP tabs are excluded. */
   broadcast?: boolean;
+  /** Connection status: "connecting" | "connected" | "disconnected" | "error" */
+  status?: "connecting" | "connected" | "disconnected" | "error";
+  /** Error message when status is "error" */
+  errorMessage?: string;
+  /** Connection config for reconnection */
+  config?: ConnectionConfig;
 }
 
 // ============ Connection API ============

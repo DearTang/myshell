@@ -10,6 +10,7 @@ import {
   getPreviousVersion,
 } from "../api";
 import type { BackupInfo } from "../api";
+import { useTheme } from "../hooks/useTheme";
 
 interface Props {
   onClose: () => void;
@@ -19,52 +20,42 @@ interface Props {
 
 const MIN_LEN = 6;
 
-function strengthHint(p: string): { label: string; color: string } {
+function strengthHint(p: string): { label: string; color: string; width: string } {
   let classes = 0;
   if (/[a-z]/.test(p)) classes++;
   if (/[A-Z]/.test(p)) classes++;
   if (/[0-9]/.test(p)) classes++;
   if (/[^A-Za-z0-9]/.test(p)) classes++;
-  if (p.length < MIN_LEN) return { label: "至少 6 个字符", color: "var(--error)" };
-  if (p.length < 8) return { label: "简单", color: "var(--warning)" };
-  if (classes <= 2) return { label: "弱", color: "var(--error)" };
-  if (classes === 3) return { label: "中", color: "var(--warning)" };
-  return { label: "强", color: "var(--success)" };
+  if (p.length < MIN_LEN) return { label: "至少 6 个字符", color: "var(--error)", width: "0%" };
+  if (p.length < 8) return { label: "简单", color: "var(--warning)", width: "25%" };
+  if (classes <= 2) return { label: "弱", color: "var(--error)", width: "50%" };
+  if (classes === 3) return { label: "中等", color: "var(--warning)", width: "75%" };
+  return { label: "强", color: "var(--success)", width: "100%" };
 }
 
 export function SettingsPanel({ onClose, onRefresh, connectionCount }: Props) {
-  // Change password state
   const [oldPass, setOldPass] = useState("");
   const [newPass, setNewPass] = useState("");
   const [confirmPass, setConfirmPass] = useState("");
   const [passwordBusy, setPasswordBusy] = useState(false);
   const [passwordErr, setPasswordErr] = useState<string | null>(null);
   const [passwordSuccess, setPasswordSuccess] = useState(false);
-
-  // Export/Import state
   const [exportBusy, setExportBusy] = useState(false);
   const [importBusy, setImportBusy] = useState(false);
   const [ioErr, setIoErr] = useState<string | null>(null);
-
-  // Export passphrase
   const [exportPass, setExportPass] = useState("");
   const [showExportDialog, setShowExportDialog] = useState(false);
-
-  // Import passphrase
   const [importPass, setImportPass] = useState("");
   const [importPath, setImportPath] = useState<string | null>(null);
   const [showImportDialog, setShowImportDialog] = useState(false);
-
-  // Backup state
   const [appVersion, setAppVersion] = useState<string>("");
   const [backups, setBackups] = useState<BackupInfo[]>([]);
   const [previousVersion, setPreviousVersion] = useState<string | null>(null);
   const [rollbackBusy, setRollbackBusy] = useState(false);
   const [rollbackResult, setRollbackResult] = useState<string | null>(null);
-
   const oldPassRef = useRef<HTMLInputElement>(null);
+  const { theme, toggleTheme } = useTheme();
 
-  // Load backup info on mount
   useEffect(() => {
     getAppVersion().then(setAppVersion).catch(() => {});
     listBackups().then(setBackups).catch(() => {});
@@ -174,7 +165,6 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount }: Props) {
     try {
       const result = await rollbackBackup(version);
       setRollbackResult(result);
-      // Refresh backup list
       const updated = await listBackups();
       setBackups(updated);
     } catch (e) {
@@ -189,495 +179,768 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount }: Props) {
       style={{
         position: "fixed",
         inset: 0,
-        background: "rgba(0,0,0,0.55)",
+        background: "var(--bg-overlay)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
         zIndex: 2000,
+        backdropFilter: "blur(8px)",
       }}
       onClick={onClose}
     >
       <div
         onClick={(e) => e.stopPropagation()}
+        className="animate-scale-in"
         style={{
-          background: "var(--bg-panel)",
-          border: "1px solid var(--border)",
-          borderRadius: 10,
-          padding: 24,
-          width: 480,
-          maxHeight: "80vh",
-          overflowY: "auto",
-          boxShadow: "0 12px 36px rgba(0,0,0,0.5)",
+          background: "var(--bg-elevated)",
+          border: "1px solid var(--border-emphasis)",
+          borderRadius: "var(--radius-xl)",
+          width: 520,
+          maxHeight: "85vh",
+          overflow: "hidden",
+          boxShadow: "var(--shadow-xl)",
+          display: "flex",
+          flexDirection: "column",
         }}
       >
+        {/* Header */}
         <div
           style={{
+            padding: "20px 24px",
+            borderBottom: "1px solid var(--border-subtle)",
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            marginBottom: 20,
+            flexShrink: 0,
           }}
         >
-          <div style={{ fontSize: 16, fontWeight: 600 }}>⚙️ 设置</div>
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 600, color: "var(--text-primary)" }}>
+              设置
+            </div>
+            <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 2 }}>
+              管理应用配置与安全设置
+            </div>
+          </div>
           <button
             onClick={onClose}
             style={{
+              width: 32,
+              height: 32,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
               background: "transparent",
               border: "none",
-              color: "var(--text-muted)",
+              color: "var(--text-tertiary)",
               fontSize: 18,
               cursor: "pointer",
-              padding: 4,
+              borderRadius: "var(--radius-md)",
+              transition: "all var(--duration-fast) var(--ease-in-out)",
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = "var(--bg-surface-hover)";
+              e.currentTarget.style.color = "var(--text-primary)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "transparent";
+              e.currentTarget.style.color = "var(--text-tertiary)";
             }}
           >
-            ×
+            ✕
           </button>
         </div>
 
-        {/* Change Password Section */}
-        <section style={{ marginBottom: 24 }}>
-          <div style={sectionTitleStyle}>修改登录密码</div>
-          <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
-            修改密码后需要使用新密码解锁应用
-          </div>
-
-          <label style={labelStyle}>原密码</label>
-          <input
-            ref={oldPassRef}
-            type="password"
-            value={oldPass}
-            onChange={(e) => setOldPass(e.target.value)}
-            placeholder="输入原密码"
-            style={inputStyle}
-          />
-
-          <label style={{ ...labelStyle, marginTop: 8 }}>新密码</label>
-          <input
-            type="password"
-            value={newPass}
-            onChange={(e) => setNewPass(e.target.value)}
-            placeholder="至少 6 个字符"
-            style={inputStyle}
-          />
-          <div style={{ fontSize: 11, color: hint.color, marginTop: 4, height: 14 }}>
-            {newPass.length > 0 && `强度：${hint.label}`}
-          </div>
-
-          <label style={{ ...labelStyle, marginTop: 8 }}>确认新密码</label>
-          <input
-            type="password"
-            value={confirmPass}
-            onChange={(e) => setConfirmPass(e.target.value)}
-            placeholder="再次输入新密码"
-            style={{
-              ...inputStyle,
-              borderColor: mismatch ? "var(--error)" : "var(--border)",
-            }}
-          />
-          <div style={{ fontSize: 11, color: "var(--error)", marginTop: 4, height: 14 }}>
-            {mismatch ? "两次输入不一致" : ""}
-          </div>
-
-          {passwordErr && (
-            <div style={errorBoxStyle}>{passwordErr}</div>
-          )}
-          {passwordSuccess && (
+        {/* Content */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
+          {/* Theme Section */}
+          <Section title="外观设置">
             <div
               style={{
-                ...errorBoxStyle,
-                background: "rgba(166,227,161,0.12)",
-                borderColor: "var(--success)",
-                color: "var(--success)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "14px 16px",
+                background: "var(--bg-surface)",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-lg)",
               }}
             >
-              密码修改成功
-            </div>
-          )}
-
-          <button
-            onClick={handleChangePassword}
-            disabled={!canChangePassword}
-            style={{
-              ...primaryBtnStyle,
-              marginTop: 12,
-              opacity: canChangePassword ? 1 : 0.45,
-              cursor: canChangePassword ? "pointer" : "not-allowed",
-            }}
-          >
-            {passwordBusy ? "处理中…" : "修改密码"}
-          </button>
-        </section>
-
-        {/* Divider */}
-        <div
-          style={{
-            height: 1,
-            background: "var(--border)",
-            margin: "16px 0",
-          }}
-        />
-
-        {/* Export/Import Section */}
-        <section>
-          <div style={sectionTitleStyle}>配置导入导出</div>
-          <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
-            导出连接配置到加密文件，或从文件导入
-          </div>
-
-          {ioErr && <div style={errorBoxStyle}>{ioErr}</div>}
-
-          <div style={{ display: "flex", gap: 8 }}>
-            <button
-              onClick={startExport}
-              disabled={exportBusy || importBusy}
-              style={{
-                ...secondaryBtnStyle,
-                flex: 1,
-                opacity: exportBusy || importBusy ? 0.45 : 1,
-              }}
-            >
-              📤 导出配置
-            </button>
-            <button
-              onClick={startImport}
-              disabled={exportBusy || importBusy}
-              style={{
-                ...secondaryBtnStyle,
-                flex: 1,
-                opacity: exportBusy || importBusy ? 0.45 : 1,
-              }}
-            >
-              📥 导入配置
-            </button>
-          </div>
-          <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 8 }}>
-            当前共有 {connectionCount} 个连接
-          </div>
-        </section>
-
-        {/* Divider */}
-        <div
-          style={{
-            height: 1,
-            background: "var(--border)",
-            margin: "16px 0",
-          }}
-        />
-
-        {/* Backup Section */}
-        <section>
-          <div style={sectionTitleStyle}>版本备份与回退</div>
-          <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
-            升级时自动备份配置，支持回退到旧版本
-          </div>
-
-          <div style={{ fontSize: 12, color: "var(--text-primary)", marginBottom: 8 }}>
-            当前版本：<b>{appVersion || "加载中..."}</b>
-          </div>
-
-          {rollbackResult && (
-            <div
-              style={{
-                ...errorBoxStyle,
-                background: rollbackResult.includes("失败") ? "rgba(239,93,111,0.12)" : "rgba(166,227,161,0.12)",
-                borderColor: rollbackResult.includes("失败") ? "var(--error)" : "var(--success)",
-                color: rollbackResult.includes("失败") ? "var(--error)" : "var(--success)",
-              }}
-            >
-              {rollbackResult}
-            </div>
-          )}
-
-          {/* Quick rollback to previous version */}
-          {previousVersion && (
-            <button
-              onClick={() => handleRollback(previousVersion)}
-              disabled={rollbackBusy}
-              style={{
-                ...secondaryBtnStyle,
-                width: "100%",
-                marginBottom: 12,
-                opacity: rollbackBusy ? 0.45 : 1,
-              }}
-            >
-              ⏪ 快速回退到上一版本 ({previousVersion})
-            </button>
-          )}
-
-          {/* Backup list */}
-          {backups.length > 0 && (
-            <div
-              style={{
-                border: "1px solid var(--border)",
-                borderRadius: 6,
-                overflow: "hidden",
-              }}
-            >
-              <div
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text-primary)" }}>
+                  主题模式
+                </div>
+                <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 2 }}>
+                  当前：{theme === "dark" ? "暗色模式" : "亮色模式"}
+                </div>
+              </div>
+              <button
+                onClick={toggleTheme}
                 style={{
-                  padding: "8px 12px",
-                  background: "var(--bg-input)",
-                  fontSize: 11,
-                  color: "var(--text-muted)",
-                  borderBottom: "1px solid var(--border)",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "8px 14px",
+                  background: "var(--bg-surface-hover)",
+                  border: "1px solid var(--border-default)",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 12,
+                  fontWeight: 500,
+                  color: "var(--text-primary)",
+                  cursor: "pointer",
+                  transition: "all var(--duration-fast) var(--ease-in-out)",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = "var(--accent-primary-muted)";
+                  e.currentTarget.style.borderColor = "var(--border-accent)";
+                  e.currentTarget.style.color = "var(--accent-primary)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "var(--bg-surface-hover)";
+                  e.currentTarget.style.borderColor = "var(--border-default)";
+                  e.currentTarget.style.color = "var(--text-primary)";
                 }}
               >
-                可用备份（最多保留 5 个）
+                <span style={{ fontSize: 14 }}>{theme === "dark" ? "󰖨" : "󰖙"}</span>
+                切换到{theme === "dark" ? "亮色" : "暗色"}模式
+              </button>
+            </div>
+          </Section>
+
+          <Divider />
+
+          {/* Change Password Section */}
+          <Section title="修改登录密码">
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
+              修改密码后需要使用新密码解锁应用
+            </div>
+
+            <Field label="原密码">
+              <Input
+                inputRef={oldPassRef}
+                type="password"
+                value={oldPass}
+                onChange={setOldPass}
+                placeholder="输入原密码"
+              />
+            </Field>
+
+            <Field label="新密码">
+              <Input
+                type="password"
+                value={newPass}
+                onChange={setNewPass}
+                placeholder="至少 6 个字符"
+              />
+              {newPass.length > 0 && (
+                <div style={{ marginTop: 8 }}>
+                  <div
+                    style={{
+                      height: 4,
+                      background: "var(--bg-surface)",
+                      borderRadius: "var(--radius-full)",
+                      overflow: "hidden",
+                    }}
+                  >
+                    <div
+                      style={{
+                        height: "100%",
+                        width: hint.width,
+                        background: hint.color,
+                        borderRadius: "var(--radius-full)",
+                        transition: "width var(--duration-normal) var(--ease-out-expo)",
+                      }}
+                    />
+                  </div>
+                  <div style={{ marginTop: 4, fontSize: 11, color: hint.color }}>
+                    强度：{hint.label}
+                  </div>
+                </div>
+              )}
+            </Field>
+
+            <Field label="确认新密码">
+              <Input
+                type="password"
+                value={confirmPass}
+                onChange={setConfirmPass}
+                placeholder="再次输入新密码"
+                error={mismatch ? "两次输入不一致" : undefined}
+              />
+            </Field>
+
+            {passwordErr && <ErrorBox>{passwordErr}</ErrorBox>}
+            {passwordSuccess && <SuccessBox>密码修改成功</SuccessBox>}
+
+            <button
+              onClick={handleChangePassword}
+              disabled={!canChangePassword}
+              style={{
+                marginTop: 8,
+                width: "100%",
+                padding: "12px 20px",
+                background: canChangePassword ? "var(--accent-primary)" : "var(--bg-surface)",
+                color: canChangePassword ? "white" : "var(--text-muted)",
+                border: "none",
+                borderRadius: "var(--radius-md)",
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: canChangePassword ? "pointer" : "not-allowed",
+                opacity: canChangePassword ? 1 : 0.5,
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+                boxShadow: canChangePassword ? "var(--shadow-glow)" : "none",
+              }}
+            >
+              {passwordBusy ? "处理中..." : "修改密码"}
+            </button>
+          </Section>
+
+          <Divider />
+
+          {/* Export/Import Section */}
+          <Section title="配置导入导出">
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
+              导出连接配置到加密文件，或从文件导入
+            </div>
+
+            {ioErr && <ErrorBox>{ioErr}</ErrorBox>}
+
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                onClick={startExport}
+                disabled={exportBusy || importBusy}
+                style={{
+                  flex: 1,
+                  padding: "12px 16px",
+                  background: "var(--bg-surface)",
+                  color: "var(--text-primary)",
+                  border: "1px solid var(--border-default)",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: exportBusy || importBusy ? "not-allowed" : "pointer",
+                  opacity: exportBusy || importBusy ? 0.5 : 1,
+                  transition: "all var(--duration-fast) var(--ease-in-out)",
+                }}
+                onMouseEnter={(e) => {
+                  if (!exportBusy && !importBusy) {
+                    e.currentTarget.style.background = "var(--bg-surface-hover)";
+                    e.currentTarget.style.borderColor = "var(--border-emphasis)";
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "var(--bg-surface)";
+                  e.currentTarget.style.borderColor = "var(--border-default)";
+                }}
+              >
+                󰉁 导出配置
+              </button>
+              <button
+                onClick={startImport}
+                disabled={exportBusy || importBusy}
+                style={{
+                  flex: 1,
+                  padding: "12px 16px",
+                  background: "var(--bg-surface)",
+                  color: "var(--text-primary)",
+                  border: "1px solid var(--border-default)",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: exportBusy || importBusy ? "not-allowed" : "pointer",
+                  opacity: exportBusy || importBusy ? 0.5 : 1,
+                  transition: "all var(--duration-fast) var(--ease-in-out)",
+                }}
+                onMouseEnter={(e) => {
+                  if (!exportBusy && !importBusy) {
+                    e.currentTarget.style.background = "var(--bg-surface-hover)";
+                    e.currentTarget.style.borderColor = "var(--border-emphasis)";
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "var(--bg-surface)";
+                  e.currentTarget.style.borderColor = "var(--border-default)";
+                }}
+              >
+                󰉀 导入配置
+              </button>
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 10, textAlign: "center" }}>
+              当前共有 {connectionCount} 个连接
+            </div>
+          </Section>
+
+          <Divider />
+
+          {/* Backup Section */}
+          <Section title="版本备份与回退">
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
+              升级时自动备份配置，支持回退到旧版本
+            </div>
+
+            <div
+              style={{
+                padding: "10px 14px",
+                background: "var(--bg-surface)",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-md)",
+                marginBottom: 12,
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+              }}
+            >
+              <span style={{ fontSize: 16, color: "var(--accent-primary)" }}>󰀫</span>
+              <div>
+                <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>当前版本</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>
+                  {appVersion || "加载中..."}
+                </div>
               </div>
-              {backups.map((backup) => (
+            </div>
+
+            {rollbackResult && (
+              <div
+                style={{
+                  marginBottom: 12,
+                  padding: "10px 14px",
+                  background: rollbackResult.includes("失败") ? "var(--error-muted)" : "var(--success-muted)",
+                  border: `1px solid ${rollbackResult.includes("失败") ? "var(--error)" : "var(--success)"}`,
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 12,
+                  color: rollbackResult.includes("失败") ? "var(--error)" : "var(--success)",
+                }}
+              >
+                {rollbackResult}
+              </div>
+            )}
+
+            {previousVersion && (
+              <button
+                onClick={() => handleRollback(previousVersion)}
+                disabled={rollbackBusy}
+                style={{
+                  width: "100%",
+                  marginBottom: 12,
+                  padding: "10px 16px",
+                  background: "transparent",
+                  color: "var(--accent-primary)",
+                  border: "1px solid var(--border-accent)",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 12,
+                  fontWeight: 500,
+                  cursor: rollbackBusy ? "not-allowed" : "pointer",
+                  opacity: rollbackBusy ? 0.5 : 1,
+                  transition: "all var(--duration-fast) var(--ease-in-out)",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = "var(--accent-primary-muted)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "transparent";
+                }}
+              >
+                ⏪ 快速回退到上一版本 ({previousVersion})
+              </button>
+            )}
+
+            {backups.length > 0 && (
+              <div
+                style={{
+                  border: "1px solid var(--border-default)",
+                  borderRadius: "var(--radius-lg)",
+                  overflow: "hidden",
+                }}
+              >
                 <div
-                  key={backup.version}
                   style={{
-                    padding: "10px 12px",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    borderBottom: "1px solid var(--border)",
+                    padding: "10px 14px",
+                    background: "var(--bg-surface)",
+                    fontSize: 11,
+                    color: "var(--text-tertiary)",
+                    borderBottom: "1px solid var(--border-subtle)",
                   }}
                 >
-                  <div>
-                    <div style={{ fontSize: 12, fontWeight: 500, color: "var(--text-primary)" }}>
-                      v{backup.version}
-                      {backup.version === appVersion && (
-                        <span style={{ color: "var(--success)", marginLeft: 6 }}>当前</span>
-                      )}
-                    </div>
-                    <div style={{ fontSize: 10, color: "var(--text-muted)" }}>
-                      {backup.timestampStr} · {backup.files.length} 个文件
-                    </div>
-                  </div>
-                  {backup.version !== appVersion && (
-                    <button
-                      onClick={() => handleRollback(backup.version)}
-                      disabled={rollbackBusy}
-                      style={{
-                        padding: "4px 10px",
-                        background: "transparent",
-                        color: "var(--accent)",
-                        border: "1px solid var(--accent)",
-                        borderRadius: 4,
-                        fontSize: 11,
-                        cursor: rollbackBusy ? "not-allowed" : "pointer",
-                        opacity: rollbackBusy ? 0.45 : 1,
-                      }}
-                    >
-                      回退
-                    </button>
-                  )}
+                  可用备份（最多保留 5 个）
                 </div>
-              ))}
-            </div>
-          )}
+                {backups.map((backup, index) => (
+                  <div
+                    key={backup.version}
+                    style={{
+                      padding: "12px 14px",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      borderBottom: index < backups.length - 1 ? "1px solid var(--border-subtle)" : "none",
+                      transition: "background var(--duration-fast) var(--ease-in-out)",
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.background = "var(--bg-surface-hover)";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = "transparent";
+                    }}
+                  >
+                    <div>
+                      <div style={{ fontSize: 12, fontWeight: 500, color: "var(--text-primary)" }}>
+                        v{backup.version}
+                        {backup.version === appVersion && (
+                          <span
+                            style={{
+                              marginLeft: 8,
+                              padding: "2px 8px",
+                              background: "var(--success-muted)",
+                              color: "var(--success)",
+                              borderRadius: "var(--radius-full)",
+                              fontSize: 10,
+                              fontWeight: 600,
+                            }}
+                          >
+                            当前
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>
+                        {backup.timestampStr} · {backup.files.length} 个文件
+                      </div>
+                    </div>
+                    {backup.version !== appVersion && (
+                      <button
+                        onClick={() => handleRollback(backup.version)}
+                        disabled={rollbackBusy}
+                        style={{
+                          padding: "6px 12px",
+                          background: "transparent",
+                          color: "var(--accent-primary)",
+                          border: "1px solid var(--border-default)",
+                          borderRadius: "var(--radius-sm)",
+                          fontSize: 11,
+                          cursor: rollbackBusy ? "not-allowed" : "pointer",
+                          opacity: rollbackBusy ? 0.5 : 1,
+                          transition: "all var(--duration-fast) var(--ease-in-out)",
+                        }}
+                        onMouseEnter={(e) => {
+                          e.currentTarget.style.background = "var(--accent-primary-muted)";
+                          e.currentTarget.style.borderColor = "var(--border-accent)";
+                        }}
+                        onMouseLeave={(e) => {
+                          e.currentTarget.style.background = "transparent";
+                          e.currentTarget.style.borderColor = "var(--border-default)";
+                        }}
+                      >
+                        回退
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
 
-          {backups.length === 0 && (
-            <div style={{ fontSize: 12, color: "var(--text-muted)", textAlign: "center", padding: 16 }}>
-              暂无备份记录
-            </div>
-          )}
-        </section>
+            {backups.length === 0 && (
+              <div style={{ fontSize: 12, color: "var(--text-muted)", textAlign: "center", padding: 24 }}>
+                暂无备份记录
+              </div>
+            )}
+          </Section>
+        </div>
       </div>
 
       {/* Export Passphrase Dialog */}
       {showExportDialog && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.55)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 2100,
-          }}
-          onClick={() => setShowExportDialog(false)}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              background: "var(--bg-panel)",
-              border: "1px solid var(--border)",
-              borderRadius: 10,
-              padding: 20,
-              width: 380,
-              boxShadow: "0 12px 36px rgba(0,0,0,0.5)",
-            }}
-          >
-            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>
-              🔐 加密导出
-            </div>
-            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
-              设置加密密码，导入时需要此密码才能解密
-            </div>
-            <label style={labelStyle}>加密密码</label>
-            <input
+        <Dialog title="加密导出" icon="󰍁" onClose={() => setShowExportDialog(false)}>
+          <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
+            设置加密密码，导入时需要此密码才能解密
+          </div>
+          <Field label="加密密码">
+            <Input
               type="password"
               value={exportPass}
-              onChange={(e) => setExportPass(e.target.value)}
+              onChange={setExportPass}
               placeholder="至少 6 个字符"
-              style={inputStyle}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleExport();
-              }}
+              autoFocus
             />
-            <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
-              <button
-                onClick={() => setShowExportDialog(false)}
-                style={cancelBtnStyle}
-              >
-                取消
-              </button>
-              <button
-                onClick={handleExport}
-                disabled={exportPass.length < MIN_LEN || exportBusy}
-                style={{
-                  ...primaryBtnStyle,
-                  opacity: exportPass.length >= MIN_LEN && !exportBusy ? 1 : 0.45,
-                }}
-              >
-                {exportBusy ? "导出中…" : "导出"}
-              </button>
-            </div>
+          </Field>
+          <div style={{ display: "flex", gap: 10, marginTop: 20, justifyContent: "flex-end" }}>
+            <button
+              onClick={() => setShowExportDialog(false)}
+              style={{
+                padding: "10px 18px",
+                background: "transparent",
+                color: "var(--text-secondary)",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-md)",
+                fontSize: 13,
+                cursor: "pointer",
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+              }}
+            >
+              取消
+            </button>
+            <button
+              onClick={handleExport}
+              disabled={exportPass.length < MIN_LEN || exportBusy}
+              style={{
+                padding: "10px 24px",
+                background: exportPass.length >= MIN_LEN && !exportBusy ? "var(--accent-primary)" : "var(--bg-surface)",
+                color: exportPass.length >= MIN_LEN && !exportBusy ? "white" : "var(--text-muted)",
+                border: "none",
+                borderRadius: "var(--radius-md)",
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: exportPass.length >= MIN_LEN && !exportBusy ? "pointer" : "not-allowed",
+                opacity: exportPass.length >= MIN_LEN && !exportBusy ? 1 : 0.5,
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+              }}
+            >
+              {exportBusy ? "导出中..." : "导出"}
+            </button>
           </div>
-        </div>
+        </Dialog>
       )}
 
       {/* Import Passphrase Dialog */}
       {showImportDialog && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.55)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 2100,
-          }}
-          onClick={() => {
-            setShowImportDialog(false);
-            setImportPath(null);
-          }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              background: "var(--bg-panel)",
-              border: "1px solid var(--border)",
-              borderRadius: 10,
-              padding: 20,
-              width: 380,
-              boxShadow: "0 12px 36px rgba(0,0,0,0.5)",
-            }}
-          >
-            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>
-              🔓 解密导入
-            </div>
-            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12 }}>
-              输入导出时设置的密码以解密
-            </div>
-            <label style={labelStyle}>解密密码</label>
-            <input
+        <Dialog title="解密导入" icon="󰍂" onClose={() => { setShowImportDialog(false); setImportPath(null); }}>
+          <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
+            输入导出时设置的密码以解密
+          </div>
+          <Field label="解密密码">
+            <Input
               type="password"
               value={importPass}
-              onChange={(e) => setImportPass(e.target.value)}
+              onChange={setImportPass}
               placeholder="至少 6 个字符"
-              style={inputStyle}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleImport();
-              }}
+              autoFocus
             />
-            <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
-              <button
-                onClick={() => {
-                  setShowImportDialog(false);
-                  setImportPath(null);
-                }}
-                style={cancelBtnStyle}
-              >
-                取消
-              </button>
-              <button
-                onClick={handleImport}
-                disabled={importPass.length < MIN_LEN || importBusy}
-                style={{
-                  ...primaryBtnStyle,
-                  opacity: importPass.length >= MIN_LEN && !importBusy ? 1 : 0.45,
-                }}
-              >
-                {importBusy ? "导入中…" : "导入"}
-              </button>
-            </div>
+          </Field>
+          <div style={{ display: "flex", gap: 10, marginTop: 20, justifyContent: "flex-end" }}>
+            <button
+              onClick={() => { setShowImportDialog(false); setImportPath(null); }}
+              style={{
+                padding: "10px 18px",
+                background: "transparent",
+                color: "var(--text-secondary)",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-md)",
+                fontSize: 13,
+                cursor: "pointer",
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+              }}
+            >
+              取消
+            </button>
+            <button
+              onClick={handleImport}
+              disabled={importPass.length < MIN_LEN || importBusy}
+              style={{
+                padding: "10px 24px",
+                background: importPass.length >= MIN_LEN && !importBusy ? "var(--accent-primary)" : "var(--bg-surface)",
+                color: importPass.length >= MIN_LEN && !importBusy ? "white" : "var(--text-muted)",
+                border: "none",
+                borderRadius: "var(--radius-md)",
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: importPass.length >= MIN_LEN && !importBusy ? "pointer" : "not-allowed",
+                opacity: importPass.length >= MIN_LEN && !importBusy ? 1 : 0.5,
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+              }}
+            >
+              {importBusy ? "导入中..." : "导入"}
+            </button>
           </div>
-        </div>
+        </Dialog>
       )}
     </div>
   );
 }
 
-const sectionTitleStyle: React.CSSProperties = {
-  fontSize: 13,
-  fontWeight: 600,
-  color: "var(--text-primary)",
-  marginBottom: 8,
-};
+// Shared Components
 
-const labelStyle: React.CSSProperties = {
-  display: "block",
-  fontSize: 11,
-  color: "var(--text-muted)",
-  marginBottom: 4,
-};
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section style={{ marginBottom: 20 }}>
+      <div
+        style={{
+          fontSize: 13,
+          fontWeight: 600,
+          color: "var(--text-primary)",
+          marginBottom: 12,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+        }}
+      >
+        {title}
+      </div>
+      {children}
+    </section>
+  );
+}
 
-const inputStyle: React.CSSProperties = {
-  width: "100%",
-  boxSizing: "border-box",
-  padding: "10px 12px",
-  background: "var(--bg-input)",
-  color: "var(--text-primary)",
-  border: "1px solid var(--border)",
-  borderRadius: 6,
-  fontSize: 13,
-  outline: "none",
-};
+function Divider() {
+  return (
+    <div
+      style={{
+        height: 1,
+        background: "var(--border-subtle)",
+        margin: "20px 0",
+      }}
+    />
+  );
+}
 
-const errorBoxStyle: React.CSSProperties = {
-  marginTop: 10,
-  padding: "8px 10px",
-  background: "rgba(239,93,111,0.12)",
-  border: "1px solid var(--error)",
-  borderRadius: 6,
-  fontSize: 12,
-  color: "var(--error)",
-};
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <label style={{ display: "block", fontSize: 12, color: "var(--text-secondary)", marginBottom: 6, fontWeight: 500 }}>
+        {label}
+      </label>
+      {children}
+    </div>
+  );
+}
 
-const primaryBtnStyle: React.CSSProperties = {
-  padding: "8px 16px",
-  background: "var(--accent)",
-  color: "var(--bg-panel)",
-  border: "none",
-  borderRadius: 6,
-  fontSize: 12,
-  fontWeight: 600,
-  cursor: "pointer",
-};
+function Input({
+  value,
+  onChange,
+  placeholder,
+  type,
+  inputRef,
+  autoFocus,
+  error,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  type?: string;
+  inputRef?: React.RefObject<HTMLInputElement>;
+  autoFocus?: boolean;
+  error?: string;
+}) {
+  return (
+    <>
+      <input
+        ref={inputRef}
+        type={type || "text"}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        autoFocus={autoFocus}
+        onFocus={(e) => {
+          e.currentTarget.style.borderColor = "var(--accent-primary)";
+          e.currentTarget.style.boxShadow = "0 0 0 3px var(--accent-primary-muted)";
+        }}
+        onBlur={(e) => {
+          e.currentTarget.style.borderColor = error ? "var(--error)" : "var(--border-default)";
+          e.currentTarget.style.boxShadow = "none";
+        }}
+        style={{
+          width: "100%",
+          padding: "10px 12px",
+          background: "var(--bg-input)",
+          color: "var(--text-primary)",
+          border: `1px solid ${error ? "var(--error)" : "var(--border-default)"}`,
+          borderRadius: "var(--radius-md)",
+          fontSize: 13,
+          outline: "none",
+          fontFamily: type === "password" ? "ui-monospace, monospace" : "inherit",
+          transition: "border-color var(--duration-fast) var(--ease-in-out), box-shadow var(--duration-fast) var(--ease-in-out)",
+        }}
+      />
+      {error && (
+        <div style={{ marginTop: 4, fontSize: 11, color: "var(--error)" }}>{error}</div>
+      )}
+    </>
+  );
+}
 
-const secondaryBtnStyle: React.CSSProperties = {
-  padding: "8px 16px",
-  background: "var(--bg-input)",
-  color: "var(--text-primary)",
-  border: "1px solid var(--border)",
-  borderRadius: 6,
-  fontSize: 12,
-  fontWeight: 500,
-  cursor: "pointer",
-};
+function ErrorBox({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        marginBottom: 12,
+        padding: "10px 14px",
+        background: "var(--error-muted)",
+        border: "1px solid var(--error)",
+        borderRadius: "var(--radius-md)",
+        fontSize: 12,
+        color: "var(--error)",
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+      }}
+    >
+      <span style={{ fontSize: 14 }}>󰀦</span>
+      {children}
+    </div>
+  );
+}
 
-const cancelBtnStyle: React.CSSProperties = {
-  padding: "7px 14px",
-  background: "transparent",
-  color: "var(--text-secondary)",
-  border: "1px solid var(--border)",
-  borderRadius: 6,
-  fontSize: 12,
-  cursor: "pointer",
-};
+function SuccessBox({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        marginBottom: 12,
+        padding: "10px 14px",
+        background: "var(--success-muted)",
+        border: "1px solid var(--success)",
+        borderRadius: "var(--radius-md)",
+        fontSize: 12,
+        color: "var(--success)",
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+      }}
+    >
+      <span style={{ fontSize: 14 }}>󰗠</span>
+      {children}
+    </div>
+  );
+}
+
+function Dialog({
+  title,
+  icon,
+  children,
+  onClose,
+}: {
+  title: string;
+  icon: string;
+  children: React.ReactNode;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "var(--bg-overlay)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 2100,
+        backdropFilter: "blur(8px)",
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="animate-scale-in"
+        style={{
+          background: "var(--bg-elevated)",
+          border: "1px solid var(--border-emphasis)",
+          borderRadius: "var(--radius-xl)",
+          padding: 24,
+          width: 400,
+          boxShadow: "var(--shadow-xl)",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+          <span style={{ fontSize: 20, color: "var(--accent-primary)" }}>{icon}</span>
+          <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>{title}</div>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}

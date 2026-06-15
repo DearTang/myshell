@@ -6,6 +6,7 @@ import {
   renameFolder,
   copyConnection,
 } from "../api";
+import { useTheme } from "../hooks/useTheme";
 
 interface Props {
   connections: ConnectionConfig[];
@@ -13,11 +14,9 @@ interface Props {
   onConnect: (config: ConnectionConfig) => void;
   onEdit: (config: ConnectionConfig) => void;
   onDelete: (id: string) => void;
-  onAddNew: (initialType?: ConnType) => void;
+  onAddNew: (initialType?: ConnType, initialFolderPath?: string) => void;
   onRefresh: () => void;
   onOpenSettings: () => void;
-  /** When true, the sidebar collapses to a narrow strip showing only an
-   * "expand" button. Clicking it flips back to the full 220px panel. */
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
 }
@@ -38,9 +37,6 @@ const ROOT: FolderNode = {
   conns: [],
 };
 
-/** Build a tree from connections' group_path + the explicit folders list.
- * Empty folders (no children + no conns) are still rendered so users can
- * pre-create structure. */
 function buildTree(conns: ConnectionConfig[], folders: string[]): FolderNode {
   const root: FolderNode = { ...ROOT, children: [], conns: [] };
   const nodeByPath = new Map<string, FolderNode>([["/", root]]);
@@ -63,16 +59,12 @@ function buildTree(conns: ConnectionConfig[], folders: string[]): FolderNode {
     return node;
   };
 
-  // Explicit folders first (creates empty branches).
   for (const f of folders) ensureNode(f);
-
-  // Then attach connections.
   for (const c of conns) {
     const path = c.group_path || "/";
     ensureNode(path).conns.push(c);
   }
 
-  // Stable sort within each level: folders first (alphabetical), then root-level conns.
   const sortRec = (n: FolderNode) => {
     n.children.sort((a, b) => a.name.localeCompare(b.name, "zh"));
     n.conns.sort((a, b) => a.name.localeCompare(b.name, "zh"));
@@ -82,10 +74,111 @@ function buildTree(conns: ConnectionConfig[], folders: string[]): FolderNode {
   return root;
 }
 
+// 使用标准 emoji 图标，确保跨平台兼容
 const CONN_ICONS: Record<ConnType, string> = {
-  ssh: "🖥",
+  ssh: "🖥️",
   sftp: "📁",
   ftp: "📤",
+};
+
+const styles = {
+  container: {
+    position: "relative" as const,
+    width: 240,
+    minWidth: 240,
+    background: "var(--bg-elevated)",
+    borderRight: "1px solid var(--border-default)",
+    display: "flex",
+    flexDirection: "column" as const,
+    overflow: "visible" as const,
+  },
+  collapsed: {
+    position: "relative" as const,
+    width: 44,
+    minWidth: 44,
+    background: "var(--bg-elevated)",
+    borderRight: "1px solid var(--border-default)",
+    display: "flex",
+    flexDirection: "column" as const,
+    alignItems: "center" as const,
+    padding: "12px 0",
+  },
+  header: {
+    padding: "14px 16px",
+    borderBottom: "1px solid var(--border-subtle)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  headerTitle: {
+    fontSize: 11,
+    fontWeight: 600,
+    color: "var(--text-secondary)",
+    textTransform: "uppercase" as const,
+    letterSpacing: "0.08em",
+  },
+  headerActions: {
+    display: "flex",
+    gap: 4,
+    alignItems: "center",
+  },
+  listContainer: {
+    flex: 1,
+    overflowY: "auto" as const,
+    padding: "8px 0",
+  },
+  emptyState: {
+    padding: 32,
+    textAlign: "center" as const,
+    color: "var(--text-muted)",
+    fontSize: 12,
+  },
+  contextMenu: {
+    position: "fixed" as const,
+    background: "var(--bg-surface)",
+    border: "1px solid var(--border-emphasis)",
+    borderRadius: "var(--radius-lg)",
+    padding: 6,
+    zIndex: 1000,
+    minWidth: 160,
+    boxShadow: "var(--shadow-xl)",
+    backdropFilter: "blur(var(--glass-blur))",
+  },
+  menuItem: {
+    padding: "8px 14px",
+    fontSize: 12,
+    cursor: "pointer",
+    borderRadius: "var(--radius-md)",
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    transition: "background var(--duration-fast) var(--ease-in-out)",
+  },
+  menuItemDanger: {
+    color: "var(--error)",
+  },
+  toggleBtn: {
+    position: "absolute" as const,
+    right: -14,
+    top: "50%",
+    transform: "translateY(-50%)",
+    width: 28,
+    height: 56,
+    borderRadius: "var(--radius-md)",
+    background: "var(--bg-surface)",
+    border: "1px solid var(--border-default)",
+    color: "var(--text-tertiary)",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 10,
+    zIndex: 100,
+    padding: 0,
+    boxShadow: "var(--shadow-md)",
+    transition: "all var(--duration-normal) var(--ease-out-expo)",
+  },
 };
 
 export function Sidebar({
@@ -100,13 +193,25 @@ export function Sidebar({
   collapsed = false,
   onToggleCollapsed,
 }: Props) {
-  // Default: all folders collapsed. Set is empty initially.
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [menu, setMenu] = useState<
-    | { x: number; y: number; kind: "blank" | "folder"; folderPath?: string }
-    | null
+    { x: number; y: number; kind: "blank" | "folder"; folderPath?: string } | null
   >(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const { theme, toggleTheme } = useTheme();
 
+  // Filter connections based on search query
+  const filteredConnections = useMemo(() => {
+    if (!searchQuery.trim()) return connections;
+    const query = searchQuery.toLowerCase();
+    return connections.filter((conn) => {
+      const nameMatch = conn.name.toLowerCase().includes(query);
+      const hostMatch = conn.host.toLowerCase().includes(query);
+      return nameMatch || hostMatch;
+    });
+  }, [connections, searchQuery]);
+
+  // Build tree for normal view (with folders)
   const tree = useMemo(() => buildTree(connections, folders), [connections, folders]);
 
   async function handleCopy(id: string) {
@@ -160,7 +265,6 @@ export function Sidebar({
     }
   }
 
-  // Flatten for rendering — DFS in display order.
   const rows: React.ReactNode[] = [];
   const walk = (node: FolderNode) => {
     if (node.path !== "/") {
@@ -188,12 +292,7 @@ export function Sidebar({
           onConnect={() => onConnect(c)}
           onContext={(e) => {
             e.preventDefault();
-            setMenu({
-              x: e.clientX,
-              y: e.clientY,
-              kind: "blank",
-            });
-            // store conn id via closure
+            setMenu({ x: e.clientX, y: e.clientY, kind: "blank" });
             (e.currentTarget as HTMLElement).dataset.connId = c.id;
           }}
           onEdit={() => onEdit(c)}
@@ -204,12 +303,34 @@ export function Sidebar({
     }
     for (const child of node.children) walk(child);
   };
-  walk(tree);
 
-  // Floating pill button anchored to the sidebar's right edge, vertically
-  // centered. Same component in both states — only the icon direction
-  // differs. Half-protrudes into the main area so it reads as a clearly
-  // grabbable handle rather than another toolbar button.
+  // Build flat list for search results
+  const searchResults: React.ReactNode[] = useMemo(() => {
+    if (!searchQuery.trim()) return [];
+    return filteredConnections.map((conn) => (
+      <ConnRow
+        key={`search:${conn.id}`}
+        conn={conn}
+        depth={0}
+        showGroupPath
+        onConnect={() => onConnect(conn)}
+        onContext={(e) => {
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY, kind: "blank" });
+          (e.currentTarget as HTMLElement).dataset.connId = conn.id;
+        }}
+        onEdit={() => onEdit(conn)}
+        onCopy={() => handleCopy(conn.id)}
+        onDelete={() => onDelete(conn.id)}
+      />
+    ));
+  }, [filteredConnections, searchQuery, onConnect, onEdit, handleCopy, onDelete]);
+
+  // Use search results if searching, otherwise use tree
+  if (!searchQuery.trim()) {
+    walk(tree);
+  }
+
   const toggleBtn = onToggleCollapsed ? (
     <button
       onClick={(e) => {
@@ -217,63 +338,33 @@ export function Sidebar({
         onToggleCollapsed();
       }}
       title={collapsed ? "展开侧栏" : "收起侧栏"}
-      style={{
-        position: "absolute",
-        right: -11,
-        top: "50%",
-        transform: "translateY(-50%)",
-        width: 22,
-        height: 48,
-        borderRadius: 10,
-        background: "var(--bg-panel)",
-        border: "1px solid var(--border)",
-        color: "var(--text-muted)",
-        cursor: "pointer",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        fontSize: 12,
-        zIndex: 100,
-        padding: 0,
-        boxShadow: "2px 1px 8px rgba(0,0,0,0.3)",
-        transition: "background 0.15s, color 0.15s, transform 0.15s ease-out",
-      }}
+      style={styles.toggleBtn}
       onMouseEnter={(e) => {
-        e.currentTarget.style.background = "var(--accent)";
-        e.currentTarget.style.color = "var(--bg-panel)";
-        e.currentTarget.style.transform = "translateY(-50%) scale(1.08)";
+        e.currentTarget.style.background = "var(--accent-primary-muted)";
+        e.currentTarget.style.borderColor = "var(--border-accent)";
+        e.currentTarget.style.color = "var(--accent-primary)";
+        e.currentTarget.style.transform = "translateY(-50%) scale(1.05)";
       }}
       onMouseLeave={(e) => {
-        e.currentTarget.style.background = "var(--bg-panel)";
-        e.currentTarget.style.color = "var(--text-muted)";
+        e.currentTarget.style.background = "var(--bg-surface)";
+        e.currentTarget.style.borderColor = "var(--border-default)";
+        e.currentTarget.style.color = "var(--text-tertiary)";
         e.currentTarget.style.transform = "translateY(-50%)";
       }}
     >
-      {collapsed ? "▶" : "◀"}
+      {collapsed ? "›" : "‹"}
     </button>
   ) : null;
 
   if (collapsed) {
     return (
-      <div
-        style={{
-          position: "relative",
-          width: 30,
-          minWidth: 30,
-          background: "var(--bg-sidebar)",
-          borderRight: "1px solid var(--border)",
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          padding: "10px 0",
-        }}
-      >
-        <span style={{ fontSize: 14, opacity: 0.5 }}>⚡</span>
+      <div style={styles.collapsed}>
+        <span style={{ fontSize: 18, opacity: 0.5 }}>⚡</span>
         <span
           style={{
             fontSize: 10,
             writingMode: "vertical-rl",
-            marginTop: 14,
+            marginTop: 16,
             letterSpacing: 2,
             color: "var(--text-muted)",
             opacity: 0.7,
@@ -288,41 +379,46 @@ export function Sidebar({
 
   return (
     <div
-      style={{
-        position: "relative",
-        width: 220,
-        minWidth: 220,
-        background: "var(--bg-sidebar)",
-        borderRight: "1px solid var(--border)",
-        display: "flex",
-        flexDirection: "column",
-        overflow: "visible",
-      }}
+      style={styles.container}
       onClick={() => setMenu(null)}
       onContextMenu={(e) => {
-        // Background right-click → new top-level folder.
         if (e.target === e.currentTarget) {
           e.preventDefault();
           setMenu({ x: e.clientX, y: e.clientY, kind: "blank" });
         }
       }}
     >
-      {/* Header — title + compact icon toolbar.
-          New-connection is the primary action; settings is secondary. */}
-      <div
-        style={{
-          padding: "8px 10px",
-          borderBottom: "1px solid var(--border)",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 4,
-        }}
-      >
-        <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)" }}>
-          连接管理
-        </span>
-        <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
+      <div style={styles.header}>
+        <span style={styles.headerTitle}>连接管理</span>
+        <div style={styles.headerActions}>
+          <button
+            onClick={toggleTheme}
+            title={theme === "dark" ? "切换到亮色模式" : "切换到暗色模式"}
+            style={{
+              width: 28,
+              height: 28,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "transparent",
+              color: "var(--text-tertiary)",
+              border: "none",
+              borderRadius: "var(--radius-md)",
+              fontSize: 14,
+              cursor: "pointer",
+              transition: "all var(--duration-fast) var(--ease-in-out)",
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = "var(--bg-surface-hover)";
+              e.currentTarget.style.color = "var(--text-primary)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "transparent";
+              e.currentTarget.style.color = "var(--text-tertiary)";
+            }}
+          >
+            {theme === "dark" ? "☀️" : "🌙"}
+          </button>
           <IconBtn title="设置" onClick={onOpenSettings}>
             ⚙️
           </IconBtn>
@@ -330,32 +426,123 @@ export function Sidebar({
             onClick={() => onAddNew()}
             title="新建连接"
             style={{
-              width: 26,
-              height: 26,
+              width: 23,
+              height: 23,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              background: "var(--accent)",
-              color: "var(--bg-panel)",
+              background: "var(--accent-primary)",
+              color: "white",
               border: "none",
-              borderRadius: 5,
-              fontSize: 15,
+              borderRadius: "var(--radius-md)",
+              fontSize: 16,
               lineHeight: 1,
               cursor: "pointer",
-              fontWeight: 600,
-              transition: "filter 0.12s",
+              fontWeight: 500,
+              transition: "all var(--duration-normal) var(--ease-out-expo)",
+              boxShadow: "var(--shadow-glow)",
             }}
-            onMouseEnter={(e) => (e.currentTarget.style.filter = "brightness(1.15)")}
-            onMouseLeave={(e) => (e.currentTarget.style.filter = "none")}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = "var(--accent-primary-hover)";
+              e.currentTarget.style.transform = "scale(1.05)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "var(--accent-primary)";
+              e.currentTarget.style.transform = "scale(1)";
+            }}
           >
             +
           </button>
         </div>
       </div>
 
-      {/* Connection List */}
+      {/* Search Box */}
+      <div style={{
+        padding: "8px 12px",
+        borderBottom: "1px solid var(--border-subtle)",
+      }}>
+        <div style={{
+          position: "relative",
+          display: "flex",
+          alignItems: "center",
+        }}>
+          <span style={{
+            position: "absolute",
+            left: 10,
+            fontSize: 14,
+            color: "var(--text-muted)",
+            pointerEvents: "none",
+          }}>
+            🔍
+          </span>
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="搜索连接名称或地址..."
+            style={{
+              width: "100%",
+              background: "var(--bg-input)",
+              border: "1px solid var(--border-default)",
+              borderRadius: "var(--radius-md)",
+              padding: "8px 10px 8px 32px",
+              color: "var(--text-primary)",
+              fontSize: 12,
+              outline: "none",
+              transition: "all var(--duration-fast) var(--ease-in-out)",
+            }}
+            onFocus={(e) => {
+              e.currentTarget.style.borderColor = "var(--accent-primary)";
+              e.currentTarget.style.boxShadow = "0 0 0 3px var(--accent-primary-muted)";
+            }}
+            onBlur={(e) => {
+              e.currentTarget.style.borderColor = "var(--border-default)";
+              e.currentTarget.style.boxShadow = "none";
+            }}
+          />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery("")}
+              title="清除搜索"
+              style={{
+                position: "absolute",
+                right: 8,
+                background: "transparent",
+                border: "none",
+                color: "var(--text-muted)",
+                fontSize: 14,
+                cursor: "pointer",
+                padding: "2px 4px",
+                borderRadius: "var(--radius-sm)",
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.color = "var(--text-primary)";
+                e.currentTarget.style.background = "var(--bg-surface-hover)";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.color = "var(--text-muted)";
+                e.currentTarget.style.background = "transparent";
+              }}
+            >
+              ✕
+            </button>
+          )}
+        </div>
+        {searchQuery && (
+          <div style={{
+            marginTop: 6,
+            fontSize: 11,
+            color: "var(--text-muted)",
+            textAlign: "center",
+          }}>
+            找到 {filteredConnections.length} 个连接
+          </div>
+        )}
+      </div>
+
       <div
-        style={{ flex: 1, overflowY: "auto", padding: "4px 0" }}
+        style={styles.listContainer}
         onContextMenu={(e) => {
           if (e.target === e.currentTarget) {
             e.preventDefault();
@@ -363,93 +550,47 @@ export function Sidebar({
           }
         }}
       >
-        {rows}
-        {connections.length === 0 && folders.length === 0 && (
-          <div
-            style={{
-              padding: 24,
-              textAlign: "center",
-              color: "var(--text-muted)",
-              fontSize: 12,
-            }}
-          >
-            暂无连接，点击"新建"添加
+        {searchQuery.trim() ? searchResults : rows}
+        {filteredConnections.length === 0 && searchQuery && (
+          <div style={styles.emptyState}>
+            <div style={{ fontSize: 32, opacity: 0.3, marginBottom: 12 }}>🔍</div>
+            <div>未找到匹配的连接</div>
+            <div style={{ marginTop: 4, color: "var(--text-muted)" }}>
+              尝试其他关键词
+            </div>
+          </div>
+        )}
+        {connections.length === 0 && folders.length === 0 && !searchQuery && (
+          <div style={styles.emptyState}>
+            <div style={{ fontSize: 32, opacity: 0.3, marginBottom: 12 }}>🖥️</div>
+            <div>暂无连接</div>
+            <div style={{ marginTop: 4, color: "var(--text-muted)" }}>
+              点击 + 新建
+            </div>
           </div>
         )}
       </div>
 
-      {/* Context Menu */}
       {menu && (
         <div
           style={{
-            position: "fixed",
+            ...styles.contextMenu,
             left: menu.x,
             top: menu.y,
-            background: "var(--bg-input)",
-            border: "1px solid var(--border)",
-            borderRadius: 6,
-            padding: 4,
-            zIndex: 1000,
-            minWidth: 140,
-            boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
           }}
           onClick={(e) => e.stopPropagation()}
         >
           {menu.kind === "blank" ? (
             <>
-              <MenuItem
-                label="新建 SSH 连接"
-                onClick={() => {
-                  onAddNew("ssh");
-                  setMenu(null);
-                }}
-              />
-              <MenuItem
-                label="新建 SFTP 连接"
-                onClick={() => {
-                  onAddNew("sftp");
-                  setMenu(null);
-                }}
-              />
-              <MenuItem
-                label="新建 FTP 连接"
-                onClick={() => {
-                  onAddNew("ftp");
-                  setMenu(null);
-                }}
-              />
-              <MenuItem
-                label="新建文件夹"
-                onClick={() => {
-                  handleAddFolder("/");
-                  setMenu(null);
-                }}
-              />
+              <MenuItem icon="🔌" label="新建连接" onClick={() => { onAddNew("ssh"); setMenu(null); }} />
+              <MenuItem icon="📂" label="新建文件夹" onClick={() => { handleAddFolder("/"); setMenu(null); }} />
             </>
           ) : (
             <>
-              <MenuItem
-                label="新建子文件夹"
-                onClick={() => {
-                  handleAddFolder(menu.folderPath!);
-                  setMenu(null);
-                }}
-              />
-              <MenuItem
-                label="重命名"
-                onClick={() => {
-                  handleRenameFolder(menu.folderPath!);
-                  setMenu(null);
-                }}
-              />
-              <MenuItem
-                label="删除"
-                danger
-                onClick={() => {
-                  handleDeleteFolder(menu.folderPath!);
-                  setMenu(null);
-                }}
-              />
+              <MenuItem icon="🔌" label="新建连接" onClick={() => { onAddNew("ssh", menu.folderPath); setMenu(null); }} />
+              <MenuItem icon="📂" label="新建子文件夹" onClick={() => { handleAddFolder(menu.folderPath!); setMenu(null); }} />
+              <MenuItem icon="✏️" label="重命名" onClick={() => { handleRenameFolder(menu.folderPath!); setMenu(null); }} />
+              <MenuItem icon="🗑️" label="删除" danger onClick={() => { handleDeleteFolder(menu.folderPath!); setMenu(null); }} />
             </>
           )}
         </div>
@@ -475,27 +616,47 @@ function FolderRow({
       onClick={onToggle}
       onContextMenu={onContext}
       style={{
-        padding: "5px 14px",
-        paddingLeft: 14 + node.depth * 12,
+        padding: "7px 16px",
+        paddingLeft: 16 + node.depth * 14,
         cursor: "pointer",
         display: "flex",
         alignItems: "center",
-        gap: 6,
+        gap: 8,
         fontSize: 12,
         color: "var(--text-secondary)",
         userSelect: "none",
-        transition: "background 0.12s",
+        transition: "background var(--duration-fast) var(--ease-in-out)",
+        borderRadius: "0 var(--radius-md) var(--radius-md) 0",
+        marginRight: 8,
       }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-input)")}
+      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-surface-hover)")}
       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
     >
-      <span style={{ fontSize: 9, width: 9 }}>{isOpen ? "▼" : "▶"}</span>
-      <span style={{ fontSize: 13 }}>{isOpen ? "📂" : "📁"}</span>
+      <span style={{
+        fontSize: 8,
+        opacity: 0.6,
+        transition: "transform var(--duration-normal) var(--ease-out-expo)",
+        display: "inline-block",
+        transform: isOpen ? "rotate(90deg)" : "rotate(0deg)",
+      }}>
+        ›
+      </span>
+      <span style={{ fontSize: 14, opacity: isOpen ? 1 : 0.7 }}>
+        {isOpen ? "📂" : "📁"}
+      </span>
       <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {node.name}
       </span>
       {node.conns.length > 0 && (
-        <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{node.conns.length}</span>
+        <span style={{
+          fontSize: 10,
+          color: "var(--text-muted)",
+          background: "var(--bg-surface)",
+          padding: "2px 6px",
+          borderRadius: "var(--radius-full)",
+        }}>
+          {node.conns.length}
+        </span>
       )}
     </div>
   );
@@ -504,6 +665,7 @@ function FolderRow({
 function ConnRow({
   conn,
   depth,
+  showGroupPath,
   onConnect,
   onContext,
   onEdit,
@@ -512,6 +674,7 @@ function ConnRow({
 }: {
   conn: ConnectionConfig;
   depth: number;
+  showGroupPath?: boolean;
   onConnect: () => void;
   onContext: (e: React.MouseEvent) => void;
   onEdit: () => void;
@@ -519,20 +682,20 @@ function ConnRow({
   onDelete: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  // Anchor coordinates (viewport-relative) for the dropdown — captured from
-  // the ⋯ button's bounding rect at click time so the menu pops next to it.
   const [anchor, setAnchor] = useState<{ x: number; y: number } | null>(null);
   const icon = CONN_ICONS[(conn.conn_type as ConnType) || "ssh"];
 
   function openMenu(e: React.MouseEvent<HTMLSpanElement>) {
     e.stopPropagation();
     const r = e.currentTarget.getBoundingClientRect();
-    // Place the menu flush with the button's right edge and just below it.
-    // If it would overflow the viewport, the consumer can scroll/clip —
-    // we don't bother flip-adjusting since the dropdown is small.
-    setAnchor({ x: r.right, y: r.bottom + 2 });
+    setAnchor({ x: r.right, y: r.bottom + 4 });
     setOpen(true);
   }
+
+  // Format group path for display
+  const groupDisplay = showGroupPath && conn.group_path && conn.group_path !== "/"
+    ? conn.group_path.startsWith("/") ? conn.group_path.slice(1) : conn.group_path
+    : null;
 
   return (
     <>
@@ -540,38 +703,79 @@ function ConnRow({
         onDoubleClick={onConnect}
         onContextMenu={onContext}
         style={{
-          padding: "6px 14px 6px 26 + depth * 12",
-          paddingLeft: 26 + depth * 12,
+          padding: "8px 16px 8px 24",
+          paddingLeft: 24 + depth * 14,
           cursor: "pointer",
           display: "flex",
           alignItems: "center",
-          gap: 8,
+          gap: 10,
           fontSize: 13,
           color: "var(--text-primary)",
-          transition: "background 0.12s",
+          transition: "background var(--duration-fast) var(--ease-in-out)",
+          borderRadius: "0 var(--radius-md) var(--radius-md) 0",
+          marginRight: 8,
         }}
-        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-input)")}
+        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-surface-hover)")}
         onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
       >
-        <span style={{ fontSize: 14 }}>{icon}</span>
-        <span
-          style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-        >
-          {conn.name}
+        <span style={{
+          fontSize: 16,
+          opacity: 0.85,
+        }}>
+          {icon}
         </span>
+        <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", gap: 2 }}>
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {conn.name}
+          </span>
+          {groupDisplay && (
+            <span style={{
+              fontSize: 10,
+              color: "var(--text-muted)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}>
+              📂 {groupDisplay}
+            </span>
+          )}
+          {showGroupPath && (
+            <span style={{
+              fontSize: 10,
+              color: "var(--text-tertiary)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}>
+              {conn.host}:{conn.port}
+            </span>
+          )}
+        </div>
         <span
           onClick={openMenu}
           title="更多操作"
-          style={{ fontSize: 14, opacity: 0.4, cursor: "pointer", padding: "0 4px" }}
-          onMouseEnter={(e) => (e.currentTarget.style.opacity = "1")}
-          onMouseLeave={(e) => (e.currentTarget.style.opacity = "0.4")}
+          style={{
+            fontSize: 12,
+            opacity: 0.35,
+            cursor: "pointer",
+            padding: "2px 6px",
+            borderRadius: "var(--radius-sm)",
+            transition: "all var(--duration-fast) var(--ease-in-out)",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.opacity = "1";
+            e.currentTarget.style.background = "var(--bg-surface-active)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.opacity = "0.35";
+            e.currentTarget.style.background = "transparent";
+          }}
         >
           ⋯
         </span>
       </div>
       {open && anchor && (
         <>
-          {/* Click-away layer: any click outside the dropdown closes it. */}
           <div
             style={{ position: "fixed", inset: 0, zIndex: 999 }}
             onClick={(e) => {
@@ -581,53 +785,18 @@ function ConnRow({
           />
           <div
             style={{
-              position: "fixed",
+              ...styles.contextMenu,
               left: anchor.x,
               top: anchor.y,
-              background: "var(--bg-input)",
-              border: "1px solid var(--border)",
-              borderRadius: 6,
-              padding: 4,
-              zIndex: 1000,
-              minWidth: 100,
-              boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
-              // If the menu would overflow the right viewport edge, flip to
-              // open leftward from the same anchor point.
-              transform:
-                anchor.x + 120 > window.innerWidth ? "translateX(-100%)" : undefined,
+              transform: anchor.x + 140 > window.innerWidth ? "translateX(-100%)" : undefined,
               transformOrigin: "top right",
             }}
             onClick={(e) => e.stopPropagation()}
           >
-            <MenuItem
-              label="连接"
-              onClick={() => {
-                onConnect();
-                setOpen(false);
-              }}
-            />
-            <MenuItem
-              label="编辑"
-              onClick={() => {
-                onEdit();
-                setOpen(false);
-              }}
-            />
-            <MenuItem
-              label="复制"
-              onClick={() => {
-                onCopy();
-                setOpen(false);
-              }}
-            />
-            <MenuItem
-              label="删除"
-              danger
-              onClick={() => {
-                onDelete();
-                setOpen(false);
-              }}
-            />
+            <MenuItem icon="🔌" label="连接" onClick={() => { onConnect(); setOpen(false); }} />
+            <MenuItem icon="✏️" label="编辑" onClick={() => { onEdit(); setOpen(false); }} />
+            <MenuItem icon="📋" label="复制" onClick={() => { onCopy(); setOpen(false); }} />
+            <MenuItem icon="🗑️" label="删除" danger onClick={() => { onDelete(); setOpen(false); }} />
           </div>
         </>
       )}
@@ -649,26 +818,26 @@ function IconBtn({
       title={title}
       onClick={onClick}
       style={{
-        width: 26,
-        height: 26,
+        width: 28,
+        height: 28,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
         background: "transparent",
-        color: "var(--text-muted)",
+        color: "var(--text-tertiary)",
         border: "none",
-        borderRadius: 5,
-        fontSize: 13,
+        borderRadius: "var(--radius-md)",
+        fontSize: 14,
         cursor: "pointer",
-        transition: "background 0.12s, color 0.12s",
+        transition: "all var(--duration-fast) var(--ease-in-out)",
       }}
       onMouseEnter={(e) => {
-        e.currentTarget.style.background = "var(--bg-input)";
+        e.currentTarget.style.background = "var(--bg-surface-hover)";
         e.currentTarget.style.color = "var(--text-primary)";
       }}
       onMouseLeave={(e) => {
         e.currentTarget.style.background = "transparent";
-        e.currentTarget.style.color = "var(--text-muted)";
+        e.currentTarget.style.color = "var(--text-tertiary)";
       }}
     >
       {children}
@@ -677,10 +846,12 @@ function IconBtn({
 }
 
 function MenuItem({
+  icon,
   label,
   onClick,
   danger,
 }: {
+  icon?: string;
   label: string;
   onClick: () => void;
   danger?: boolean;
@@ -689,15 +860,13 @@ function MenuItem({
     <div
       onClick={onClick}
       style={{
-        padding: "6px 12px",
-        fontSize: 12,
-        cursor: "pointer",
+        ...styles.menuItem,
         color: danger ? "var(--error)" : "var(--text-primary)",
-        borderRadius: 4,
       }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-dark)")}
+      onMouseEnter={(e) => (e.currentTarget.style.background = danger ? "var(--error-muted)" : "var(--bg-surface-hover)")}
       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
     >
+      {icon && <span style={{ fontSize: 14, opacity: 0.8 }}>{icon}</span>}
       {label}
     </div>
   );

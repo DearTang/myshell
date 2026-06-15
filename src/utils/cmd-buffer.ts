@@ -29,7 +29,8 @@ const SKIP_PATTERNS = [
   // because the password prompt form is varied: `-p Secret`, `--password=x`,
   // `url:user:pass`, etc.
   /\bpasswd\b/,                       // passwd (interactive, next inputs are password)
-  /^sudo\b/,                          // sudo may prompt for password
+  // Note: removed /^sudo\b/ - sudo commands are useful to record
+  // (the password prompt is separate and won't be captured)
   /^su\b/,                            // su prompts for password
   /\bmysql\s+.*-p[\s=]/,              // mysql -pSECRET or mysql -p SECRET
   /\bpsql\s+.*\bPGPASSWORD=/,         // PGPASSWORD=... psql
@@ -96,10 +97,12 @@ export function recordKeystroke(
     const code = ch.charCodeAt(0);
 
     if (ansiEscRef.current) {
-      // Inside an ANSI escape sequence. Most terminate with a letter in
-      // the range A-Z (plus '[' and ']' for some OSC sequences). We're
-      // conservative: any byte >= 0x40 ('@') terminates the sequence.
-      if (code >= 0x40) {
+      // Inside an ANSI escape sequence. Most CSI sequences (ESC [ ... letter)
+      // terminate with a letter in the range A-Z or a-z. We swallow ALL bytes
+      // until we see a letter that terminates the sequence.
+      // IMPORTANT: Only letters (A-Z, a-z) terminate, NOT all bytes >= 0x40.
+      // This prevents recording 'A' from arrow keys (ESC [ A).
+      if ((code >= 0x41 && code <= 0x5A) || (code >= 0x61 && code <= 0x7A)) {
         ansiEscRef.current = false;
       }
       // Otherwise swallow the byte (part of the sequence).
@@ -140,7 +143,8 @@ export function recordKeystroke(
     // We accept UTF-8 multibyte sequences as-is; JavaScript strings are
     // UTF-16 so each code unit is either ASCII or a surrogate pair.
     // Skip control chars below 0x20 (except those handled above).
-    if (code >= 0x20 || code >= 0x80) {
+    // Fixed: proper condition for printable characters
+    if ((code >= 0x20 && code <= 0x7e) || code >= 0x80) {
       bufRef.current += ch;
     }
   }

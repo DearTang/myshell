@@ -18,9 +18,13 @@ interface Props {
   /** Callback to register our reload function with the parent's ref so
    * onData can trigger a history refresh after recording a new command. */
   onRegisterRefresh?: (fn: () => void) => void;
+  /** Connection status: "connecting" | "connected" | "disconnected" | "error" */
+  status?: "connecting" | "connected" | "disconnected" | "error";
+  /** Callback to reconnect when status is disconnected/error */
+  onReconnect?: () => void;
 }
 
-export function CommandBar({ sessionId, connectionId, broadcastTargets = [], onRegisterRefresh }: Props) {
+export function CommandBar({ sessionId, connectionId, broadcastTargets = [], onRegisterRefresh, status, onReconnect }: Props) {
   const [input, setInput] = useState("");
   const [history, setHistory] = useState<CommandHistoryItem[]>([]);
   const [panelOpen, setPanelOpen] = useState(false);
@@ -95,8 +99,8 @@ export function CommandBar({ sessionId, connectionId, broadcastTargets = [], onR
       style={{
         height: 36,
         minHeight: 36,
-        background: "var(--bg-panel)",
-        borderTop: "1px solid var(--border)",
+        background: "var(--bg-elevated)",
+        borderTop: "1px solid var(--border-default)",
         display: "flex",
         alignItems: "center",
         padding: "0 12px",
@@ -118,8 +122,8 @@ export function CommandBar({ sessionId, connectionId, broadcastTargets = [], onR
         style={{
           flex: 1,
           background: "var(--bg-input)",
-          border: "1px solid var(--border)",
-          borderRadius: 6,
+          border: "1px solid var(--border-default)",
+          borderRadius: "var(--radius-md)",
           padding: "6px 10px",
           color: "var(--text-primary)",
           fontSize: 13,
@@ -132,21 +136,57 @@ export function CommandBar({ sessionId, connectionId, broadcastTargets = [], onR
         onClick={() => setPanelOpen((v) => !v)}
         title="历史命令"
         style={{
-          background: panelOpen ? "var(--accent)" : "var(--bg-input)",
-          color: panelOpen ? "var(--bg-panel)" : "var(--text-secondary)",
-          border: "1px solid var(--border)",
-          borderRadius: 6,
+          background: panelOpen ? "var(--accent-primary)" : "var(--bg-input)",
+          color: panelOpen ? "white" : "var(--text-secondary)",
+          border: "1px solid var(--border-default)",
+          borderRadius: "var(--radius-md)",
           padding: "6px 12px",
           fontSize: 12,
           cursor: "pointer",
           display: "flex",
           alignItems: "center",
           gap: 4,
+          transition: "all var(--duration-fast) var(--ease-in-out)",
         }}
       >
         <span>📜</span>
         <span>历史</span>
       </button>
+
+      {/* Reconnect button (only when disconnected/error) */}
+      {(status === "disconnected" || status === "error") && onReconnect && (
+        <button
+          onClick={onReconnect}
+          title="重新连接"
+          style={{
+            background: "var(--success-muted)",
+            color: "var(--success)",
+            border: "1px solid var(--success)",
+            borderRadius: 6,
+            padding: "6px 12px",
+            fontSize: 12,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+            fontWeight: 600,
+            transition: "all var(--duration-fast) var(--ease-in-out)",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = "var(--success)";
+            e.currentTarget.style.color = "white";
+            e.currentTarget.style.transform = "scale(1.05)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "var(--success-muted)";
+            e.currentTarget.style.color = "var(--success)";
+            e.currentTarget.style.transform = "scale(1)";
+          }}
+        >
+          <span>⚡</span>
+          <span>重连</span>
+        </button>
+      )}
 
       {/* Expanded history panel (floating overlay) */}
       {panelOpen && (
@@ -157,10 +197,10 @@ export function CommandBar({ sessionId, connectionId, broadcastTargets = [], onR
             right: 8,
             width: 480,
             maxHeight: "60vh",
-            background: "var(--bg-panel)",
-            border: "1px solid var(--border)",
-            borderRadius: 8,
-            boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+            background: "var(--bg-surface)",
+            border: "1px solid var(--border-emphasis)",
+            borderRadius: "var(--radius-lg)",
+            boxShadow: "var(--shadow-xl)",
             display: "flex",
             flexDirection: "column",
             zIndex: 10,
@@ -170,7 +210,7 @@ export function CommandBar({ sessionId, connectionId, broadcastTargets = [], onR
           <div
             style={{
               padding: "8px 12px",
-              borderBottom: "1px solid var(--border)",
+              borderBottom: "1px solid var(--border-default)",
               display: "flex",
               alignItems: "center",
               justifyContent: "space-between",
@@ -223,10 +263,10 @@ export function CommandBar({ sessionId, connectionId, broadcastTargets = [], onR
                     padding: "6px 12px",
                     gap: 8,
                     cursor: "pointer",
-                    transition: "background 0.15s",
+                    transition: "background var(--duration-fast) var(--ease-in-out)",
                   }}
                   onMouseEnter={(e) => {
-                    e.currentTarget.style.background = "var(--bg-input)";
+                    e.currentTarget.style.background = "var(--bg-surface-hover)";
                   }}
                   onMouseLeave={(e) => {
                     e.currentTarget.style.background = "transparent";

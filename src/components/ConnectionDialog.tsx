@@ -10,15 +10,17 @@ interface Props {
   onClose: () => void;
   onSave: () => void;
   initialConnType?: ConnType;
+  initialFolderPath?: string;
+  folders?: string[];
 }
 
 const TYPE_OPTIONS: { value: ConnType; label: string; icon: string; defaultPort: number }[] = [
-  { value: "ssh", label: "SSH", icon: "🖥", defaultPort: 22 },
-  { value: "sftp", label: "SFTP", icon: "📁", defaultPort: 22 },
-  { value: "ftp", label: "FTP", icon: "📤", defaultPort: 21 },
+  { value: "ssh", label: "SSH", icon: "󰖟", defaultPort: 22 },
+  { value: "sftp", label: "SFTP", icon: "󰉋", defaultPort: 22 },
+  { value: "ftp", label: "FTP", icon: "󰈙", defaultPort: 21 },
 ];
 
-export function ConnectionDialog({ config, onClose, onSave, initialConnType }: Props) {
+export function ConnectionDialog({ config, onClose, onSave, initialConnType, initialFolderPath, folders = [] }: Props) {
   const [connType, setConnType] = useState<ConnType>(
     (config?.conn_type as ConnType) || initialConnType || "ssh"
   );
@@ -28,15 +30,16 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
   const [username, setUsername] = useState(config?.username || "");
   const [authMethod, setAuthMethod] = useState(config?.auth_method || "password");
   const [password, setPassword] = useState(config?.password || "");
-  // Private key in vault: state holds PEM content (transient) + a display
-  // name for the UI. When editing an existing connection that already has
-  // a PEM in the vault, we know the key is present without re-fetching the
-  // content (it isn't returned by get_connections to avoid leaking it
-  // through IPC); show "已加密存储" and only overwrite if user picks a new file.
   const [privateKeyPem, setPrivateKeyPem] = useState<string | undefined>(config?.private_key_pem);
   const [privateKeyName, setPrivateKeyName] = useState<string | undefined>(undefined);
   const [hadExistingKey, setHadExistingKey] = useState(!!config?.private_key_pem);
-  const [groupPath, setGroupPath] = useState((config?.group_path || "/").slice(1));
+  const [groupPath, setGroupPath] = useState(
+    config?.group_path
+      ? (config.group_path || "/").slice(1)
+      : initialFolderPath
+        ? (initialFolderPath.startsWith("/") ? initialFolderPath.slice(1) : initialFolderPath)
+        : ""
+  );
   const [ftpTls, setFtpTls] = useState<FtpTls>(config?.ftp_tls || "none");
   const [ftpPassive, setFtpPassive] = useState(config?.ftp_passive ?? true);
   const [proxyType, setProxyType] = useState<ProxyType>(
@@ -47,24 +50,13 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
     String(config?.proxy_port || (config?.proxy_type === "http" ? 8080 : 1080))
   );
   const [proxyUsername, setProxyUsername] = useState(config?.proxy_username || "");
-  // proxy_password is NEVER echoed back from the backend on edit (it lives in
-  // the OS keyring, not SQLite). Empty input = "keep existing keyring value";
-  // backend distinguishes by reading keyring at connect time.
   const [proxyPassword, setProxyPassword] = useState("");
   const [saving, setSaving] = useState(false);
-
-  // Password visibility state
   const [showPassword, setShowPassword] = useState(false);
   const [showProxyPassword, setShowProxyPassword] = useState(false);
   const [passwordVerifyTarget, setPasswordVerifyTarget] = useState<"password" | "proxy" | null>(null);
-
-  // Tracks whether the user manually edited the name field. Until they do,
-  // the name auto-syncs to host (per spec: "主机地址填了后连接名默认跟主机地址一致").
   const nameTouchedRef = useRef(!!config?.name);
 
-  // Wipe all credential state on unmount — passwords fetched from the
-  // backend (via getConnectionPassword) shouldn't linger in React state
-  // after the dialog closes. Catches save, cancel, and click-outside.
   useEffect(() => {
     return () => {
       setPassword("");
@@ -87,7 +79,6 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
 
   function handleTypeChange(t: ConnType) {
     setConnType(t);
-    // Auto-adjust port to the type's default IF the user hasn't customized it.
     setPort((prev) => {
       const n = parseInt(prev, 10);
       const isDefault = n === 22 || n === 21 || prev === "";
@@ -114,8 +105,6 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
       return;
     }
 
-    // Proxy validation — only enforce when a proxy type is selected. Host is
-    // mandatory; port must be a valid 1-65535 integer (default by type).
     let proxyPortNum: number | undefined;
     if (proxyType !== "none") {
       if (!proxyHost.trim()) {
@@ -158,9 +147,6 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
           proxyType !== "none" && proxyUsername.trim()
             ? proxyUsername.trim()
             : undefined,
-        // Send undefined (not "") when type=none so backend deletes the
-        // keyring entry; undefined when type!=none + empty input means
-        // "keep existing keyring value" — backend handles both.
         proxy_password:
           proxyType !== "none" && proxyPassword ? proxyPassword : undefined,
         created_at: config?.created_at || new Date().toISOString(),
@@ -179,103 +165,118 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
       style={{
         position: "fixed",
         inset: 0,
-        background: "rgba(0,0,0,0.6)",
+        background: "var(--bg-overlay)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
         zIndex: 999,
-        backdropFilter: "blur(2px)",
+        backdropFilter: "blur(8px)",
       }}
       onClick={onClose}
     >
       <div
         onClick={(e) => e.stopPropagation()}
+        className="animate-scale-in"
         style={{
-          background: "var(--bg-dark)",
-          border: "1px solid var(--border)",
-          borderRadius: 12,
-          width: 440,
+          background: "var(--bg-elevated)",
+          border: "1px solid var(--border-emphasis)",
+          borderRadius: "var(--radius-xl)",
+          width: 480,
           maxHeight: "90vh",
           overflowY: "auto",
-          boxShadow: "0 12px 40px rgba(0,0,0,0.6)",
+          boxShadow: "var(--shadow-xl)",
         }}
       >
         {/* Header */}
         <div
           style={{
-            padding: "16px 20px",
-            borderBottom: "1px solid var(--border)",
+            padding: "20px 24px",
+            borderBottom: "1px solid var(--border-subtle)",
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
           }}
         >
-          <span style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>
-            {config ? "编辑连接" : "新建连接"}
-          </span>
-          <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 600, color: "var(--text-primary)" }}>
+              {config ? "编辑连接" : "新建连接"}
+            </div>
+            <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 2 }}>
+              配置您的远程服务器连接
+            </div>
+          </div>
+          <div
+            style={{
+              padding: "4px 10px",
+              background: "var(--accent-primary-muted)",
+              borderRadius: "var(--radius-full)",
+              fontSize: 11,
+              fontWeight: 600,
+              color: "var(--accent-primary)",
+              letterSpacing: "0.04em",
+            }}
+          >
             {connType.toUpperCase()}
-          </span>
+          </div>
         </div>
 
         {/* Type Selector */}
-        <div style={{ padding: "14px 20px 4px" }}>
+        <div style={{ padding: "16px 24px 8px" }}>
           <TypeSelector value={connType} onChange={handleTypeChange} disabled={!!config} />
         </div>
 
         {/* Form */}
-        <div style={{ padding: "12px 20px 16px", display: "flex", flexDirection: "column", gap: 14 }}>
-          <FieldGroup label="基本">
+        <div style={{ padding: "12px 24px 20px", display: "flex", flexDirection: "column", gap: 16 }}>
+          <FieldGroup label="基本设置">
             <FormField label="连接名称">
               <Input
                 value={name}
                 onChange={handleNameChange}
-                placeholder={`${connType}_${host || "host"}`}
+                placeholder={`${connType}_${host || "server"}`}
               />
             </FormField>
-            <FormField label="主机地址">
-              <Input
-                value={host}
-                onChange={handleHostChange}
-                placeholder="192.168.1.100"
-                autoFocus
-              />
-            </FormField>
-            <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ display: "flex", gap: 12 }}>
+              <div style={{ flex: 2 }}>
+                <FormField label="主机地址">
+                  <Input
+                    value={host}
+                    onChange={handleHostChange}
+                    placeholder="192.168.1.100"
+                    autoFocus
+                  />
+                </FormField>
+              </div>
               <div style={{ flex: 1 }}>
                 <FormField label="端口">
                   <Input value={port} onChange={setPort} placeholder="22" />
                 </FormField>
               </div>
-              <div style={{ flex: 1 }}>
-                <FormField label="用户名">
-                  <Input value={username} onChange={setUsername} placeholder="root" />
-                </FormField>
-              </div>
             </div>
+            <FormField label="用户名">
+              <Input value={username} onChange={setUsername} placeholder="root" />
+            </FormField>
           </FieldGroup>
 
-          <FieldGroup label="认证">
-            <FormField label="认证方式">
+          <FieldGroup label="认证方式">
+            <FormField label="认证类型">
               <Select
                 value={authMethod}
                 onChange={setAuthMethod}
                 options={[
-                  { value: "password", label: "密码" },
-                  { value: "key", label: "私钥" },
+                  { value: "password", label: "密码认证" },
+                  { value: "key", label: "私钥认证" },
                 ]}
               />
             </FormField>
             {authMethod === "password" ? (
               <FormField label="密码">
-                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                   <div style={{ flex: 1 }}>
                     <Input
                       value={password}
                       onChange={setPassword}
                       type={showPassword ? "text" : "password"}
                       placeholder={config ? "留空保持不变" : "••••••"}
-                      accent="warning"
                     />
                   </div>
                   {config && (
@@ -284,16 +285,17 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
                       onClick={() => setPasswordVerifyTarget("password")}
                       title={showPassword ? "隐藏密码" : "查看密码"}
                       style={{
-                        padding: "7px 10px",
-                        background: "var(--bg-input)",
-                        border: "1px solid var(--border)",
-                        borderRadius: 6,
+                        padding: "10px 12px",
+                        background: "var(--bg-surface)",
+                        border: "1px solid var(--border-default)",
+                        borderRadius: "var(--radius-md)",
                         fontSize: 14,
                         cursor: "pointer",
-                        color: showPassword ? "var(--success)" : "var(--text-muted)",
+                        color: showPassword ? "var(--success)" : "var(--text-tertiary)",
+                        transition: "all var(--duration-fast) var(--ease-in-out)",
                       }}
                     >
-                      {showPassword ? "👁" : "👁‍🗨"}
+                      {showPassword ? "󰈉" : "󰈈"}
                     </button>
                   )}
                 </div>
@@ -345,21 +347,21 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
             </FieldGroup>
           )}
 
-          <FieldGroup label="代理">
+          <FieldGroup label="代理设置">
             <FormField label="代理类型">
               <Select
                 value={proxyType}
                 onChange={(v) => setProxyType(v as ProxyType)}
                 options={[
-                  { value: "none", label: "不使用代理（直连）" },
-                  { value: "socks5", label: "SOCKS5" },
-                  { value: "http", label: "HTTP CONNECT" },
+                  { value: "none", label: "直连（不使用代理）" },
+                  { value: "socks5", label: "SOCKS5 代理" },
+                  { value: "http", label: "HTTP CONNECT 代理" },
                 ]}
               />
             </FormField>
             {proxyType !== "none" && (
               <>
-                <div style={{ display: "flex", gap: 10 }}>
+                <div style={{ display: "flex", gap: 12 }}>
                   <div style={{ flex: 2 }}>
                     <FormField label="代理主机">
                       <Input
@@ -387,14 +389,13 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
                   />
                 </FormField>
                 <FormField label="代理密码（可选）">
-                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                     <div style={{ flex: 1 }}>
                       <Input
                         value={proxyPassword}
                         onChange={setProxyPassword}
                         type={showProxyPassword ? "text" : "password"}
                         placeholder={config?.proxy_type && config.proxy_type !== "none" ? "留空保持不变" : "••••••"}
-                        accent="warning"
                       />
                     </div>
                     {config?.proxy_type && config.proxy_type !== "none" && (
@@ -403,23 +404,32 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
                         onClick={() => setPasswordVerifyTarget("proxy")}
                         title={showProxyPassword ? "隐藏密码" : "查看密码"}
                         style={{
-                          padding: "7px 10px",
-                          background: "var(--bg-input)",
-                          border: "1px solid var(--border)",
-                          borderRadius: 6,
+                          padding: "10px 12px",
+                          background: "var(--bg-surface)",
+                          border: "1px solid var(--border-default)",
+                          borderRadius: "var(--radius-md)",
                           fontSize: 14,
                           cursor: "pointer",
-                          color: showProxyPassword ? "var(--success)" : "var(--text-muted)",
+                          color: showProxyPassword ? "var(--success)" : "var(--text-tertiary)",
+                          transition: "all var(--duration-fast) var(--ease-in-out)",
                         }}
                       >
-                        {showProxyPassword ? "👁" : "👁‍🗨"}
+                        {showProxyPassword ? "󰈉" : "󰈈"}
                       </button>
                     )}
                   </div>
                 </FormField>
                 {connType === "ftp" && ftpTls !== "none" && (
-                  <div style={{ fontSize: 11, color: "var(--warning)", lineHeight: 1.4 }}>
-                    注意：FTPS（TLS）当前版本暂不支持，连接时会报错。如需走代理，请把 TLS 模式切回「不加密」。
+                  <div style={{
+                    padding: "10px 12px",
+                    background: "var(--warning-muted)",
+                    border: "1px solid var(--warning)",
+                    borderRadius: "var(--radius-md)",
+                    fontSize: 11,
+                    color: "var(--warning)",
+                    lineHeight: 1.5,
+                  }}>
+                    ⚠ 注意：FTPS（TLS）当前版本暂不支持，连接时会报错。如需走代理，请把 TLS 模式切回「不加密」。
                   </div>
                 )}
               </>
@@ -427,12 +437,59 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
           </FieldGroup>
 
           <FieldGroup label="分组">
-            <FormField label="文件夹路径（用 / 分隔）">
-              <Input
-                value={groupPath}
-                onChange={setGroupPath}
-                placeholder="生产/web"
-              />
+            <FormField label="选择或输入分组路径">
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {folders.length > 0 && (
+                  <select
+                    value={groupPath}
+                    onChange={(e) => setGroupPath(e.target.value)}
+                    style={{
+                      width: "100%",
+                      background: "var(--bg-input)",
+                      border: "1px solid var(--border-default)",
+                      borderRadius: "var(--radius-md)",
+                      padding: "10px 12px",
+                      color: "var(--text-primary)",
+                      fontSize: 13,
+                      outline: "none",
+                      cursor: "pointer",
+                      transition: "border-color var(--duration-fast) var(--ease-in-out)",
+                    }}
+                    onFocus={(e) => {
+                      e.currentTarget.style.borderColor = "var(--accent-primary)";
+                    }}
+                    onBlur={(e) => {
+                      e.currentTarget.style.borderColor = "var(--border-default)";
+                    }}
+                  >
+                    <option value="">根目录 (/)</option>
+                    {folders.map((f) => {
+                      const display = f.startsWith("/") ? f.slice(1) : f;
+                      return (
+                        <option key={f} value={display}>
+                          {display}
+                        </option>
+                      );
+                    })}
+                  </select>
+                )}
+                <Input
+                  value={groupPath}
+                  onChange={setGroupPath}
+                  placeholder={folders.length > 0 ? "或手动输入新分组路径" : "生产/web"}
+                />
+                {folders.length === 0 && (
+                  <div style={{
+                    fontSize: 11,
+                    color: "var(--text-muted)",
+                    padding: "6px 10px",
+                    background: "var(--bg-surface)",
+                    borderRadius: "var(--radius-sm)",
+                  }}>
+                    💡 提示：先在左侧创建文件夹，这里就可以快速选择了
+                  </div>
+                )}
+              </div>
             </FormField>
           </FieldGroup>
         </div>
@@ -440,21 +497,70 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
         {/* Footer */}
         <div
           style={{
-            padding: "12px 20px",
-            borderTop: "1px solid var(--border)",
+            padding: "16px 24px",
+            borderTop: "1px solid var(--border-subtle)",
             display: "flex",
             justifyContent: "flex-end",
-            gap: 8,
+            gap: 10,
+            background: "var(--bg-surface)",
+            borderRadius: "0 0 var(--radius-xl) var(--radius-xl)",
           }}
         >
-          <button onClick={onClose} style={btnSecondary}>取消</button>
-          <button onClick={handleSave} disabled={saving} style={btnPrimary(saving)}>
+          <button
+            onClick={onClose}
+            style={{
+              padding: "10px 20px",
+              background: "transparent",
+              color: "var(--text-secondary)",
+              border: "1px solid var(--border-default)",
+              borderRadius: "var(--radius-md)",
+              fontSize: 13,
+              cursor: "pointer",
+              transition: "all var(--duration-fast) var(--ease-in-out)",
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = "var(--bg-surface-hover)";
+              e.currentTarget.style.borderColor = "var(--border-emphasis)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "transparent";
+              e.currentTarget.style.borderColor = "var(--border-default)";
+            }}
+          >
+            取消
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            style={{
+              padding: "10px 28px",
+              background: "var(--accent-primary)",
+              color: "white",
+              border: "none",
+              borderRadius: "var(--radius-md)",
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: saving ? "wait" : "pointer",
+              opacity: saving ? 0.7 : 1,
+              transition: "all var(--duration-fast) var(--ease-in-out)",
+              boxShadow: "var(--shadow-glow)",
+            }}
+            onMouseEnter={(e) => {
+              if (!saving) {
+                e.currentTarget.style.background = "var(--accent-primary-hover)";
+                e.currentTarget.style.transform = "translateY(-1px)";
+              }
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "var(--accent-primary)";
+              e.currentTarget.style.transform = "translateY(0)";
+            }}
+          >
             {saving ? "保存中..." : "保存"}
           </button>
         </div>
       </div>
 
-      {/* Password verify dialog */}
       {passwordVerifyTarget && (
         <PasswordVerifyDialog
           onSuccess={async () => {
@@ -488,30 +594,6 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType }: P
   );
 }
 
-const btnSecondary: React.CSSProperties = {
-  background: "var(--bg-input)",
-  color: "var(--text-secondary)",
-  border: "1px solid var(--border)",
-  borderRadius: 6,
-  padding: "8px 20px",
-  fontSize: 13,
-  cursor: "pointer",
-  transition: "all 0.15s",
-};
-
-const btnPrimary = (saving: boolean): React.CSSProperties => ({
-  background: "var(--accent)",
-  color: "var(--bg-panel)",
-  border: "none",
-  borderRadius: 6,
-  padding: "8px 26px",
-  fontSize: 13,
-  fontWeight: 600,
-  cursor: saving ? "wait" : "pointer",
-  opacity: saving ? 0.6 : 1,
-  transition: "all 0.15s",
-});
-
 function TypeSelector({
   value,
   onChange,
@@ -522,7 +604,7 @@ function TypeSelector({
   disabled?: boolean;
 }) {
   return (
-    <div style={{ display: "flex", gap: 6, opacity: disabled ? 0.5 : 1 }}>
+    <div style={{ display: "flex", gap: 8, opacity: disabled ? 0.5 : 1 }}>
       {TYPE_OPTIONS.map((opt) => {
         const active = value === opt.value;
         return (
@@ -532,24 +614,23 @@ function TypeSelector({
             onClick={() => onChange(opt.value)}
             style={{
               flex: 1,
-              background: active ? "var(--accent)" : "var(--bg-input)",
-              color: active ? "var(--bg-panel)" : "var(--text-secondary)",
-              border: active
-                ? "1px solid var(--accent)"
-                : "1px solid var(--border)",
-              borderRadius: 8,
-              padding: "10px 8px",
+              background: active ? "var(--accent-primary-muted)" : "var(--bg-surface)",
+              color: active ? "var(--accent-primary)" : "var(--text-secondary)",
+              border: active ? "1px solid var(--border-accent)" : "1px solid var(--border-default)",
+              borderRadius: "var(--radius-lg)",
+              padding: "14px 12px",
               fontSize: 13,
               fontWeight: active ? 600 : 500,
               cursor: disabled ? "not-allowed" : "pointer",
               display: "flex",
               flexDirection: "column",
               alignItems: "center",
-              gap: 4,
-              transition: "all 0.15s",
+              gap: 8,
+              transition: "all var(--duration-normal) var(--ease-out-expo)",
+              boxShadow: active ? "var(--shadow-glow)" : "none",
             }}
           >
-            <span style={{ fontSize: 18 }}>{opt.icon}</span>
+            <span style={{ fontSize: 22 }}>{opt.icon}</span>
             <span>{opt.label}</span>
           </button>
         );
@@ -562,22 +643,22 @@ function FieldGroup({ label, children }: { label: string; children: React.ReactN
   return (
     <div
       style={{
-        background: "var(--bg-panel)",
-        border: "1px solid var(--border)",
-        borderRadius: 8,
-        padding: "12px 14px",
+        background: "var(--bg-surface)",
+        border: "1px solid var(--border-default)",
+        borderRadius: "var(--radius-lg)",
+        padding: "16px",
         display: "flex",
         flexDirection: "column",
-        gap: 10,
+        gap: 12,
       }}
     >
       <div
         style={{
           fontSize: 10,
           fontWeight: 700,
-          color: "var(--text-muted)",
+          color: "var(--text-tertiary)",
           textTransform: "uppercase",
-          letterSpacing: 0.8,
+          letterSpacing: "0.1em",
         }}
       >
         {label}
@@ -589,8 +670,8 @@ function FieldGroup({ label, children }: { label: string; children: React.ReactN
 
 function FormField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-      <label style={{ fontSize: 12, color: "var(--text-secondary)" }}>{label}</label>
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <label style={{ fontSize: 12, color: "var(--text-secondary)", fontWeight: 500 }}>{label}</label>
       {children}
     </div>
   );
@@ -601,22 +682,14 @@ function Input({
   onChange,
   placeholder,
   type,
-  accent,
   autoFocus,
 }: {
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
   type?: string;
-  accent?: "warning" | "info";
   autoFocus?: boolean;
 }) {
-  const accentColor =
-    accent === "warning"
-      ? "var(--warning)"
-      : accent === "info"
-      ? "var(--accent)"
-      : "var(--border)";
   return (
     <input
       value={value}
@@ -625,23 +698,23 @@ function Input({
       type={type || "text"}
       autoFocus={autoFocus}
       onFocus={(e) => {
-        e.currentTarget.style.borderColor = "var(--accent)";
-        e.currentTarget.style.boxShadow = "0 0 0 2px rgba(137,180,250,0.18)";
+        e.currentTarget.style.borderColor = "var(--accent-primary)";
+        e.currentTarget.style.boxShadow = "0 0 0 3px var(--accent-primary-muted)";
       }}
       onBlur={(e) => {
-        e.currentTarget.style.borderColor = accentColor;
+        e.currentTarget.style.borderColor = "var(--border-default)";
         e.currentTarget.style.boxShadow = "none";
       }}
       style={{
         width: "100%",
         background: "var(--bg-input)",
-        border: `1px solid ${accentColor}`,
-        borderRadius: 6,
-        padding: "7px 10px",
+        border: "1px solid var(--border-default)",
+        borderRadius: "var(--radius-md)",
+        padding: "10px 12px",
         color: "var(--text-primary)",
         fontSize: 13,
         outline: "none",
-        transition: "border-color 0.15s, box-shadow 0.15s",
+        transition: "border-color var(--duration-fast) var(--ease-in-out), box-shadow var(--duration-fast) var(--ease-in-out)",
       }}
     />
   );
@@ -663,13 +736,20 @@ function Select({
       style={{
         width: "100%",
         background: "var(--bg-input)",
-        border: "1px solid var(--border)",
-        borderRadius: 6,
-        padding: "7px 10px",
+        border: "1px solid var(--border-default)",
+        borderRadius: "var(--radius-md)",
+        padding: "10px 12px",
         color: "var(--text-primary)",
         fontSize: 13,
         outline: "none",
         cursor: "pointer",
+        transition: "border-color var(--duration-fast) var(--ease-in-out)",
+      }}
+      onFocus={(e) => {
+        e.currentTarget.style.borderColor = "var(--accent-primary)";
+      }}
+      onBlur={(e) => {
+        e.currentTarget.style.borderColor = "var(--border-default)";
       }}
     >
       {options.map((o) => (
@@ -681,12 +761,6 @@ function Select({
   );
 }
 
-/** Private-key picker: a single button that opens a file dialog, reads the
- * PEM content via the `read_text_file` Rust command, and surfaces either
- * "已导入：xxx" or "已加密存储（vault 中已有）" depending on state. The
- * clear button resets both. We never display the path on screen — once
- * imported, the path is irrelevant; only the encrypted-in-vault content
- * matters. */
 function KeyPicker({
   pem,
   fileName,
@@ -731,24 +805,25 @@ function KeyPicker({
 
   return (
     <div>
-      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
         <button
           type="button"
           onClick={pick}
           disabled={busy}
           style={{
-            padding: "6px 12px",
-            background: "var(--accent)",
-            color: "var(--bg-panel)",
+            padding: "8px 14px",
+            background: "var(--accent-primary)",
+            color: "white",
             border: "none",
-            borderRadius: 5,
+            borderRadius: "var(--radius-md)",
             fontSize: 12,
             fontWeight: 600,
             cursor: busy ? "wait" : "pointer",
-            opacity: busy ? 0.6 : 1,
+            opacity: busy ? 0.7 : 1,
+            transition: "all var(--duration-fast) var(--ease-in-out)",
           }}
         >
-          {busy ? "读取中…" : hasExisting ? "替换私钥" : "📁 选择私钥文件"}
+          {busy ? "读取中..." : hasExisting ? "替换私钥" : "󰈗 选择私钥文件"}
         </button>
         {(hasNew || hasExisting) && (
           <button
@@ -756,13 +831,14 @@ function KeyPicker({
             onClick={onClear}
             title="清除"
             style={{
-              padding: "6px 10px",
+              padding: "8px 12px",
               background: "transparent",
-              color: "var(--text-muted)",
-              border: "1px solid var(--border)",
-              borderRadius: 5,
+              color: "var(--text-tertiary)",
+              border: "1px solid var(--border-default)",
+              borderRadius: "var(--radius-md)",
               fontSize: 12,
               cursor: "pointer",
+              transition: "all var(--duration-fast) var(--ease-in-out)",
             }}
           >
             ✕
@@ -781,15 +857,23 @@ function KeyPicker({
           {hasNew
             ? `✓ 已导入：${fileName}`
             : hasExisting
-              ? "✓ 已加密存储（vault 中已有）"
+              ? "✓ 已加密存储"
               : "未选择"}
         </span>
       </div>
       {err && (
-        <div style={{ marginTop: 6, fontSize: 11, color: "var(--error)" }}>{err}</div>
+        <div style={{ marginTop: 8, fontSize: 11, color: "var(--error)" }}>{err}</div>
       )}
-      <div style={{ marginTop: 6, fontSize: 10, color: "var(--text-muted)", lineHeight: 1.4 }}>
-        私钥将以主密码加密后存入本地数据库，原文件不会被修改。
+      <div style={{
+        marginTop: 8,
+        fontSize: 10,
+        color: "var(--text-muted)",
+        lineHeight: 1.5,
+        padding: "8px 10px",
+        background: "var(--bg-surface)",
+        borderRadius: "var(--radius-sm)",
+      }}>
+        🔒 私钥将以主密码加密后存入本地数据库，原文件不会被修改。
       </div>
     </div>
   );

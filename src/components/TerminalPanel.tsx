@@ -35,9 +35,16 @@ interface Props {
    * (so their xterm history + onSshOutput subscriptions persist across tab
    * switches); we only refit and refocus when this becomes the active tab. */
   active?: boolean;
+  /** Callback fired when the SSH session is closed (server-initiated or
+   * network error). Used to update the tab status to "disconnected". */
+  onDisconnected?: () => void;
+  /** Connection status: "connecting" | "connected" | "disconnected" | "error" */
+  status?: "connecting" | "connected" | "disconnected" | "error";
+  /** Callback to reconnect when status is disconnected/error */
+  onReconnect?: () => void;
 }
 
-export function TerminalPanel({ sessionId, connectionId, broadcastTargets, active = true }: Props) {
+export function TerminalPanel({ sessionId, connectionId, broadcastTargets, active = true, onDisconnected, status, onReconnect }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -140,7 +147,7 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
       ).then((results) => {
         results.forEach((r, i) => {
           if (r.status === "rejected") {
-            console.error(`Broadcast send to ${destinations[i]} failed:`, r.reason);
+            // Silently ignore broadcast failures (session may have been closed)
           }
         });
       });
@@ -228,6 +235,7 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
       closed = true;
       term.write("\r\n\x1b[31m[Connection closed]\x1b[0m\r\n");
       term.options.cursorBlink = false;
+      onDisconnected?.();
     })
       .then((un) => {
         if (closed) un();
@@ -307,8 +315,31 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
     const term = termRef.current;
     const fit = fitRef.current;
     if (!term || !fit) return;
+
     if (active) {
-      try { fit.fit(); } catch { /* container not yet sized */ }
+      // Guard against container not yet sized or terminal disposed
+      const container = containerRef.current;
+      if (!container) return;
+
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      if (w < 80 || h < 40) {
+        // Container not yet sized, skip fit to avoid RenderService error
+        return;
+      }
+
+      // Additional safety: check if terminal is still usable
+      if (!term.element || !term.element.parentElement) {
+        return;
+      }
+
+      try {
+        fit.fit();
+      } catch (error) {
+        // Silently ignore fit errors during transitions
+        return;
+      }
+
       sshResize(sessionIdRef.current, term.cols, term.rows).catch(() => {});
       // Sync the freshly-refit cols to broadcast members so their shells
       // output in the same width — covers the case where this tab was
@@ -399,6 +430,8 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
           sessionId={sessionId}
           connectionId={connectionId}
           broadcastTargets={broadcastTargets}
+          status={status}
+          onReconnect={onReconnect}
           onRegisterRefresh={(fn) => {
             refreshHistoryRef.current = fn;
           }}
