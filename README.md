@@ -2,7 +2,7 @@
 
 一款基于 Tauri v2 构建的跨平台 SSH/SFTP/FTP 桌面客户端，灵感来自 FinalShell。
 
-![Version](https://img.shields.io/badge/version-0.2.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-green)
 ![React](https://img.shields.io/badge/React-18-blue)
 ![Rust](https://img.shields.io/badge/Rust-1.70+-orange)
@@ -12,6 +12,8 @@
 ### 连接管理
 - 支持 **SSH**、**SFTP**、**FTP** 协议
 - 连接分组管理（树形结构）
+- **模糊搜索**：快速定位服务器连接
+- **文件夹快速选择**：编辑服务器时可快速选择所属文件夹
 - 导入/导出连接配置（AES-256-GCM 加密）
 - 连接配置持久化存储（SQLite + OS Keyring）
 - 代理支持（SOCKS5、HTTP）
@@ -19,7 +21,10 @@
 ### 终端功能
 - 基于 xterm.js 的高性能终端模拟
 - Catppuccin Mocha 深色主题
+- **暗黑模式**：支持深色/浅色主题切换
 - 终端自适应尺寸调整
+- **连接状态指示**：tab 页顶部显示在线（绿色）/离线（红色）/异常（红色×）状态
+- **连接失败重连**：tab 页右下角显示失败提示，支持一键重连
 - **命令历史栏**：最近 50 条命令 + 钉住置顶
 - **广播输入**：同时向多个终端发送相同命令
 - ZMODEM 协议支持（rz/sz 文件传输）

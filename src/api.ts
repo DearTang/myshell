@@ -239,6 +239,64 @@ export async function clearCommandHistory(connectionId: string, includePinned: b
   await invoke("clear_command_history", { connectionId, includePinned });
 }
 
+// ============ Quick Commands API ============
+//
+// User-defined reusable command snippets. `connectionId` is null for global
+// scope (every server) or a ConnectionConfig.id for per-server scope. Stored
+// as plaintext (commands aren't secrets). Keyed by connectionId (stable across
+// reconnects), same convention as Command History.
+
+export interface QuickCommandItem {
+  id: number;
+  connectionId: string | null;
+  label: string;
+  command: string;
+  sortOrder: number;
+}
+
+/** Flattened item for the terminal execution panel: union of global + current
+ * connection commands, with isGlobal for grouping. */
+export interface QuickCommandExecItem {
+  id: number;
+  isGlobal: boolean;
+  label: string;
+  command: string;
+}
+
+export async function addQuickCommand(
+  connectionId: string | null,
+  label: string,
+  command: string
+): Promise<number> {
+  return await invoke("add_quick_command", { connectionId, label, command });
+}
+
+export async function listQuickCommands(connectionId: string | null): Promise<QuickCommandItem[]> {
+  return await invoke("list_quick_commands", { connectionId });
+}
+
+export async function listQuickCommandsForConnection(
+  connectionId: string
+): Promise<QuickCommandExecItem[]> {
+  return await invoke("list_quick_commands_for_connection", { connectionId });
+}
+
+export async function updateQuickCommand(
+  id: number,
+  label: string,
+  command: string
+): Promise<void> {
+  await invoke("update_quick_command", { id, label, command });
+}
+
+export async function updateQuickCommandOrder(id: number, sortOrder: number): Promise<void> {
+  await invoke("update_quick_command_order", { id, sortOrder });
+}
+
+export async function deleteQuickCommand(id: number): Promise<void> {
+  await invoke("delete_quick_command", { id });
+}
+
 // ============ Server Info API ============
 
 export interface ServerInfo {

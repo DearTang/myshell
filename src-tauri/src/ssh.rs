@@ -378,7 +378,7 @@ async fn channel_reader(
     let mut flush_interval = tokio::time::interval(Duration::from_millis(16));
     // First tick completes immediately; consume it so we don't flush an empty buffer.
     flush_interval.tick().await;
-    eprintln!("[ssh:{}] channel_reader started", session_id);
+    log::info!("[ssh:{}] channel_reader started", session_id);
 
     let mut mode = TermMode::Normal;
     // Count of OO bytes (0x4F) eaten from the start of the post-ZMODEM
@@ -528,6 +528,7 @@ async fn channel_reader(
     if let Ok(mut map) = sessions.lock() {
         map.remove(&session_id);
     }
+    log::info!("[ssh:{}] channel_reader exited", session_id);
 }
 
 /// Routes incoming PTY bytes: terminal output in Normal mode, raw ZMODEM frames

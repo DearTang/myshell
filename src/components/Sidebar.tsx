@@ -17,6 +17,7 @@ interface Props {
   onAddNew: (initialType?: ConnType, initialFolderPath?: string) => void;
   onRefresh: () => void;
   onOpenSettings: () => void;
+  onOpenQuickCommands: () => void;
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
 }
@@ -160,24 +161,24 @@ const styles = {
   },
   toggleBtn: {
     position: "absolute" as const,
-    right: -14,
+    right: -13,
     top: "50%",
+    width: 26,
+    height: 26,
     transform: "translateY(-50%)",
-    width: 28,
-    height: 56,
-    borderRadius: "var(--radius-md)",
+    borderRadius: "var(--radius-full)",
     background: "var(--bg-surface)",
-    border: "1px solid var(--border-default)",
+    border: "1px solid var(--border-emphasis)",
     color: "var(--text-tertiary)",
     cursor: "pointer",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    fontSize: 10,
     zIndex: 100,
     padding: 0,
-    boxShadow: "var(--shadow-md)",
-    transition: "all var(--duration-normal) var(--ease-out-expo)",
+    boxShadow: "var(--shadow-sm), inset 0 1px 0 rgba(255,255,255,0.06)",
+    transition:
+      "background var(--duration-normal) var(--ease-out-expo), color var(--duration-normal) var(--ease-out-expo), border-color var(--duration-normal) var(--ease-out-expo), box-shadow var(--duration-normal) var(--ease-out-expo), transform var(--duration-normal) var(--ease-out-expo)",
   },
 };
 
@@ -190,6 +191,7 @@ export function Sidebar({
   onAddNew,
   onRefresh,
   onOpenSettings,
+  onOpenQuickCommands,
   collapsed = false,
   onToggleCollapsed,
 }: Props) {
@@ -338,21 +340,26 @@ export function Sidebar({
         onToggleCollapsed();
       }}
       title={collapsed ? "展开侧栏" : "收起侧栏"}
+      aria-label={collapsed ? "展开侧栏" : "收起侧栏"}
       style={styles.toggleBtn}
       onMouseEnter={(e) => {
         e.currentTarget.style.background = "var(--accent-primary-muted)";
         e.currentTarget.style.borderColor = "var(--border-accent)";
         e.currentTarget.style.color = "var(--accent-primary)";
-        e.currentTarget.style.transform = "translateY(-50%) scale(1.05)";
+        e.currentTarget.style.transform = "translateY(-50%) scale(1.1)";
+        e.currentTarget.style.boxShadow =
+          "var(--shadow-md), inset 0 1px 0 rgba(255,255,255,0.08)";
       }}
       onMouseLeave={(e) => {
         e.currentTarget.style.background = "var(--bg-surface)";
-        e.currentTarget.style.borderColor = "var(--border-default)";
+        e.currentTarget.style.borderColor = "var(--border-emphasis)";
         e.currentTarget.style.color = "var(--text-tertiary)";
-        e.currentTarget.style.transform = "translateY(-50%)";
+        e.currentTarget.style.transform = "translateY(-50%) scale(1)";
+        e.currentTarget.style.boxShadow =
+          "var(--shadow-sm), inset 0 1px 0 rgba(255,255,255,0.06)";
       }}
     >
-      {collapsed ? "›" : "‹"}
+      <ChevronIcon size={12} rotated={collapsed} />
     </button>
   ) : null;
 
@@ -419,39 +426,51 @@ export function Sidebar({
           >
             {theme === "dark" ? "☀️" : "🌙"}
           </button>
+          <IconBtn title="快捷命令" onClick={onOpenQuickCommands}>
+            🧩
+          </IconBtn>
           <IconBtn title="设置" onClick={onOpenSettings}>
             ⚙️
           </IconBtn>
           <button
             onClick={() => onAddNew()}
             title="新建连接"
+            aria-label="新建连接"
             style={{
-              width: 23,
-              height: 23,
+              width: 28,
+              height: 28,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              background: "var(--accent-primary)",
-              color: "white",
-              border: "none",
+              background: "var(--accent-primary-muted)",
+              color: "var(--accent-primary)",
+              border: "1px solid transparent",
               borderRadius: "var(--radius-md)",
-              fontSize: 16,
-              lineHeight: 1,
               cursor: "pointer",
-              fontWeight: 500,
-              transition: "all var(--duration-normal) var(--ease-out-expo)",
-              boxShadow: "var(--shadow-glow)",
+              transition:
+                "background var(--duration-normal) var(--ease-out-expo), color var(--duration-normal) var(--ease-out-expo), border-color var(--duration-normal) var(--ease-out-expo), box-shadow var(--duration-normal) var(--ease-out-expo), transform var(--duration-fast) var(--ease-out-expo)",
             }}
             onMouseEnter={(e) => {
-              e.currentTarget.style.background = "var(--accent-primary-hover)";
-              e.currentTarget.style.transform = "scale(1.05)";
+              e.currentTarget.style.background = "var(--accent-primary)";
+              e.currentTarget.style.color = "#ffffff";
+              e.currentTarget.style.borderColor = "var(--accent-primary-hover)";
+              e.currentTarget.style.boxShadow = "var(--shadow-glow)";
             }}
             onMouseLeave={(e) => {
-              e.currentTarget.style.background = "var(--accent-primary)";
+              e.currentTarget.style.background = "var(--accent-primary-muted)";
+              e.currentTarget.style.color = "var(--accent-primary)";
+              e.currentTarget.style.borderColor = "transparent";
+              e.currentTarget.style.boxShadow = "none";
+              e.currentTarget.style.transform = "scale(1)";
+            }}
+            onMouseDown={(e) => {
+              e.currentTarget.style.transform = "scale(0.88)";
+            }}
+            onMouseUp={(e) => {
               e.currentTarget.style.transform = "scale(1)";
             }}
           >
-            +
+            <PlusIcon size={16} />
           </button>
         </div>
       </div>
@@ -801,6 +820,52 @@ function ConnRow({
         </>
       )}
     </>
+  );
+}
+
+function PlusIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      <path
+        d="M12 5v14M5 12h14"
+        stroke="currentColor"
+        strokeWidth="2.2"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function ChevronIcon({ size = 14, rotated }: { size?: number; rotated: boolean }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+      style={{
+        display: "block",
+        transform: rotated ? "rotate(180deg)" : "rotate(0deg)",
+        transition: "transform var(--duration-normal) var(--ease-out-expo)",
+      }}
+    >
+      {/* Left-pointing chevron; rotates 180° to point right when collapsed */}
+      <path
+        d="M15 6l-6 6 6 6"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   );
 }
 

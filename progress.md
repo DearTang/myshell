@@ -226,3 +226,83 @@
 | 目标是什么？ | 5 大需求完整可用 |
 | 我学到了什么？ | suppaftp v8 API 大改（无 `passive()`/`types::File`，mlsd 返回 String）；FTP session 因 `AsyncFtpStream` 不 Clone 必须用 take/return 借还术；russh 0.50 Handle 是 Arc 可多开 channel — exec channel 与 PTY channel 共存（ServerInfo panel 与终端同时工作） |
 | 我做了什么？ | Phase A：DB schema；Phase B：UI 美化；Phase C：树形文件夹；Phase D：服务器信息侧栏；Phase E：FTP 全栈 |
+
+## 会话：2026-06-15 — 全局 + 服务器专属快捷命令
+
+### 阶段 8：快捷命令功能（全局 + 服务器专属 + 多行顺序执行）
+- **状态：** complete（cargo check + tsc + clippy 新代码三绿；端到端待用户手动验证）
+- **需求：** 设置中添加全局快捷命令；针对当前服务器的专属快捷命令；多行命令按行顺序执行；终端一键点击直接执行
+- **设计决策（与用户确认）：**
+  - 数据模型：单表 `quick_commands`，`connection_id` 为 NULL=全局、非 NULL=服务器专属；执行面板一条 SQL（`WHERE connection_id IS NULL OR connection_id = ?`）联合取全局+专属
+  - NULL 安全：db.rs 按 scope 分支构造 SQL（None→`IS NULL`，Some→`= ?1`），规避 `connection_id IS ?1` 跨 SQLite 版本语义风险
+  - 多行执行：前端按 `\r?\n` 拆行→trim→跳过空行和行首 `#` 注释→用 `\r` 拼接一次性 `sshSend`（PTY 必须用 `\r` 触发执行，`\n` 不触发）；复用 `sshSend` + 广播扇出
+  - 管理界面：独立 `QuickCommandsPanel`（作用域下拉切换 全局/任意服务器），入口三处（侧边栏 🧩 / 终端执行面板"管理"链接 / 设置面板内 Section）
+  - 点击行为：直接执行（不填输入框，符合"快捷"定位）
+  - 不写入 command_history（多行语义与单行历史模型不匹配）
+  - `delete_connection` 改造为事务 + 级联清理该服务器的专属命令（command_history 保持现状不级联，向后兼容）
+- **修改明细：**
+  - `src-tauri/src/db.rs` — `init_db` 加 `quick_commands` 表 + 2 索引；`QuickCommandTuple` type alias（消 clippy complex_type warning）；6 个 CRUD（`add_quick_command`/`list_quick_commands`/`list_quick_commands_for_connection` 联合查询/`update_quick_command`/`update_quick_command_order`/`delete_quick_command`）；`delete_connection` 改事务级联
+  - `src-tauri/src/main.rs` — `QuickCommandItem`/`QuickCommandExecItem` struct；6 个 `#[tauri::command]`（同步，明文不调 `require_dek`）；`generate_handler!` 注册
+  - `src/api.ts` — `QuickCommandItem`/`QuickCommandExecItem` interface + 6 个 invoke 包装（按 connectionId 键控，与 command_history 同约定）
+  - `src/components/QuickCommandsPanel.tsx`（新建）— 统一管理面板：作用域下拉切换 + CRUD 列表 + 内联编辑表单 + ↑↓排序（交换相邻 sortOrder）
+  - `src/components/CommandBar.tsx` — `⌨ 快捷` 按钮 + 浮层面板（🌐 全局 / 📌 本服务器专属 分组）+ `handleExecuteQuickCommand`（多行 `\r` 拼接 + 跳过空行/注释 + 广播扇出）+ `QuickCommandGroup` 子组件
+  - `src/components/TerminalPanel.tsx` — 透传 `onOpenQuickCommandsManage` prop
+  - `src/App.tsx` — `showQuickCommands`/`qcInitialConnectionId` state + 面板渲染 + 三入口接线（Sidebar/CommandBar 管理/SettingsPanel）
+  - `src/components/Sidebar.tsx` — 🧩 按钮（同款 IconBtn）
+  - `src/components/SettingsPanel.tsx` — "快捷命令" Section 入口
+- **验证：**
+  - `cargo check` PASS（8m52s，首次编译 tauri 全套依赖；零错误零警告）
+  - `cargo clippy` 新代码 0 warning（修复 `list_quick_commands` 的 "very complex type" → `QuickCommandTuple` type alias）；剩余 5 个 warning 均为项目预存（ssh.rs:249 / db.rs:243 / backup.rs:187 / main.rs:303 / backup create）
+  - `npx tsc --noEmit` PASS
+- **待手动 E2E（需真实 SSH 服务器）：**
+  1. 管理面板：全局新增 `echo global`；当前服务器新增多行 `cd /tmp`+`# 注释`+`echo $PWD`
+  2. 终端 `⌨ 快捷`：两组命令分组显示，点击直接执行；多行按顺序、空行/注释跳过
+  3. 广播：两 tab 广播，点快捷命令同步执行
+  4. 级联：删除服务器，专属命令被清、全局保留；重连后面板仍能列出并执行
+- **遗留风险/限制：**
+  - heredoc（`<<EOF`）体内 `#` 开头行/空行会被过滤误删 — 面板文案已提示，未来可加 per-command raw 开关
+  - 多行执行依赖 PTY 行缓冲保证顺序；`cd` 等状态依赖命令需用户在同一快捷命令内写好
+  - 图标避开 `⚡`（重连按钮已占用，CommandBar.tsx:186）：执行按钮用 `⌨`，管理入口用 `🧩`
+- **首次编译踩坑：** `cargo check` 首次因网络中断下载 `web-sys`（reqwest→tauri 依赖）失败（`schannel: server closed abruptly`），重试一次后成功
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 8 快捷命令功能完成；cargo check + tsc + clippy（新代码）三绿 |
+| 我要去哪里？ | 用户运行 `cargo tauri dev` 连真实服务器跑 E2E（多行 `\r` 执行顺序是验证重点） |
+| 目标是什么？ | 全局+服务器专属快捷命令，多行按行顺序执行，终端一键点击直接运行 |
+| 我学到了什么？ | command_history 是快捷命令的天然模板（同款建表/CRUD/IPC/执行通道）；PTY 多行必须用 `\r` 拼接而非 `\n`；`connection_id IS ?1` 的 NULL 语义跨版本有风险，应按 scope 分支构造 SQL；rusqlite `query_map` 两分支若用不同闭包字面量会类型不一致，需提取成函数指针（fn 类型）复用 |
+| 我做了什么？ | 阶段 8：db 建表+CRUD+级联；main struct+commands+注册；api.ts 封装；CommandBar 执行面板；QuickCommandsPanel 管理面板；App/Sidebar/SettingsPanel/TerminalPanel 接线 |
+
+## 会话：2026-06-15 — 日志增强（7 天保留 + 结构化诊断日志）
+
+### 阶段 9：日志系统加固
+- **状态：** complete（cargo clippy 通过，新代码 0 warning）
+- **需求：** 多增加日志方便后续定位问题；默认删除 7 天前的日志
+- **现有机制发现：** release 模式已有 `setup_file_logging`（Windows CRT `_open_osfhandle` + `_dup2` 把 stderr fd 2 重定向到按天命名的文件 `<config_dir>/myshell/logs/myshell-{day}.log`），所有 `eprintln!` 已落盘；但保留期是 14 天，且 `env_logger::init()` 默认 error 级别导致 `log::info!/warn!` 被过滤掉
+- **改动明细：**
+  - `src-tauri/src/main.rs` `setup_file_logging`
+    - 清理阈值 14 天 → **7 天**（`60*60*24*14` → `*7`，含 doc 注释）
+    - 清理逻辑统计删除数量（`pruned: u32` 计数），在 dup2 完成后的 startup banner 输出（dup2 之前的日志写原始 stderr，release 会丢失）
+    - startup banner 从 `eprintln!`（无格式 epoch 秒）→ `log::info!`（带级别/时间戳/保留期/清理数）
+  - `src-tauri/src/main.rs` `run()`
+    - `env_logger::init()` → `Builder::from_env(Env::default().default_filter_or("info")).format_timestamp_millis()` —— 让 log 宏在默认级别生效；RUST_LOG 仍可覆盖（如 `RUST_LOG=myshell=debug` 排查）
+    - 启动阶段日志：db 初始化 info、schema 迁移结果（失败 warn / 成功 info）、backup 检查失败 warn
+  - `src-tauri/src/main.rs` 关键诊断路径
+    - `ssh_connect`：请求（user@host:port + auth + proxy）、成功（sid + target）、失败（error + 原因）
+    - `ssh_disconnect`：disconnect requested
+    - `delete_connection`：keyring 删除失败 warn、完成 info（级联清理提示）
+    - 快捷命令 `add_quick_command` / `update_quick_command` / `delete_quick_command`：info（id / label / scope）
+  - `src-tauri/src/ssh.rs` `channel_reader`：启动 started + 退出 exited（info）—— 定位 SSH 输出中断/会话结束的关键
+- **保留未改：** 现有 `eprintln!`（debug 数据流 `Data N bytes`、PTY 步骤等）保留 —— release 已通过 stderr 重定向写入文件，工作正常，避免全量替换引入风险
+- **验证：** `cargo clippy` PASS（7.93s 增量编译，0 错误）；新代码 0 warning（5 个 warning 均为项目预存：backup sort_by / main.rs manual_strip / main.rs open_options / ssh.rs field assignment / db.rs complex type）
+- **日志查看：** release 用户看 `%APPDATA%/myshell/logs/myshell-{day}.log`；开发 debug 看控制台；排查连接问题搜 `[ssh]` 前缀（connect requested → connected/failed → channel_reader started/exited 完整链路）
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 9 日志增强完成；cargo clippy 通过 |
+| 我要去哪里？ | release 运行验证日志文件实际写入 + 7 天清理生效（需积累日志或手动测试清理逻辑） |
+| 目标是什么？ | 通过日志文件能定位问题，自动清理 7 天前日志 |
+| 我学到了什么？ | 现有已有 setup_file_logging（dup2 stderr → 按天文件），只需调阈值 + 配置 env_logger 级别即可让 log 宏生效，无需重写日志框架；env_logger 默认 error 级别会吞掉 info/warn，必须显式 `default_filter_or("info")`；dup2 之前的日志写原始 stderr（release 丢失），所以清理计数要在 dup2 后的 banner 输出 |
+| 我做了什么？ | 阶段 9：清理 14→7 天；env_logger 配 info + 毫秒时间戳；startup / SSH 生命周期 / 快捷命令 / delete_connection / channel_reader 补充结构化日志 |

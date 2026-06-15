@@ -110,6 +110,29 @@ pub struct CommandHistoryItem {
     pub created_at: String,
 }
 
+// ============ Quick Command Entries ============
+
+/// A quick command as stored/managed (global or per-connection). Used by the
+/// management panel. `connection_id` is None for global scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuickCommandItem {
+    pub id: i64,
+    pub connection_id: Option<String>,
+    pub label: String,
+    pub command: String,
+    pub sort_order: i64,
+}
+
+/// A quick command flattened for the terminal execution panel: the union of
+/// global + current-connection commands, with an `is_global` flag for grouping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuickCommandExecItem {
+    pub id: i64,
+    pub is_global: bool,
+    pub label: String,
+    pub command: String,
+}
+
 // ============ App State ============
 
 pub struct AppState {
@@ -202,13 +225,17 @@ fn delete_connection(state: State<AppState>, id: String) -> Result<(), String> {
     // errors (not "not found") so a leaked credential isn't silently left
     // in the OS keyring when the user thought they'd deleted the connection.
     if let Err(e) = secrets::delete_password(&id) {
-        eprintln!("[delete_connection] keyring delete password failed for {}: {}", id, e);
+        log::warn!("[delete_connection] keyring delete password failed for {}: {}", id, e);
     }
     if let Err(e) = secrets::delete_proxy_password(&id) {
-        eprintln!("[delete_connection] keyring delete proxy password failed for {}: {}", id, e);
+        log::warn!("[delete_connection] keyring delete proxy password failed for {}: {}", id, e);
     }
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db::delete_connection(&db, &id).map_err(|e| e.to_string())
+    let result = db::delete_connection(&db, &id).map_err(|e| e.to_string());
+    if result.is_ok() {
+        log::info!("[delete_connection] removed {} (cascaded per-server quick commands)", id);
+    }
+    result
 }
 
 /// Clone a connection: same config, new UUID + incremented name suffix.
@@ -936,6 +963,108 @@ fn clear_command_history(
     db::clear_command_history(&db, &connection_id, include_pinned).map_err(|e| e.to_string())
 }
 
+// ============ Quick Commands Commands ============
+
+#[tauri::command]
+fn add_quick_command(
+    state: State<AppState>,
+    connection_id: Option<String>,
+    label: String,
+    command: String,
+) -> Result<i64, String> {
+    let label = label.trim();
+    let command = command.trim();
+    if label.is_empty() || command.is_empty() {
+        return Err("名称和命令不能为空".to_string());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let new_id = db::add_quick_command(&db, connection_id.as_deref(), label, command, &now)
+        .map_err(|e| e.to_string())?;
+    log::info!(
+        "[quick-cmd] added id={} label={:?} scope={:?}",
+        new_id, label, connection_id
+    );
+    Ok(new_id)
+}
+
+#[tauri::command]
+fn list_quick_commands(
+    state: State<AppState>,
+    connection_id: Option<String>,
+) -> Result<Vec<QuickCommandItem>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let rows = db::list_quick_commands(&db, connection_id.as_deref()).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, cid, label, command, sort_order)| QuickCommandItem {
+            id,
+            connection_id: cid,
+            label,
+            command,
+            sort_order,
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn list_quick_commands_for_connection(
+    state: State<AppState>,
+    connection_id: String,
+) -> Result<Vec<QuickCommandExecItem>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let rows = db::list_quick_commands_for_connection(&db, &connection_id)
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, is_global, label, command)| QuickCommandExecItem {
+            id,
+            is_global,
+            label,
+            command,
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn update_quick_command(
+    state: State<AppState>,
+    id: i64,
+    label: String,
+    command: String,
+) -> Result<(), String> {
+    let label = label.trim();
+    let command = command.trim();
+    if label.is_empty() || command.is_empty() {
+        return Err("名称和命令不能为空".to_string());
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::update_quick_command(&db, id, label, command).map_err(|e| e.to_string())?;
+    log::info!("[quick-cmd] updated id={} label={:?}", id, label);
+    Ok(())
+}
+
+#[tauri::command]
+fn update_quick_command_order(
+    state: State<AppState>,
+    id: i64,
+    sort_order: i64,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::update_quick_command_order(&db, id, sort_order).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_quick_command(state: State<AppState>, id: i64) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::delete_quick_command(&db, id).map_err(|e| e.to_string())?;
+    log::info!("[quick-cmd] deleted id={}", id);
+    Ok(())
+}
+
 /// Normalize a folder path: trim, ensure leading slash, collapse duplicate
 /// slashes, strip trailing slash (except root).
 fn normalize_folder_path(input: &str) -> String {
@@ -1004,6 +1133,11 @@ async fn ssh_connect(
     window: tauri::WebviewWindow,
     mut config: ConnectionConfig,
 ) -> Result<String, String> {
+    let target = format!("{}@{}:{}", config.username, config.host, config.port);
+    log::info!(
+        "[ssh] connect requested: {} (auth={}, proxy={})",
+        target, config.auth_method, config.proxy_type
+    );
     // Resolve password from keyring here, not in ssh.rs, so the SSH module
     // doesn't need to know about the vault. Key auth uses private_key_pem
     // which is already in the config (populated by get_connections).
@@ -1018,7 +1152,12 @@ async fn ssh_connect(
         let key = require_dek(&state)?;
         config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
     }
-    ssh::connect(state, window, config).await
+    let result = ssh::connect(state, window, config).await;
+    match &result {
+        Ok(sid) => log::info!("[ssh:{}] connected to {}", sid, target),
+        Err(e) => log::error!("[ssh] connect failed for {}: {}", target, e),
+    }
+    result
 }
 
 #[tauri::command]
@@ -1046,6 +1185,7 @@ async fn ssh_resize(
 
 #[tauri::command]
 async fn ssh_disconnect(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    log::info!("[ssh:{}] disconnect requested", session_id);
     ssh::disconnect(&state, &session_id).await
 }
 
@@ -1683,7 +1823,7 @@ fn sz_close(id: String, state: State<'_, AppState>) -> Result<(), String> {
 /// In release builds, redirect CRT file descriptor 2 (stderr) to a daily
 /// log file under `<config_dir>/myshell/logs/`. All `eprintln!` calls then
 /// land on disk instead of disappearing into the void of the windows
-/// subsystem. Old logs (>14 days) are pruned on each launch.
+/// subsystem. Old logs (>7 days) are pruned on each launch.
 ///
 /// The CRT functions `_open_osfhandle` + `_dup2` are MSVC-specific; we
 /// extern them under the "system" ABI (cdecl on x64). The OpenOptions
@@ -1714,15 +1854,20 @@ fn setup_file_logging() {
         eprintln!("[startup] failed to create log dir, fallback: {}", e);
     }
 
-    // Prune logs older than 14 days. Best-effort — ignore errors.
+    // Prune logs older than 7 days. Best-effort — ignore errors. Count is
+    // surfaced in the startup banner below (emitted after dup2 so it lands
+    // in the freshly opened daily file, not the pre-redirect stderr).
+    let mut pruned = 0u32;
     if let Ok(entries) = std::fs::read_dir(&log_dir) {
         let cutoff = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(60 * 60 * 24 * 14);
+            - std::time::Duration::from_secs(60 * 60 * 24 * 7);
         for entry in entries.flatten() {
             if let Ok(meta) = entry.metadata() {
                 if let Ok(mt) = meta.modified() {
                     if mt < cutoff && entry.path().extension().and_then(|e| e.to_str()) == Some("log") {
-                        let _ = std::fs::remove_file(entry.path());
+                        if std::fs::remove_file(entry.path()).is_ok() {
+                            pruned += 1;
+                        }
                     }
                 }
             }
@@ -1762,32 +1907,37 @@ fn setup_file_logging() {
         }
     }
 
-    eprintln!(
-        "[startup] === MyShell starting at {} ===",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+    log::info!(
+        "[startup] === MyShell starting === (log retention 7d, pruned {} old log file(s))",
+        pruned
     );
 }
 
 pub fn run() {
-    env_logger::init();
+    // Default INFO so log::info!/warn!/error! surface in the daily log file
+    // (release dup2's stderr → file) / console (debug). RUST_LOG still wins
+    // for ad-hoc verbose debugging (e.g. RUST_LOG=myshell=debug).
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
     #[cfg(not(debug_assertions))]
     setup_file_logging();
 
     // Check for version upgrade and backup if needed
     if let Err(e) = backup::check_and_backup() {
-        eprintln!("[startup] backup check failed: {}", e);
+        log::warn!("[startup] backup check failed: {}", e);
     }
 
     let conn = db::init_db().expect("Failed to initialize database");
+    log::info!("[startup] database initialized");
     // v0.1 → v0.2 schema migration (group_name rename, conn_type/ftp_*
     // columns, drop plaintext password column). v0.2 → vault migration
     // happens later inside setup_vault, once the user provides a master
     // password and we have a derived key to encrypt with.
     if let Err(e) = db::migrate_legacy_schema(&conn) {
-        eprintln!("[startup] legacy schema migration failed: {}", e);
+        log::warn!("[startup] legacy schema migration failed: {}", e);
+    } else {
+        log::info!("[startup] schema migration ok");
     }
 
     let state = AppState {
@@ -1832,6 +1982,12 @@ pub fn run() {
             set_command_history_pinned,
             delete_command_history,
             clear_command_history,
+            add_quick_command,
+            list_quick_commands,
+            list_quick_commands_for_connection,
+            update_quick_command,
+            update_quick_command_order,
+            delete_quick_command,
             ssh_connect,
             ssh_send,
             ssh_resize,

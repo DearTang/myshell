@@ -61,7 +61,17 @@ pub fn init_db() -> Result<Connection> {
             pinned_at     TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cmd_history_conn ON command_history(connection_id);
-        CREATE INDEX IF NOT EXISTS idx_cmd_history_pinned ON command_history(connection_id, pinned, pinned_at DESC);"
+        CREATE INDEX IF NOT EXISTS idx_cmd_history_pinned ON command_history(connection_id, pinned, pinned_at DESC);
+        CREATE TABLE IF NOT EXISTS quick_commands (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            connection_id TEXT,
+            label         TEXT    NOT NULL,
+            command       TEXT    NOT NULL,
+            sort_order    INTEGER NOT NULL DEFAULT 0,
+            created_at    TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_qc_conn ON quick_commands(connection_id);
+        CREATE INDEX IF NOT EXISTS idx_qc_sort ON quick_commands(connection_id, sort_order, id);"
     )?;
     Ok(conn)
 }
@@ -533,7 +543,13 @@ pub fn connection_name_exists(conn: &Connection, name: &str) -> Result<bool> {
 }
 
 pub fn delete_connection(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute("DELETE FROM connections WHERE id = ?1", params![id])?;
+    // Cascade: remove the connection's per-server quick_commands in the same
+    // transaction. command_history is intentionally NOT cascaded (preserves
+    // existing behavior — it self-trims to 50 rows anyway).
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM quick_commands WHERE connection_id = ?1", params![id])?;
+    tx.execute("DELETE FROM connections WHERE id = ?1", params![id])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -707,6 +723,143 @@ pub fn clear_command_history(conn: &Connection, connection_id: &str, include_pin
             params![connection_id],
         )?,
     };
+    Ok(())
+}
+
+// ============ Quick Commands ============
+//
+// User-defined reusable command snippets. `connection_id` is NULL for global
+// scope (available on every server) or a `ConnectionConfig.id` for per-server
+// scope. Multi-line commands are stored verbatim (with `\n`); line splitting
+// for ordered execution happens in the frontend before `sshSend`.
+
+/// `(id, connection_id, label, command, sort_order)` — raw column tuple for
+/// the management listing, unwrapped into a struct in main.rs.
+type QuickCommandTuple = (i64, Option<String>, String, String, i64);
+
+/// Read a quick_commands row into [`QuickCommandTuple`].
+fn read_quick_command_row(row: &rusqlite::Row) -> rusqlite::Result<QuickCommandTuple> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, Option<String>>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, i64>(4)?,
+    ))
+}
+
+pub fn add_quick_command(
+    conn: &Connection,
+    connection_id: Option<&str>,
+    label: &str,
+    command: &str,
+    created_at: &str,
+) -> Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+    // Append at the end of the current scope's ordering. Branch on scope to
+    // match NULL (global) rows correctly — `MAX(sort_order) ... WHERE id = ?`
+    // would never match a global row.
+    let next_order: i64 = if connection_id.is_some() {
+        tx.query_row(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM quick_commands WHERE connection_id = ?1",
+            params![connection_id],
+            |row| row.get(0),
+        )?
+    } else {
+        tx.query_row(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM quick_commands WHERE connection_id IS NULL",
+            [],
+            |row| row.get(0),
+        )?
+    };
+    tx.execute(
+        "INSERT INTO quick_commands (connection_id, label, command, sort_order, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![connection_id, label, command, next_order, created_at],
+    )?;
+    let new_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(new_id)
+}
+
+pub fn list_quick_commands(
+    conn: &Connection,
+    connection_id: Option<&str>,
+) -> Result<Vec<QuickCommandTuple>> {
+    // Branch on scope to avoid relying on `connection_id IS ?1` NULL semantics
+    // (whose behavior with a bound NULL can vary across SQLite versions).
+    let (sql, scoped): (&str, bool) = if connection_id.is_some() {
+        (
+            "SELECT id, connection_id, label, command, sort_order FROM quick_commands
+             WHERE connection_id = ?1 ORDER BY sort_order ASC, id ASC",
+            true,
+        )
+    } else {
+        (
+            "SELECT id, connection_id, label, command, sort_order FROM quick_commands
+             WHERE connection_id IS NULL ORDER BY sort_order ASC, id ASC",
+            false,
+        )
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = if scoped {
+        stmt.query_map(params![connection_id], read_quick_command_row)?
+    } else {
+        stmt.query_map([], read_quick_command_row)?
+    };
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn list_quick_commands_for_connection(
+    conn: &Connection,
+    connection_id: &str,
+) -> Result<Vec<(i64, bool, String, String)>> {
+    // Union of global + this connection's per-server commands. Global first
+    // (is_global DESC) so shared commands surface above server-specific ones.
+    let mut stmt = conn.prepare(
+        "SELECT id, (connection_id IS NULL) AS is_global, label, command
+         FROM quick_commands
+         WHERE connection_id IS NULL OR connection_id = ?1
+         ORDER BY is_global DESC, sort_order ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![connection_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)? != 0,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn update_quick_command(conn: &Connection, id: i64, label: &str, command: &str) -> Result<()> {
+    // Scope is immutable — changing scope equals delete + re-add.
+    conn.execute(
+        "UPDATE quick_commands SET label = ?2, command = ?3 WHERE id = ?1",
+        params![id, label, command],
+    )?;
+    Ok(())
+}
+
+pub fn update_quick_command_order(conn: &Connection, id: i64, sort_order: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE quick_commands SET sort_order = ?2 WHERE id = ?1",
+        params![id, sort_order],
+    )?;
+    Ok(())
+}
+
+pub fn delete_quick_command(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM quick_commands WHERE id = ?1", params![id])?;
     Ok(())
 }
 

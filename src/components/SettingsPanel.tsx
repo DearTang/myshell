@@ -16,6 +16,7 @@ interface Props {
   onClose: () => void;
   onRefresh: () => void;
   connectionCount: number;
+  onOpenQuickCommands: () => void;
 }
 
 const MIN_LEN = 6;
@@ -33,7 +34,7 @@ function strengthHint(p: string): { label: string; color: string; width: string 
   return { label: "强", color: "var(--success)", width: "100%" };
 }
 
-export function SettingsPanel({ onClose, onRefresh, connectionCount }: Props) {
+export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuickCommands }: Props) {
   const [oldPass, setOldPass] = useState("");
   const [newPass, setNewPass] = useState("");
   const [confirmPass, setConfirmPass] = useState("");
@@ -254,6 +255,41 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount }: Props) {
         {/* Content */}
         <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
           {/* Theme Section */}
+          <Section title="快捷命令">
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, color: "var(--text-primary)" }}>
+                  全局与服务器专属快捷命令
+                </div>
+                <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+                  定义可复用的命令片段，支持多行按顺序执行，终端中一键运行
+                </div>
+              </div>
+              <button
+                onClick={onOpenQuickCommands}
+                style={{
+                  padding: "8px 14px",
+                  background: "var(--accent-primary)",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                🧩 管理
+              </button>
+            </div>
+          </Section>
           <Section title="外观设置">
             <div
               style={{

@@ -42,9 +42,12 @@ interface Props {
   status?: "connecting" | "connected" | "disconnected" | "error";
   /** Callback to reconnect when status is disconnected/error */
   onReconnect?: () => void;
+  /** Callback to open the quick-commands management panel (scoped to this
+   * connection). Passed through to CommandBar's "管理" link. */
+  onOpenQuickCommandsManage?: () => void;
 }
 
-export function TerminalPanel({ sessionId, connectionId, broadcastTargets, active = true, onDisconnected, status, onReconnect }: Props) {
+export function TerminalPanel({ sessionId, connectionId, broadcastTargets, active = true, onDisconnected, status, onReconnect, onOpenQuickCommandsManage }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -432,6 +435,7 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
           broadcastTargets={broadcastTargets}
           status={status}
           onReconnect={onReconnect}
+          onOpenQuickCommandsManage={onOpenQuickCommandsManage}
           onRegisterRefresh={(fn) => {
             refreshHistoryRef.current = fn;
           }}

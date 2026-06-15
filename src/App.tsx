@@ -7,6 +7,7 @@ import { ServerInfoPanel } from "./components/ServerInfoPanel";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 import { MasterPasswordGate } from "./components/MasterPasswordGate";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { QuickCommandsPanel } from "./components/QuickCommandsPanel";
 import {
   getConnections,
   listFolders,
@@ -29,6 +30,11 @@ export default function App() {
   const [initialFolderPath, setInitialFolderPath] = useState<string | undefined>(undefined);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showQuickCommands, setShowQuickCommands] = useState(false);
+  // Preset scope when opening the quick-commands panel: null = global,
+  // a connection id = that server's per-server scope. Set by the entry point
+  // (Sidebar global button → null, CommandBar "管理" → current connection).
+  const [qcInitialConnectionId, setQcInitialConnectionId] = useState<string | null>(null);
 
   // Vault gate: null = checking, "setup" = no vault yet, "unlock" = vault
   // exists but locked, "ready" = master key loaded. Render the gate until
@@ -328,6 +334,10 @@ export default function App() {
         onAddNew={handleAddNew}
         onRefresh={reload}
         onOpenSettings={() => setShowSettings(true)}
+        onOpenQuickCommands={() => {
+          setQcInitialConnectionId(null);
+          setShowQuickCommands(true);
+        }}
         collapsed={sidebarCollapsed}
         onToggleCollapsed={() => setSidebarCollapsed((v) => !v)}
       />
@@ -394,6 +404,10 @@ export default function App() {
                       active={isActive}
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}
+                      onOpenQuickCommandsManage={() => {
+                        setQcInitialConnectionId(tab.connectionId || null);
+                        setShowQuickCommands(true);
+                      }}
                       onDisconnected={() => {
                         setTabs((prev) =>
                           prev.map((t) =>
@@ -466,6 +480,19 @@ export default function App() {
           onClose={() => setShowSettings(false)}
           onRefresh={reload}
           connectionCount={connections.length}
+          onOpenQuickCommands={() => {
+            setQcInitialConnectionId(null);
+            setShowSettings(false);
+            setShowQuickCommands(true);
+          }}
+        />
+      )}
+      {showQuickCommands && (
+        <QuickCommandsPanel
+          onClose={() => setShowQuickCommands(false)}
+          connections={connections}
+          initialConnectionId={qcInitialConnectionId}
+          activeConnectionId={activeTab?.connectionId ?? null}
         />
       )}
     </div>
