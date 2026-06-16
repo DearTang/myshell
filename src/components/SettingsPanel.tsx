@@ -8,9 +8,12 @@ import {
   rollbackBackup,
   getAppVersion,
   getPreviousVersion,
+  readFileBase64,
 } from "../api";
 import type { BackupInfo } from "../api";
 import { useTheme } from "../hooks/useTheme";
+import { useColorScheme } from "../hooks/useColorScheme";
+import { PRESETS, type ColorPalette } from "../themes";
 
 interface Props {
   onClose: () => void;
@@ -56,6 +59,29 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   const [rollbackResult, setRollbackResult] = useState<string | null>(null);
   const oldPassRef = useRef<HTMLInputElement>(null);
   const { theme, toggleTheme } = useTheme();
+  const {
+    paletteId,
+    setPaletteId,
+    customPalette,
+    setCustomPalette,
+    clearCustomPalette,
+    bgImage,
+    setBgImage,
+  } = useColorScheme();
+
+  // Background image local state (preview before applying)
+  const [bgImagePath, setBgImagePath] = useState<string | null>(null);
+  const [bgOpacity, setBgOpacity] = useState(bgImage.opacity * 100);
+  const [bgImageBusy, setBgImageBusy] = useState(false);
+
+  // Custom palette dialog state
+  const [showCustomDialog, setShowCustomDialog] = useState(false);
+  const [customAccent, setCustomAccent] = useState(
+    customPalette?.dark.ui?.["--accent-primary"]?.toString() || "#6366f1"
+  );
+  const [customBg, setCustomBg] = useState(
+    customPalette?.dark.terminal?.background || "#1e1e2e"
+  );
 
   useEffect(() => {
     getAppVersion().then(setAppVersion).catch(() => {});
@@ -290,55 +316,429 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
               </button>
             </div>
           </Section>
-          <Section title="外观设置">
+
+          {/* Color Scheme Section */}
+          <Section title="配色方案">
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
+              选择预设配色方案，同步更新终端和界面颜色
+            </div>
             <div
               style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                padding: "14px 16px",
-                background: "var(--bg-surface)",
-                border: "1px solid var(--border-default)",
-                borderRadius: "var(--radius-lg)",
+                display: "grid",
+                gridTemplateColumns: "repeat(5, 1fr)",
+                gap: 10,
               }}
             >
-              <div>
-                <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text-primary)" }}>
-                  主题模式
-                </div>
-                <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 2 }}>
-                  当前：{theme === "dark" ? "暗色模式" : "亮色模式"}
-                </div>
-              </div>
-              <button
-                onClick={toggleTheme}
+              {PRESETS.map((preset) => {
+                const isActive = paletteId === preset.id && !customPalette;
+                const variant = theme === "dark" ? preset.dark : preset.light;
+                const dotColor = variant.terminal.background;
+                const accentColor =
+                  variant.ui?.["--accent-primary"] ||
+                  (theme === "dark" ? "#6366f1" : "#4f46e5");
+                return (
+                  <button
+                    key={preset.id}
+                    onClick={() => {
+                      setPaletteId(preset.id);
+                      clearCustomPalette();
+                    }}
+                    title={preset.name}
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "center",
+                      gap: 6,
+                      padding: "10px 6px",
+                      background: isActive
+                        ? "var(--accent-primary-muted)"
+                        : "var(--bg-surface)",
+                      border: isActive
+                        ? "2px solid var(--accent-primary)"
+                        : "2px solid transparent",
+                      borderRadius: "var(--radius-lg)",
+                      cursor: "pointer",
+                      transition: "all var(--duration-fast) var(--ease-out-expo)",
+                    }}
+                    onMouseEnter={(e) => {
+                      if (!isActive) {
+                        e.currentTarget.style.borderColor = "var(--border-emphasis)";
+                        e.currentTarget.style.background = "var(--bg-surface-hover)";
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      if (!isActive) {
+                        e.currentTarget.style.borderColor = "transparent";
+                        e.currentTarget.style.background = "var(--bg-surface)";
+                      }
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: 32,
+                        height: 32,
+                        borderRadius: "var(--radius-md)",
+                        background: dotColor,
+                        border: "1px solid var(--border-default)",
+                        position: "relative",
+                        overflow: "hidden",
+                      }}
+                    >
+                      {/* Color accent bar at bottom of swatch */}
+                      <div
+                        style={{
+                          position: "absolute",
+                          bottom: 0,
+                          left: 0,
+                          right: 0,
+                          height: 8,
+                          background: accentColor,
+                        }}
+                      />
+                    </div>
+                    <span
+                      style={{
+                        fontSize: 10,
+                        fontWeight: isActive ? 600 : 400,
+                        color: isActive
+                          ? "var(--accent-primary)"
+                          : "var(--text-tertiary)",
+                        textAlign: "center",
+                        lineHeight: 1.3,
+                      }}
+                    >
+                      {preset.name}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Custom palette entry */}
+            <button
+              onClick={() => setShowCustomDialog(true)}
+              style={{
+                marginTop: 10,
+                width: "100%",
+                padding: "10px 14px",
+                background: customPalette
+                  ? "var(--accent-primary-muted)"
+                  : "var(--bg-surface)",
+                color: customPalette
+                  ? "var(--accent-primary)"
+                  : "var(--text-tertiary)",
+                border: customPalette
+                  ? "1px solid var(--border-accent)"
+                  : "1px dashed var(--border-default)",
+                borderRadius: "var(--radius-md)",
+                fontSize: 12,
+                fontWeight: 500,
+                cursor: "pointer",
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = "var(--accent-primary-muted)";
+                e.currentTarget.style.borderColor = "var(--border-accent)";
+                e.currentTarget.style.color = "var(--accent-primary)";
+              }}
+              onMouseLeave={(e) => {
+                if (!customPalette) {
+                  e.currentTarget.style.background = "var(--bg-surface)";
+                  e.currentTarget.style.borderColor = "var(--border-default)";
+                  e.currentTarget.style.color = "var(--text-tertiary)";
+                }
+              }}
+            >
+              <span style={{ fontSize: 14 }}>🎨</span>
+              {customPalette ? "管理自定义主题" : "自定义主题..."}
+            </button>
+
+            {/* Custom palette dialog */}
+            {showCustomDialog && (
+              <CustomPaletteDialog
+                accent={customAccent}
+                bg={customBg}
+                onAccentChange={setCustomAccent}
+                onBgChange={setCustomBg}
+                onSave={() => {
+                  const id = `custom-${Date.now()}`;
+                  const palette: ColorPalette = {
+                    id,
+                    name: "自定义主题",
+                    dark: {
+                      terminal: { ...PRESETS[0].dark.terminal, background: customBg },
+                      ui: {
+                        ...PRESETS[0].dark.ui,
+                        "--accent-primary": customAccent,
+                        "--accent-primary-hover": customAccent + "cc",
+                        "--accent-primary-muted": customAccent + "26",
+                        "--border-accent": customAccent + "66",
+                        "--shadow-glow": `0 0 20px ${customAccent}40`,
+                        "--bg-base": customBg,
+                      },
+                    },
+                    light: {
+                      terminal: { ...PRESETS[0].light.terminal, background: customBg },
+                      ui: {
+                        ...PRESETS[0].light.ui,
+                        "--accent-primary": customAccent,
+                        "--accent-primary-hover": customAccent + "cc",
+                        "--accent-primary-muted": customAccent + "1a",
+                        "--border-accent": customAccent + "66",
+                        "--shadow-glow": `0 0 20px ${customAccent}33`,
+                      },
+                    },
+                  };
+                  setCustomPalette(palette);
+                  setPaletteId(id);
+                  setShowCustomDialog(false);
+                }}
+                onClose={() => setShowCustomDialog(false)}
+              />
+            )}
+          </Section>
+
+          {/* Background Image Section */}
+          <Section title="背景图片">
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
+              为终端区域设置背景图片
+            </div>
+
+            {/* Select image file button */}
+            <button
+              onClick={async () => {
+                setBgImageBusy(true);
+                try {
+                  const selected = await open({
+                    multiple: false,
+                    filters: [
+                      { name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"] },
+                    ],
+                  });
+                  if (selected && !Array.isArray(selected)) {
+                    const dataUrl = await readFileBase64(selected);
+                    setBgImagePath(dataUrl);
+                    // Auto-apply immediately
+                    setBgImage({ dataUrl: dataUrl, opacity: bgOpacity / 100 });
+                  }
+                } catch (e) {
+                  console.error("Failed to read image:", e);
+                } finally {
+                  setBgImageBusy(false);
+                }
+              }}
+              disabled={bgImageBusy}
+              style={{
+                width: "100%",
+                padding: "10px 16px",
+                background: "var(--bg-surface)",
+                color: "var(--text-primary)",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-md)",
+                fontSize: 13,
+                fontWeight: 500,
+                cursor: bgImageBusy ? "not-allowed" : "pointer",
+                opacity: bgImageBusy ? 0.5 : 1,
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 8,
+              }}
+              onMouseEnter={(e) => {
+                if (!bgImageBusy) {
+                  e.currentTarget.style.background = "var(--bg-surface-hover)";
+                  e.currentTarget.style.borderColor = "var(--border-emphasis)";
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (!bgImageBusy) {
+                  e.currentTarget.style.background = "var(--bg-surface)";
+                  e.currentTarget.style.borderColor = "var(--border-default)";
+                }
+              }}
+            >
+              <span style={{ fontSize: 14 }}>🖼️</span>
+              {bgImageBusy ? "选择中..." : bgImage.dataUrl ? "更换图片" : "选择图片"}
+            </button>
+
+            {/* Image preview thumbnail */}
+            {bgImage.dataUrl && (
+              <div
+                style={{
+                  marginTop: 10,
+                  width: "100%",
+                  height: 120,
+                  borderRadius: "var(--radius-lg)",
+                  backgroundImage: `url(${bgImage.dataUrl})`,
+                  backgroundSize: "cover",
+                  backgroundPosition: "center",
+                  border: "1px solid var(--border-default)",
+                  opacity: bgOpacity / 100,
+                }}
+              />
+            )}
+
+            {/* Status */}
+            <div
+              style={{
+                marginTop: 10,
+                padding: "8px 14px",
+                background: "var(--bg-surface)",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-md)",
+                fontSize: 11,
+                color: bgImage.dataUrl
+                  ? "var(--success)"
+                  : "var(--text-muted)",
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+              }}
+            >
+              <span>{bgImage.dataUrl ? "✅" : "💭"}</span>
+              <span>
+                {bgImage.dataUrl
+                  ? `已设置背景 (透明度: ${Math.round(bgOpacity)}%)`
+                  : "未设置背景图片"}
+              </span>
+            </div>
+
+            {/* Opacity slider — live-applied */}
+            <div style={{ marginTop: 12 }}>
+              <div
                 style={{
                   display: "flex",
                   alignItems: "center",
-                  gap: 8,
-                  padding: "8px 14px",
-                  background: "var(--bg-surface-hover)",
-                  border: "1px solid var(--border-default)",
+                  justifyContent: "space-between",
+                  marginBottom: 4,
+                }}
+              >
+                <label
+                  style={{
+                    fontSize: 12,
+                    color: "var(--text-secondary)",
+                    fontWeight: 500,
+                  }}
+                >
+                  透明度
+                </label>
+                <span
+                  style={{
+                    fontSize: 11,
+                    color: "var(--text-muted)",
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  {Math.round(bgOpacity)}%
+                </span>
+              </div>
+              {/* Range slider with proper vendor-prefixed pseudo-element reset */}
+              <style>{`
+                input[type="range"].bg-opacity-slider {
+                  -webkit-appearance: none;
+                  appearance: none;
+                  width: 100%;
+                  height: 6px;
+                  border-radius: 3px;
+                  outline: none;
+                  cursor: pointer;
+                  background: var(--bg-surface);
+                }
+                input[type="range"].bg-opacity-slider::-webkit-slider-runnable-track {
+                  -webkit-appearance: none;
+                  height: 6px;
+                  border-radius: 3px;
+                }
+                input[type="range"].bg-opacity-slider::-webkit-slider-thumb {
+                  -webkit-appearance: none;
+                  width: 16px;
+                  height: 16px;
+                  border-radius: 50%;
+                  background: var(--accent-primary);
+                  border: 2px solid var(--bg-elevated);
+                  margin-top: -5px;
+                  cursor: pointer;
+                  box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+                }
+                input[type="range"].bg-opacity-slider::-moz-range-thumb {
+                  width: 16px;
+                  height: 16px;
+                  border-radius: 50%;
+                  background: var(--accent-primary);
+                  border: 2px solid var(--bg-elevated);
+                  cursor: pointer;
+                  box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+                }
+                input[type="range"].bg-opacity-slider::-moz-range-track {
+                  height: 6px;
+                  border-radius: 3px;
+                  background: var(--bg-surface);
+                }
+                /* Progress fill via linear-gradient on the track */
+                input[type="range"].bg-opacity-slider {
+                  background: linear-gradient(
+                    to right,
+                    var(--accent-primary) 0%,
+                    var(--accent-primary) ${bgOpacity}%,
+                    var(--bg-surface) ${bgOpacity}%,
+                    var(--bg-surface) 100%
+                  );
+                }
+              `}</style>
+              <input
+                type="range"
+                className="bg-opacity-slider"
+                min={10}
+                max={100}
+                value={bgOpacity}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  setBgOpacity(v);
+                  // Live-update opacity on existing background
+                  if (bgImage.dataUrl) {
+                    setBgImage({ dataUrl: bgImage.dataUrl, opacity: v / 100 });
+                  }
+                }}
+              />
+            </div>
+
+            {/* Clear button */}
+            <div style={{ marginTop: 12 }}>
+              <button
+                onClick={() => {
+                  setBgImage({ dataUrl: null, opacity: 1 });
+                  setBgImagePath(null);
+                  setBgOpacity(85);
+                }}
+                disabled={!bgImage.dataUrl}
+                style={{
+                  width: "100%",
+                  padding: "10px 16px",
+                  background: "transparent",
+                  color: bgImage.dataUrl ? "var(--error)" : "var(--text-muted)",
+                  border: `1px solid ${bgImage.dataUrl ? "var(--error)" : "var(--border-default)"}`,
                   borderRadius: "var(--radius-md)",
-                  fontSize: 12,
+                  fontSize: 13,
                   fontWeight: 500,
-                  color: "var(--text-primary)",
-                  cursor: "pointer",
+                  cursor: bgImage.dataUrl ? "pointer" : "not-allowed",
+                  opacity: bgImage.dataUrl ? 1 : 0.5,
                   transition: "all var(--duration-fast) var(--ease-in-out)",
                 }}
                 onMouseEnter={(e) => {
-                  e.currentTarget.style.background = "var(--accent-primary-muted)";
-                  e.currentTarget.style.borderColor = "var(--border-accent)";
-                  e.currentTarget.style.color = "var(--accent-primary)";
+                  if (bgImage.dataUrl) {
+                    e.currentTarget.style.background = "var(--error-muted)";
+                  }
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "var(--bg-surface-hover)";
-                  e.currentTarget.style.borderColor = "var(--border-default)";
-                  e.currentTarget.style.color = "var(--text-primary)";
+                  e.currentTarget.style.background = "transparent";
                 }}
               >
-                <span style={{ fontSize: 14 }}>{theme === "dark" ? "󰖨" : "󰖙"}</span>
-                切换到{theme === "dark" ? "亮色" : "暗色"}模式
+                清除背景图片
               </button>
             </div>
           </Section>
@@ -978,5 +1378,145 @@ function Dialog({
         {children}
       </div>
     </div>
+  );
+}
+
+// ── Custom Palette Dialog ──
+
+function CustomPaletteDialog({
+  accent,
+  bg,
+  onAccentChange,
+  onBgChange,
+  onSave,
+  onClose,
+}: {
+  accent: string;
+  bg: string;
+  onAccentChange: (v: string) => void;
+  onBgChange: (v: string) => void;
+  onSave: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog title="自定义主题" icon="🎨" onClose={onClose}>
+      <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
+        选择主题色和终端背景色，保存为自定义主题
+      </div>
+
+      <Field label="主题色">
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <input
+            type="color"
+            value={accent}
+            onChange={(e) => onAccentChange(e.target.value)}
+            style={{
+              width: 36,
+              height: 36,
+              padding: 0,
+              border: "1px solid var(--border-default)",
+              borderRadius: "var(--radius-md)",
+              cursor: "pointer",
+              background: "transparent",
+            }}
+          />
+          <Input
+            value={accent}
+            onChange={onAccentChange}
+            placeholder="#6366f1"
+          />
+        </div>
+      </Field>
+
+      <Field label="终端背景色">
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <input
+            type="color"
+            value={bg}
+            onChange={(e) => onBgChange(e.target.value)}
+            style={{
+              width: 36,
+              height: 36,
+              padding: 0,
+              border: "1px solid var(--border-default)",
+              borderRadius: "var(--radius-md)",
+              cursor: "pointer",
+              background: "transparent",
+            }}
+          />
+          <Input
+            value={bg}
+            onChange={onBgChange}
+            placeholder="#1e1e2e"
+          />
+        </div>
+      </Field>
+
+      {/* Preview */}
+      <div
+        style={{
+          marginTop: 16,
+          padding: 16,
+          background: bg,
+          border: `2px solid ${accent}`,
+          borderRadius: "var(--radius-lg)",
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+        }}
+      >
+        <div style={{ fontSize: 11, color: "#888", textAlign: "center" }}>
+          预览
+        </div>
+        <div
+          style={{
+            padding: "6px 12px",
+            background: accent,
+            borderRadius: "var(--radius-md)",
+            fontSize: 12,
+            fontWeight: 600,
+            color: "#fff",
+            textAlign: "center",
+          }}
+        >
+          主题按钮
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 10, marginTop: 20, justifyContent: "flex-end" }}>
+        <button
+          onClick={onClose}
+          style={{
+            padding: "10px 18px",
+            background: "transparent",
+            color: "var(--text-secondary)",
+            border: "1px solid var(--border-default)",
+            borderRadius: "var(--radius-md)",
+            fontSize: 13,
+            cursor: "pointer",
+            transition: "all var(--duration-fast) var(--ease-in-out)",
+          }}
+        >
+          取消
+        </button>
+        <button
+          onClick={onSave}
+          style={{
+            padding: "10px 24px",
+            background: "var(--accent-primary)",
+            color: "white",
+            border: "none",
+            borderRadius: "var(--radius-md)",
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: "pointer",
+            transition: "all var(--duration-fast) var(--ease-in-out)",
+            boxShadow: "var(--shadow-glow)",
+          }}
+        >
+          保存
+        </button>
+      </div>
+    </Dialog>
   );
 }

@@ -824,6 +824,48 @@ fn read_text_file(path: String) -> Result<String, String> {
     Ok(text)
 }
 
+/// Read an image file from disk and return it as a base64 data URL suitable
+/// for use as a CSS `background-image`. Path is validated before IO.
+#[tauri::command]
+fn read_file_base64(path: String) -> Result<String, String> {
+    use base64::Engine as _;
+
+    if path.bytes().any(|b| b == 0) {
+        return Err("无效路径".to_string());
+    }
+    if path.len() > 4096 {
+        return Err("路径过长".to_string());
+    }
+    let meta = std::fs::metadata(&path).map_err(|_| "读取文件失败".to_string())?;
+    if !meta.is_file() {
+        return Err("读取文件失败".to_string());
+    }
+    // Limit to 8 MiB for background images
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    if meta.len() > MAX_BYTES {
+        return Err("文件过大（最大 8 MB）".to_string());
+    }
+    let bytes = std::fs::read(&path).map_err(|_| "读取文件失败".to_string())?;
+
+    // Simple extension-based MIME detection — avoids a dependency
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let mime = match ext.to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
+    };
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
+}
+
 /// Get the plaintext password for a connection (requires DEK).
 /// Used for viewing passwords in the UI after verification.
 #[tauri::command]
@@ -1961,6 +2003,7 @@ pub fn run() {
             get_lockout_info,
             change_master_password,
             read_text_file,
+            read_file_base64,
             get_connection_password,
             get_connection_proxy_password,
             list_backups,

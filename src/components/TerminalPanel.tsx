@@ -17,6 +17,8 @@ import { ZmodemBridge, type ZmodemStatus } from "../zmodem-bridge";
 import { ZmodemProgressOverlay } from "./ZmodemProgressOverlay";
 import { CommandBar } from "./CommandBar";
 import { recordKeystroke } from "../utils/cmd-buffer";
+import { useColorScheme } from "../hooks/useColorScheme";
+import { useTheme } from "../hooks/useTheme";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props {
@@ -71,6 +73,17 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
   broadcastRef.current = broadcastTargets || [];
   connectionIdRef.current = connectionId;
 
+  // Color scheme & background image from context
+  const { getActivePalette, bgImage } = useColorScheme();
+  const { theme } = useTheme();
+
+  // Derive the terminal theme from the active palette for the current mode.
+  // Re-resolved on every render so a palette switch instantly rebinds.
+  const activePalette = getActivePalette();
+  const variant = theme === "dark" ? activePalette.dark : activePalette.light;
+  const terminalTheme = variant.terminal;
+  const hasBgImage = bgImage.dataUrl !== null;
+
   const [zmodemStatus, setZmodemStatus] = useState<ZmodemStatus>({
     active: false,
     direction: null,
@@ -90,30 +103,9 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
       cursorBlink: true,
       fontSize: 14,
       fontFamily: "'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace",
-      theme: {
-        background: "#1e1e2e",
-        foreground: "#cdd6f4",
-        cursor: "#f5e0dc",
-        cursorAccent: "#1e1e2e",
-        selectionBackground: "#585b7055",
-        black: "#45475a",
-        red: "#f38ba8",
-        green: "#a6e3a1",
-        yellow: "#f9e2af",
-        blue: "#89b4fa",
-        magenta: "#f5c2e7",
-        cyan: "#94e2d5",
-        white: "#bac2de",
-        brightBlack: "#585b70",
-        brightRed: "#f38ba8",
-        brightGreen: "#a6e3a1",
-        brightYellow: "#f9e2af",
-        brightBlue: "#89b4fa",
-        brightMagenta: "#f5c2e7",
-        brightCyan: "#94e2d5",
-        brightWhite: "#a6adc8",
-      },
+      theme: terminalTheme,
       allowProposedApi: true,
+      allowTransparency: hasBgImage,
     });
 
     const fitAddon = new FitAddon();
@@ -309,6 +301,24 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
     };
   }, [sessionId]);
 
+  // Live theme update: when the user switches palette or toggles dark/light,
+  // update the existing terminal theme without losing scrollback.
+  // xterm.js 5.x supports live `term.options.theme` mutation.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+
+    const currentBg = hasBgImage ? "transparent" : terminalTheme.background;
+    term.options.theme = { ...terminalTheme, background: currentBg };
+    term.options.allowTransparency = hasBgImage;
+
+    // Also sync the container background
+    if (containerRef.current) {
+      containerRef.current.style.background = currentBg;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePalette.id, theme, hasBgImage]);
+
   // Active-tab transitions: refit on show (the last fit ran against a
   // display:none container with zero geometry) and grab focus so the user
   // can type immediately. Blur on hide so keystrokes don't leak to an
@@ -397,15 +407,52 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
         flexDirection: "column",
       }}
     >
+      {/* When a background image is active, force xterm.js internal DOM
+          layers (.xterm-viewport, .xterm-screen, canvas) transparent so the
+          image shows through.  xterm.css ships with solid background-color
+          rules that must be overridden. */}
+      {hasBgImage && (
+        <style>{`
+          .terminal-bg-transparent .xterm-viewport,
+          .terminal-bg-transparent .xterm-screen,
+          .terminal-bg-transparent .xterm {
+            background: transparent !important;
+          }
+          .terminal-bg-transparent .xterm-viewport::-webkit-scrollbar-track {
+            background: transparent !important;
+          }
+        `}</style>
+      )}
       {/* xterm container — flex:1 so it takes all space above CommandBar */}
-      <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
+      <div
+        className={hasBgImage ? "terminal-bg-transparent" : undefined}
+        style={{ flex: 1, minHeight: 0, position: "relative" }}
+      >
+        {/* Background image layer — rendered behind the terminal when configured */}
+        {hasBgImage && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              backgroundImage: `url(${bgImage.dataUrl})`,
+              backgroundSize: "cover",
+              backgroundPosition: "center",
+              backgroundRepeat: "no-repeat",
+              opacity: bgImage.opacity,
+              pointerEvents: "none",
+              zIndex: 0,
+            }}
+          />
+        )}
         <div
           ref={containerRef}
           style={{
             width: "100%",
             height: "100%",
-            background: "#1e1e2e",
+            background: hasBgImage ? "transparent" : terminalTheme.background,
             padding: 4,
+            position: "relative",
+            zIndex: 1,
           }}
         />
         <ZmodemProgressOverlay

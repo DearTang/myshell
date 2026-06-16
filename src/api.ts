@@ -520,6 +520,16 @@ export async function szClose(id: string): Promise<void> {
   await invoke("sz_close", { id });
 }
 
+// ============ File Utilities ============
+
+/**
+ * Read a local image file and return a base64 data URL suitable for CSS
+ * background-image.  Max file size: 8 MiB.
+ */
+export async function readFileBase64(path: string): Promise<string> {
+  return await invoke("read_file_base64", { path });
+}
+
 // ============ ZMODEM Event Subscriptions ============
 
 export interface ZmodemStartPayload {
