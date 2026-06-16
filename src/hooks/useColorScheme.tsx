@@ -104,9 +104,12 @@ function writeStored<T>(key: string, value: T): void {
 export function ColorSchemeProvider({ children }: { children: ReactNode }) {
   const { theme } = useTheme();
 
-  const [paletteId, setPaletteIdRaw] = useState<string>(() =>
-    readStored(STORAGE_KEY_COLOR, DEFAULT_PALETTE_ID)
-  );
+  const [paletteId, setPaletteIdRaw] = useState<string>(() => {
+    const stored = readStored<string>(STORAGE_KEY_COLOR, DEFAULT_PALETTE_ID);
+    // Migrate old default to new Carbon design
+    if (stored === "catppuccin-mocha") return DEFAULT_PALETTE_ID;
+    return stored;
+  });
 
   const [customPalette, setCustomPaletteRaw] = useState<ColorPalette | null>(
     () => readStored<ColorPalette | null>(STORAGE_KEY_CUSTOM, null)
