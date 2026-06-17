@@ -15,9 +15,20 @@ interface Props {
 }
 
 const TYPE_OPTIONS: { value: ConnType; label: string; icon: string; defaultPort: number }[] = [
-  { value: "ssh", label: "SSH", icon: "󰖟", defaultPort: 22 },
-  { value: "sftp", label: "SFTP", icon: "󰉋", defaultPort: 22 },
-  { value: "ftp", label: "FTP", icon: "󰈙", defaultPort: 21 },
+  { value: "ssh", label: "SSH", icon: "🖥️", defaultPort: 22 },
+  { value: "sftp", label: "SFTP", icon: "📁", defaultPort: 22 },
+  { value: "ftp", label: "FTP", icon: "📤", defaultPort: 21 },
+  { value: "local", label: "本地", icon: "💻", defaultPort: 0 },
+];
+
+/// Quick-pick shell presets for conn_type='local'. The user can still type a
+/// custom path in the input — these just save looking up common exes.
+const SHELL_PRESETS: { value: string; label: string }[] = [
+  { value: "pwsh.exe", label: "PowerShell 7 (pwsh.exe)" },
+  { value: "powershell.exe", label: "Windows PowerShell (powershell.exe)" },
+  { value: "cmd.exe", label: "命令提示符 (cmd.exe)" },
+  { value: "wsl.exe", label: "WSL (wsl.exe)" },
+  { value: "C:\\Program Files\\Git\\bin\\bash.exe", label: "Git Bash" },
 ];
 
 export function ConnectionDialog({ config, onClose, onSave, initialConnType, initialFolderPath, folders = [] }: Props) {
@@ -51,6 +62,9 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
   );
   const [proxyUsername, setProxyUsername] = useState(config?.proxy_username || "");
   const [proxyPassword, setProxyPassword] = useState("");
+  const [shellPath, setShellPath] = useState(config?.shell_path || "");
+  const [shellArgs, setShellArgs] = useState(config?.shell_args || "");
+  const [initCommand, setInitCommand] = useState(config?.init_command || "");
   const [saving, setSaving] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showProxyPassword, setShowProxyPassword] = useState(false);
@@ -83,11 +97,53 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
       const n = parseInt(prev, 10);
       const isDefault = n === 22 || n === 21 || prev === "";
       if (!isDefault) return prev;
-      return String(t === "ftp" ? 21 : 22);
+      if (t === "ftp") return "21";
+      if (t === "local") return prev; // local terminals have no port
+      return "22";
     });
   }
 
   async function handleSave() {
+    // Local terminal — no host/port/auth, just a shell to spawn.
+    if (connType === "local") {
+      if (!name.trim()) {
+        alert("请填写连接名称");
+        return;
+      }
+      if (!shellPath.trim()) {
+        alert("请填写启动 shell 路径");
+        return;
+      }
+      setSaving(true);
+      try {
+        const trimmedGroup = groupPath
+          .trim()
+          .replace(/^\/+|\/+$/g, "")
+          .replace(/\/+/g, "/");
+        const conn: ConnectionConfig = {
+          id: config?.id || crypto.randomUUID(),
+          name: name.trim(),
+          host: "",
+          port: 0,
+          username: "",
+          auth_method: "password", // unused for local, struct requires a value
+          conn_type: "local",
+          group_path: trimmedGroup ? `/${trimmedGroup}` : "/",
+          shell_path: shellPath.trim(),
+          shell_args: shellArgs.trim() || undefined,
+          init_command: initCommand.trim() || undefined,
+          created_at: config?.created_at || new Date().toISOString(),
+        };
+        await saveConnection(conn);
+        onSave();
+      } catch (e) {
+        alert(`保存失败: ${e}`);
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
+
     if (!name.trim() || !host.trim() || !username.trim()) {
       alert("请填写必要字段");
       return;
@@ -172,10 +228,8 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
         zIndex: 999,
         backdropFilter: "blur(8px)",
       }}
-      onClick={onClose}
     >
       <div
-        onClick={(e) => e.stopPropagation()}
         className="animate-scale-in"
         style={{
           background: "var(--bg-elevated)",
@@ -232,31 +286,78 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
               <Input
                 value={name}
                 onChange={handleNameChange}
-                placeholder={`${connType}_${host || "server"}`}
+                placeholder={connType === "local" ? "本地终端" : `${connType}_${host || "server"}`}
               />
             </FormField>
-            <div style={{ display: "flex", gap: 12 }}>
-              <div style={{ flex: 2 }}>
-                <FormField label="主机地址">
-                  <Input
-                    value={host}
-                    onChange={handleHostChange}
-                    placeholder="192.168.1.100"
-                    autoFocus
-                  />
+            {connType !== "local" && (
+              <>
+                <div style={{ display: "flex", gap: 12 }}>
+                  <div style={{ flex: 2 }}>
+                    <FormField label="主机地址">
+                      <Input
+                        value={host}
+                        onChange={handleHostChange}
+                        placeholder="192.168.1.100"
+                        autoFocus
+                      />
+                    </FormField>
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <FormField label="端口">
+                      <Input value={port} onChange={setPort} placeholder="22" />
+                    </FormField>
+                  </div>
+                </div>
+                <FormField label="用户名">
+                  <Input value={username} onChange={setUsername} placeholder="root" />
                 </FormField>
-              </div>
-              <div style={{ flex: 1 }}>
-                <FormField label="端口">
-                  <Input value={port} onChange={setPort} placeholder="22" />
-                </FormField>
-              </div>
-            </div>
-            <FormField label="用户名">
-              <Input value={username} onChange={setUsername} placeholder="root" />
-            </FormField>
+              </>
+            )}
           </FieldGroup>
 
+          {connType === "local" ? (
+            <FieldGroup label="启动 Shell">
+              <FormField label="Shell 类型（快速选择）">
+                <Select
+                  value={shellPath}
+                  onChange={setShellPath}
+                  options={[{ value: "", label: "— 自定义路径 —" }, ...SHELL_PRESETS]}
+                />
+              </FormField>
+              <FormField label="可执行文件路径">
+                <Input
+                  value={shellPath}
+                  onChange={setShellPath}
+                  placeholder="pwsh.exe 或完整路径"
+                  autoFocus
+                />
+              </FormField>
+              <FormField label="启动参数（可选）">
+                <Input
+                  value={shellArgs}
+                  onChange={setShellArgs}
+                  placeholder="-d Ubuntu / --login -i"
+                />
+              </FormField>
+              <FormField label="启动命令（可选）">
+                <Input
+                  value={initCommand}
+                  onChange={setInitCommand}
+                  placeholder="claude / docker ps"
+                />
+              </FormField>
+              <div style={{
+                fontSize: 11,
+                color: "var(--text-muted)",
+                lineHeight: 1.5,
+                padding: "8px 10px",
+                background: "var(--bg-surface)",
+                borderRadius: "var(--radius-sm)",
+              }}>
+                💡 本地终端在本机启动一个 shell（PowerShell / CMD / WSL 等），等同打开一个本地命令行窗口。「启动命令」会在 shell 就绪后自动执行一次（如打开即跑 claude）。
+              </div>
+            </FieldGroup>
+          ) : (
           <FieldGroup label="认证方式">
             <FormField label="认证类型">
               <Select
@@ -320,6 +421,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
               </FormField>
             )}
           </FieldGroup>
+          )}
 
           {connType === "ftp" && (
             <FieldGroup label="FTP 选项">
@@ -347,6 +449,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
             </FieldGroup>
           )}
 
+          {connType !== "local" && (
           <FieldGroup label="代理设置">
             <FormField label="代理类型">
               <Select
@@ -435,6 +538,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
               </>
             )}
           </FieldGroup>
+          )}
 
           <FieldGroup label="分组">
             <FormField label="选择或输入分组路径">

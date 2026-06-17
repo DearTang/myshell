@@ -16,6 +16,8 @@ import {
   sshDisconnect,
   ftpConnect,
   ftpDisconnect,
+  localConnect,
+  localDisconnect,
   vaultStatus,
 } from "./api";
 import type { ConnectionConfig, ConnType, Tab } from "./api";
@@ -110,7 +112,7 @@ export default function App() {
 
   async function handleConnect(config: ConnectionConfig) {
     const connType = config.conn_type ?? "ssh";
-    const display = `${config.username}@${config.host}`;
+    const display = connType === "local" ? config.name : `${config.username}@${config.host}`;
 
     // Create a temporary tab with "connecting" status
     const tempTabId = `temp-${Date.now()}`;
@@ -148,6 +150,25 @@ export default function App() {
           )
         );
         setActiveTabId(ftpId);
+      } else if (connType === "local") {
+        const sessionId = await localConnect(config);
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.id === tempTabId
+              ? {
+                  id: sessionId,
+                  name: display,
+                  sessionId,
+                  type: "terminal",
+                  connType: "local",
+                  connectionId: config.id,
+                  status: "connected",
+                  config: config,
+                }
+              : t
+          )
+        );
+        setActiveTabId(sessionId);
       } else {
         const sessionId = await sshConnect(config);
         setTabs((prev) =>
@@ -219,6 +240,22 @@ export default function App() {
           )
         );
         setActiveTabId(ftpId);
+      } else if (connType === "local") {
+        const sessionId = await localConnect(config);
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.id === tabId
+              ? {
+                  ...t,
+                  id: sessionId,
+                  sessionId,
+                  status: "connected",
+                  errorMessage: undefined,
+                }
+              : t
+          )
+        );
+        setActiveTabId(sessionId);
       } else {
         const sessionId = await sshConnect(config);
         setTabs((prev) =>
@@ -254,6 +291,8 @@ export default function App() {
       try {
         if (tab.connType === "ftp" && tab.ftpSessionId) {
           await ftpDisconnect(tab.ftpSessionId);
+        } else if (tab.connType === "local") {
+          await localDisconnect(tab.sessionId);
         } else {
           await sshDisconnect(tab.sessionId);
         }
@@ -401,6 +440,7 @@ export default function App() {
                     <TerminalPanel
                       sessionId={tab.sessionId!}
                       connectionId={tab.connectionId || ""}
+                      connType={tab.connType}
                       broadcastTargets={getBroadcastTargets(tab)}
                       active={isActive}
                       status={tab.status}
@@ -427,6 +467,7 @@ export default function App() {
                     <TerminalPanel
                       sessionId={tab.sessionId!}
                       connectionId={tab.connectionId || ""}
+                      connType={tab.connType}
                       active={isActive}
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}

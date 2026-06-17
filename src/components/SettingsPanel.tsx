@@ -23,6 +23,9 @@ interface Props {
 }
 
 const MIN_LEN = 6;
+// Background opacity slider range. Keep in sync with the <input type="range"> below.
+const BG_OPACITY_MIN = 10;
+const BG_OPACITY_MAX = 100;
 
 function strengthHint(p: string): { label: string; color: string; width: string } {
   let classes = 0;
@@ -73,6 +76,10 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   const [bgImagePath, setBgImagePath] = useState<string | null>(null);
   const [bgOpacity, setBgOpacity] = useState(bgImage.opacity * 100);
   const [bgImageBusy, setBgImageBusy] = useState(false);
+  // Map the slider value into a 0–100% track position so the progress fill
+  // lines up with the thumb (which itself is placed over [MIN, MAX]).
+  const bgOpacityFillPct =
+    ((bgOpacity - BG_OPACITY_MIN) / (BG_OPACITY_MAX - BG_OPACITY_MIN)) * 100;
 
   // Custom palette dialog state
   const [showCustomDialog, setShowCustomDialog] = useState(false);
@@ -684,8 +691,8 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
                   background: linear-gradient(
                     to right,
                     var(--accent-primary) 0%,
-                    var(--accent-primary) ${bgOpacity}%,
-                    var(--bg-surface) ${bgOpacity}%,
+                    var(--accent-primary) ${bgOpacityFillPct}%,
+                    var(--bg-surface) ${bgOpacityFillPct}%,
                     var(--bg-surface) 100%
                   );
                 }
@@ -693,8 +700,8 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
               <input
                 type="range"
                 className="bg-opacity-slider"
-                min={10}
-                max={100}
+                min={BG_OPACITY_MIN}
+                max={BG_OPACITY_MAX}
                 value={bgOpacity}
                 onChange={(e) => {
                   const v = Number(e.target.value);

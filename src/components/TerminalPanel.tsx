@@ -6,6 +6,8 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   sshSend,
   sshResize,
+  localSend,
+  localResize,
   onSshOutput,
   onSshClosed,
   onZmodemStart,
@@ -13,6 +15,7 @@ import {
   onZmodemEnd,
   addCommandHistory,
 } from "../api";
+import type { ConnType } from "../api";
 import { ZmodemBridge, type ZmodemStatus } from "../zmodem-bridge";
 import { ZmodemProgressOverlay } from "./ZmodemProgressOverlay";
 import { CommandBar } from "./CommandBar";
@@ -23,6 +26,9 @@ import "@xterm/xterm/css/xterm.css";
 
 interface Props {
   sessionId: string;
+  /** Tab connection type — selects ssh_* vs local_* backend commands.
+   * Defaults to "ssh". sftp/ftp tabs never render a TerminalPanel. */
+  connType?: ConnType;
   /** ConnectionConfig.id this session belongs to. Used as the persistence
    * key for command history — survives reconnect (sessionId changes each
    * connect, connectionId doesn't). Empty for sessions without a backing
@@ -49,11 +55,12 @@ interface Props {
   onOpenQuickCommandsManage?: () => void;
 }
 
-export function TerminalPanel({ sessionId, connectionId, broadcastTargets, active = true, onDisconnected, status, onReconnect, onOpenQuickCommandsManage }: Props) {
+export function TerminalPanel({ sessionId, connType, connectionId, broadcastTargets, active = true, onDisconnected, status, onReconnect, onOpenQuickCommandsManage }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const sessionIdRef = useRef(sessionId);
+  const connTypeRef = useRef(connType);
   const broadcastRef = useRef<string[]>(broadcastTargets || []);
   const bridgeRef = useRef<ZmodemBridge | null>(null);
   const isZmodemRef = useRef(false);
@@ -95,6 +102,16 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
   });
 
   sessionIdRef.current = sessionId;
+  connTypeRef.current = connType;
+
+  // Route send/resize to the ssh_* or local_* backend depending on the tab's
+  // connection type. Read via ref so the closures bound in the [sessionId]
+  // effect always hit the right backend (connType is fixed per tab in
+  // practice, but the ref keeps it honest).
+  const sendTo = (sid: string, data: string) =>
+    connTypeRef.current === "local" ? localSend(sid, data) : sshSend(sid, data);
+  const resizeTo = (sid: string, cols: number, rows: number) =>
+    connTypeRef.current === "local" ? localResize(sid, cols, rows) : sshResize(sid, cols, rows);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -124,7 +141,7 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
 
     setTimeout(() => {
       fitAddon.fit();
-      sshResize(sessionIdRef.current, term.cols, term.rows).catch(() => {});
+      resizeTo(sessionIdRef.current, term.cols, term.rows).catch(() => {});
     }, 100);
 
     // Handle user input. In ZMODEM mode, swallow keystrokes so the user
@@ -138,7 +155,7 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
       const destinations =
         targets.length > 0 ? targets : [sessionIdRef.current];
       Promise.allSettled(
-        destinations.map((sid) => sshSend(sid, data))
+        destinations.map((sid) => sendTo(sid, data))
       ).then((results) => {
         results.forEach((r, i) => {
           if (r.status === "rejected") {
@@ -196,10 +213,10 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
           `[TerminalPanel] cols shrank ${prevCols}→${term.cols} at container ${w}x${h}`
         );
       }
-      sshResize(sessionIdRef.current, term.cols, term.rows).catch(() => {});
+      resizeTo(sessionIdRef.current, term.cols, term.rows).catch(() => {});
       for (const sid of broadcastRef.current) {
         if (sid !== sessionIdRef.current) {
-          sshResize(sid, term.cols, term.rows).catch(() => {});
+          resizeTo(sid, term.cols, term.rows).catch(() => {});
         }
       }
     });
@@ -353,13 +370,13 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
         return;
       }
 
-      sshResize(sessionIdRef.current, term.cols, term.rows).catch(() => {});
+      resizeTo(sessionIdRef.current, term.cols, term.rows).catch(() => {});
       // Sync the freshly-refit cols to broadcast members so their shells
       // output in the same width — covers the case where this tab was
       // inactive through a window resize and the others had stale dims.
       for (const sid of broadcastRef.current) {
         if (sid !== sessionIdRef.current) {
-          sshResize(sid, term.cols, term.rows).catch(() => {});
+          resizeTo(sid, term.cols, term.rows).catch(() => {});
         }
       }
       term.focus();
@@ -391,7 +408,7 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
     if (term.cols < 20) return;
     for (const sid of targets) {
       if (sid !== sessionIdRef.current) {
-        sshResize(sid, term.cols, term.rows).catch(() => {});
+        resizeTo(sid, term.cols, term.rows).catch(() => {});
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -479,6 +496,7 @@ export function TerminalPanel({ sessionId, connectionId, broadcastTargets, activ
         <CommandBar
           sessionId={sessionId}
           connectionId={connectionId}
+          connType={connType}
           broadcastTargets={broadcastTargets}
           status={status}
           onReconnect={onReconnect}

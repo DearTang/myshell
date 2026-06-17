@@ -54,6 +54,7 @@
 | 使用 xterm.js 做终端渲染 | 成熟的 Web 终端模拟器，广泛使用 |
 | 使用 SQLite (rusqlite) 存储连接配置 | 轻量本地存储，无需外部数据库 |
 | 前端使用 React + TypeScript | 生态成熟，Tauri 官方模板支持 |
+| 使用 portable-pty 做本地终端 PTY（阶段10） | 跨平台（Win ConPTY / Unix openpty），wezterm 出品；真 PTY 让本地 shell 支持 TUI/颜色/resize，本地终端复用 SSH 事件通道 |
 
 ## 遇到的错误
 | 错误 | 尝试次数 | 解决方案 |

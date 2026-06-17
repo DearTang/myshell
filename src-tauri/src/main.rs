@@ -19,6 +19,7 @@ mod crypto;
 mod vault;
 mod proxy;
 mod backup;
+mod local;
 
 // ============ Connection Config ============
 
@@ -69,6 +70,20 @@ pub struct ConnectionConfig {
     /// time, written to keyring at save time. Same scheme as `password`.
     #[serde(default)]
     pub proxy_password: Option<String>,
+    /// Local terminal only (`conn_type == "local"`): shell executable to
+    /// spawn, e.g. `pwsh.exe`, `powershell.exe`, `cmd.exe`, `wsl.exe`, or an
+    /// absolute path. Ignored for ssh/sftp/ftp. Plain column — a program
+    /// path isn't a secret.
+    #[serde(default)]
+    pub shell_path: Option<String>,
+    /// Local terminal only: optional shell arguments (e.g. `-d Ubuntu`).
+    #[serde(default)]
+    pub shell_args: Option<String>,
+    /// Optional command injected into the PTY right after the shell starts
+    /// (e.g. `claude` to auto-launch on open). Currently honored for local
+    /// terminals; SSH may use it later. Plain column — not a secret.
+    #[serde(default)]
+    pub init_command: Option<String>,
     pub created_at: String,
 }
 
@@ -141,6 +156,9 @@ pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub ssh_sessions: Arc<Mutex<std::collections::HashMap<String, ssh::SshSession>>>,
     pub ftp_sessions: Arc<Mutex<std::collections::HashMap<String, ftp::FtpSession>>>,
+    /// Local PTY terminal sessions, keyed by UUID session id (== frontend
+    /// tab id, same invariant as ssh_sessions).
+    pub local_sessions: Arc<Mutex<std::collections::HashMap<String, local::LocalSession>>>,
     pub zmodem_files: Mutex<HashMap<String, ZmodemFileHandle>>,
     /// Data Encryption Key (DEK) — random 32-byte key for encrypting all
     /// database columns and keyring entries. Derived once at setup and
@@ -1252,6 +1270,63 @@ async fn ssh_send_zmodem_abort(
     ssh::zmodem_abort(&state, &session_id).await
 }
 
+// ============ Local Terminal Commands ============
+//
+// Local terminal sessions (conn_type='local') spawn a shell under a PTY. They
+// reuse the SSH event channel (ssh_output / ssh_closed) so the frontend
+// TerminalPanel doesn't branch on event names — only on which connect/send
+// commands to invoke.
+
+#[tauri::command]
+async fn local_connect(
+    state: State<'_, AppState>,
+    window: tauri::WebviewWindow,
+    config: ConnectionConfig,
+) -> Result<String, String> {
+    log::info!(
+        "[local] connect requested: name={} shell={:?}",
+        config.name, config.shell_path
+    );
+    // No DEK/keyring resolution — a local shell has no credentials. The vault
+    // must still be unlocked to list the connection row (enforced by
+    // get_connections), but local_connect itself needs no secret.
+    local::connect(state, window, config, 80, 24).await
+}
+
+#[tauri::command]
+async fn local_send(
+    state: State<'_, AppState>,
+    session_id: String,
+    data: String,
+) -> Result<(), String> {
+    // Same per-call cap as ssh_send — a paste is rarely >64 KiB and a
+    // compromised renderer shouldn't be able to balloon the channel.
+    const MAX_INPUT_BYTES: usize = 256 * 1024;
+    if data.len() > MAX_INPUT_BYTES {
+        return Err("输入数据过大".to_string());
+    }
+    local::send_input(&state, &session_id, data.as_bytes()).await
+}
+
+#[tauri::command]
+async fn local_resize(
+    state: State<'_, AppState>,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    local::resize_terminal(&state, &session_id, cols, rows).await
+}
+
+#[tauri::command]
+async fn local_disconnect(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    log::info!("[local:{}] disconnect requested", session_id);
+    local::disconnect(&state, &session_id).await
+}
+
 // ============ SSH Server Info ============
 
 #[derive(Serialize)]
@@ -1986,6 +2061,7 @@ pub fn run() {
         db: Arc::new(Mutex::new(conn)),
         ssh_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         ftp_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        local_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         zmodem_files: Mutex::new(HashMap::new()),
         dek: Arc::new(Mutex::new(None)),
     };
@@ -2037,6 +2113,10 @@ pub fn run() {
             ssh_disconnect,
             ssh_send_zmodem,
             ssh_send_zmodem_abort,
+            local_connect,
+            local_send,
+            local_resize,
+            local_disconnect,
             ssh_get_server_info,
             sftp_list_dir,
             sftp_mkdir,
@@ -2080,8 +2160,17 @@ fn drain_all_sessions(app_handle: &tauri::AppHandle) {
     let Some(state) = app_handle.try_state::<AppState>() else {
         return;
     };
-    let senders: Vec<_> = {
+    let ssh_senders: Vec<_> = {
         let Ok(sessions) = state.ssh_sessions.lock() else {
+            return;
+        };
+        sessions
+            .values()
+            .map(|s| s.command_tx.clone())
+            .collect()
+    };
+    let local_senders: Vec<_> = {
+        let Ok(sessions) = state.local_sessions.lock() else {
             return;
         };
         sessions
@@ -2100,16 +2189,20 @@ fn drain_all_sessions(app_handle: &tauri::AppHandle) {
         sessions.clear();
         count
     };
-    if senders.is_empty() && ftp_count == 0 {
+    if ssh_senders.is_empty() && local_senders.is_empty() && ftp_count == 0 {
         return;
     }
     eprintln!(
-        "[exit] draining {} SSH + {} FTP session(s)",
-        senders.len(),
+        "[exit] draining {} SSH + {} local + {} FTP session(s)",
+        ssh_senders.len(),
+        local_senders.len(),
         ftp_count
     );
-    for tx in &senders {
+    for tx in &ssh_senders {
         let _ = tx.send(ssh::SessionCommand::Disconnect);
+    }
+    for tx in &local_senders {
+        let _ = tx.send(local::LocalCommand::Disconnect);
     }
 }
 

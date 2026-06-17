@@ -6,13 +6,16 @@ import {
   clearCommandHistory,
   addCommandHistory,
   sshSend,
+  localSend,
   listQuickCommandsForConnection,
 } from "../api";
-import type { CommandHistoryItem, QuickCommandExecItem } from "../api";
+import type { CommandHistoryItem, ConnType, QuickCommandExecItem } from "../api";
 
 interface Props {
   sessionId: string;
   connectionId: string;
+  /** Tab connection type — picks ssh_send vs local_send. Defaults to ssh. */
+  connType?: ConnType;
   /** Broadcast target session IDs. If non-empty, commands from the input box
    * will be sent to all targets (including this session). */
   broadcastTargets?: string[];
@@ -27,7 +30,10 @@ interface Props {
   onOpenQuickCommandsManage?: () => void;
 }
 
-export function CommandBar({ sessionId, connectionId, broadcastTargets = [], onRegisterRefresh, status, onReconnect, onOpenQuickCommandsManage }: Props) {
+export function CommandBar({ sessionId, connectionId, connType, broadcastTargets = [], onRegisterRefresh, status, onReconnect, onOpenQuickCommandsManage }: Props) {
+  // Pick the send backend by connection type — local tabs must route to
+  // local_send, not ssh_send.
+  const sendFn = connType === "local" ? localSend : sshSend;
   const [input, setInput] = useState("");
   const [history, setHistory] = useState<CommandHistoryItem[]>([]);
   const [panelOpen, setPanelOpen] = useState(false);
@@ -66,7 +72,7 @@ export function CommandBar({ sessionId, connectionId, broadcastTargets = [], onR
 
     // Send to all destinations (broadcast or single)
     await Promise.allSettled(
-      destinations.map((sid) => sshSend(sid, cmd + "\r"))
+      destinations.map((sid) => sendFn(sid, cmd + "\r"))
     );
 
     // Record to history (only once, for this connection)
@@ -127,7 +133,7 @@ export function CommandBar({ sessionId, connectionId, broadcastTargets = [], onR
     if (!executable) return;
     const destinations = broadcastTargets.length > 0 ? broadcastTargets : [sessionId];
     await Promise.allSettled(
-      destinations.map((sid) => sshSend(sid, executable + "\r"))
+      destinations.map((sid) => sendFn(sid, executable + "\r"))
     );
     setQuickPanelOpen(false);
   }

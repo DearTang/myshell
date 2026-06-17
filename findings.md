@@ -13,6 +13,7 @@
 - FinalShell 特性：SSH终端、SFTP文件管理、多标签、连接管理器、服务器监控
 - russh：纯 Rust SSH2 实现，异步（tokio），支持会话/通道/SFTP子系统
 - Tauri v2：Rust 原生桌面框架，支持前端渲染，IPC 通信
+- 本地终端（阶段10）：复用 SSH 的 `ssh_output`/`ssh_closed` 事件通道，前端按 `connType` 分发命令即可零成本接入；portable-pty reader 是阻塞 `Read`，需 `spawn_blocking` 独立线程 + writer 任务（不同于 SSH `select!` 单循环）
 
 ## 技术决策
 | 决策 | 理由 |
@@ -23,6 +24,7 @@
 | xterm.js | Web 终端标准，Unicode 支持好 |
 | SQLite (rusqlite) | 本地连接配置存储，轻量无依赖 |
 | React + TypeScript | Tauri 官方支持，类型安全 |
+| portable-pty | 本地终端 PTY（Win ConPTY / Unix openpty），真 PTY 让本地 shell 支持 TUI/颜色/resize |
 
 ## 遇到的问题
 | 问题 | 解决方案 |

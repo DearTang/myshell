@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 // ============ Types ============
 
-export type ConnType = "ssh" | "sftp" | "ftp";
+export type ConnType = "ssh" | "sftp" | "ftp" | "local";
 
 export type FtpTls = "none" | "implicit" | "explicit";
 
@@ -35,6 +35,17 @@ export interface ConnectionConfig {
    * when non-empty — never persisted to SQLite. Empty on edit means "keep
    * existing keyring value"; backend reads from keyring at connect time. */
   proxy_password?: string;
+  /** Local terminal only (conn_type === "local"): shell executable to spawn
+   * — e.g. "pwsh.exe", "cmd.exe", "wsl.exe", or an absolute path. Ignored for
+   * ssh/sftp/ftp. Plain column (a program path isn't a secret). Matches the
+   * Rust field name verbatim (serde default = snake_case, like the other
+   * fields here). */
+  shell_path?: string;
+  /** Local terminal only: optional shell args (e.g. "-d Ubuntu"). */
+  shell_args?: string;
+  /** Optional command auto-executed right after the shell starts (e.g.
+   * "claude" to launch on open). Currently honored for local terminals. */
+  init_command?: string;
   created_at: string;
 }
 
@@ -342,6 +353,32 @@ export async function sshResize(
 
 export async function sshDisconnect(sessionId: string): Promise<void> {
   await invoke("ssh_disconnect", { sessionId });
+}
+
+// ============ Local Terminal API ============
+//
+// Local PTY terminals (conn_type === "local"). They reuse the SSH event
+// channel (onSshOutput / onSshClosed), so only these four commands differ —
+// TerminalPanel branches on connType to pick ssh_* vs local_*.
+
+export async function localConnect(config: ConnectionConfig): Promise<string> {
+  return await invoke("local_connect", { config });
+}
+
+export async function localSend(sessionId: string, data: string): Promise<void> {
+  await invoke("local_send", { sessionId, data });
+}
+
+export async function localResize(
+  sessionId: string,
+  cols: number,
+  rows: number
+): Promise<void> {
+  await invoke("local_resize", { sessionId, cols, rows });
+}
+
+export async function localDisconnect(sessionId: string): Promise<void> {
+  await invoke("local_disconnect", { sessionId });
 }
 
 // ============ SFTP API ============

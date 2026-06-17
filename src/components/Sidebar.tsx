@@ -81,6 +81,7 @@ const CONN_ICONS: Record<ConnType, string> = {
   ssh: "🖥️",
   sftp: "📁",
   ftp: "📤",
+  local: "💻",
 };
 
 const styles = {

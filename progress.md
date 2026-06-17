@@ -306,3 +306,57 @@
 | 目标是什么？ | 通过日志文件能定位问题，自动清理 7 天前日志 |
 | 我学到了什么？ | 现有已有 setup_file_logging（dup2 stderr → 按天文件），只需调阈值 + 配置 env_logger 级别即可让 log 宏生效，无需重写日志框架；env_logger 默认 error 级别会吞掉 info/warn，必须显式 `default_filter_or("info")`；dup2 之前的日志写原始 stderr（release 丢失），所以清理计数要在 dup2 后的 banner 输出 |
 | 我做了什么？ | 阶段 9：清理 14→7 天；env_logger 配 info + 毫秒时间戳；startup / SSH 生命周期 / 快捷命令 / delete_connection / channel_reader 补充结构化日志 |
+
+## 会话：2026-06-17 — 本地终端（连接本地 PowerShell / CMD / WSL / 自定义 shell）
+
+### 阶段 10：本地终端全栈（conn_type='local'）
+- **状态：** 前端 complete（tsc 通过）；后端代码 complete 但 **未编译验证**（环境无 rustup）；端到端待用户 `cargo build` + 运行
+- **需求：** 在 MyShell 里直连本地的 PowerShell / CMD / WSL / 自定义 shell，作为可保存的连接（进文件夹、带 shell 配置），与 SSH 终端体验一致
+- **设计决策（与用户确认）：**
+  - 入口形态：本地终端作为 `conn_type='local'` 的一种 `ConnectionConfig`，复用现有连接管理 / 文件夹 / 命令历史 / 快捷命令全套 —— 不新建表、不新写管理 UI
+  - 复用 SSH 事件通道：本地后端 emit 现有的 `ssh_output` / `ssh_closed`，`TerminalPanel` 事件订阅零改动，只按 `connType` 选 connect/send/resize/disconnect 命令
+  - vault 解锁保持现状：本地连接行随 connections 表加密存储，列出需解锁（`get_connections` 的 DEK 门禁自动覆盖）；`local_connect` 本身不需要密码/DEK
+  - shell 配置双字段：`shell_path`（可执行路径，明文列）+ `shell_args`（可选参数）—— 不用单字段命令串，避免 `C:\Program Files\...` 空格被 split 破坏
+  - 技术选型：`portable-pty`（Windows ConPTY / Unix openpty，wezterm 出品）。`std::process` + pipe 因无 PTY 被否决（交互式 TUI / 颜色 / resize 全废）
+- **修改明细：**
+  - `src-tauri/Cargo.toml` — 加 `portable-pty = "0.8"`
+  - `src-tauri/src/local.rs`（新建）— `LocalCommand` 枚举（Input/Resize/Disconnect，本地无 ZMODEM）+ `LocalSession { command_tx }` + `connect`：openpty → spawn shell → **reader 阻塞线程**（`spawn_blocking`，因 portable-pty reader 是阻塞 `Read`）emit `ssh_output`，EOF emit `ssh_closed` + 从 map 移除；**writer 任务**（async，持 master）处理 Input/Resize/Disconnect（Disconnect 时 `child.kill()`）。`send_input`/`resize_terminal`/`disconnect` 镜像 ssh.rs
+  - `src-tauri/src/db.rs` — `init_db` 加 `shell_path`/`shell_args` 明文列；`migrate_legacy_schema` 加幂等迁移（`column_exists` 探测 + `ALTER TABLE ADD COLUMN`）；`get_all_connections`/`get_connection`/`save_connection` 三处 SELECT+元组+INSERT 同步加列
+  - `src-tauri/src/main.rs` — `mod local`；`ConnectionConfig` 加 `shell_path`/`shell_args`（`#[serde(default)]`）；`AppState.local_sessions` map + 初始化；`drain_all_sessions` 加 local 清理（发 `LocalCommand::Disconnect`）；4 命令 `local_connect`/`local_send`/`local_resize`/`local_disconnect`（`local_send` 复用 256KB 输入上限）+ `generate_handler!` 注册
+  - `src/api.ts` — `ConnType` 加 `"local"`；`ConnectionConfig` 加 `shell_path`/`shell_args`（snake_case，匹配后端 serde 默认）；4 个 wrapper
+  - `src/App.tsx` — `handleConnect`/`handleReconnect`/`handleCloseTab` 加 `connType==='local'` 分支（`localConnect`/`localDisconnect`，display name 用 `config.name`）；TerminalPanel 透传 `connType`
+  - `src/components/TerminalPanel.tsx` — `connType` prop + `connTypeRef` + `sendTo`/`resizeTo` 分发（按 connType 选 ssh_*/local_*）；事件订阅 `onSshOutput`/`onSshClosed` 原样复用
+  - `src/components/CommandBar.tsx` — `connType` prop + `sendFn` 分发（**修复**：原本直接 `sshSend`，本地 tab 命令会发错后端；现按 connType 选 sshSend/localSend）
+  - `src/components/ConnectionDialog.tsx` — `TYPE_OPTIONS` 加 local + `SHELL_PRESETS`（pwsh/powershell/cmd/wsl/git-bash）；`connType==='local'` 时表单只显示 名称/分组/shell 选择+路径+参数，隐藏 host/port/auth/proxy；`handleSave` local 分支（host="" port=0 username=""，shell_path 必填校验）
+  - `src/components/Sidebar.tsx` — `CONN_ICONS` 加 `local: 💻`
+- **验证：**
+  - `npx tsc --noEmit` PASS（首次 3 个错误：ConnectionDialog 误用 `shell_path`/`shell_args` 而 api.ts 我先写成了 camelCase `shellPath`/`shellArgs`；统一为 snake_case 与其他字段一致后通过）
+  - Rust `cargo build` **未执行**（环境无 rustup）—— 最可能的调整点是 portable-pty 0.8 的 `take_writer`/`spawn_command` 返回的 trait bound
+- **遗留风险 / 待验证：**
+  - **ConPTY 编码**：Windows 上 portable-pty 输出按 shell 的 console codepage 走（pwsh=UTF-8 正常；Windows PowerShell 5.1 在中文系统可能 GBK → xterm 中文乱码）。v1 emit 原始字节（与 SSH 一致，不做转换）；如实测乱码，改 pwsh 或在 `local.rs` reader 加 `encoding_rs` 转换 / 注入 `chcp 65001`
+  - **Rust 未编译**：portable-pty API 细节、`CommandBuilder` 默认环境/cwd 继承行为需 `cargo build` + 运行确认
+  - `shell_args` 空白分割：含空格的单个参数需用户自加引号（v1 限制，`local.rs` 注释已标注）
+  - 本地终端不参与广播（`getBroadcastTargets` 已按 `connType==='ssh'` 过滤）也不显示 ServerInfoPanel（同样 ssh-only 判断）—— 无需额外排除
+- **首次类型检查踩坑：** `ConnectionConfig` 在 TS 侧一直用 snake_case（匹配后端 serde 默认，无 `rename_all`），新加字段时误用 camelCase 导致不一致；统一 snake_case 后 tsc 绿
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 10 本地终端前端 complete（tsc 绿）；后端代码 complete 但未编译（无 rustup） |
+| 我要去哪里？ | 用户 `cargo build`（可能需调 portable-pty API）→ `cargo tauri dev` → 新建本地连接（pwsh.exe）双击开 tab 验证打字/输出/resize/关闭/编码 |
+| 目标是什么？ | MyShell 直连本地 PowerShell/CMD/WSL/自定义 shell，作为可保存的连接，体验等同 SSH 终端 |
+| 我学到了什么？ | 本地终端与 SSH 终端在渲染层完全同构（都是 xterm + 字节流），差异只在上游数据源 —— 抽象出按 connType 分发即可零成本复用；portable-pty 的 reader 是阻塞 `Read`，必须 `spawn_blocking` 独立线程 + writer 任务双线（不同于 SSH 的 select! 单循环）；CommandBar 直接调 sshSend 是隐藏的分发遗漏点，新增后端必须全局 grep 确认所有 ssh_* 调用点 |
+| 我做了什么？ | 阶段 10：Cargo + local.rs PTY 模块；db schema + 字段；main AppState + 4 命令 + drain；api.ts 类型 + wrapper；App/TerminalPanel/CommandBar 按 connType 分发；ConnectionDialog local 表单 + shell 预设；Sidebar 图标 |
+
+### 阶段 10.1：类型图标修复 + 启动命令 init_command（2026-06-17）
+- **状态：** 前端 complete（tsc 通过）；后端代码 complete 未编译；**版本号 1.1.0 → 1.2.2**
+- **问题1：新建连接类型选择图标显示方框**
+  - 根因：`ConnectionDialog` 的 `TYPE_OPTIONS` 里 ssh/sftp/ftp 用 Nerd Font 私有区字符（`󰖟`/`󰉋`/`󰈙`），系统未装 Nerd Font 就渲染成方框；local 用 emoji（`💻`）所以正常
+  - 修复：`TYPE_OPTIONS` 图标改 emoji，与 Sidebar `CONN_ICONS` 一致 —— `🖥️`/`📁`/`📤`/`💻`，免字体跨平台
+- **问题2：本地终端打开后默认执行命令（init_command）**
+  - 需求：连接里配 `claude`，开 tab 自动执行
+  - 设计：`ConnectionConfig` 加 `init_command`（明文列，通用字段先本地用）→ `local.rs` writer 任务 `take_writer` 后立即注入 `init_command + \r`（PTY stdin 缓冲，shell 就绪后 echo + 执行；`\r` 触发执行，与 onData 转发 Enter 一致）；`ConnectionDialog` 本地表单加「启动命令（可选）」输入
+  - 数据层：`db.rs` 加 `init_command TEXT` 列 + 幂等迁移 + `get_all`/`get`/`save` 三处 SQL 同步；`main.rs`/`api.ts` `ConnectionConfig` 双端加字段
+  - 限制：当前把整条 `init_command` 当**单行**命令注入（trim + `\r`）；多行命令暂不支持，后续可按 `\n` 拆分依次注入
+- **版本号：** `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `Cargo.lock`(myshell 条目) 四处 1.1.0 → 1.2.2；`backup.rs::APP_VERSION` 经 `env!("CARGO_PKG_VERSION")` 自动跟随 Cargo.toml，无需手改
+- **验证：** `npx tsc --noEmit` PASS；Rust 待 `cargo build`（含 portable-pty 编译验证）

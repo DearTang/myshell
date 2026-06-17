@@ -39,7 +39,7 @@ When adding a command, update **three** places in lockstep:
 2. The relevant module (`ssh.rs` / `sftp.rs` / `db.rs`) for the actual logic
 3. `src/api.ts` — typed wrapper so the frontend gets types
 
-Current command surface: `get_connections`, `save_connection`, `delete_connection`, `ssh_connect`, `ssh_send`, `ssh_resize`, `ssh_disconnect`, `sftp_list_dir`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`.
+Current command surface (see `generate_handler!` in `main.rs` for the full, ever-growing list): `get_connections`, `save_connection`, `delete_connection`, `ssh_connect`, `ssh_send`, `ssh_resize`, `ssh_disconnect`, `sftp_list_dir`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, plus vault / folder / quick-command / FTP commands and the local-terminal set `local_connect` / `local_send` / `local_resize` / `local_disconnect`.
 
 Shared types (`ConnectionConfig`, `FileEntry`) are defined twice and must stay in sync: once in `src-tauri/src/main.rs` (serde-derived structs) and once in `src/api.ts` (TS interfaces).
 
@@ -49,6 +49,7 @@ Shared types (`ConnectionConfig`, `FileEntry`) are defined twice and must stay i
 - `ssh.rs` — russh client: connect, authenticate (password/pubkey), open PTY, send input, resize, disconnect
 - `sftp.rs` — russh-sftp: list/create/remove/rename. **Each SFTP call opens a fresh subsystem channel** (`get_sftp_session`) — there's no cached `SftpSession`.
 - `db.rs` — rusqlite (bundled) CRUD. DB lives at `<config_dir>/myshell/connections.db` (via the `dirs` crate).
+- `local.rs` — local terminal (`conn_type='local'`): spawns a shell under a PTY (`portable-pty`: ConPTY on Windows / openpty on Unix) and emits `ssh_output`/`ssh_closed` so `TerminalPanel` reuses the SSH render path. Reader runs on a `spawn_blocking` thread (portable-pty's reader is a blocking `Read`); a writer task owns the master for input/resize and kills the child on disconnect.
 
 `AppState` is registered via `.manage()` and accessed through `State<AppState>`. It holds:
 - `db: Mutex<rusqlite::Connection>` — single shared SQLite handle
@@ -74,6 +75,7 @@ The frontend uses the session UUID as the tab ID, so `tab.id === sessionId` is a
 - App/window close does not disconnect active sessions — SSH TCP connections leak until OS reaps them. Add a `RunEvent::Exit` handler in `main.rs` to drain `ssh_sessions`.
 - `load_secret_key` accepts arbitrary path (no canonicalization/allow-list) — file existence oracle.
 - Known risk: `channel.wait()` in `select!` may not be cancel-safe — if bytes are observed being dropped under high traffic, switch to `channel.make_reader()` + `tokio::io::split()`.
+- **Local terminal (`conn_type='local'`) code is written but not yet compiled** — rustup isn't installed in the editing environment, so `local.rs` + the 4 `local_*` commands are unverified. Run `cargo build` from `src-tauri/` after installing Rust; the most likely fix point is `portable-pty` 0.8 trait bounds on `take_writer`/`spawn_command`. Also: on Windows the PTY output follows the shell's console codepage — pwsh is UTF-8, but Windows PowerShell 5.1 on a zh-CN system may emit GBK and render mojibake in xterm. v1 emits raw bytes (no re-encode, matching SSH); mitigation TBD (`encoding_rs` decode in the reader, or inject `chcp 65001`). See `progress.md` 阶段10.
 
 ## Living planning docs (Chinese)
 
