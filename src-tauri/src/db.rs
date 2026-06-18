@@ -41,7 +41,8 @@ pub fn init_db() -> Result<Connection> {
             shell_path TEXT,
             shell_args TEXT,
             init_command TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            terminal_font TEXT
         );
         CREATE TABLE IF NOT EXISTS known_hosts (
             host TEXT NOT NULL,
@@ -177,6 +178,10 @@ pub fn migrate_legacy_schema(conn: &Connection) -> Result<()> {
     }
     if !column_exists(&tx, "connections", "init_command") {
         tx.execute("ALTER TABLE connections ADD COLUMN init_command TEXT", [])?;
+    }
+    // Per-connection terminal font override (nullable; NULL = use global).
+    if !column_exists(&tx, "connections", "terminal_font") {
+        tx.execute("ALTER TABLE connections ADD COLUMN terminal_font TEXT", [])?;
     }
 
     tx.execute(
@@ -373,7 +378,7 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
     let mut stmt = conn.prepare(
         "SELECT id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
                 private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
-                proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at
+                proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font
          FROM connections ORDER BY group_path, name"
     )?;
 
@@ -401,6 +406,7 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
             row.get::<_, Option<String>>(17)?,              // shell_args
             row.get::<_, Option<String>>(18)?,              // init_command
             row.get::<_, String>(19)?,                      // created_at
+            row.get::<_, Option<String>>(20)?,              // terminal_font
         ))
     })?;
 
@@ -409,7 +415,7 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
         let (id, name, host_enc, port_i, user_enc, auth_method, pem_enc,
              conn_type, group_path, ftp_tls, ftp_passive,
              proxy_type, proxy_host_enc, proxy_port_i, proxy_username,
-             shell_path, shell_args, init_command, created_at) = row?;
+             shell_path, shell_args, init_command, created_at, terminal_font) = row?;
         let host = decrypt_field(key, host_enc)?.unwrap_or_default();
         let username = decrypt_field(key, user_enc)?.unwrap_or_default();
         let private_key_pem = decrypt_field(key, pem_enc)?;
@@ -438,6 +444,7 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
             init_command,
             proxy_password: None, // resolved from keyring by caller
             created_at,
+            terminal_font,
         });
     }
     Ok(configs)
@@ -469,8 +476,8 @@ pub fn save_connection(conn: &Connection, key: &[u8; 32], config: &ConnectionCon
         "INSERT OR REPLACE INTO connections
             (id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
              private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
-             proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+             proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             config.id,
             config.name,
@@ -491,6 +498,7 @@ pub fn save_connection(conn: &Connection, key: &[u8; 32], config: &ConnectionCon
             config.shell_args,
             config.init_command,
             config.created_at,
+            config.terminal_font,
         ],
     )?;
     Ok(())
@@ -500,7 +508,7 @@ pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Opt
     let mut stmt = conn.prepare(
         "SELECT id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
                 private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
-                proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at
+                proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font
          FROM connections WHERE id = ?1"
     )?;
     let mut rows = stmt.query_map(params![id], |row| {
@@ -524,13 +532,14 @@ pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Opt
             row.get::<_, Option<String>>(17)?,               // shell_args
             row.get::<_, Option<String>>(18)?,               // init_command
             row.get::<_, String>(19)?,                       // created_at
+            row.get::<_, Option<String>>(20)?,               // terminal_font
         ))
     })?;
     match rows.next() {
         Some(Ok((id, name, host_enc, port_i, user_enc, auth_method, pem_enc,
                  conn_type, group_path, ftp_tls, ftp_passive,
                  proxy_type, proxy_host_enc, proxy_port_i, proxy_username,
-                 shell_path, shell_args, init_command, created_at))) => {
+                 shell_path, shell_args, init_command, created_at, terminal_font))) => {
             let host = decrypt_field(key, host_enc)?.unwrap_or_default();
             let username = decrypt_field(key, user_enc)?.unwrap_or_default();
             let private_key_pem = decrypt_field(key, pem_enc)?;
@@ -559,6 +568,7 @@ pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Opt
                 init_command,
                 proxy_password: None,
                 created_at,
+                terminal_font,
             }))
         }
         Some(Err(e)) => Err(e),

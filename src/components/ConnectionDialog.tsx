@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { FontField } from "./FontField";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { saveConnection, getConnectionPassword, getConnectionProxyPassword } from "../api";
@@ -65,6 +66,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
   const [shellPath, setShellPath] = useState(config?.shell_path || "");
   const [shellArgs, setShellArgs] = useState(config?.shell_args || "");
   const [initCommand, setInitCommand] = useState(config?.init_command || "");
+  const [terminalFont, setTerminalFont] = useState(config?.terminal_font || "");
   const [saving, setSaving] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showProxyPassword, setShowProxyPassword] = useState(false);
@@ -132,6 +134,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
           shell_path: shellPath.trim(),
           shell_args: shellArgs.trim() || undefined,
           init_command: initCommand.trim() || undefined,
+          terminal_font: terminalFont.trim() || undefined,
           created_at: config?.created_at || new Date().toISOString(),
         };
         await saveConnection(conn);
@@ -205,6 +208,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
             : undefined,
         proxy_password:
           proxyType !== "none" && proxyPassword ? proxyPassword : undefined,
+        terminal_font: terminalFont.trim() || undefined,
         created_at: config?.created_at || new Date().toISOString(),
       };
       await saveConnection(conn);
@@ -315,6 +319,21 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
             )}
           </FieldGroup>
 
+          {(connType === "ssh" || connType === "local") && (
+            <FieldGroup label="终端">
+              <FormField label="字体（可选）">
+                <FontField
+                  value={terminalFont}
+                  onChange={setTerminalFont}
+                  placeholder="留空使用全局字体"
+                />
+              </FormField>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                为该连接单独指定终端字体；留空则使用设置中的全局字体。
+              </div>
+            </FieldGroup>
+          )}
+
           {connType === "local" ? (
             <FieldGroup label="启动 Shell">
               <FormField label="Shell 类型（快速选择）">
@@ -354,7 +373,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
                 background: "var(--bg-surface)",
                 borderRadius: "var(--radius-sm)",
               }}>
-                💡 本地终端在本机启动一个 shell（PowerShell / CMD / WSL 等），等同打开一个本地命令行窗口。「启动命令」会在 shell 就绪后自动执行一次（如打开即跑 claude）。
+                💡 本地终端在本机启动一个 shell（PowerShell / CMD / WSL 等），等同打开一个本地命令行窗口。「启动命令」会在 shell 就绪后自动执行一次（如打开即跑 claude）。需要管理员权限？在「设置 → 管理员权限」以管理员重启 MyShell，所有本地连接即获得管理员权限。
               </div>
             </FieldGroup>
           ) : (
@@ -608,6 +627,12 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
             gap: 10,
             background: "var(--bg-surface)",
             borderRadius: "0 0 var(--radius-xl) var(--radius-xl)",
+            // Sticky so Save/Cancel stay visible without scrolling to the
+            // bottom — the card above is the scroll container (overflowY auto).
+            position: "sticky",
+            bottom: 0,
+            flexShrink: 0,
+            zIndex: 5,
           }}
         >
           <button

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -22,6 +23,7 @@ import { CommandBar } from "./CommandBar";
 import { recordKeystroke } from "../utils/cmd-buffer";
 import { useColorScheme } from "../hooks/useColorScheme";
 import { useTheme } from "../hooks/useTheme";
+import { useTerminalFont, resolveFontStack } from "../hooks/useTerminalFont";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props {
@@ -34,6 +36,9 @@ interface Props {
    * connect, connectionId doesn't). Empty for sessions without a backing
    * connection row (shouldn't normally happen). */
   connectionId: string;
+  /** Per-connection terminal font override (family name). When set, wins over
+   * the global terminal font for this tab. Undefined/empty → use global. */
+  fontOverride?: string;
   /** When non-empty (and contains more than just this tab's own sessionId),
    * every keystroke is mirrored to all listed sessions in addition to the
    * local one. The list is read live from a ref so toggling broadcast on/
@@ -55,7 +60,7 @@ interface Props {
   onOpenQuickCommandsManage?: () => void;
 }
 
-export function TerminalPanel({ sessionId, connType, connectionId, broadcastTargets, active = true, onDisconnected, status, onReconnect, onOpenQuickCommandsManage }: Props) {
+export function TerminalPanel({ sessionId, connType, connectionId, fontOverride, broadcastTargets, active = true, onDisconnected, status, onReconnect, onOpenQuickCommandsManage }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -83,6 +88,9 @@ export function TerminalPanel({ sessionId, connType, connectionId, broadcastTarg
   // Color scheme & background image from context
   const { getActivePalette, bgImage } = useColorScheme();
   const { theme } = useTheme();
+  const { fontFamily: globalFontFamily } = useTerminalFont();
+  // Per-connection override wins over the global setting; empty → global.
+  const fontFamily = fontOverride ? resolveFontStack(fontOverride) : globalFontFamily;
 
   // Derive the terminal theme from the active palette for the current mode.
   // Re-resolved on every render so a palette switch instantly rebinds.
@@ -119,8 +127,8 @@ export function TerminalPanel({ sessionId, connType, connectionId, broadcastTarg
     const term = new Terminal({
       cursorBlink: true,
       fontSize: 14,
-      fontFamily: "'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace",
-      theme: terminalTheme,
+      fontFamily,
+      theme: hasBgImage ? { ...terminalTheme, background: "rgba(0, 0, 0, 0)" } : terminalTheme,
       allowProposedApi: true,
       allowTransparency: hasBgImage,
     });
@@ -131,6 +139,18 @@ export function TerminalPanel({ sessionId, connType, connectionId, broadcastTarg
     term.loadAddon(fitAddon);
     term.loadAddon(webLinksAddon);
     term.open(containerRef.current);
+
+    // Use the WebGL renderer when available. The default canvas renderer does
+    // NOT clear cell pixels on redraw under allowTransparency, so with a
+    // background image set, input characters leave ghosting/smearing — they
+    // appear to "jump" and the background gets smeared (worst on the local
+    // ConPTY path). WebGL redraws every frame, so transparency composites
+    // cleanly. Falls back to canvas if WebGL isn't usable (old GPU/drivers).
+    try {
+      term.loadAddon(new WebglAddon());
+    } catch (e) {
+      console.warn("[TerminalPanel] WebGL renderer unavailable, using canvas:", e);
+    }
 
     // Block OSC 52 clipboard writes from the remote side. Without this,
     // a malicious SSH server can silently replace the user's clipboard
@@ -232,9 +252,28 @@ export function TerminalPanel({ sessionId, connType, connectionId, broadcastTarg
     let unlistenZmodemRaw: UnlistenFn | null = null;
     let unlistenZmodemEnd: UnlistenFn | null = null;
     let closed = false;
+    let firstOutputHandled = false;
 
     onSshOutput(sessionIdRef.current, (data) => {
-      if (!closed) term.write(data);
+      if (closed) return;
+      term.write(data);
+      if (!firstOutputHandled) {
+        firstOutputHandled = true;
+        // The shell emitted its first frame — for local PowerShell this means
+        // PSReadLine is now initialized. The PTY started at 80x24 and the
+        // initial 100ms fit/resize may have landed BEFORE PSReadLine was ready,
+        // leaving it on a stale width → cursor jumps while editing. Refit +
+        // resize now so PSReadLine picks up the real cols. Harmless for SSH
+        // (bash already syncs via SIGWINCH).
+        setTimeout(() => {
+          try {
+            fitAddon.fit();
+          } catch {
+            /* container transitioning */
+          }
+          resizeTo(sessionIdRef.current, term.cols, term.rows).catch(() => {});
+        }, 0);
+      }
     })
       .then((un) => {
         if (closed) un();
@@ -325,7 +364,10 @@ export function TerminalPanel({ sessionId, connType, connectionId, broadcastTarg
     const term = termRef.current;
     if (!term) return;
 
-    const currentBg = hasBgImage ? "transparent" : terminalTheme.background;
+    // NOTE: must be a real alpha-0 color, not the "transparent" keyword — the
+    // WebGL renderer can't parse "transparent" (canvas could), and falls back
+    // to an opaque black clearColor, hiding the background image.
+    const currentBg = hasBgImage ? "rgba(0, 0, 0, 0)" : terminalTheme.background;
     term.options.theme = { ...terminalTheme, background: currentBg };
     term.options.allowTransparency = hasBgImage;
 
@@ -335,6 +377,16 @@ export function TerminalPanel({ sessionId, connType, connectionId, broadcastTarg
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePalette.id, theme, hasBgImage]);
+
+  // Live font update: apply a newly chosen terminal font to the existing
+  // terminal without re-creating it. xterm.js re-rasterizes glyphs when
+  // fontFamily changes, so the new font (and its Nerd Font glyphs) shows up
+  // immediately on open tabs.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.fontFamily = fontFamily;
+  }, [fontFamily]);
 
   // Active-tab transitions: refit on show (the last fit ran against a
   // display:none container with zero geometry) and grab focus so the user

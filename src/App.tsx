@@ -11,6 +11,7 @@ import { QuickCommandsPanel } from "./components/QuickCommandsPanel";
 import { BrandLogo } from "./components/BrandLogo";
 import {
   getConnections,
+  deleteConnection,
   listFolders,
   sshConnect,
   sshDisconnect,
@@ -367,7 +368,6 @@ export default function App() {
         onConnect={handleConnect}
         onEdit={handleEdit}
         onDelete={async (id) => {
-          const { deleteConnection } = await import("./api");
           await deleteConnection(id);
           reload();
         }}
@@ -441,6 +441,7 @@ export default function App() {
                       sessionId={tab.sessionId!}
                       connectionId={tab.connectionId || ""}
                       connType={tab.connType}
+                      fontOverride={connections.find((c) => c.id === (tab.connectionId || ""))?.terminal_font}
                       broadcastTargets={getBroadcastTargets(tab)}
                       active={isActive}
                       status={tab.status}
@@ -468,6 +469,7 @@ export default function App() {
                       sessionId={tab.sessionId!}
                       connectionId={tab.connectionId || ""}
                       connType={tab.connType}
+                      fontOverride={connections.find((c) => c.id === (tab.connectionId || ""))?.terminal_font}
                       active={isActive}
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}

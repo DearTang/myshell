@@ -113,7 +113,6 @@ export function PassphraseDialog({ mode, count, onSubmit, onClose }: Props) {
         justifyContent: "center",
         zIndex: 2000,
       }}
-      onClick={onClose}
     >
       <div
         onClick={(e) => e.stopPropagation()}

@@ -46,6 +46,10 @@ export interface ConnectionConfig {
   /** Optional command auto-executed right after the shell starts (e.g.
    * "claude" to launch on open). Currently honored for local terminals. */
   init_command?: string;
+  /** Optional per-connection terminal font override (family name). When set,
+   * takes precedence over the global terminal font for this connection's
+   * tabs. Empty/undefined = use the global setting. Plain column. */
+  terminal_font?: string;
   created_at: string;
 }
 
@@ -377,8 +381,30 @@ export async function localResize(
   await invoke("local_resize", { sessionId, cols, rows });
 }
 
+/** Installed font family names on the host (sorted, deduped) — for the
+ * terminal font picker in Settings and per-connection config. Empty list on
+ * failure (picker then degrades to free-text entry). */
+export async function listSystemFonts(): Promise<string[]> {
+  return invoke<string[]>("list_system_fonts");
+}
+
 export async function localDisconnect(sessionId: string): Promise<void> {
   await invoke("local_disconnect", { sessionId });
+}
+
+// ============ Elevation (run as admin) ============
+
+/** Whether MyShell is running elevated (admin on Windows, root on Unix). */
+export async function isElevated(): Promise<boolean> {
+  return invoke<boolean>("is_elevated");
+}
+
+/**
+ * Re-launch MyShell elevated via the UAC consent dialog; the current process
+ * exits after launching. Rejects if the user cancels UAC (we then stay as-is).
+ */
+export async function restartAsAdmin(): Promise<void> {
+  await invoke("restart_as_admin");
 }
 
 // ============ SFTP API ============

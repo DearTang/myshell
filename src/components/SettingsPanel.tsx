@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open, save, confirm } from "@tauri-apps/plugin-dialog";
 import {
   changeMasterPassword,
   exportConnections,
@@ -9,11 +9,15 @@ import {
   getAppVersion,
   getPreviousVersion,
   readFileBase64,
+  isElevated,
+  restartAsAdmin,
 } from "../api";
 import type { BackupInfo } from "../api";
 import { useTheme } from "../hooks/useTheme";
 import { useColorScheme } from "../hooks/useColorScheme";
+import { useTerminalFont } from "../hooks/useTerminalFont";
 import { PRESETS, type ColorPalette } from "../themes";
+import { FontField } from "./FontField";
 
 interface Props {
   onClose: () => void;
@@ -71,6 +75,7 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
     bgImage,
     setBgImage,
   } = useColorScheme();
+  const { primaryFont, setPrimaryFont } = useTerminalFont();
 
   // Background image local state (preview before applying)
   const [bgImagePath, setBgImagePath] = useState<string | null>(null);
@@ -89,11 +94,15 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   const [customBg, setCustomBg] = useState(
     customPalette?.dark.terminal?.background || "#1e1e2e"
   );
+  // null = not yet checked. Drives the admin/elevation status chip + restart button.
+  const [elevated, setElevated] = useState<boolean | null>(null);
+  const [restartBusy, setRestartBusy] = useState(false);
 
   useEffect(() => {
     getAppVersion().then(setAppVersion).catch(() => {});
     listBackups().then(setBackups).catch(() => {});
     getPreviousVersion().then(setPreviousVersion).catch(() => {});
+    isElevated().then(setElevated).catch(() => setElevated(false));
   }, []);
 
   const hint = strengthHint(newPass);
@@ -103,6 +112,25 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
     newPass.length >= MIN_LEN &&
     confirmPass === newPass &&
     !passwordBusy;
+
+  async function handleRestartAdmin() {
+    const ok = await confirm(
+      "将以管理员身份重启 MyShell，当前所有终端会话将被关闭。是否继续？",
+      { title: "以管理员重启", kind: "warning" }
+    );
+    if (!ok) return;
+    setRestartBusy(true);
+    try {
+      await restartAsAdmin();
+      // On success the process exits and the elevated instance takes over —
+      // we intentionally don't reset restartBusy (this UI is about to vanish).
+    } catch (e) {
+      setRestartBusy(false);
+      const msg = String(e);
+      // Silent on UAC cancel; surface everything else.
+      if (!msg.includes("取消")) alert(`以管理员重启失败: ${msg}`);
+    }
+  }
 
   async function handleChangePassword() {
     if (!canChangePassword) return;
@@ -220,7 +248,6 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
         zIndex: 2000,
         backdropFilter: "blur(8px)",
       }}
-      onClick={onClose}
     >
       <div
         onClick={(e) => e.stopPropagation()}
@@ -748,6 +775,77 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
                 清除背景图片
               </button>
             </div>
+          </Section>
+
+          {/* Terminal Font Section */}
+          <Section title="终端字体">
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
+              自定义终端字体；留空使用内置默认（已含 Nerd Font 回退）。填入本机已安装的字体名即可显示图标 / Powerline 字形。
+            </div>
+            <Field label="字体 (Font Family)">
+              <FontField
+                value={primaryFont}
+                onChange={setPrimaryFont}
+                placeholder="例如：CaskaydiaCove Nerd Font（留空用默认）"
+              />
+            </Field>
+            <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 8, lineHeight: 1.6 }}>
+              常见 Nerd Font：CaskaydiaCove Nerd Font、MesloLGM NF、JetBrainsMono Nerd Font、FiraCode Nerd Font、Hack Nerd Font
+            </div>
+          </Section>
+
+          {/* Admin / Elevation Section */}
+          <Section title="🛡️ 管理员权限">
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.6 }}>
+              本地终端以 MyShell 自身的权限运行 shell。需要管理员权限执行命令（如安装软件、修改系统配置）时，以管理员身份重启 MyShell，之后所有本地连接即获得管理员权限。
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              <span style={{
+                fontSize: 12,
+                fontWeight: 600,
+                padding: "5px 12px",
+                borderRadius: "var(--radius-full)",
+                background: elevated ? "var(--bg-surface-hover)" : "var(--bg-surface)",
+                color: elevated ? "var(--success)" : "var(--text-tertiary)",
+                border: elevated ? "1px solid var(--success)" : "1px solid var(--border-default)",
+              }}>
+                {elevated === null ? "检测中…" : elevated ? "✓ 已是管理员" : "当前：普通用户"}
+              </span>
+              {elevated === false && (
+                <button
+                  onClick={handleRestartAdmin}
+                  disabled={restartBusy}
+                  style={{
+                    padding: "8px 16px",
+                    background: "var(--accent-primary)",
+                    color: "white",
+                    border: "none",
+                    borderRadius: "var(--radius-md)",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    cursor: restartBusy ? "wait" : "pointer",
+                    opacity: restartBusy ? 0.7 : 1,
+                    transition: "all var(--duration-fast) var(--ease-in-out)",
+                  }}
+                >
+                  {restartBusy ? "启动中…" : "以管理员重启"}
+                </button>
+              )}
+            </div>
+            {elevated === false && (
+              <div style={{
+                marginTop: 10,
+                padding: "8px 12px",
+                fontSize: 11,
+                color: "var(--warning)",
+                background: "var(--warning-muted)",
+                border: "1px solid var(--warning)",
+                borderRadius: "var(--radius-md)",
+                lineHeight: 1.5,
+              }}>
+                ⚠ 重启将关闭当前所有终端会话；Windows 会弹出 UAC 确认，点击「是」后以管理员启动新实例。
+              </div>
+            )}
           </Section>
 
           <Divider />
@@ -1364,7 +1462,6 @@ function Dialog({
         zIndex: 2100,
         backdropFilter: "blur(8px)",
       }}
-      onClick={onClose}
     >
       <div
         onClick={(e) => e.stopPropagation()}

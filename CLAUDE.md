@@ -80,3 +80,5 @@ The frontend uses the session UUID as the tab ID, so `tab.id === sessionId` is a
 ## Living planning docs (Chinese)
 
 `findings.md`, `progress.md`, and `task_plan.md` at the repo root are the project's phase tracker and decision log. They are written and updated in Chinese. Per the docs' own instructions, update `progress.md` after each phase or error, and re-read `task_plan.md` before major decisions.
+
+**Doc-after-feature (standing rule):** every time a feature is finished, update the docs **directly, without asking** — append a `### 阶段 N` entry (+ 五问重启检查) to `progress.md`, and keep `README.md` in sync (功能特性 sections + 更新日志). This is a built-in final step of "feature done", same as running `npx tsc --noEmit`.

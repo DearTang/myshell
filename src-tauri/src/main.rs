@@ -20,6 +20,8 @@ mod vault;
 mod proxy;
 mod backup;
 mod local;
+mod fonts;
+mod elevation;
 
 // ============ Connection Config ============
 
@@ -84,6 +86,11 @@ pub struct ConnectionConfig {
     /// terminals; SSH may use it later. Plain column — not a secret.
     #[serde(default)]
     pub init_command: Option<String>,
+    /// Optional per-connection terminal font override (family name). When set,
+    /// takes precedence over the global terminal font for this connection's
+    /// tabs. Plain column — not a secret.
+    #[serde(default)]
+    pub terminal_font: Option<String>,
     pub created_at: String,
 }
 
@@ -958,7 +965,11 @@ fn add_command_history(
     connection_id: String,
     command: String,
 ) -> Result<i64, String> {
-    if command.trim().is_empty() {
+    let trimmed = command.trim();
+    // Drop empty + junk commands. `is_junk_command` covers the user-reported
+    // noise (commands made only of 'a'/'d' like "A", "AD"). Ok(0) → "nothing
+    // inserted", same shape the caller already sees for the empty case.
+    if trimmed.is_empty() || is_junk_command(trimmed) {
         return Ok(0);
     }
     let now = std::time::SystemTime::now()
@@ -966,7 +977,19 @@ fn add_command_history(
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string());
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db::add_command_history(&db, &connection_id, &command, &now).map_err(|e| e.to_string())
+    db::add_command_history(&db, &connection_id, trimmed, &now).map_err(|e| e.to_string())
+}
+
+/// Whether a command should be silently dropped from history. Currently matches
+/// the user's complaint: commands consisting only of 'a'/'d' (case-insensitive)
+/// — accidental single/double taps like "A", "D", "AD", "DA" — that are never
+/// useful history. NOTE this also matches "dd"; add a whitelist here if a real
+/// command starts getting dropped.
+fn is_junk_command(trimmed: &str) -> bool {
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|c| matches!(c.to_ascii_lowercase(), 'a' | 'd'))
 }
 
 #[tauri::command]
@@ -1325,6 +1348,28 @@ async fn local_disconnect(
 ) -> Result<(), String> {
     log::info!("[local:{}] disconnect requested", session_id);
     local::disconnect(&state, &session_id).await
+}
+
+// ============ Elevation (run as admin) ============
+
+/// Whether MyShell is running elevated (admin on Windows, root on Unix). Drives
+/// the "管理员权限" status chip in Settings — the local-terminal admin story is
+/// "elevate the whole app" (see `elevation.rs`), so the UI just reports state.
+#[tauri::command]
+fn is_elevated() -> bool {
+    elevation::is_elevated()
+}
+
+/// Re-launch MyShell elevated via the UAC consent dialog, then exit the current
+/// (non-elevated) process. The elevated instance starts independently. Errors
+/// if the user cancels UAC — in which case we stay running as-is.
+#[tauri::command]
+fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
+    elevation::restart_as_admin()?;
+    // Elevated instance is launching; tear this process down. `exit(0)` runs the
+    // ExitRequested handler so live SSH/local sessions drain gracefully.
+    app.exit(0);
+    Ok(())
 }
 
 // ============ SSH Server Info ============
@@ -2117,6 +2162,9 @@ pub fn run() {
             local_send,
             local_resize,
             local_disconnect,
+            fonts::list_system_fonts,
+            is_elevated,
+            restart_as_admin,
             ssh_get_server_info,
             sftp_list_dir,
             sftp_mkdir,

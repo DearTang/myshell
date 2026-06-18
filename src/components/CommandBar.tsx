@@ -370,7 +370,9 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
                       padding: 0,
                     }}
                   >
-                    {item.pinned ? "📌" : "📍"}
+                    {/* 📌 in both states — pinned is fully lit, unpinned dimmed
+                        via opacity. 📍 round-pushpin read as a balloon. */}
+                    📌
                   </button>
 
                   {/* Command text */}

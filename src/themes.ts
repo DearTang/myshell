@@ -62,9 +62,24 @@ export interface BackgroundImageConfig {
 export const STORAGE_KEY_COLOR = "myshell-color-scheme";
 export const STORAGE_KEY_CUSTOM = "myshell-custom-color-scheme";
 export const STORAGE_KEY_BG = "myshell-bg-image";
+export const STORAGE_KEY_TERMINAL_FONT = "myshell-terminal-font";
 
 export const DEFAULT_PALETTE_ID = "carbon";
 export const DEFAULT_BG_IMAGE: BackgroundImageConfig = { dataUrl: null, opacity: 0.85 };
+
+/**
+ * Default terminal font stack. Nerd Font families are listed FIRST so the
+ * powerline arrows + icon glyphs emitted by prompt engines (Oh My Posh /
+ * Starship / powerlevel10k) render correctly — those glyphs live in the
+ * Nerd Font Private-Use Area, which base fonts (Cascadia Code, Consolas…)
+ * lack, so without a Nerd Font they show as tofu / blank squares. Base
+ * monospace fonts remain as a fallback for users without a Nerd Font.
+ *
+ * Used as the fallback chain; a user-chosen primary family (see
+ * useTerminalFont) is prepended when set.
+ */
+export const TERMINAL_FONT_DEFAULT_STACK =
+  "'CaskaydiaCove Nerd Font', 'Cascadia Code NF', 'MesloLGM Nerd Font', 'MesloLGM NF', 'JetBrainsMono Nerd Font', 'FiraCode Nerd Font', 'Hack Nerd Font', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace";
 
 // ===========================================================================
 // TERMINAL COLOR PALETTES — Each preset redesigned for high contrast & harmony

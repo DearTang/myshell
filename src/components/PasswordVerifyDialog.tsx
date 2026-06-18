@@ -51,7 +51,6 @@ export function PasswordVerifyDialog({ onSuccess, onClose }: Props) {
         justifyContent: "center",
         zIndex: 3000,
       }}
-      onClick={onClose}
     >
       <div
         onClick={(e) => e.stopPropagation()}

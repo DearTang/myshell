@@ -21,6 +21,7 @@
 use crate::{AppState, ConnectionConfig};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 use tauri::{Emitter, State, WebviewWindow};
 use tauri::async_runtime;
@@ -62,6 +63,40 @@ fn pty_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
+/// Returns a UTF-8 setup sequence to feed the shell at startup, for shells
+/// that otherwise emit the system ANSI console codepage (e.g. GBK on zh-CN
+/// Windows) and would render as mojibake in xterm. Returns `None` for shells
+/// that are already UTF-8 (pwsh 7, bash, zsh, …) so we don't clutter them.
+///
+/// Detection is by the executable's file stem, so it works for both bare
+/// names (`powershell`) and full paths (`C:\...\powershell.exe`).
+fn shell_utf8_prelude(shell_path: &str) -> Option<Vec<u8>> {
+    let stem = Path::new(shell_path)
+        .file_stem()?
+        .to_string_lossy()
+        .to_lowercase();
+    match stem.as_str() {
+        // `@` suppresses echo of the line; `>nul` suppresses the codepage
+        // report. All subsequent command output is then UTF-8.
+        "cmd" => Some(b"@chcp 65001>nul\r".to_vec()),
+        // Windows PowerShell 5.1: force the console I/O encoding to UTF-8 and
+        // switch the codepage. pwsh (7) is already UTF-8 and is handled by the
+        // `_` arm below.
+        "powershell" => Some(
+            // concat! joins the pieces at compile time (adjacent b"..." byte
+            // strings do NOT auto-concatenate in Rust, unlike "..." str lit).
+            concat!(
+                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;",
+                "[Console]::InputEncoding=[System.Text.Encoding]::UTF8;",
+                "chcp 65001 > $null\r",
+            )
+            .as_bytes()
+            .to_vec(),
+        ),
+        _ => None,
+    }
+}
+
 pub async fn connect(
     state: State<'_, AppState>,
     window: WebviewWindow,
@@ -97,6 +132,14 @@ pub async fn connect(
             cmd.arg(arg);
         }
     }
+    // Advertise a capable terminal so prompt engines (Oh My Posh / Starship)
+    // and color-aware tools render their full styling. The GUI process
+    // inherits no TERM, which can make them dumb-down to a plain prompt or
+    // drop colors. env() only overrides these keys — the rest of the parent
+    // environment (PATH, profile, etc.) is still inherited below.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERM_PROGRAM", "MyShell");
     // Inherit the parent environment so PATH / user profile resolve like a
     // shell the user opened themselves.
     let child = pair
@@ -154,6 +197,11 @@ pub async fn connect(
     // ---- Writer task (owns master + writer + child) ----
     let writer_sid = sid.clone();
     let init_command = config.init_command.clone();
+    // Per-shell UTF-8 setup (cmd / Windows PowerShell 5.1) fed as the very
+    // first input so those shells emit UTF-8 instead of the system ANSI
+    // codepage (GBK on zh-CN) which renders as mojibake in xterm. None for
+    // pwsh / *nix shells that are already UTF-8.
+    let utf8_prelude = shell_utf8_prelude(&shell_path);
     let master = pair.master;
     async_runtime::spawn(async move {
         let mut writer = match master.take_writer() {
@@ -165,6 +213,16 @@ pub async fn connect(
         };
         let mut command_rx = command_rx;
         let mut child = child;
+
+        // Force UTF-8 for shells that otherwise emit the system ANSI codepage.
+        // Sent before the user's init command so any output that follows is
+        // already UTF-8.
+        if let Some(prelude) = utf8_prelude.as_ref() {
+            if let Err(e) = writer.write_all(prelude) {
+                eprintln!("[local:{}] utf8 prelude write failed: {}", writer_sid, e);
+            }
+            let _ = writer.flush();
+        }
 
         // Inject the optional init command (e.g. "claude") right after the
         // writer is ready. The PTY stdin buffers it until the shell finishes

@@ -360,3 +360,243 @@
   - 限制：当前把整条 `init_command` 当**单行**命令注入（trim + `\r`）；多行命令暂不支持，后续可按 `\n` 拆分依次注入
 - **版本号：** `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `Cargo.lock`(myshell 条目) 四处 1.1.0 → 1.2.2；`backup.rs::APP_VERSION` 经 `env!("CARGO_PKG_VERSION")` 自动跟随 Cargo.toml，无需手改
 - **验证：** `npx tsc --noEmit` PASS；Rust 待 `cargo build`（含 portable-pty 编译验证）
+
+## 会话：2026-06-18 — 安装器数据删除安全 / 本地终端渲染与编码修复
+
+### 阶段 11：安装器「删除应用数据」二次确认 + 危险提示 + 直白文案
+- **状态：** complete（配置与脚本就位；本机无 rustup，未跑 `cargo tauri build` 实际打包验证）
+- **问题：** NSIS 卸载/更新流程勾选「删除应用程序数据」（`deleteAppData`）会递归删 `$APPDATA\<bundle>` + `$LOCALAPPDATA\<bundle>` = 整个 `connections.db`（全部连接 / 明文密码 / 命令历史 / 快捷命令 / 密钥库，不可恢复），但只是一个无警告的复选框 + 模糊文案，极易误删
+- **方案（不 fork 900 行模板，用官方机制）：**
+  - **二次确认**：`installerHooks` 注入 `NSIS_HOOK_PREUNINSTALL` 宏 —— 在 `Section Uninstall` 开头（删数据之前、`$UpdateMode`/`$DeleteAppDataCheckboxState` 已就绪时）拦截：仅当勾选且非自动更新模式弹 `MessageBox MB_YESNO|MB_ICONEXCLAMATION|MB_DEFBUTTON2`（默认「否」、`/SD IDNO`），点「否」则置 `$DeleteAppDataCheckboxState=0` 取消删除
+  - **文案直白**：`customLanguageFiles`（合并语义，仅覆盖 `deleteAppData` 一条）把「删除应用程序数据」→「删除全部应用数据（连接/密码/历史/密钥库，不可恢复）」
+- **修改明细：**
+  - `src-tauri/nsis/uninstall-confirm-hook.nsh`（新建，UTF-8 BOM）— `NSIS_HOOK_PREUNINSTALL` 宏 + 双语危险提示
+  - `src-tauri/nsis/lang/SimpChinese.nsh`（新建，BOM）/ `English.nsh`（新建）— `deleteAppData` 覆盖
+  - `src-tauri/tauri.conf.json` — `bundle.windows.nsis` 加 `installerHooks` + `customLanguageFiles`
+- **验证：** JSON 解析通过；NSIS 钩子语法/BOM/反斜杠续行逐项核对；实机验证待 `cargo tauri build` 后覆盖安装→卸载页勾选→应见警告框默认「否」
+- **机制确认：** `NSIS_HOOK_PREUNINSTALL` 由模板 `Section Uninstall` 顶部 `!insertmacro`（本地生成 installer.nsi L747-748 实证）；`customLanguageFiles` 为 Rust 层按键名合并（NSIS 不允许同名 LangString 重复，故必为合并而非 include 叠加，仅需写覆盖项）—— 依据 Tauri v2 官方文档 + 配置参考
+
+### 阶段 12：本地终端渲染与编码修复（字体 / TERM 环境 / 字体可配置 / UTF-8 硬化）
+- **状态：** 前端 complete（`npx tsc --noEmit` PASS）；后端代码 complete 未编译（无 rustup）
+- **问题：** 本地终端（`conn_type='local'`）从 MyShell 打开时「字体样式乱码」——① xterm `fontFamily` 只列基础字体（Cascadia Code/Fira Code…），无 Nerd Font，提示符 powerline/图标字形（Oh My Posh 等）渲染成豆腐块；② `local.rs` spawn 继承父进程环境无 `TERM`/`COLORTERM`，提示符引擎可能降级；③ cmd / Windows PowerShell 5.1 在 zh-CN 吐 GBK → 中文乱码（阶段10 遗留）
+- **方案：**
+  - **字体**：xterm 字体栈改为 Nerd Font 优先（CaskaydiaCove/Cascadia Code NF/MesloLGM/JetBrainsMono/FiraCode/Hack Nerd Font）+ 基础字体回退
+  - **环境**：`CommandBuilder::env` 声明 `TERM=xterm-256color` / `COLORTERM=truecolor` / `TERM_PROGRAM=MyShell`（portable-pty `env()` 为加性覆盖，PATH/profile 照常继承 —— 已查文档确认）
+  - **字体可配置**：新增 localStorage 设置（沿用主题/配色同一套持久化模式）—— 用户填入本机已装字体名即生效（无需内置字体，要用 Nerd Font 的用户必然已自装）
+  - **UTF-8 硬化**：`local.rs` 启动时按 shell 名注入 UTF-8 前导（写在 init_command 之前）—— cmd：`@chcp 65001>nul`；PowerShell 5.1：`[Console]::{Output,Input}Encoding=[Text.Encoding]::UTF8; chcp 65001 > $null`；pwsh / bash / zsh / wsl 不处理（本就 UTF-8）
+- **修改明细：**
+  - `src/components/TerminalPanel.tsx` — 字体栈移至共享常量；`useTerminalFont` 取字体；新增 `useEffect` 热更新 `term.options.fontFamily`（已开终端免重开）
+  - `src/themes.ts` — 加 `STORAGE_KEY_TERMINAL_FONT` + `TERMINAL_FONT_DEFAULT_STACK`
+  - `src/hooks/useTerminalFont.ts`（新建）— localStorage 读/写 + 解析 `fontFamily`（选中字体 + 默认回退栈）
+  - `src/components/SettingsPanel.tsx` — 新增「终端字体」Section（Input + 常见 Nerd Font 提示）
+  - `src-tauri/src/local.rs` — `use std::path::Path`；新增 `shell_utf8_prelude()`（按 file_stem 匹配，裸名/全路径皆认）；`connect` 计算 prelude 并 move 进 writer 任务，`take_writer` 后先于 init_command 写入
+- **验证：** `npx tsc --noEmit` PASS；Rust 待 `cargo tauri dev`（设置面板改字体→已开/新开终端字形即出；本地连 cmd/powershell.exe 中文不再乱码）
+- **遗留 / 提醒：** PowerShell 5.1 启动会回显一行编码命令（交互式 PS 无法干净抑制，可接受）；首帧提示符（profile 用旧编码绘制）可能略瑕疵，注入后全部 UTF-8
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 11/12 complete（前端 tsc 绿，Rust 未编译）；已按新规同步更新 progress.md + README.md |
+| 我要去哪里？ | 用户 `cargo tauri build` 验证安装器二次确认 + `cargo tauri dev` 验证字体/编码 |
+| 目标是什么？ | 卸载数据删除防误删；本地终端字体/编码与真终端一致 |
+| 我学到了什么？ | Tauri NSIS 钩子（`NSIS_HOOK_PREUNINSTALL`）+ `customLanguageFiles`（合并语义）能在不 fork 模板的前提下改卸载行为与文案；portable-pty `CommandBuilder::env` 加性覆盖（镜像 std `Command`）；本地终端乱码是「字体缺 Nerd Font 私有区字形 + 缺 TERM 环境 + 非 UTF-8 shell」三因叠加 |
+| 我做了什么？ | 阶段 11：卸载钩子 + 语言串覆盖 + tauri.conf 接线；阶段 12：Nerd Font 默认栈 + TERM/COLORTERM + 字体可配置（hook/设置面板/热更新）+ cmd/PS5.1 UTF-8 前导 |
+
+### 阶段 13：终端字体——系统字体下拉选择 + 按连接单独覆盖（2026-06-18）
+- **状态：** 前端 complete（`npx tsc --noEmit` PASS）；后端代码 complete 未编译（无 rustup，font-kit 首次拉取 + DB 迁移待 `cargo build` 验证）
+- **需求（用户反馈）：** ① 字体设置不该手输，应查询系统可用字体做下拉选择；② 不同连接可能需要不同字体（可访问性/常盯的生产机更大字号/仅某些连接用 Nerd Font），希望按终端单独设字体
+- **决策（与用户确认两个分叉）：** 字体枚举用 **font-kit 后端真实枚举**（最贴合"查询系统字体"，跨平台；代价是新增 1 个依赖）；按连接覆盖存 **数据库列**（随连接走，导出/导入备份一起带走，沿用 shell_path/init_command 同款幂等迁移）
+- **设计：** 复用 `FontField` 组件（input + 原生 `<datalist>`，模块级缓存共享一次 fetch，失败降级为纯手输）；全局设置 + 按连接覆盖都用它；TerminalPanel 解析 `override ?? global` 热更新
+- **修改明细：**
+  - `src-tauri/Cargo.toml` — 加 `font-kit = "0.14"`
+  - `src-tauri/src/fonts.rs`（新建）— `list_system_fonts` 命令：`SystemSource::new().all_families()` → 排序去重，失败返空
+  - `src-tauri/src/db.rs` — `connections` 加 `terminal_font TEXT` 列 + 幂等迁移 + `get_all`/`get`/`save` 三处 SQL（SELECT 末尾追加 index 20、tuple、struct、INSERT 列/VALUES/params）
+  - `src-tauri/src/main.rs` — `ConnectionConfig` 加 `terminal_font: Option<String>`（`#[serde(default)]`）；`mod fonts`；`generate_handler!` 注册 `list_system_fonts`
+  - `src/api.ts` — `ConnectionConfig.terminal_font?` + `listSystemFonts()` wrapper
+  - `src/hooks/useTerminalFont.ts` — 抽出导出 `resolveFontStack(primary?)`（选中字体优先 + 默认回退栈），hook 与按连接覆盖共用
+  - `src/components/FontField.tsx`（新建）— input + datalist，`useId` 防多实例 id 冲突，模块级 fetch 缓存
+  - `src/components/SettingsPanel.tsx` — 全局字体 `Input` → `FontField`
+  - `src/components/ConnectionDialog.tsx` — `terminalFont` state；ssh+local 显示「终端」FieldGroup（FontField，留空=全局）；`handleSave` 两分支（local / ssh·sftp·ftp）都写 `terminal_font`
+  - `src/components/TerminalPanel.tsx` — `fontOverride?` prop；`fontFamily = fontOverride ? resolveFontStack(fontOverride) : globalFontFamily`；既有 live-update effect 自动覆盖
+  - `src/App.tsx` — 两处 `<TerminalPanel>` 传 `fontOverride={connections.find(...)?.terminal_font}`
+- **验证：** `npx tsc --noEmit` PASS；Rust 待 `cargo tauri dev`（font-kit 首次编译 + 验证枚举返回 + DB 迁移 + 字体覆盖生效）
+- **遗留 / 风险：** font-kit 为新依赖（Windows 用 DirectWrite 枚举，构建应可靠，但本机无法预编译验证；若 build 报错最可能在此依赖）；DB get_all/get/save 的列索引改动需 `cargo build` 确认无 off-by-one
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 13 前端 complete（tsc 绿）；后端 font-kit + DB 迁移未编译 |
+| 我要去哪里？ | 用户 `cargo tauri dev` 验证：设置/连接对话框字体下拉列出系统字体；按连接设字体后该 tab 生效 |
+| 目标是什么？ | 字体从系统字体选择（非手输）；支持按连接单独覆盖字体 |
+| 我学到了什么？ | Tauri NSIS 之外又一个"前端要的能力在后端枚举再走 IPC"模式（字体枚举用 font-kit，前端零权限弹窗）；DB 加列要同步改 SELECT/row.get index/tuple 解构/struct/INSERT 五处，SELECT 末尾追加新列可保持既有 index 不动（created_at 仍 19，新列 20）降低 off-by-one 风险；xterm fontFamily 可 live mutation，按连接覆盖复用同一 effect |
+| 我做了什么？ | 阶段 13：font-kit 枚举命令 + DB terminal_font 列/迁移 + 类型双端 + FontField 组件 + 设置/连接对话框接入 + TerminalPanel override 解析 + App 透传 |
+
+### 阶段 14：对话框「点击遮罩即关闭」误触修复（2026-06-18）
+- **状态：** 前端 complete（`npx tsc --noEmit` PASS）
+- **问题（用户反馈）：** 设置 / 快捷命令界面与新建连接界面存在同一个毛病——点到操作框（对话框内容）外的遮罩区域，界面直接退出。设置/快捷命令这类长表单误触代价高（已填内容全丢）。新建连接（`ConnectionDialog`）其实已无此问题（overlay 未挂 `onClick`），其余弹窗未对齐。
+- **根因：** 这些弹窗的遮罩层 `<div>` 上挂了 `onClick={onClose}`，内容容器再 `stopPropagation` 阻断——这是「点遮罩关闭」标准模式。长表单不适合，需统一为「只有关闭按钮 / 取消按钮关闭」。
+- **方案：** 移除所有遮罩层的 `onClick={onClose}`；点击遮罩不再关闭，必须走关闭按钮。内部 `stopPropagation` 一律保留（无副作用、防御性）；所有按钮的 `onClick` 不动。
+- **修改明细（5 处遮罩）：**
+  - `src/components/SettingsPanel.tsx` — 主面板 overlay（zIndex 2000）+ `Dialog` 子组件 overlay（zIndex 2100，自定义主题弹窗用）两处 `onClick={onClose}` 移除
+  - `src/components/QuickCommandsPanel.tsx` — 面板 overlay `onClick={onClose}` 移除
+  - `src/components/PassphraseDialog.tsx` — overlay `onClick={onClose}` 移除
+  - `src/components/PasswordVerifyDialog.tsx` — overlay `onClick={onClose}` 移除
+- **已核查不变更（无此问题或不适用）：**
+  - `ConnectionDialog.tsx` — overlay 本就无 `onClick`（正确参照样本）
+  - `MasterPasswordGate.tsx` — 启动主密码门，无 overlay `onClick`（不应轻易关闭）
+  - `App.tsx:653` — 仅是连接失败提示框的「关闭」按钮（非遮罩），保留
+  - `Sidebar.tsx:801` — 右键菜单遮罩，点空白关闭菜单是期望行为，不动
+- **验证：** `npx tsc --noEmit` PASS
+- **附：阶段 13 build 收尾** — `src-tauri/src/main.rs` `generate_handler!` 里 `list_system_fonts` 改为限定路径 `fonts::list_system_fonts`（命令定义在 `fonts.rs` 而非 main.rs，需模块限定）；`cargo check` 已绿，阶段 13 后端可编译
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 14 complete（对话框误触关闭修复，tsc 绿）；阶段 13 build 已收尾（cargo check 绿） |
+| 我要去哪里？ | 用户 `cargo tauri dev` 验证：打开设置 / 快捷命令 / 主密码 / 密码验证弹窗，点遮罩不再关闭，只能用关闭/取消按钮 |
+| 目标是什么？ | 所有对话框点操作框外不意外退出，行为与新建连接一致 |
+| 我学到了什么？ | 「overlay `onClick={onClose}` + content `stopPropagation`」是点遮罩关闭的标准模式，但长表单误触代价高应禁用；批量改时靠 `position:fixed;inset:0` 的遮罩区分「overlay 的 onClick」与「按钮的 onClick」，逐个用 zIndex 上下文唯一定位避免误删按钮 |
+| 我做了什么？ | 4 个组件共 5 处遮罩移除 `onClick={onClose}`；顺带修阶段 13 build 错误（`fonts::` 限定路径） |
+
+### 阶段 15：字体选择——模糊搜索下拉 + 样式统一（2026-06-18）
+- **状态：** 前端 complete（`npx tsc --noEmit` PASS）
+- **需求（用户反馈）：** ① 字体选择支持模糊搜索，通过下拉框选择；② 现在字体下拉框很丑，统一样式
+- **问题（原实现）：** `FontField` 用原生 `<datalist>`——① 浏览器默认下拉样式无法定制，与应用 Catppuccin 主题完全不搭（丑）；② 只做前缀/子串匹配，输入中间词无法过滤，谈不上「模糊搜索」
+- **方案：** 重写为自定义 combobox（props 签名 `value/onChange/placeholder` 不变，`SettingsPanel` / `ConnectionDialog` 调用处零改动）
+  - **模糊匹配**：查询按空格分词，每个 token（大小写不敏感）都需出现在字体名中、顺序无关 → `nerd mono` 命中 `JetBrainsMono Nerd Font Mono`
+  - **`value` / `query` 分离**：过滤用独立 `query`，已选字体重新聚焦仍显示完整列表，不会被自身值过滤掉；选中 / 外部清空时重置 `query`
+  - **匹配片段高亮**：结果中把命中 token 加粗 + 加深色，模糊命中一目了然
+  - **统一样式**：输入框复用项目输入框样式 + focus 蓝环（`--accent-primary` + `0 0 0 3px --accent-primary-muted`）；下拉面板用 `--bg-elevated` / `--border-emphasis` / `--shadow-xl` / `--radius-md`，选项高亮用 `--accent-primary-muted` + `--accent-primary`，与 TypeSelector / 按钮选中态一致；右侧加 `▾` 提示可下拉
+  - **交互**：键盘 `↑↓` 移动高亮、`Enter` 选中、`Esc` 关闭；hover 同步高亮；点击选中。选项 `onMouseDown preventDefault` 防止 input blur 先关掉下拉
+  - **性能**：`MAX_RESULTS = 200` + 超量截断提示；字体列表模块级缓存（沿用）
+  - 加载中 / 无匹配 空状态提示，自由文本输入仍可用（系统字体枚举可能不全）
+- **修改明细：**
+  - `src/components/FontField.tsx` — 整体重写（datalist → combobox + `renderHighlighted` 片段高亮工具）
+- **验证：** `npx tsc --noEmit` PASS；待 `cargo tauri dev` 实测：设置 / 连接对话框字体输入触发模糊过滤、下拉主题一致、键盘可导航、匹配字加粗
+- **遗留 / 限制：** 下拉用 `relative + absolute`，位于设置面板 / 连接对话框的 `overflowY: auto` 内容区内；字体字段贴近可视区底部时下拉可能被裁剪（内容区可滚动看到）。两处实际使用位置（设置中段、连接对话框表单上部）空间充足，暂不引入 portal/fixed 定位；若反馈裁剪再升级
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 15 complete（字体 combobox，tsc 绿） |
+| 我要去哪里？ | 用户 `cargo tauri dev` 验证：设置 / 连接对话框字体框输入即模糊过滤、下拉样式统一、键盘 ↑↓/Enter/Esc 可用 |
+| 目标是什么？ | 字体模糊搜索 + 下拉选择 + 与应用统一的下拉样式 |
+| 我学到了什么？ | 原生 `<datalist>` 不可定制样式且只前缀匹配；combobox 必须 `value`/`query` 分离，否则已选字体聚焦时会被自身值过滤成只剩自己；选项点击用 `onMouseDown preventDefault` 阻止 input 先 blur 关下拉，是 combobox 经典坑 |
+| 我做了什么？ | `FontField` 重写：模糊匹配（多 token 任意顺序）+ value/query 分离 + 匹配片段高亮 + 主题化下拉 + 键盘/hover/点击交互 + 截断与空状态 |
+
+### 阶段 16：本地连接「以管理员运行」（整体提权方案）（2026-06-18）
+- **状态：** 前端 complete（`npx tsc --noEmit` PASS）；后端 complete（`cargo check` PASS，winapi 新增 features 编译通过）
+- **需求（用户）：** 本地的连接是否可以支持管理员运行？
+- **技术调研（为何不单连接提权）：** 本地 shell 经 `portable-pty` 的 `openpty()` + `spawn_command()` 启动，继承 MyShell 完整性级别（IL）。单连接提权的硬约束：① `portable-pty`/`CommandBuilder` 走 `CreateProcessW`，无提权选项；② 标准提权 `ShellExecute("runas")` 无法挂 ConPTY（ConPTY 要先 `CreatePseudoConsole` 再用带 `hPC` 的 `STARTUPINFOEX`）；③ medium-IL 进程无法把 ConPTY attach 到 high-IL shell（完整性级别隔离）。结论：要让 elevated shell 跑进我们的 ConPTY，**ConPTY 必须在已提权进程内创建**——即单连接提权需另起 elevated helper 进程 + 跨完整性级别命名管道 IPC 转发，工程量大、每次弹 UAC、维护重；连 Windows Terminal 都只开独立 elevated 窗口而非单进程混跑 IL。
+- **决策（用户选定方案 A · 整体提权）：** 以管理员身份重启 MyShell，提权后所有本地连接自动获得管理员权限。最小代价覆盖"偶尔要管理员跑命令"的真实需求。
+- **方案：**
+  - 新增 `elevation.rs`：
+    - `is_elevated()` — Windows：`OpenProcessToken` + `GetTokenInformation(TokenElevation)`；非 Windows：`geteuid()==0`（extern C 声明，免 libc 依赖）
+    - `restart_as_admin()` — Windows：`ShellExecuteW(verb="runas")` 触发 UAC，返回 HINSTANCE ≤ 32 为错误（1223=ERROR_CANCELLED 用户取消）；非 Windows：stub 返回"暂不支持"
+  - `main.rs`：`is_elevated` / `restart_as_admin` 两个 `#[tauri::command]`；后者成功后 `app.exit(0)` 触发 `ExitRequested` → `drain_all_sessions` 优雅排空再退出，elevated 新实例由系统在 UAC 后独立启动
+  - 前端：`api.ts` 加 `isElevated()` / `restartAsAdmin()`；`SettingsPanel` 新增「🛡️ 管理员权限」Section（状态 chip：检测中 / ✓ 已是管理员 / 当前普通用户 + 未提权时「以管理员重启」按钮 + 警告条）；`ConnectionDialog` 本地 shell 提示加引导语
+  - 依赖：winapi 升为 Windows-only 直接依赖（features：`processthreadsapi`/`securitybaseapi`/`winnt`/`handleapi`/`shellapi`/`winuser`）——原为 portable-pty 间接依赖，声明直接依赖以便手写 elevation FFI
+- **修改明细：**
+  - `src-tauri/src/elevation.rs`（新建）
+  - `src-tauri/Cargo.toml` — `[target.'cfg(windows)'.dependencies] winapi = { ..., features=[...] }`
+  - `src-tauri/src/main.rs` — `mod elevation` + 2 命令 + `generate_handler!` 注册
+  - `src/api.ts` — `isElevated` / `restartAsAdmin`
+  - `src/components/SettingsPanel.tsx` — import `confirm`/`isElevated`/`restartAsAdmin`；`elevated`/`restartBusy` state + 加载 effect；`handleRestartAdmin`（`confirm` 二次确认 → `restartAsAdmin`，取消 UAC 静默、其他错误 alert）；管理员权限 Section
+  - `src/components/ConnectionDialog.tsx` — 本地 shell 说明追加管理员引导
+- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS（winapi features 齐全，`myshell` 编译通过）
+- **遗留 / 限制：**
+  - 粒度为全局：重启后所有连接提权，非单连接；重启丢失当前 tab（已在警告条 + 二次确认说明）
+  - 每次重启弹一次 UAC
+  - 非 Windows：`restart_as_admin` 为 stub，前端按钮在非 root 时仍可见但点击报"当前平台暂不支持"（项目 Windows 优先，未做平台级隐藏）；如需可在前端按 `navigator.platform` 隐藏
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 16 complete（管理员重启；前端 tsc 绿 + 后端 cargo check 绿） |
+| 我要去哪里？ | 用户 `cargo tauri dev` → 设置面板看「管理员权限」状态 → 未提权点「以管理员重启」→ UAC「是」→ 新实例管理员运行 → 开本地连接执行需管理员命令 |
+| 目标是什么？ | 本地连接支持以管理员身份运行 shell（整体提权方案） |
+| 我学到了什么？ | ConPTY + UAC 完整性级别隔离使单连接提权必须 elevated helper + 跨 IL IPC（Windows Terminal 也只开独立 elevated 窗口）→ 整体提权性价比最高；`ShellExecuteW("runas")` 返回 HINSTANCE≤32 为错（1223=用户取消）；winapi 直接依赖需按用到的 API 精确列 features |
+| 我做了什么？ | `elevation.rs`（is_elevated + restart_as_admin）+ winapi Windows-only 依赖 + main.rs 两命令（重启后 app.exit 触发 drain）+ api.ts + SettingsPanel 管理员 Section + ConnectionDialog 引导 |
+
+### 阶段 17：v1.3.3 综合优化（历史过滤 / 保存按钮悬浮 / 版本号单一源 / 图标重生成）（2026-06-18）
+- **状态：** 前端 complete（tsc PASS）；后端 complete（cargo check PASS，`myshell v1.3.3`）；图标全套重生成（tauri icon from source-a.svg）
+- **四项改动：**
+  1. **历史命令废命令过滤**：用户反馈历史里有 "A"、"AD" 这类误触单/双字母无效命令。在 `add_command_history` 边界（main.rs，覆盖 TerminalPanel + CommandBar 两个调用入口）加 `is_junk_command`：trim 后仅由 a/d 字符组成（大小写不敏感）→ 返回 Ok(0) 不入库。⚠️ 此规则也匹配 `dd`（Linux 常用），已向用户提示，如需可加白名单
+  2. **新建连接保存按钮悬浮**：ConnectionDialog 底部「取消/保存」footer 加 `position: sticky; bottom: 0`（卡片是 overflowY auto 滚动容器），长表单不用滚到底也能点保存
+  3. **版本号单一源**：`Cargo.toml [package] version` 为唯一手动源；`tauri.conf.json` 删除 version 字段（Tauri v2 自动读 Cargo.toml）；新增 `scripts/sync-version.mjs` 在 `npm run build`（tauri build 的 beforeBuildCommand）前自动把 version 同步到 package.json + package-lock.json，亦可 `npm run version:sync` 手动。以后升版只改 Cargo.toml 一处
+  4. **打包图标重生成**：用户上传的图标即当前 Aurora Prompt（source-a.svg 渲染）。用矢量源 `source-a.svg`（1024 viewBox）跑 `npx tauri icon` 重新生成全套——icon.ico（exe）、icon.icns（mac）、各尺寸 PNG、Square*Logo/StoreLogo（NSIS 安装器）、iOS/Android，确保全套高清一致
+- **版本号：** 1.2.2 → 1.3.3（Cargo.toml / package.json / package-lock；tauri.conf.json 无 version，由 Cargo.toml 驱动）
+- **修改明细：**
+  - `src-tauri/src/main.rs` — `add_command_history` 改用 trimmed + `is_junk_command` 过滤；新增 `is_junk_command` 函数
+  - `src/components/ConnectionDialog.tsx` — footer 加 sticky bottom / flexShrink / zIndex
+  - `src-tauri/Cargo.toml` / `package.json` / `package-lock.json` — version → 1.3.3
+  - `src-tauri/tauri.conf.json` — 删除 version 字段
+  - `scripts/sync-version.mjs`（新建）— Cargo.toml → package.json/lock 同步脚本
+  - `package.json` scripts — build 前置 sync-version，新增 version:sync
+  - `src-tauri/icons/*` — tauri icon 从 source-a.svg 重新生成全套
+- **验证：** tsc PASS；cargo check PASS（v1.3.3）；sync-version.mjs 运行 OK（"already at 1.3.3"）；tauri icon 全套生成 OK（icon.ico/icns/png/Square*Logo/iOS/Android 均 11:21 更新）
+- **遗留 / 提醒：** ① 历史过滤 dd 风险（见上，待用户确认是否加白名单）；② tauri.conf.json 删 version 依赖 Tauri v2 自动读 Cargo.toml（官方行为，待 `tauri build` 实测 version 显示）；③ 看新 exe 图标需重新 `cargo tauri build`，Windows 可能要清图标缓存
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 17 complete（v1.3.3 四项优化，tsc + cargo check 绿，图标重生成） |
+| 我要去哪里？ | 用户 `cargo tauri build` 验证：版本 1.3.3、exe 图标、安装器；`cargo tauri dev` 验证历史命令过滤 + 保存按钮悬浮 |
+| 目标是什么？ | 过滤历史废命令；保存按钮常驻；版本号只改一处；打包图标统一高清 |
+| 我学到了什么？ | Tauri v2 `tauri.conf.json` 的 version 可省略、自动读 Cargo.toml（单一源关键）；`npx tauri icon` 接受 SVG 矢量源生成全平台图标（输出默认在 tauri.conf.json 旁的 icons/）；`position: sticky; bottom: 0` 在 overflowY auto 容器内让 footer 常驻且不脱离流（无遮挡）；历史过滤放在系统边界（命令层）可覆盖所有调用入口 |
+| 我做了什么？ | main.rs 历史过滤 + ConnectionDialog footer sticky + 版本号单一源（Cargo.toml 唯一 / tauri.conf.json 删 / sync 脚本）+ tauri icon 全套重生成 + 版本号 1.3.3 |
+
+### 阶段 17 补：NSIS 打包 BOM 修复（2026-06-18）
+- **现象：** `cargo tauri build` 在 NSIS 阶段失败：`Invalid command: "﻿;"` → `!include: error in script: SimpChinese.nsh on line 1` → `aborting creation process`。
+- **根因：** `src-tauri/nsis/lang/SimpChinese.nsh` 与 `src-tauri/nsis/uninstall-confirm-hook.nsh` 文件头带 **UTF-8 BOM（U+FEFF）**，NSIS 不认 BOM，把 BOM 当命令解析。`English.nsh` 无 BOM 故正常。潜伏问题——之前各阶段只跑 cargo check / dev，未跑完整 NSIS 打包，未暴露。
+- **修复：** 去掉这两个 `.nsh` 的 BOM（保留 UTF-8 内容；NSIS Unicode 模式按 UTF-8 读中文）。
+- **验证：** 重新 `npm run tauri:build` 成功，生成 `MyShell_1.3.3_x64-setup.exe`；文件名 1.3.3 证明 tauri.conf.json 删 version 后 Tauri 正确取自 Cargo.toml（单一源方案生效）。
+- **教训：** NSIS 的 `.nsh`（customLanguageFiles / installerHooks）必须 **无 BOM**；以后新增/编辑 .nsh 注意编辑器别存 BOM。
+
+### 阶段 18：打包警告清理 + 本地 PowerShell 透明背景渲染修复（2026-06-18）
+- **状态：** 前端 complete（tsc PASS）；打包验证通过（MyShell_1.3.3_x64-setup.exe，两 warning 消失）
+- **三项改动：**
+  1. **bundle identifier**：`com.myshell.app` → `com.myshell.client`（消除 Tauri "ends with `.app`" macOS 冲突警告）。副作用：新 identifier = 新 app 标识；DB/连接/密码/历史不变（存 `dirs/myshell`，不依赖 identifier）；WebView2 localStorage（主题/字体）可能重置；旧版（com.myshell.app）需手动卸载
+  2. **api.ts 动态导入**：App.tsx `await import("./api")` 改为静态 `import { deleteConnection }`（消除 vite "dynamically imported but also statically imported" 警告，bundle 635→632KB）
+  3. **本地 PowerShell 输入字母乱跳 + 影响背景**：根因——终端设背景图时 `allowTransparency: true`，xterm 默认 **canvas renderer 在透明模式下重绘不清除旧像素** → 输入字符残影叠加（"乱跳"）+ 残影糊在背景图上（"影响背景"），本地 ConPTY 输出更易触发。修复：加 `@xterm/addon-webgl`，启用 **WebGL renderer**（每帧完整重绘，透明合成干净无残影），失败 fallback canvas
+- **修改明细：**
+  - `src-tauri/tauri.conf.json` — identifier → `com.myshell.client`
+  - `src/App.tsx` — deleteConnection 改静态 import；onDelete 去掉 `await import`
+  - `package.json` — 加 `@xterm/addon-webgl@^0.18`
+  - `src/components/TerminalPanel.tsx` — import WebglAddon；`term.open` 后 `loadAddon(new WebglAddon())`（try/catch fallback）
+- **验证：** tsc PASS；`npm run tauri:build` 成功，两 warning 消失；WebGL 待 dev/build 实测乱跳是否消除
+- **遗留：** ① 图标问题待澄清——用户反馈 setup.exe 图标"仍是旧的"，但 `source-a.svg` 本就是当前 chevron，重新生成同款无变化，需用户确认期望的图标设计或排查 Windows 图标缓存；② PowerShell 乱跳修复待用户实测确认（若 WebGL 不解决再排查 cols/ConPTY 时序）
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 18 complete（identifier + vite 警告清理已验证；PowerShell WebGL 修复待实测） |
+| 我要去哪里？ | 用户 `cargo tauri dev` 实测本地 PowerShell 输入不再乱跳/糊背景；确认 setup.exe 图标问题（缓存 or 需换源） |
+| 目标是什么？ | 消除两个打包 warning；修复本地 PowerShell 透明背景渲染；澄清图标 |
+| 我学到了什么？ | xterm `allowTransparency` + 默认 canvas renderer 透明模式重绘不清像素（残影），透明背景应用 WebGL renderer；Tauri identifier 不应以 `.app` 结尾（macOS 冲突）；改 identifier 不影响 dirs/myshell 下的 DB，但 WebView2 localStorage 会重置；vite 静态+动态混用导入失去分块意义 |
+| 我做了什么？ | identifier 改 com.myshell.client + App.tsx 动态改静态 + TerminalPanel 加 WebGL renderer + @xterm/addon-webgl 依赖 |
+
+### 阶段 18 补：NSIS 安装包（setup.exe）图标修复（2026-06-18）
+- **现象：** 用户反馈 setup.exe（安装包）图标不是 chevron，但应用图标（myshell.exe）正常。
+- **根因：** 应用图标走 `bundle.icon`（icon.ico，正常）；但 **NSIS 安装器图标是独立的 `bundle.windows.nsis.installerIcon` 字段**，之前未配置 → Tauri 用内置默认安装器图标。installer.nsi 里 `MUI_ICON "${INSTALLERICON}"`，而 INSTALLERICON 未指向用户图标。
+- **修复：** `tauri.conf.json` 的 nsis 块加 `"installerIcon": "icons/icon.ico"`（source-a.svg 渲染的 chevron）。
+- **验证：** rebuild 后 installer.nsi:39 `!define INSTALLERICON "F:\...\src-tauri\icons\icon.ico"`，setup.exe（MyShell_1.3.3_x64-setup.exe）嵌入 chevron 图标。
+- **遗留：** 资源管理器若仍显示旧图标，是 Windows 图标缓存（setup.exe 同名缓存）——右键属性看真实图标，或清 `%localappdata%\IconCache.db` + 重启资源管理器。
+
+### 阶段 18 补 2：NSIS 定制整体回退到初始（2026-06-18）
+- **现象：** 用户反馈卸载页面空白、安装最终页有问题（阶段 11 的 NSIS 定制 + 阶段 18 补的 installerIcon 引起）。
+- **决策：** 用户要求把安装/卸载变更回退到初始状态。
+- **回退：**
+  - `tauri.conf.json` nsis 块恢复到 HEAD 初始 —— 移除 `installerIcon` / `installerHooks` / `customLanguageFiles`，仅保留 `installMode` / `languages` / `displayLanguageSelector`
+  - 删除 `src-tauri/nsis/` 目录（uninstall-confirm-hook.nsh + lang/SimpChinese.nsh + lang/English.nsh，均为阶段 11 新增的 untracked 文件）
+- **保留（非安装/卸载页面变更）：** 版本号单一源（Cargo.toml 驱动，tauri.conf.json 无 version 字段）、identifier `com.myshell.client`
+- **验证：** rebuild 成功，MyShell_1.3.3_x64-setup.exe 生成；installer.nsi 无 `customLanguageFile` / `uninstall-confirm` 引用（`NSIS_HOOK_*` 是 Tauri 默认模板的钩子检查点，宏未定义故跳过）→ 卸载页 / 安装最终页恢复 Tauri 默认（不再空白/错误）
+- **影响：** ① setup.exe 图标回到 Tauri 默认（installerIcon 已移除）；② 卸载不再有"删除应用数据"二次确认钩子；③ 语言串用 Tauri 默认（不再覆盖 deleteAppData 文案）
+- **后续（同日，installerIcon 单独加回）：** 应用户要求只恢复安装器图标 —— nsis 块加回 `"installerIcon": "icons/icon.ico"`（钩子 / 语言覆盖保持回退）。验证：rebuild 成功，installer.nsi `INSTALLERICON → icons/icon.ico`，`customLanguageFile | uninstall-confirm` 计数 = 0 → 安装器图标 = chevron，卸载页 / 安装页仍 Tauri 默认（不空白）
+
+### 阶段 18 补 3：WebGL 透明背景修复（背景图变黑）（2026-06-18）
+- **现象：** 阶段 18 加 WebGL renderer 后，用户反馈背景图变黑（看不到实际背景图）。
+- **根因：** 终端透明背景之前用 `theme.background = "transparent"` 字符串。canvas renderer 认这个 CSS 关键字（透明），但 **WebGL renderer 解析颜色失败**，clearColor 回退到不透明黑，盖住背景图层。
+- **修复：** 透明色改 `rgba(0, 0, 0, 0)`（alpha=0，WebGL 能正确解析）。两处：初始 Terminal 的 `theme` + live theme effect 的 `currentBg`。
+- **验证：** tsc PASS；待 build/dev 实测：WebGL 透明（背景图透出）+ 每帧重绘（无残影 / 乱跳）。
+- **教训：** xterm theme 色要用 WebGL / canvas 都能解析的格式（rgba / hex），别用 `"transparent"` 关键字——canvas 容忍、webgl 不认。

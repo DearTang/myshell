@@ -134,7 +134,6 @@ export function QuickCommandsPanel({
 
   return (
     <div
-      onClick={onClose}
       style={{
         position: "fixed",
         inset: 0,
