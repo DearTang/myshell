@@ -229,6 +229,16 @@ pub async fn connect(
         // starting up, then the shell reads + echoes + executes it. We use
         // CR (\r) to trigger execution — same as how a user's Enter key is
         // forwarded in onData.
+        //
+        // NOTE: sent immediately at startup (NOT deferred to the first
+        // resize). An earlier revision deferred it so a TUI like claude would
+        // read the real cols instead of the PTY's startup 80×24 — but that
+        // introduces a visible downside (the shell prompt flashes before the
+        // TUI takes over), and it turned out NOT to fix the originally-
+        // reported "shift left" (that's the ConPTY Chinese-IME upstream bug,
+        // see progress.md 阶段23 — not fixable here). Reverted per user call;
+        // the cols-layout benefit wasn't worth the prompt flash. Don't re-add
+        // the deferral without re-evaluating that trade-off.
         if let Some(init) = init_command
             .as_ref()
             .map(|s| s.trim())

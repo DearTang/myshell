@@ -70,6 +70,10 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
   const bridgeRef = useRef<ZmodemBridge | null>(null);
   const isZmodemRef = useRef(false);
   const abortTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Timers for the first-output cols re-sync (see onSshOutput below). Held in
+  // a ref so the [sessionId] cleanup can clear them if the panel tears down
+  // before the last delayed sync fires.
+  const firstSyncTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   // Command-history keystroke buffer. These refs are NOT React state —
   // we don't want every keystroke to trigger a re-render. The buffer is
   // flushed on Enter and the resulting command is sent to the backend.
@@ -140,16 +144,25 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
     term.loadAddon(webLinksAddon);
     term.open(containerRef.current);
 
-    // Use the WebGL renderer when available. The default canvas renderer does
-    // NOT clear cell pixels on redraw under allowTransparency, so with a
-    // background image set, input characters leave ghosting/smearing — they
-    // appear to "jump" and the background gets smeared (worst on the local
-    // ConPTY path). WebGL redraws every frame, so transparency composites
-    // cleanly. Falls back to canvas if WebGL isn't usable (old GPU/drivers).
-    try {
-      term.loadAddon(new WebglAddon());
-    } catch (e) {
-      console.warn("[TerminalPanel] WebGL renderer unavailable, using canvas:", e);
+    // Renderer choice depends on whether a background image is active:
+    //  • Background image set → WebGL renderer. It redraws every frame, which
+    //    is required for clean compositing under allowTransparency: the canvas
+    //    renderer leaves ghosts/smearing on transparent backgrounds (input
+    //    chars appear to "jump", worst on the local ConPTY path).
+    //  • No background image → canvas renderer (xterm default). On an opaque
+    //    terminal it has zero ghosting, AND it sidesteps the WebGL renderer's
+    //    known wrap-edge / glyph-atlas offset artifacts that can shift a
+    //    repainted wrapped line ("background shifts left"). Robustness over
+    //    FPS when we don't need transparency.
+    // Falls back to canvas if WebGL isn't usable (old GPU/drivers). Toggling
+    // the background-image setting after open needs a tab reopen to switch
+    // renderers (this runs once at mount).
+    if (hasBgImage) {
+      try {
+        term.loadAddon(new WebglAddon());
+      } catch (e) {
+        console.warn("[TerminalPanel] WebGL renderer unavailable, using canvas:", e);
+      }
     }
 
     // Block OSC 52 clipboard writes from the remote side. Without this,
@@ -259,20 +272,37 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
       term.write(data);
       if (!firstOutputHandled) {
         firstOutputHandled = true;
-        // The shell emitted its first frame — for local PowerShell this means
-        // PSReadLine is now initialized. The PTY started at 80x24 and the
-        // initial 100ms fit/resize may have landed BEFORE PSReadLine was ready,
-        // leaving it on a stale width → cursor jumps while editing. Refit +
-        // resize now so PSReadLine picks up the real cols. Harmless for SSH
-        // (bash already syncs via SIGWINCH).
-        setTimeout(() => {
+        // CRITICAL — push the real cols to the PTY AFTER the shell settles.
+        // The PTY starts at 80×24 (main.rs local_connect) and the shell
+        // (PSReadLine on pwsh, readline on bash) caches those cols. We MUST
+        // overwrite them with the real width once the shell is ready; miss
+        // the window and the backend stays at 80 while the frontend is e.g.
+        // 120. Input past col 80 then makes the backend wrap while the
+        // frontend doesn't, so PSReadLine repaints the edit line into the
+        // wrong cells — characters "jump out" / the background "shifts left",
+        // recovering only after Enter (a fresh prompt is a single line).
+        // This is the classic xterm↔PTY cols desync.
+        //
+        // The first output frame means the shell drew its prompt (PSReadLine
+        // is up), but its resize listener needs a beat to fully take over —
+        // and the mount-time 100ms fit/resize usually lands BEFORE PSReadLine
+        // initializes, so that one is lost. Re-fit + resize now AND on two
+        // increasing delays so a slow shell init can't strand us at 80 cols.
+        // (The community writeup that pinned this exact symptom used a 200ms
+        // delay; we cover 0/250/600ms for varying shell cold-start times.)
+        const syncRealCols = () => {
           try {
             fitAddon.fit();
           } catch {
-            /* container transitioning */
+            /* container mid-transition */
           }
           resizeTo(sessionIdRef.current, term.cols, term.rows).catch(() => {});
-        }, 0);
+        };
+        syncRealCols();
+        firstSyncTimersRef.current = [
+          setTimeout(syncRealCols, 250),
+          setTimeout(syncRealCols, 600),
+        ];
       }
     })
       .then((un) => {
@@ -351,6 +381,8 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
         clearTimeout(abortTimeoutRef.current);
         abortTimeoutRef.current = null;
       }
+      firstSyncTimersRef.current.forEach(clearTimeout);
+      firstSyncTimersRef.current = [];
       termRef.current = null;
       fitRef.current = null;
       bridgeRef.current = null;
@@ -382,10 +414,51 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
   // terminal without re-creating it. xterm.js re-rasterizes glyphs when
   // fontFamily changes, so the new font (and its Nerd Font glyphs) shows up
   // immediately on open tabs.
+  //
+  // CRITICAL — refit after the font change. xterm re-measures the cell width
+  // when fontFamily changes but does NOT recompute cols, so cols × cellWidth
+  // silently drifts from the container width. The terminal then keeps
+  // reporting stale cols to the PTY; pwsh's PSReadLine absolutely-positions
+  // the cursor on EVERY keystroke and repaints the whole input line against
+  // those stale cols — so glyphs land in the wrong cells. On the transparent
+  // background + background-image path those mis-drawn glyphs float over the
+  // wrong part of the image, which reads as "characters typed beside the
+  // background, pushing it left" (worst when input nears the right margin).
+  //
+  // The same drift bites the INITIAL fit: Nerd Font files load asynchronously,
+  // so the mount-time fit() (100ms) can measure against the fallback font and
+  // be wrong the instant the real font finishes loading. This effect runs on
+  // mount too (fontFamily's initial value), so waiting on document.fonts.ready
+  // covers both the first-paint race and later font switches.
   useEffect(() => {
     const term = termRef.current;
+    const fit = fitRef.current;
     if (!term) return;
     term.options.fontFamily = fontFamily;
+
+    const refit = () => {
+      if (!fit) return;
+      const container = containerRef.current;
+      // Same tiny-size guard as the ResizeObserver — don't fit against a
+      // collapsed container (tab hidden mid-transition) and poison cols.
+      if (!container || container.clientWidth < 80 || container.clientHeight < 40) return;
+      try {
+        fit.fit();
+      } catch {
+        return;
+      }
+      resizeTo(sessionIdRef.current, term.cols, term.rows).catch(() => {});
+    };
+
+    if (typeof document !== "undefined" && document.fonts?.ready) {
+      // document.fonts.ready resolves once all pending font loads settle; if
+      // the font is already loaded it resolves immediately. catch → refit
+      // anyway so a failed/never-resolving font load can't leave us on the
+      // fallback metrics forever.
+      document.fonts.ready.then(refit).catch(refit);
+    } else {
+      refit();
+    }
   }, [fontFamily]);
 
   // Active-tab transitions: refit on show (the last fit ran against a
@@ -492,10 +565,20 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
           }
         `}</style>
       )}
-      {/* xterm container — flex:1 so it takes all space above CommandBar */}
+      {/* xterm container — flex:1 so it takes all space above CommandBar.
+          padding lives HERE on the wrapper, NOT on the xterm container below.
+          See the comment on containerRef for why. The wrapper also takes the
+          terminal background so the 4px inset stays seamless (no gap to the
+          app chrome behind it) in the non-background-image case. */}
       <div
         className={hasBgImage ? "terminal-bg-transparent" : undefined}
-        style={{ flex: 1, minHeight: 0, position: "relative" }}
+        style={{
+          flex: 1,
+          minHeight: 0,
+          position: "relative",
+          padding: 4,
+          background: hasBgImage ? "transparent" : terminalTheme.background,
+        }}
       >
         {/* Background image layer — rendered behind the terminal when configured */}
         {hasBgImage && (
@@ -519,7 +602,19 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
             width: "100%",
             height: "100%",
             background: hasBgImage ? "transparent" : terminalTheme.background,
-            padding: 4,
+            // NO padding here — the 4px visual inset lives on the wrapper
+            // above. xterm's .xterm element fills this container's content
+            // box, and FitAddon reads getComputedStyle(thisContainer).width as
+            // the usable width. Under the global `* { box-sizing: border-box }`
+            // rule, padding on THIS div would be included in that width but
+            // excluded from .xterm's actual render area, so FitAddon over-
+            // counts cols by ~1 (8px / cellWidth). xterm then tells the PTY
+            // one more column than it can actually paint: the last column
+            // renders off-canvas and PSReadLine mis-positions the cursor on
+            // every keystroke, so the input line redraws with characters
+            // spilling out and the background shifted left ("字符跳出界面 /
+            // 背景左移", worst on the local PowerShell/ConPTY path). Keeping
+            // the inset on the wrapper leaves the column math exact.
             position: "relative",
             zIndex: 1,
           }}

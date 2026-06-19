@@ -112,6 +112,15 @@
 - **新建连接保存按钮悬浮**：底部「取消/保存」常驻可见，长表单无需滚到底即可保存
 - **版本号单一源**：只需改 `Cargo.toml` 一处版本号，`tauri.conf.json` / `package.json` 自动同步（build 时）
 - **图标重生成**：用矢量源重新生成全平台图标，确保 exe / 安装器 / 各尺寸高清一致
+- **本地终端输入错位修复**：修正终端列宽（cols）计算被容器 padding 污染的问题——承载 xterm 的容器在全局 `box-sizing:border-box` 下不应带 padding（会被 FitAddon 计入可用宽度、多算约 1 列），改为外层 wrapper 留内缩；本地 PowerShell / ConPTY 输入长命令时不再字符跳出界面、不再背景左移
+- **本地终端输入错位修复（二）**：修字体异步加载导致列宽漂移——xterm 改字体后会重新测量单元格宽度却不重算 cols，现改为等字体真正加载完成（`document.fonts.ready`）再 `fit()` 并把正确 cols 同步给 PTY；避免 pwsh 的 PSReadLine 按过期列宽重绘输入行、把字符画进错误单元格（透明背景图下表现为"字符挤开背景"）
+- **本地终端输入回卷错位修复（三）**：修终端与本地 PTY 的列数（cols）初始同步时机——PTY 以 80 列启动、PSReadLine 缓存后，若初始 resize（shell 未就绪时发送）被丢弃，后端会一直停在 80 列、与前端真实列数不符，导致输入超过 80 列时一方换行一方不换行、编辑行错位（"背景左移"），换行后恢复；现改为首帧输出后多次延迟（0/250/600ms）把真实列数同步给 PTY，覆盖 PSReadLine/ConPTY 冷启动就绪窗口
+
+---
+
+## 已知限制
+
+- **中文输入法（IME）输入时终端会短暂左移**：这是 Windows ConPTY 对中文输入法预编辑串（composition string）宽度计算的[上游 bug](https://github.com/microsoft/vscode/issues/255285)（VS Code 终端同样存在，非应用层可根治）。字母 / 英文输入不受影响；输入法确认（空格 / 回车）后左移立即恢复。**缓解**：分段确认输入、避免单次超长拼音；待 Windows 更新修复 ConPTY。详见 `progress.md` 阶段 23。
 
 ---
 

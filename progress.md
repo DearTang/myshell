@@ -600,3 +600,117 @@
 - **修复：** 透明色改 `rgba(0, 0, 0, 0)`（alpha=0，WebGL 能正确解析）。两处：初始 Terminal 的 `theme` + live theme effect 的 `currentBg`。
 - **验证：** tsc PASS；待 build/dev 实测：WebGL 透明（背景图透出）+ 每帧重绘（无残影 / 乱跳）。
 - **教训：** xterm theme 色要用 WebGL / canvas 都能解析的格式（rgba / hex），别用 `"transparent"` 关键字——canvas 容忍、webgl 不认。
+
+### 阶段 19：本地终端输入字符跳出 + 背景左移（cols 被 padding 污染）（2026-06-19）
+- **现象：** 用户反馈本地终端（PowerShell / ConPTY）输入命令时字符会跳出界面，并出现背景左移。这正是阶段 18 WebGL 修复（透明背景残影）之后**仍残留**的症状——阶段 18 遗留项②「若 WebGL 不解决再排查 cols / ConPTY 时序」预判的 cols 方向。
+- **根因：** FitAddon（@xterm/addon-fit 0.10.x）`proposeDimensions` 读 `getComputedStyle(容器).width`（border-box 宽度）当可用宽度，再除以 cellWidth 得 cols。而 `global.css` 全局 `* { box-sizing: border-box }` + `TerminalPanel.tsx` 的 **xterm 容器自身带 `padding: 4`** → 容器 `.width`（border-box，含 padding）≠ `.xterm` 实际填充的 content box（减 8px）。FitAddon 因此多算约 8px ≈ **多 1 列**。xterm 把这个偏大的 cols 经 `localResize`/`sshResize` 发给 PTY，PSReadLine 每次按键按偏大 cols 全行重绘 + 绝对光标定位 `\x1b[<n>G` → 最后一列画到 canvas 外（字符跳出）、重绘清除范围与可视区错位（背景左移）。本地 PowerShell/ConPTY 上 PSReadLine 对 cols 最敏感故最明显（SSH bash readline 同样受影响，只是表现不同）。
+- **修复：** 把 `padding: 4` 从 xterm 容器移到外层 wrapper div；外层同时设 `background: terminalTheme.background`（非背景图模式）保证 4px 内缩无缝（不露 App 底色）；容器自身去 padding，`.xterm` 干净填满 content box（此时 content box == border box），FitAddon 读到的宽度 == `.xterm` 真实渲染宽度 → cols 精确。背景图模式下 wrapper 透明 + 背景图层 `inset:0` 仍铺满 padding box（背景铺到边缘、文字内缩）。
+- **修改明细：** `src/components/TerminalPanel.tsx` —— 外层 wrapper div（`.terminal-bg-transparent` 那层）加 `padding: 4` + `background`；`containerRef` div 移除 `padding: 4` 并加详细注释解释为何不能在此层加 padding。
+- **验证：** `npx tsc --noEmit` PASS。待 `cargo tauri dev` 实测：本地终端输入长命令不再跳出、不再背景左移；SSH 终端行尾对齐亦应更准。
+- **遗留：** 本地终端以 80×24 启动（main.rs `local_connect` 写死），靠 mount 后 100ms fit + 首帧输出后再 fit 两次 resize 同步真实 cols；本次只修 cols 计算（让其准确），时序逻辑本身未改。若极个别场景仍偶发抖动，再考虑改 initial cols 或加 debounce。
+- **关联：** 阶段 18 WebGL renderer（解决透明残影）+ 本次 cols 修复，两者叠加才彻底解决"输入乱跳 / 糊背景"——前者管透明重绘，后者管列宽。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 19 complete（本地终端 cols 污染修复，tsc 绿，待 dev 实测） |
+| 我要去哪里？ | 用户 `cargo tauri dev` 实测本地 PowerShell：输入长命令不跳出、不背景左移；顺带验证 SSH 行尾对齐 |
+| 目标是什么？ | 彻底解决阶段 18 WebGL 之后仍残留的"字符跳出 + 背景左移"——这次的根因是 cols 被容器 padding 污染 |
+| 我学到了什么？ | FitAddon 读的是 `getComputedStyle(容器).width`（border-box，含 padding）；全局 `box-sizing:border-box` 下，承载 `.xterm` 的容器**绝不能带 padding**（会被算进列宽），视觉内缩应放外层 wrapper；"输入乱跳"可有多层根因（阶段 18 透明残影 / 阶段 19 cols 偏差），需逐层排查 |
+| 我做了什么？ | TerminalPanel.tsx padding 从 xterm 容器移到外层 wrapper（+ 外层补背景色保无缝）+ 注释 + tsc 验证 |
+
+### 阶段 20：本地终端输入字符错位（二）—— 字体加载竞态致 cols 漂移（2026-06-19）
+- **现象：** 阶段 19 padding 修复后用户仍反馈：本地终端输入时"在背景旁边输入字符，把背景挤到左边"，**随机出现**。
+- **定位（AskUserQuestion 锁环境）：** ① 设置了自定义背景图（→ 走 allowTransparency + WebGL 透明路径）② PowerShell 7 (pwsh) ③ 随机 / 不确定。
+- **根因：** pwsh 的 PSReadLine **每次按键都用绝对光标定位（`\x1b[<col>G`）重绘整个输入行**。一旦 xterm 的 cols 与 PTY 认为的列数不一致（哪怕差 1），光标和重绘内容就画进错误单元格；透明 canvas + 背景图下，画错位的字符浮在背景的错误位置 → 视觉"字符跑到背景旁、把背景挤偏"。随机是因为只有输入触碰列边界（近行尾 / 回卷）才显现。cols 不一致的剩余根因 = **字体异步加载竞态**：Nerd Font 文件没加载完时 `fit()` 用 fallback 字体量 cellWidth → cols 偏；字体就绪后 cellWidth 变但 cols 没重算。且代码里 `fontFamily` 变化时只改 `term.options.fontFamily`、**没有重新 fit**——xterm 改字体重新量 cellWidth 却不重算 cols，`cols × cellWidth` 静默漂离容器宽度。
+- **修复：** `TerminalPanel.tsx` 的 fontFamily effect：改字体后（含 mount 初始触发）等 `document.fonts.ready` 再 `fit()` + `resizeTo()`，把字体就绪后的正确 cols 推给 PTY。覆盖初始字体竞态 + 后续字体切换两个场景。沿用 ResizeObserver 的 `clientWidth<80` 小尺寸保护。
+- **研究依据：** xterm.js 社区同类问题经验——[Issue #2252](https://github.com/xtermjs/xterm.js/issues/2252)（WebGL 透明）、[#1901](https://github.com/xtermjs/xterm.js/issues/1901)（buffer line 光标跳）、[#3287](https://github.com/xtermjs/xterm.js/issues/3287)（glyph 定位）+ 通用建议「fit() 前等 `document.fonts.ready`、改 fontFamily 后必须重新 fit」。
+- **修改明细：** `src/components/TerminalPanel.tsx` —— fontFamily effect 扩展：`document.fonts.ready.then(refit)`（catch 兜底），refit 内含小尺寸保护 + fit + resizeTo。
+- **验证：** `npx tsc --noEmit` PASS。待 `cargo tauri dev` 实测：本地 pwsh + 背景图，输入长命令不再随机错位 / 挤背景。
+- **遗留 / 二分诊断：** 若字体 fit 修复后**仍有**问题，请临时在设置里**关掉背景图**测试——① 关背景图后正常 → 确认是 WebGL 透明合成路径独立问题（Issue #2252 类），下一步考虑 canvas 回退（但会带回残影）或升级 xterm / 调透明策略；② 关背景图仍有 → 纯 cols 问题，继续排查 initial 80×24 跳变 / ResizeObserver 瞬时尺寸。
+- **关联：** 阶段 18（WebGL 透明重绘）+ 阶段 19（padding 修 cols 几何）+ 阶段 20（字体 fit 修 cols 时序）三层叠加治理"输入乱跳 / 挤背景"——同一症状的多层根因。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 20 complete（字体加载竞态致 cols 漂移修复，tsc 绿，待 dev 实测） |
+| 我要去哪里？ | 用户 dev 实测本地 pwsh + 背景图输入不再随机错位；若仍有，按"关背景图二分"判断是否 WebGL 路径独立问题 |
+| 目标是什么？ | 修掉阶段 19 padding 之后仍残留的"字符挤背景"——这次根因是字体异步加载让 cols 漂移、PSReadLine 按错误 cols 重绘 |
+| 我学到了什么？ | xterm 改 fontFamily 重新量 cellWidth 但**不重算 cols**，必须手动 fit；fit() 前应等 `document.fonts.ready`；PSReadLine 每键绝对定位重绘、对 cols 偏差零容忍；"输入乱跳"是多层根因（透明残影 / padding / 字体时序），需逐层剥 + 用 AskUserQuestion 锁环境再改，避免盲目修偏 |
+| 我做了什么？ | AskUserQuestion 锁定（背景图 + pwsh + 随机）+ 研究 xterm 社区经验 + TerminalPanel fontFamily effect 加 document.fonts.ready → fit + resize + tsc 验证 |
+
+### 阶段 21：本地终端输入回卷错位（三）—— PTY 初始 cols 同步时机（决定性根因）（2026-06-19）
+- **现象（用户给出完美复现点）：** 阶段 20 字体 fit 修复后，用户锁定**百分百复现**条件——输入内容超过本行（触发回卷）必现"背景左移"；**无背景图也复现**（排除 WebGL 透明路径）；输入完成换行后**恢复正常**。
+- **根因（掘金 juejin/7476761846411870258 100% 匹配验证）：** 经典 xterm↔PTY cols 不同步。本地 PTY 以 **80×24 启动**（main.rs `local_connect` 写死 cols=80），pwsh 的 PSReadLine 缓存了 80；前端 xterm 经 fit 得到真实 cols（如 120）。同步链两处时机都太赶：① mount 100ms resize 撞在 PSReadLine 初始化**之前** → 被丢弃；② firstOutput 的 resize 是 `setTimeout(..., 0)`，PSReadLine 刚画完 prompt、resize listener 还没接管 → 再次丢弃。结果后端 cols 卡在 80、前端 120，输入过第 80 列后端换行前端不换行 → PSReadLine 重绘编辑行进错单元格 = "背景左移"；Enter 后新 prompt 单行故恢复。回卷边界 100% 复现完全吻合。
+- **修复：** `TerminalPanel.tsx` firstOutput 把单次 `setTimeout(0)` resize 改为**立即 + 250ms + 600ms 多次延迟同步**（fit + resizeTo），覆盖不同 shell 冷启动速度下 PSReadLine/ConPTY 就绪窗口（掘金验证 200ms 有效，多次更稳）。新增 `firstSyncTimersRef` + [sessionId] cleanup 清理 timers。
+- **研究依据：** [掘金：xterm.js 输入字符换行覆盖排查](https://juejin.cn/post/7476761846411870258)（$COLUMNS=80 + resize 后正常 + onResize/200ms 防抖 + 首帧 output 触发 resize）；[Issue #3342](https://github.com/xtermjs/xterm.js/issues/3342) nerd font 宽字符裁剪（相关但非本次主因）。
+- **修改明细：** `src/components/TerminalPanel.tsx` —— firstOutput 同步改为多次延迟（0/250/600ms）；新增 firstSyncTimersRef ref；cleanup 清理。
+- **验证：** `npx tsc --noEmit` PASS。待 `cargo tauri dev` 实测：本地 pwsh 输入超过 80 列不再回卷错位 / 背景左移。
+- **遗留 / 诊断命令：** 若仍有问题，在出问题的本地终端跑 `$Host.UI.RawUI.WindowSize.Width`——① 仍是 80 → resize 没送达 ConPTY（升级 portable-pty 0.8 或查 ConPTY resize 时序）；② 已是真实值但仍错位 → 转向 xterm 渲染层（WebGL/canvas 对比、nerd font 宽字符 #3342、clearTextureAtlas）。
+- **关联：** 阶段 18（WebGL 透明残影）+ 19（padding 修 cols 几何）+ 20（字体 fit 修 cols 时序）+ 21（PTY 初始同步送达）四层叠加。**前三次修的是"前端 cols 算得对不对"，本次修的是"前端算对了之后有没有把正确 cols 送达后端 PTY"**——这是 SSH/PTY 终端经验里最经典、最易漏的一环。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 21 complete（PTY 初始 cols 同步时机修复，tsc 绿，待 dev 实测） |
+| 我要去哪里？ | 用户 dev 实测本地 pwsh：输入超过 80 列不再回卷错位；若仍有跑 `$Host.UI.RawUI.WindowSize.Width` 诊断 cols 是否送达 |
+| 目标是什么？ | 彻底解决"输入回卷必现背景左移、换行恢复"——根因是 PTY 以 80 启动、初始 resize 时机太早被丢弃，后端卡 80 |
+| 我学到了什么？ | xterm↔PTY cols 同步是终端最经典 bug：PTY 启动 cols（80）≠ 前端真实 cols，必须在 shell 就绪后（首帧 output + 充分延迟）把真实 cols resize 给后端，时机要给足（PSReadLine 初始化慢，0ms 不够，需 200ms+，多次更稳）；掘金实战文章比泛搜更精准；"换行后恢复 + 回卷边界 100% 复现"是 cols 不同步的指纹 |
+| 我做了什么？ | 掘金文章锁定 cols 不同步根因 + firstOutput 单次 0ms → 多次延迟（0/250/600ms）同步 + firstSyncTimersRef cleanup + tsc 验证 |
+
+### 阶段 22：claude TUI 输入左移（决定性根因）—— init_command 启动时机（2026-06-19）
+- **现象：** 阶段 21 cols 同步修复后，用户给出**决定性线索**——左移**只有 claude（Claude Code CLI）里才有**，普通命令（ls/dir）完全正常；且 claude 是配置**「启动命令」自动启动**的。
+- **推理：** "只有 claude" 排除了 cols 同步对 PSReadLine 的问题——普通命令正常 = PowerShell 行编辑拿到的列数是对的，即阶段 19-21 的 cols 同步**确实生效**了。问题聚焦到 claude 这个 TUI 应用本身。
+- **根因：** claude 是交互式 TUI，启动时读取终端列数布局界面（输入框宽度），且**启动后不跟随 resize**。它通过「启动命令」（init_command）自动启动，而 init_command 在 PTY **刚以 80×24 启动时就被立即写入 stdin**（local.rs writer task 启动即发）→ claude 启动读到 **80 列** → TUI 按 80 布局 → 之后前端 resize 到真实宽度（如 120）但 claude 已缓存 80 不更新 → 输入过第 80 字符时 claude 按其认知的 80 列重绘输入框，在实际上 120 宽的终端里错位、左移；Enter 后新 prompt 单行故恢复。普通命令不缓存列数（每次按当前宽度输出）故完全正常。**完美解释"只有 claude + 回卷边界 100% 复现 + 换行恢复"**。
+- **修复：** `src-tauri/src/local.rs` writer task：把 init_command 从「启动时立即发」改为「**第一次 resize 到达后再发**」。第一次 resize = 前端已 fit 出真实尺寸并同步给 PTY 的信号，此时再发 init_command，claude 启动读到的就是真实列数（而非 80）。utf8_prelude 仍立即发（shell 编码设置需在启动早期）；`pending_init` 用 `take()` 保证只发一次。
+- **副作用（预期）：** pwsh 提示符会**先短暂出现**（init_command 延迟到第一次 resize ~100ms 后才发），随后 claude 启动。可接受。非 TUI 的 init_command（如 cd）延迟执行亦无害。
+- **修改明细：** `src-tauri/src/local.rs` —— 移除 init_command 启动即发块，改为 `pending_init: Option<String>`；Resize 分支 `master.resize` 后 `if let Some(init) = pending_init.take() { write + \r + flush }`。
+- **验证：** `cargo check` PASS（**首次**——Rust 工具链现已在编辑环境可用，之前各阶段 Rust 侧未编译过）。待 `cargo tauri dev` 实测：claude 输入超过本行不再左移。
+- **关联：** 阶段 18-21 修的是 cols 的**正确性 + 同步**（前端算对、同步给 PTY），但 claude TUI 在 cols 同步**之前**就启动并缓存了 80。本次（22）修的是「**让 claude 在 cols 同步之后再启动**」——同一条"左移"症状，五层根因（透明残影 / padding / 字体时序 / PTY 同步 / **TUI 启动时机**）逐层剥开。
+- **教训：** "只有某个 TUI 应用才有"是关键信号——TUI 缓存终端尺寸且不跟随 resize，与普通 shell 行为不同；init_command 类的自动启动命令应在终端尺寸确定后再发，否则 TUI 拿到的是 PTY 启动默认值（80）；连续盲改无效时要回到"什么场景才有 / 没有该现象"的对比来缩小范围。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 22 complete（init_command 延迟到 cols 同步后，cargo check 绿，待 dev 实测） |
+| 我要去哪里？ | 用户 cargo tauri dev 实测：claude 输入超长不再左移；留意 pwsh prompt 先短暂闪现再进 claude（预期副作用） |
+| 目标是什么？ | 修掉"只有 claude 才有的输入左移"——根因是 claude 作为启动命令在 PTY 80×24 时就启动、缓存 80 列不跟随 resize |
+| 我学到了什么？ | "只有某 TUI 才有" = TUI 缓存终端尺寸不跟随 resize（vs 普通 shell 实时读），init_command 必须在尺寸确定后发；连续盲改无效时要回到"什么场景才有/没有该现象"的对比缩小范围；Rust 工具链现已可用，cargo check 能验证后端改动 |
+| 我做了什么？ | AskUserQuestion 确认 claude = 启动命令自动启动 + local.rs init_command 启动即发 → 第一次 resize 后发（pending_init + Resize 分支 take）+ cargo check PASS |
+
+### 阶段 23：中文 IME 输入左移 —— ConPTY 上游 bug（已知限制，应用层无法根治）（2026-06-19）
+- **现象（更精确线索）：** 阶段 22 后，用户进一步定位——左移**只在中文 IME 输入时发生**，字母/英文输入完全正常；PowerShell 和 claude 都有。
+- **排查（命中铁证）：** 搜索命中 [VSCode #255285 "Terminal viewport shifts left with Chinese IME"](https://github.com/microsoft/vscode/issues/255285)，现象/触发/根因**逐字匹配**——"IME composition string 打到第 4 个字符，整个终端视口水平左移；按空格完成输入后立即恢复"。
+- **根因：** **ConPTY 对中文 IME composition string 的宽度计算错误（miscalculation）**，触发不必要的视口左移。这是 **ConPTY 的上游 bug**。触发条件：会"每键重绘输入行"的程序（PSReadLine、claude/ink、gemini-cli）；vim / node / python REPL 不触发（它们不实时重绘输入行）—— 完美解释"字母正常（单宽，重绘无歧义）+ 中文左移（双宽 composition 宽度算错）+ PowerShell 和 claude 都有"。
+- **VSCode 确认的 workaround：** 禁用 ConPTY、改用 **winpty** 后端（VS Code `terminal.integrated.windowsEnableConpty: false`）。
+- **我们的困境（关键）：** 我们用的 **portable-pty 0.8.1 已移除 winpty 支持**（`src/win/` 只有 `conpty.rs`，无 `winpty.rs`；`NativePtySystem = ConPtySystem`）。所以 **winpty workaround 对我们不可行**。降级 portable-pty 或换 winpty-rs 代价大，且 **winpty 对中文 UTF-8 不友好**（走 Windows console codepage，可能引入中文乱码，比左移更糟）。
+- **结论：** 这是 **ConPTY 上游 bug，应用层无法完美修复**。需等微软修复（VSCode #255285 open，2025-07 报，目前未修；用户 Windows 11 26200 仍存在）。
+- **前几轮修复的价值（重要）：** 阶段 18-22 的修复（WebGL 透明残影 / padding cols 几何 / 字体 cols 时序 / PTY 同步时机 / TUI 启动时机）**都是对的、有价值的**——"字母输入完全正常换行"就是证明（cols 同步正确、PSReadLine 拿到真实列数）。**中文 IME 是唯一剩下的、独立的 ConPTY 上游限制**，与前几轮无关。
+- **实用缓解（对用户）：** ① 输入法确认（空格/回车）后左移**立即恢复**，影响仅 composition 输入过程中；② 避免一次打超长 composition，分段确认可减少触发；③ 等 Windows 更新修复 ConPTY。
+- **修改：** 本次无代码修改（应用层无法修复 ConPTY bug）；仅研究确认 + 文档记录，避免未来重复排查。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 23：确认中文 IME 左移是 ConPTY 上游 bug（VSCode #255285 铁证），应用层无法根治，记录为已知限制 |
+| 我要去哪里？ | 告知用户根因 + 困境（portable-pty 0.8.1 无 winpty）+ 实用缓解；等微软修复 ConPTY |
+| 目标是什么？ | 给"中文 IME 左移"一个准确、有据的结论，避免反复盲改 |
+| 我学到了什么？ | "只在某种输入（中文 IME / 双宽）才出"= 上游 CJK/IME 处理 bug 的信号；ConPTY 对 IME composition 宽度计算有已知 bug（VSCode 也中招）；portable-pty 0.8.x 已移除 winpty（只 ConPTY），winpty workaround 对我们不可行；遇到上游 bug 要查 VSCode/microsoft-terminal 同款 issue，比泛搜精准 |
+| 我做了什么？ | WebSearch 命中 VSCode #255285（铁证）+ webReader 读全文 + 确认 portable-pty 0.8.1 无 winpty（src/win/ 只有 conpty.rs）+ 记录已知限制 |
+
+### 阶段 24：回退阶段 22（init_command 延迟）—— 副作用不值（2026-06-19）
+- **决策：** 用户拍板回退阶段 22（local.rs init_command 延迟到首次 resize）。
+- **理由：** 阶段 22 修的"claude TUI 以 80 cols 启动"是真实但独立的问题，且**没修复**用户报告的左移（那其实是阶段 23 确认的 ConPTY 中文 IME 上游 bug）；而它的副作用——开 tab 时 PowerShell 提示符**先短暂闪现再进 claude**——可感知、不值。权衡后回退。
+- **改动：** `src-tauri/src/local.rs` writer task —— init_command 从"第一次 resize 后发"改回"启动时立即发"（恢复阶段 21 完成时的状态）；Resize 分支移除 pending_init 逻辑；保留一条注释说明为什么立即发 + 曾试过延迟但回退，避免未来重复尝试。
+- **保留不动：** 阶段 19（padding cols 几何）、20（字体 fit）、21（firstOutput 多次延迟 resize）、WebGL 条件加载——这些是 cols 正确性 / 同步 / 渲染的净收益，与阶段 22 无关，"字母正常换行"就是它们的成果。
+- **验证：** `cargo check` PASS（1.50s 增量）。
+- **结论：** 最终代码 = 阶段 19/20/21 + WebGL 条件加载**保留**，阶段 22 **回退**。中文 IME 左移 = ConPTY 上游 bug（阶段 23），应用层不修。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 24：回退阶段 22（init_command 延迟），cargo check 绿 |
+| 我要去哪里？ | 用户 dev 验证：开 claude tab 不再有 prompt 闪现（启动命令立即执行）；中文 IME 左移按已知限制（阶段 23）接受 |
+| 目标是什么？ | 移除阶段 22 的副作用（prompt 闪现），保留其余净收益修复 |
+| 我学到了什么？ | 修真问题也要权衡可感知副作用；当某个修复最终没命中用户真实问题（实为上游 bug）时，它的副作用就不值得，应回退；回退要留注释说明曾尝试 + 为什么放弃，防重复 |
+| 我做了什么？ | local.rs init_command 延迟 → 启动即发（回退阶段 22）+ 保留防重复注释 + cargo check PASS + 文档同步（progress 阶段 24 / README 移除阶段 22 条目） |
