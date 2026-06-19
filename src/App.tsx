@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { TerminalPanel } from "./components/TerminalPanel";
@@ -7,8 +7,10 @@ import { ServerInfoPanel } from "./components/ServerInfoPanel";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 import { MasterPasswordGate } from "./components/MasterPasswordGate";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { AiPanel } from "./components/AiPanel";
 import { QuickCommandsPanel } from "./components/QuickCommandsPanel";
 import { BrandLogo } from "./components/BrandLogo";
+import type { Terminal } from "@xterm/xterm";
 import {
   getConnections,
   deleteConnection,
@@ -35,6 +37,24 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showQuickCommands, setShowQuickCommands] = useState(false);
+  // AI assistant panel (global docked-right chat bar). Width persists in
+  // localStorage so it survives reloads.
+  const [showAiPanel, setShowAiPanel] = useState(false);
+  const [aiPanelWidth, setAiPanelWidth] = useState(
+    () => Number(localStorage.getItem("myshell.aiPanelWidth")) || 380
+  );
+  // Phase 3: live xterm registry, keyed by sessionId. The AI panel reads
+  // terminal output/selection and pastes commands through it. Populated by
+  // TerminalPanel.onTerminalReady, drained on close/reconnect.
+  const terminalRegistryRef = useRef<Map<string, Terminal>>(new Map());
+  const handleTerminalReady = (sid: string, term: Terminal) => {
+    terminalRegistryRef.current.set(sid, term);
+  };
+  const handleTerminalGone = (sid: string) => {
+    terminalRegistryRef.current.delete(sid);
+  };
+  const getTerminal = (sid?: string): Terminal | undefined =>
+    sid ? terminalRegistryRef.current.get(sid) : undefined;
   // Preset scope when opening the quick-commands panel: null = global,
   // a connection id = that server's per-server scope. Set by the entry point
   // (Sidebar global button → null, CommandBar "管理" → current connection).
@@ -443,6 +463,9 @@ export default function App() {
                       connType={tab.connType}
                       fontOverride={connections.find((c) => c.id === (tab.connectionId || ""))?.terminal_font}
                       broadcastTargets={getBroadcastTargets(tab)}
+                      onTerminalReady={handleTerminalReady}
+                      onTerminalGone={handleTerminalGone}
+                      onOpenAi={() => setShowAiPanel(true)}
                       active={isActive}
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}
@@ -470,6 +493,9 @@ export default function App() {
                       connectionId={tab.connectionId || ""}
                       connType={tab.connType}
                       fontOverride={connections.find((c) => c.id === (tab.connectionId || ""))?.terminal_font}
+                      onTerminalReady={handleTerminalReady}
+                      onTerminalGone={handleTerminalGone}
+                      onOpenAi={() => setShowAiPanel(true)}
                       active={isActive}
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}
@@ -498,6 +524,20 @@ export default function App() {
             />
           )}
       </div>
+      {showAiPanel && (
+        <AiPanel
+          activeConnType={activeTab?.connType}
+          activeConnectionName={activeTab?.config?.name ?? activeTab?.connectionId}
+          activeSessionId={activeTab?.sessionId}
+          getTerminal={getTerminal}
+          width={aiPanelWidth}
+          onWidthChange={(w) => {
+            setAiPanelWidth(w);
+            localStorage.setItem("myshell.aiPanelWidth", String(w));
+          }}
+          onClose={() => setShowAiPanel(false)}
+        />
+      )}
       {showDialog && (
         <ConnectionDialog
           config={editConfig}

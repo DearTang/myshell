@@ -529,6 +529,142 @@ export function onSshExit(
   });
 }
 
+// ============ AI API ============
+
+export type AiProvider = "claude" | "openai" | "ollama";
+
+export interface ChatMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+}
+
+/** Live terminal context attached to a chat request. Serialized into the
+ * system prompt so the model sees the user's current shell state alongside
+ * their question. */
+export interface AiContext {
+  terminalOutput?: string;
+  selection?: string;
+  inspectData?: string;
+  /** Shell hint ("bash" / "powershell" / "pwsh" / "zsh"…) so generated
+   * commands use the right syntax. */
+  shellHint?: string;
+  /** Active connection type — lets the system prompt describe the runtime
+   * (remote SSH server vs. the user's own machine). */
+  connType?: ConnType;
+}
+
+/** Non-secret AI config returned by getAiSettings. The API key is never sent
+ * to the frontend — `hasKey` only indicates one is stored in the vault. */
+export interface AiSettings {
+  provider: AiProvider;
+  model?: string;
+  baseUrl?: string;
+  proxyUrl?: string;
+  hasKey: boolean;
+  temperature: number;
+}
+
+/** Streaming payloads, keyed by requestId so concurrent streams don't cross. */
+export interface AiTokenPayload {
+  requestId: string;
+  token: string;
+}
+
+export interface AiDonePayload {
+  requestId: string;
+}
+
+export interface AiErrorPayload {
+  requestId: string;
+  error: string;
+}
+
+/**
+ * Stream a chat completion. Tokens arrive via onAiToken(requestId); the stream
+ * ends with onAiDone or onAiError. Subscribe BEFORE calling so no early
+ * tokens are missed.
+ */
+export function aiChat(
+  requestId: string,
+  messages: ChatMessage[],
+  system: string | null,
+  context: AiContext | null
+): Promise<void> {
+  return invoke("ai_chat", { requestId, messages, system, context });
+}
+
+/** Run the read-only health-inspection script on an SSH/Linux host and stream
+ * an AI health report. */
+export function aiInspectHealthSsh(
+  sessionId: string,
+  requestId: string
+): Promise<void> {
+  return invoke("ai_inspect_health_ssh", { sessionId, requestId });
+}
+
+/** Run the read-only health-inspection script on the local machine and stream
+ * an AI health report. */
+export function aiInspectHealthLocal(requestId: string): Promise<void> {
+  return invoke("ai_inspect_health_local", { requestId });
+}
+
+/** Read the AI provider config (no key — only `hasKey`). Works with the vault
+ * locked, so the settings form can render before unlock. */
+export function getAiSettings(): Promise<AiSettings> {
+  return invoke("get_ai_settings");
+}
+
+/** Save the AI provider config. `apiKey`: a non-empty string re-encrypts &
+ * overwrites; "" / undefined leaves the existing key. Requires the vault
+ * unlocked. */
+export function saveAiSettings(
+  provider: AiProvider,
+  model: string | null,
+  baseUrl: string | null,
+  proxyUrl: string | null,
+  apiKey: string | null,
+  temperature: number
+): Promise<void> {
+  return invoke("save_ai_settings", {
+    provider,
+    model,
+    baseUrl,
+    proxyUrl,
+    apiKey,
+    temperature,
+  });
+}
+
+/** Subscribe to streaming tokens for a specific request. */
+export function onAiToken(
+  requestId: string,
+  handler: (token: string) => void
+): Promise<UnlistenFn> {
+  return listen<AiTokenPayload>("ai_token", (event) => {
+    if (event.payload.requestId === requestId) handler(event.payload.token);
+  });
+}
+
+/** Subscribe to stream-completion for a specific request. */
+export function onAiDone(
+  requestId: string,
+  handler: () => void
+): Promise<UnlistenFn> {
+  return listen<AiDonePayload>("ai_done", (event) => {
+    if (event.payload.requestId === requestId) handler();
+  });
+}
+
+/** Subscribe to stream-error for a specific request. */
+export function onAiError(
+  requestId: string,
+  handler: (error: string) => void
+): Promise<UnlistenFn> {
+  return listen<AiErrorPayload>("ai_error", (event) => {
+    if (event.payload.requestId === requestId) handler(event.payload.error);
+  });
+}
+
 // ============ ZMODEM API ============
 
 export async function sshSendZmodem(sessionId: string, data: Uint8Array): Promise<void> {

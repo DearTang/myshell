@@ -75,8 +75,33 @@ pub fn init_db() -> Result<Connection> {
             created_at    TEXT    NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_qc_conn ON quick_commands(connection_id);
-        CREATE INDEX IF NOT EXISTS idx_qc_sort ON quick_commands(connection_id, sort_order, id);"
+        CREATE INDEX IF NOT EXISTS idx_qc_sort ON quick_commands(connection_id, sort_order, id);
+        -- AI assistant: single-row config (CHECK id=1 forces it). api_key_enc
+        -- holds a crypto::encrypt_with_key blob (AES-256-GCM, base64); never
+        -- plaintext. Provider/model/baseUrl/temperature are non-secret.
+        CREATE TABLE IF NOT EXISTS ai_settings (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            provider    TEXT NOT NULL DEFAULT 'claude',
+            model       TEXT,
+            base_url    TEXT,
+            api_key_enc TEXT,
+            proxy_url   TEXT,
+            temperature REAL NOT NULL DEFAULT 0.7
+        );
+        CREATE TABLE IF NOT EXISTS ai_conversations (
+            id            TEXT PRIMARY KEY,
+            connection_id TEXT,
+            role          TEXT NOT NULL,
+            content       TEXT NOT NULL,
+            created_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_conv_conn ON ai_conversations(connection_id, created_at);"
     )?;
+    // AI proxy_url column — idempotent ALTER for installs that already
+    // created ai_settings without it (CREATE IF NOT EXISTS won't add it).
+    if !column_exists(&conn, "ai_settings", "proxy_url") {
+        conn.execute("ALTER TABLE ai_settings ADD COLUMN proxy_url TEXT", [])?;
+    }
     Ok(conn)
 }
 

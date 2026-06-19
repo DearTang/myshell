@@ -22,6 +22,7 @@ mod backup;
 mod local;
 mod fonts;
 mod elevation;
+mod ai;
 
 // ============ Connection Config ============
 
@@ -1350,6 +1351,148 @@ async fn local_disconnect(
     local::disconnect(&state, &session_id).await
 }
 
+// ============ AI assistant ============
+
+/// Non-secret projection of the `ai_settings` row for the settings UI. The
+/// API key never leaves the backend — `has_key` only tells the form a key is
+/// already stored.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiSettingsView {
+    provider: String,
+    model: Option<String>,
+    base_url: Option<String>,
+    proxy_url: Option<String>,
+    has_key: bool,
+    temperature: f64,
+}
+
+/// Stream a chat completion. Tokens arrive as `ai_token` events; the stream
+/// ends with `ai_done` (or `ai_error` on failure). Vault must be unlocked,
+/// since the API key is encrypted with the DEK.
+#[tauri::command]
+async fn ai_chat(
+    state: State<'_, AppState>,
+    window: tauri::WebviewWindow,
+    request_id: String,
+    messages: Vec<ai::ChatMessage>,
+    system: Option<String>,
+    context: Option<ai::AiContext>,
+) -> Result<(), String> {
+    ai::chat_stream(
+        &state,
+        &window,
+        ai::AiChatParams {
+            request_id,
+            messages,
+            system,
+            context,
+        },
+    )
+    .await
+}
+
+/// Run the read-only Linux diagnostic script over an open SSH session, then
+/// stream an AI health report. Mirrors `ssh_get_server_info`'s use of
+/// `ssh::exec_once`.
+#[tauri::command]
+async fn ai_inspect_health_ssh(
+    state: State<'_, AppState>,
+    window: tauri::WebviewWindow,
+    session_id: String,
+    request_id: String,
+) -> Result<(), String> {
+    ai::inspect_health_ssh(&state, &window, &session_id, &request_id).await
+}
+
+/// Run the read-only diagnostic script on the local machine, then stream an
+/// AI health report. No PTY session needed — it's the user's own machine.
+#[tauri::command]
+async fn ai_inspect_health_local(
+    state: State<'_, AppState>,
+    window: tauri::WebviewWindow,
+    request_id: String,
+) -> Result<(), String> {
+    ai::inspect_health_local(&state, &window, &request_id).await
+}
+
+/// Read the AI provider config. The API key is NOT returned — only `has_key`.
+/// Works with the vault locked, so the settings form can render before unlock.
+#[tauri::command]
+fn get_ai_settings(state: State<'_, AppState>) -> Result<AiSettingsView, String> {
+    let (provider, model, base_url, api_key_enc, proxy_url, temperature) = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        match db.query_row(
+            "SELECT provider, model, base_url, api_key_enc, proxy_url, temperature FROM ai_settings WHERE id = 1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, f64>(5)?,
+                ))
+            },
+        ) {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                ("claude".to_string(), None, None, None, None, 0.7)
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    Ok(AiSettingsView {
+        provider,
+        model,
+        base_url,
+        proxy_url,
+        has_key: api_key_enc
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        temperature,
+    })
+}
+
+/// Save the AI provider config. `api_key` is Optional: a non-empty value
+/// re-encrypts & overwrites; empty/None leaves the existing key untouched (so
+/// the user can change model without re-entering the key). Requires an
+/// unlocked vault (key is encrypted with the DEK).
+#[tauri::command]
+async fn save_ai_settings(
+    state: State<'_, AppState>,
+    provider: String,
+    model: Option<String>,
+    base_url: Option<String>,
+    proxy_url: Option<String>,
+    api_key: Option<String>,
+    temperature: f64,
+) -> Result<(), String> {
+    let dek = require_dek(&state)?;
+    let new_key_enc = api_key
+        .filter(|s| !s.is_empty())
+        .map(|k| crypto::encrypt_with_key(&dek, k.as_bytes()))
+        .transpose()?;
+
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.execute(
+        "INSERT INTO ai_settings (id, provider, model, base_url, api_key_enc, proxy_url, temperature)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET
+            provider   = excluded.provider,
+            model      = excluded.model,
+            base_url   = excluded.base_url,
+            proxy_url  = excluded.proxy_url,
+            temperature = excluded.temperature,
+            api_key_enc = COALESCE(excluded.api_key_enc, ai_settings.api_key_enc)",
+        rusqlite::params![provider, model, base_url, new_key_enc, proxy_url, temperature],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ============ Elevation (run as admin) ============
 
 /// Whether MyShell is running elevated (admin on Windows, root on Unix). Drives
@@ -2182,6 +2325,11 @@ pub fn run() {
             sz_open_write,
             sz_write_chunk,
             sz_close,
+            ai_chat,
+            ai_inspect_health_ssh,
+            ai_inspect_health_local,
+            get_ai_settings,
+            save_ai_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

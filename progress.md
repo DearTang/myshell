@@ -714,3 +714,40 @@
 | 目标是什么？ | 移除阶段 22 的副作用（prompt 闪现），保留其余净收益修复 |
 | 我学到了什么？ | 修真问题也要权衡可感知副作用；当某个修复最终没命中用户真实问题（实为上游 bug）时，它的副作用就不值得，应回退；回退要留注释说明曾尝试 + 为什么放弃，防重复 |
 | 我做了什么？ | local.rs init_command 延迟 → 启动即发（回退阶段 22）+ 保留防重复注释 + cargo check PASS + 文档同步（progress 阶段 24 / README 移除阶段 22 条目） |
+
+### 阶段 25：集成 AI 助手（多提供商聊天 + 命令生成/诊断/解释 + 主动巡检）（2026-06-19）
+- **目标：** 在终端工具内集成 AI，覆盖命令生成、输出诊断、命令解释、服务器巡检。多提供商（Claude/OpenAI/Ollama）、全局右侧聊天栏、API key 复用 vault、AI 调用在 Rust 后端流式输出。
+- **方案**（plan `twinkly-mapping-floyd.md`，已批准）：4 Phase。
+- **Phase 1 后端核心：** `Cargo.toml` +reqwest(rustls+json+stream)+futures-util；`db.rs` 加 `ai_settings`(单行,_enc key)+`ai_conversations` 表；新模块 `ai.rs`（Provider enum[Claude/OpenAi/Ollama] + 各自 endpoint/auth/body/SSE·NDJSON 解析 + `chat_stream` 流式 emit ai_token/done/error + vault 取 key[decrypt_with_key] + Linux/Windows 只读巡检脚本 + `inspect_health_ssh`[复用 ssh::exec_once]/`local`[std::process]）；`main.rs` +`mod ai` +5 命令(ai_chat/ai_inspect_health_ssh/ai_inspect_health_local/get_ai_settings/save_ai_settings，均 require_dek)。
+- **Phase 2 前端面板：** `package.json` +react-markdown+remark-gfm；`api.ts` +aiChat/onAiToken/onAiDone/onAiError + AiSettings/ChatMessage/AiContext 类型；`useAiConfig` hook(走 IPC)；新组件 `AiPanel.tsx`(全局 docked 右栏, 消息列表, 流式渲染, react-markdown, 代码块复制, 拖拽调宽)；`App.tsx` +showAiPanel/aiPanelWidth state + 挂载 + activeTab 上下文；`Sidebar` +🤖 按钮；`SettingsPanel` +🤖 AI 助手 Section(provider select/key/model/baseUrl/temperature)。
+- **Phase 3 终端集成：** `TerminalPanel` +onTerminalReady/onTerminalGone props(暴露 xterm 实例)；`App` 维护 Map<sessionId,Terminal> registry + getTerminal；`AiPanel` 采集选区[getSelection]/最近 40 行[buffer.active.getLine.translateToString]作上下文 + 代码块"插入终端"按钮[term.paste，不自动执行] + "附带选区"按钮。
+- **Phase 4 主动巡检：** `AiPanel` header +🔍 巡检按钮，按 connType 调 aiInspectHealthSsh(sessionId)/aiInspectHealthLocal，复用流式渲染健康报告。
+- **安全：** API key 全程 Rust（vault 加密，永不进 webview）；AI 命令默认只"插入终端"不自动执行（用户手动 Enter）；巡检脚本严格只读（free/df/top/uptime 等，无 rm/mv/>）；AI 调用经 vault（require_dek，未解锁则 AI 不可用）。
+- **验证：** `cargo check` PASS（Phase 1，reqwest 首次编译 23s）；`npx tsc --noEmit` PASS（Phase 2/3/4）。待 `cargo tauri dev` 实测：设置填 key → 🤖 聊天 → 流式回复；选中报错→附带选区→诊断；🔍 巡检→健康报告。
+- **修改文件：** 新增 `src-tauri/src/ai.rs`、`src/components/AiPanel.tsx`、`src/hooks/useAiConfig.ts`；修改 `Cargo.toml`、`db.rs`、`main.rs`、`package.json`、`api.ts`、`App.tsx`、`Sidebar.tsx`、`SettingsPanel.tsx`、`TerminalPanel.tsx`。
+- **遗留：** ① SSE 解析三家格式不同，最易出 bug 处（建议各 provider fixture 单测）；② vault 未解锁时 AI 不可用（UI 在错误消息提示）；③ CommandBar AI 入口省略（AiPanel 的"附带选区"已覆盖核心）；④ 巡检脚本 Linux/Windows 只读，可按需扩展。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 25 complete（AI 助手 4 Phase，cargo check + tsc 绿，待 dev 实测） |
+| 我要去哪里？ | 用户 cargo tauri dev 实测：填 key→聊天→流式；选区诊断；巡检报告 |
+| 目标是什么？ | 集成 AI 辅助命令生成/诊断/解释 + 服务器巡检，多提供商，vault 保护 key |
+| 我学到了什么？ | xterm buffer 读取(buffer.active.getLine.translateToString + getSelection)；reqwest SSE 用 bytes_stream + Vec<u8> 按行切(避免 UTF-8 跨 chunk 损坏)；Provider enum dispatch 比 async trait 简单；流式复用 window.emit(同 ssh_output)；API key 复用 vault(require_dek + encrypt_with_key)统一安全 |
+| 我做了什么？ | EnterPlanMode + 2 Explore agent 摸集成点 + AskUserQuestion 锁决策(多提供商/全局栏/vault/预设脚本) + 4 Phase 实现(ai.rs/AiPanel/registry/巡检) + cargo check + tsc 全绿 + 文档 |
+
+### 阶段 26：AI 助手网络代理支持（2026-06-19）
+- **需求：** AI 助手需支持网络代理（国内访问 Claude/OpenAI 常需代理）。
+- **方案：** AI 设置加 `proxy_url` 字段；reqwest 加 `socks` feature 支持 SOCKS5。
+- **改动：** `Cargo.toml` reqwest +`socks` feature；`db.rs` `ai_settings` +`proxy_url` 列（+ `column_exists` ALTER 兼容老库）；`ai.rs` `LoadedSettings`/`load_settings` 读 `proxy_url`，`run_chat_stream` 创建 client 时按 `proxy_url` 配 `reqwest::Proxy::all`（支持 http/https/socks5/socks5h，url 内可含 `user:pass@host` 认证）；`main.rs` `get/save_ai_settings` +`proxy_url`；前端 `api.ts`/`useAiConfig` +`proxyUrl`；`SettingsPanel` AI 区 +"网络代理" Field。
+- **验证：** `cargo check` PASS（reqwest socks 编译 3.66s）；`npx tsc --noEmit` PASS。
+- **遗留：** `proxy_url` 明文存（代理地址非敏感；认证写 url 内）；如需独立认证字段后续加。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 26 complete（AI 网络代理，cargo check + tsc 绿） |
+| 我要去哪里？ | 用户 dev 实测：填代理（如 http://127.0.0.1:7890）→ AI 请求走代理 |
+| 目标是什么？ | AI 助手支持 http/socks5 代理，应对无法直连 Claude/OpenAI 的环境 |
+| 我学到了什么？ | reqwest 代理用 `Proxy::all(url)`（socks5 需 `socks` feature）；url 内 `user:pass@host` 支持认证；SQLite 加列对已存在表用 `column_exists` + `ALTER`（CREATE IF NOT EXISTS 不加列） |
+| 我做了什么？ | 4 文件后端（Cargo/db/ai/main）+ 3 文件前端（api/hook/Settings）协调加 proxy_url，cargo check + tsc 全绿 |

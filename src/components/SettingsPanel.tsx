@@ -16,6 +16,8 @@ import type { BackupInfo } from "../api";
 import { useTheme } from "../hooks/useTheme";
 import { useColorScheme } from "../hooks/useColorScheme";
 import { useTerminalFont } from "../hooks/useTerminalFont";
+import { useAiConfig } from "../hooks/useAiConfig";
+import type { AiProvider } from "../api";
 import { PRESETS, type ColorPalette } from "../themes";
 import { FontField } from "./FontField";
 
@@ -76,6 +78,56 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
     setBgImage,
   } = useColorScheme();
   const { primaryFont, setPrimaryFont } = useTerminalFont();
+
+  // ── AI assistant config ── editable local state, initialized once from the
+  // vault-backed settings, persisted via useAiConfig.save (key re-encrypted
+  // in the backend; an empty key field means "keep existing").
+  const { settings: aiSettings, save: saveAiConfig, loading: aiLoading } = useAiConfig();
+  const [aiProvider, setAiProvider] = useState<AiProvider>("claude");
+  const [aiModel, setAiModel] = useState("");
+  const [aiBaseUrl, setAiBaseUrl] = useState("");
+  const [aiProxy, setAiProxy] = useState("");
+  const [aiKey, setAiKey] = useState("");
+  const [aiTemp, setAiTemp] = useState(0.7);
+  const [aiSaving, setAiSaving] = useState(false);
+  const [aiMsg, setAiMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const aiInitRef = useRef(false);
+  useEffect(() => {
+    // Sync once the backend config finishes loading — NOT on first render,
+    // when aiSettings is still the DEFAULT placeholder. Without the loading
+    // gate the ref flips before the real values arrive (IPC is async) and the
+    // saved provider/model/baseUrl never populate the form.
+    if (!aiLoading && !aiInitRef.current) {
+      aiInitRef.current = true;
+      setAiProvider(aiSettings.provider);
+      setAiModel(aiSettings.model ?? "");
+      setAiBaseUrl(aiSettings.baseUrl ?? "");
+      setAiProxy(aiSettings.proxyUrl ?? "");
+      setAiTemp(aiSettings.temperature);
+    }
+  }, [aiSettings, aiLoading]);
+
+  const handleSaveAi = async () => {
+    setAiSaving(true);
+    setAiMsg(null);
+    try {
+      await saveAiConfig({
+        provider: aiProvider,
+        model: aiModel.trim() || undefined,
+        baseUrl: aiBaseUrl.trim() || undefined,
+        proxyUrl: aiProxy.trim() || undefined,
+        apiKey: aiKey,
+        temperature: aiTemp,
+      });
+      setAiKey("");
+      setAiMsg({ kind: "ok", text: "已保存" });
+    } catch (e) {
+      setAiMsg({ kind: "err", text: `保存失败: ${e}` });
+    } finally {
+      setAiSaving(false);
+      window.setTimeout(() => setAiMsg(null), 3000);
+    }
+  };
 
   // Background image local state (preview before applying)
   const [bgImagePath, setBgImagePath] = useState<string | null>(null);
@@ -793,6 +845,115 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
               常见 Nerd Font：CaskaydiaCove Nerd Font、MesloLGM NF、JetBrainsMono Nerd Font、FiraCode Nerd Font、Hack Nerd Font
             </div>
           </Section>
+
+          {/* AI Assistant Section */}
+          <Section title="🤖 AI 助手">
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.6 }}>
+              配置 AI 提供商，用于命令生成、输出诊断与服务器巡检。API key 经主密码库（vault）加密存储；本地 Ollama 无需 key、数据不出本机。
+            </div>
+            <Field label="提供商 (Provider)">
+              <select
+                value={aiProvider}
+                onChange={(e) => setAiProvider(e.target.value as AiProvider)}
+                style={{
+                  width: "100%",
+                  padding: "10px 12px",
+                  background: "var(--bg-input)",
+                  color: "var(--text-primary)",
+                  border: "1px solid var(--border-default)",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 13,
+                  outline: "none",
+                }}
+              >
+                <option value="claude">Claude (Anthropic)</option>
+                <option value="openai">OpenAI (GPT)</option>
+                <option value="ollama">Ollama (本地)</option>
+              </select>
+            </Field>
+            <Field label="模型 (Model)">
+              <Input
+                value={aiModel}
+                onChange={setAiModel}
+                placeholder={
+                  aiProvider === "claude"
+                    ? "claude-sonnet-4-6（留空用默认）"
+                    : aiProvider === "openai"
+                    ? "gpt-4o（留空用默认）"
+                    : "llama3.1（留空用默认）"
+                }
+              />
+            </Field>
+            <Field label="API Base URL（可选：自建 / 代理 / Ollama 地址）">
+              <Input
+                value={aiBaseUrl}
+                onChange={setAiBaseUrl}
+                placeholder={
+                  aiProvider === "ollama"
+                    ? "http://localhost:11434/api（留空用默认）"
+                    : "留空用官方；自定义填到版本路径，如智谱 https://open.bigmodel.cn/api/paas/v4"
+                }
+              />
+            </Field>
+            <Field label="网络代理（可选：http:// 或 socks5://）">
+              <Input
+                value={aiProxy}
+                onChange={setAiProxy}
+                placeholder="留空直连；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080（认证写 user:pass@host）"
+              />
+            </Field>
+            <Field
+              label={`API Key${aiSettings.hasKey ? "（已保存，留空保持不变）" : ""}`}
+            >
+              <Input
+                value={aiKey}
+                onChange={setAiKey}
+                type="password"
+                placeholder={aiSettings.hasKey ? "••••••（已保存）" : "粘贴 API key"}
+              />
+            </Field>
+            <Field label={`Temperature（创造性 ${aiTemp}）`}>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.1}
+                value={aiTemp}
+                onChange={(e) => setAiTemp(Number(e.target.value))}
+                style={{ width: "100%" }}
+              />
+            </Field>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <button
+                onClick={handleSaveAi}
+                disabled={aiSaving}
+                style={{
+                  background: "var(--accent-primary)",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: "var(--radius-md)",
+                  padding: "9px 16px",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: aiSaving ? "default" : "pointer",
+                  opacity: aiSaving ? 0.7 : 1,
+                }}
+              >
+                {aiSaving ? "保存中…" : "保存 AI 配置"}
+              </button>
+              {aiMsg && (
+                <span
+                  style={{
+                    fontSize: 12,
+                    color: aiMsg.kind === "ok" ? "var(--success)" : "var(--error)",
+                  }}
+                >
+                  {aiMsg.text}
+                </span>
+              )}
+            </div>
+          </Section>
+          <Divider />
 
           {/* Admin / Elevation Section */}
           <Section title="🛡️ 管理员权限">

@@ -33,6 +33,11 @@ base64 = "0.22"
 chrono = "0.4"
 # Local terminal: spawn a shell under a PTY (ConPTY on Windows, openpty on Unix).
 portable-pty = "0.8"
+# AI assistant: HTTP client for provider APIs (Claude / OpenAI / Ollama).
+# rustls-tls matches suppaftp's tokio-rustls-ring (no OpenSSL on Windows);
+# "stream" gives Response::bytes_stream() for SSE token streaming.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "socks"] }
+futures-util = "0.3"
 # Enumerate installed font families for the terminal font picker.
 font-kit = "0.14"
 

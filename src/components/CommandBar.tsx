@@ -28,9 +28,11 @@ interface Props {
   onReconnect?: () => void;
   /** Callback to open the quick-commands management panel. */
   onOpenQuickCommandsManage?: () => void;
+  /** Open the docked AI assistant panel. */
+  onOpenAi?: () => void;
 }
 
-export function CommandBar({ sessionId, connectionId, connType, broadcastTargets = [], onRegisterRefresh, status, onReconnect, onOpenQuickCommandsManage }: Props) {
+export function CommandBar({ sessionId, connectionId, connType, broadcastTargets = [], onRegisterRefresh, status, onReconnect, onOpenQuickCommandsManage, onOpenAi }: Props) {
   // Pick the send backend by connection type — local tabs must route to
   // local_send, not ssh_send.
   const sendFn = connType === "local" ? localSend : sshSend;
@@ -232,6 +234,28 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
       >
         <span>📜</span>
         <span>历史</span>
+      </button>
+
+      {/* AI assistant button — opens the docked right panel */}
+      <button
+        onClick={() => onOpenAi?.()}
+        title="AI 助手"
+        style={{
+          background: "var(--bg-input)",
+          color: "var(--text-secondary)",
+          border: "1px solid var(--border-default)",
+          borderRadius: "var(--radius-md)",
+          padding: "6px 12px",
+          fontSize: 12,
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          gap: 4,
+          transition: "all var(--duration-fast) var(--ease-in-out)",
+        }}
+      >
+        <span>🤖</span>
+        <span>AI</span>
       </button>
 
       {/* Reconnect button (only when disconnected/error) */}

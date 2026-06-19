@@ -58,9 +58,17 @@ interface Props {
   /** Callback to open the quick-commands management panel (scoped to this
    * connection). Passed through to CommandBar's "管理" link. */
   onOpenQuickCommandsManage?: () => void;
+  /** Open the docked AI assistant panel (the trigger button lives in
+   * CommandBar, next to the history button). */
+  onOpenAi?: () => void;
+  /** Phase 3: registers the xterm instance with the App-level terminal
+   * registry so the AI panel can read selection / recent output and paste
+   * commands into it. Fired after the terminal opens; torn down on close. */
+  onTerminalReady?: (sessionId: string, term: Terminal) => void;
+  onTerminalGone?: (sessionId: string) => void;
 }
 
-export function TerminalPanel({ sessionId, connType, connectionId, fontOverride, broadcastTargets, active = true, onDisconnected, status, onReconnect, onOpenQuickCommandsManage }: Props) {
+export function TerminalPanel({ sessionId, connType, connectionId, fontOverride, broadcastTargets, active = true, onDisconnected, status, onReconnect, onTerminalReady, onTerminalGone, onOpenQuickCommandsManage, onOpenAi }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -364,6 +372,7 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
 
     termRef.current = term;
     fitRef.current = fitAddon;
+    onTerminalReady?.(sessionId, term);
 
     term.focus();
 
@@ -383,6 +392,7 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
       }
       firstSyncTimersRef.current.forEach(clearTimeout);
       firstSyncTimersRef.current = [];
+      onTerminalGone?.(sessionId);
       termRef.current = null;
       fitRef.current = null;
       bridgeRef.current = null;
@@ -648,6 +658,7 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
           status={status}
           onReconnect={onReconnect}
           onOpenQuickCommandsManage={onOpenQuickCommandsManage}
+          onOpenAi={onOpenAi}
           onRegisterRefresh={(fn) => {
             refreshHistoryRef.current = fn;
           }}
