@@ -40,9 +40,14 @@ export default function App() {
   // AI assistant panel (global docked-right chat bar). Width persists in
   // localStorage so it survives reloads.
   const [showAiPanel, setShowAiPanel] = useState(false);
-  const [aiPanelWidth, setAiPanelWidth] = useState(
-    () => Number(localStorage.getItem("myshell.aiPanelWidth")) || 380
-  );
+  const [aiPanelWidth, setAiPanelWidth] = useState(() => {
+    // Clamp stored value to the panel's own [300, 720] bounds (see
+    // AiPanel.onResizeStart) so a stale/out-of-range value can't render the
+    // panel unusably narrow or absurdly wide.
+    const stored = Number(localStorage.getItem("myshell.aiPanelWidth"));
+    if (!Number.isFinite(stored)) return 380;
+    return Math.min(720, Math.max(300, stored));
+  });
   // Phase 3: live xterm registry, keyed by sessionId. The AI panel reads
   // terminal output/selection and pastes commands through it. Populated by
   // TerminalPanel.onTerminalReady, drained on close/reconnect.

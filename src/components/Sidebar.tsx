@@ -297,7 +297,6 @@ export function Sidebar({
           onContext={(e) => {
             e.preventDefault();
             setMenu({ x: e.clientX, y: e.clientY, kind: "blank" });
-            (e.currentTarget as HTMLElement).dataset.connId = c.id;
           }}
           onEdit={() => onEdit(c)}
           onCopy={() => handleCopy(c.id)}
@@ -321,7 +320,6 @@ export function Sidebar({
         onContext={(e) => {
           e.preventDefault();
           setMenu({ x: e.clientX, y: e.clientY, kind: "blank" });
-          (e.currentTarget as HTMLElement).dataset.connId = conn.id;
         }}
         onEdit={() => onEdit(conn)}
         onCopy={() => handleCopy(conn.id)}

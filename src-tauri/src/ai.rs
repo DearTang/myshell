@@ -491,10 +491,17 @@ async fn run_chat_stream(
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
+        return s.to_string();
     }
+    // Step back to the nearest UTF-8 char boundary at or below `max`.
+    // Slicing at an arbitrary byte index (`&s[..max]`) panics when `max`
+    // lands inside a multi-byte character — common for CJK error bodies at
+    // max=500.
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 // ───────────────────────────── health inspection ─────────────────────────────
@@ -596,9 +603,16 @@ pub async fn inspect_health_local(
     window: &WebviewWindow,
     request_id: &str,
 ) -> Result<(), String> {
-    let raw = tokio::task::spawn_blocking(run_local_script)
-        .await
-        .map_err(|e| format!("巡检任务失败: {}", e))?;
+    // Match inspect_health_ssh's 20s cap. Without it, a hung PowerShell
+    // (WMI/CIM provider stuck) blocks spawn_blocking forever and the UI
+    // shows "inspecting..." indefinitely.
+    let raw = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::task::spawn_blocking(run_local_script),
+    )
+    .await
+    .map_err(|_| "巡检命令执行超时".to_string())?
+    .map_err(|e| format!("巡检任务失败: {}", e))?;
 
     let raw = match raw {
         Ok(s) => s,

@@ -211,19 +211,40 @@ pub fn list_backups() -> Result<Vec<BackupInfo>, String> {
     Ok(manifest.backups)
 }
 
+/// True for a syntactically safe version string (ASCII digits and dots only,
+/// no leading/trailing dot, no empty `.` segments). Used to gate path
+/// construction so a user-supplied version can never traverse out of the
+/// backups directory via `..`, separators, or an absolute path.
+fn is_valid_version(version: &str) -> bool {
+    if version.is_empty() || version.starts_with('.') || version.ends_with('.') {
+        return false;
+    }
+    version.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && version.split('.').all(|seg| !seg.is_empty())
+}
+
 /// Rollback to a specific version
 pub fn rollback(version: &str) -> Result<String, String> {
-    let backup = backup_dir(version);
-    let config = config_dir();
-
-    if !backup.exists() {
-        return Err(format!("备份版本 {} 不存在", version));
+    // Defense-in-depth: `version` flows into a path. The manifest lookup
+    // below already restricts it to known backup versions (which are always
+    // clean CARGO_PKG_VERSION strings), but reject anything that isn't a
+    // dotted version number up front so the path can never escape the
+    // backups dir via "..", separators, or an absolute path.
+    if !is_valid_version(version) {
+        return Err(format!("无效的备份版本: {}", version));
     }
 
     let manifest = BackupManifest::load();
     let backup_info = manifest.backups.iter()
         .find(|b| b.version == version)
         .ok_or_else(|| format!("找不到版本 {} 的备份信息", version))?;
+
+    let backup = backup_dir(version);
+    let config = config_dir();
+
+    if !backup.exists() {
+        return Err(format!("备份版本 {} 不存在", version));
+    }
 
     let mut restored_files = Vec::new();
 
@@ -239,9 +260,13 @@ pub fn rollback(version: &str) -> Result<String, String> {
         }
     }
 
-    // Update version marker to indicate rollback
-    fs::write(version_marker_path(), format!("{} (rolled back)", version))
+    // Write the *current* app version (not `"{version} (rolled back)"`) so
+    // the next launch's version check is stable — the old suffix never
+    // matched APP_VERSION and triggered a fresh backup on every startup.
+    // The rolled-back state is already captured by the restored files.
+    fs::write(version_marker_path(), APP_VERSION)
         .map_err(|e| format!("更新版本标记失败: {}", e))?;
+    eprintln!("[backup] rolled back config to version {}", version);
 
     let msg = format!(
         "已回退到版本 {}，恢复了 {} 个文件",

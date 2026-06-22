@@ -88,6 +88,21 @@ impl ProxyConfig {
     }
 }
 
+/// Validate the eventual proxy target host. Rejects empty hosts and any
+/// containing control/whitespace characters — CR/LF in particular would let
+/// a malicious `target_host` smuggle extra bytes into the `CONNECT` request
+/// line or `Host:` header of `http_connect_handshake`. A valid hostname or
+/// IP literal never contains such characters.
+fn validate_target_host(host: &str) -> Result<(), String> {
+    if host.is_empty() {
+        return Err("目标主机为空".to_string());
+    }
+    if host.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("目标主机包含非法字符".to_string());
+    }
+    Ok(())
+}
+
 /// Run the proxy handshake and return a stream ready for protocol use.
 /// The returned `TcpStream` is positioned just past the handshake — caller
 /// should treat it as if it were a direct `TcpStream` to the target.
@@ -96,6 +111,7 @@ pub async fn connect_via_proxy(
     target_host: &str,
     target_port: u16,
 ) -> Result<TcpStream, String> {
+    validate_target_host(target_host)?;
     let proxy_host = proxy.host().to_string();
     let proxy_port = proxy.port();
 

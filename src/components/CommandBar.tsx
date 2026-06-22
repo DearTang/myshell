@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   listCommandHistory,
   setCommandHistoryPinned,
@@ -46,6 +46,12 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
   const [quickPanelOpen, setQuickPanelOpen] = useState(false);
   const [quickCommands, setQuickCommands] = useState<QuickCommandExecItem[]>([]);
   const [quickLoading, setQuickLoading] = useState(false);
+
+  // Root container ref so we can scope DOM queries (e.g. focusing the input
+  // after selecting a history item) to THIS CommandBar — a global
+  // document.querySelector would target whichever tab's CommandBar rendered
+  // first, hijacking focus to the wrong tab.
+  const containerRef = useRef<HTMLDivElement>(null);
 
   const reload = useCallback(async () => {
     if (!connectionId) return;
@@ -144,13 +150,15 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
   function handleSelectItem(cmd: string) {
     setInput(cmd);
     setPanelOpen(false);
-    // 聚焦到输入框方便用户修改后回车执行
-    const inputEl = document.querySelector<HTMLInputElement>('[data-cmd-input]');
+    // 聚焦到输入框方便用户修改后回车执行。Scope to this CommandBar's
+    // container so focus stays in the active tab when several are open.
+    const inputEl = containerRef.current?.querySelector<HTMLInputElement>('[data-cmd-input]');
     inputEl?.focus();
   }
 
   return (
     <div
+      ref={containerRef}
       style={{
         height: 36,
         minHeight: 36,

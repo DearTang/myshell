@@ -647,24 +647,28 @@ pub fn delete_folder(conn: &Connection, path: &str) -> Result<()> {
 }
 
 pub fn rename_folder(conn: &Connection, old_path: &str, new_path: &str) -> Result<()> {
-    let pattern = format!("{}/%", old_path);
+    // Escape LIKE wildcards so a folder literally named e.g. "a_b" or "100%"
+    // matches only itself — without this, the LIKE branch would also match
+    // "axb/sub" / "100x/sub" and corrupt those rows' group_path. ?2 stays the
+    // raw old_path for the equality test and the substr length calculation.
+    let pattern = like_prefix_pattern(old_path);
     conn.execute(
         "UPDATE connections SET group_path = ?1 || substr(group_path, length(?2) + 1)
-         WHERE group_path = ?2 OR group_path LIKE ?3",
+         WHERE group_path = ?2 OR group_path LIKE ?3 ESCAPE '\\'",
         params![new_path, old_path, pattern],
     )?;
     conn.execute(
         "UPDATE folders SET path = ?1 || substr(path, length(?2) + 1)
-         WHERE path = ?2 OR path LIKE ?3",
+         WHERE path = ?2 OR path LIKE ?3 ESCAPE '\\'",
         params![new_path, old_path, pattern],
     )?;
     Ok(())
 }
 
 pub fn folder_has_children(conn: &Connection, path: &str) -> Result<bool> {
-    let pattern = format!("{}/%", path);
+    let pattern = like_prefix_pattern(path);
     let conn_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM connections WHERE group_path = ?1 OR group_path LIKE ?2",
+        "SELECT COUNT(*) FROM connections WHERE group_path = ?1 OR group_path LIKE ?2 ESCAPE '\\'",
         params![path, pattern],
         |row| row.get(0),
     )?;
@@ -672,11 +676,22 @@ pub fn folder_has_children(conn: &Connection, path: &str) -> Result<bool> {
         return Ok(true);
     }
     let folder_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM folders WHERE path = ?1 OR path LIKE ?2",
+        "SELECT COUNT(*) FROM folders WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
         params![path, pattern],
         |row| row.get(0),
     )?;
     Ok(folder_count > 0)
+}
+
+/// Build a LIKE pattern matching `prefix` itself plus everything under it
+/// (`prefix/%`), with LIKE wildcards (`%`, `_`) and the escape char (`\`)
+/// in `prefix` escaped so they match literally.
+fn like_prefix_pattern(prefix: &str) -> String {
+    let escaped = prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("{}/%", escaped)
 }
 
 // ============ Command History ============
@@ -695,10 +710,11 @@ pub fn add_command_history(conn: &Connection, connection_id: &str, command: &str
 
     let tx = conn.unchecked_transaction()?;
 
-    // Delete any existing entry with the same command (dedup across all history).
-    // The new insert will place it at the top (most recent).
+    // Delete any existing UNPINNED entry with the same command (dedup across
+    // recent history). Preserve pinned entries — without `AND pinned = 0`
+    // re-running a command the user pinned would silently delete the pin.
     tx.execute(
-        "DELETE FROM command_history WHERE connection_id = ?1 AND command = ?2",
+        "DELETE FROM command_history WHERE connection_id = ?1 AND command = ?2 AND pinned = 0",
         params![connection_id, trimmed],
     )?;
 

@@ -146,6 +146,18 @@ export function recordKeystroke(
 
     // Printable ASCII (0x20-0x7E) or high-byte UTF-8 (>= 0x80)
     if ((code >= 0x20 && code <= 0x7E) || code >= 0x80) {
+      // Astral characters (emoji, some rare CJK) arrive as a UTF-16
+      // surrogate pair: a high unit (0xD800-0xDBFF) followed by a low unit
+      // (0xDC00-0xDFFF). Without this, the lone high surrogate is appended,
+      // corrupting the recorded command. Consume both units.
+      if (code >= 0xD800 && code <= 0xDBFF && i + 1 < data.length) {
+        const next = data.charCodeAt(i + 1);
+        if (next >= 0xDC00 && next <= 0xDFFF) {
+          bufRef.current += ch + data[i + 1];
+          i += 1; // also consume the low surrogate (loop's i++ adds the 2nd)
+          continue;
+        }
+      }
       bufRef.current += ch;
     }
   }

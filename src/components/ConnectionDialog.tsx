@@ -1,8 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { FontField } from "./FontField";
 import { open } from "@tauri-apps/plugin-dialog";
-import { invoke } from "@tauri-apps/api/core";
-import { saveConnection, getConnectionPassword, getConnectionProxyPassword } from "../api";
+import { saveConnection, getConnectionPassword, getConnectionProxyPassword, readTextFile } from "../api";
 import type { ConnectionConfig, ConnType, FtpTls, ProxyType } from "../api";
 import { PasswordVerifyDialog } from "./PasswordVerifyDialog";
 
@@ -922,7 +921,7 @@ function KeyPicker({
         ],
       });
       if (!selected || Array.isArray(selected)) return;
-      const content: string = await invoke("read_text_file", { path: selected });
+      const content: string = await readTextFile(selected);
       const name = selected.split(/[\\/]/).pop() || "key";
       onPick(content, name);
     } catch (e) {

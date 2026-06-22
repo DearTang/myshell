@@ -186,8 +186,20 @@ impl LockoutState {
         std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("serialize lockout: {}", e))?;
-        std::fs::write(lockout_path(), json)
-            .map_err(|e| format!("write lockout: {}", e))
+        // Atomic write (tmp + rename): a plain fs::write that crashes
+        // mid-write leaves a truncated lockout.json that parses as default
+        // and silently resets the brute-force counter — an attacker who can
+        // crash the process between attempts gets unlimited retries. The
+        // unique tmp name avoids a lost-rename race when two concurrent
+        // verify_password calls both save (same tmp name would let one
+        // rename the other's tmp out from under it).
+        let final_path = lockout_path();
+        let tmp = dir.join(format!(".lockout.{:016x}.tmp", rand::random::<u64>()));
+        std::fs::write(&tmp, &json).map_err(|e| format!("write lockout: {}", e))?;
+        std::fs::rename(&tmp, &final_path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("rename lockout: {}", e)
+        })
     }
 
     /// Get current Unix timestamp in seconds

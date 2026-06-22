@@ -751,3 +751,38 @@
 | 目标是什么？ | AI 助手支持 http/socks5 代理，应对无法直连 Claude/OpenAI 的环境 |
 | 我学到了什么？ | reqwest 代理用 `Proxy::all(url)`（socks5 需 `socks` feature）；url 内 `user:pass@host` 支持认证；SQLite 加列对已存在表用 `column_exists` + `ALTER`（CREATE IF NOT EXISTS 不加列） |
 | 我做了什么？ | 4 文件后端（Cargo/db/ai/main）+ 3 文件前端（api/hook/Settings）协调加 proxy_url，cargo check + tsc 全绿 |
+
+### 阶段 27：全量安全 + 逻辑 + 冗余代码审计与修复（2026-06-22）
+- **需求：** 用户要求排查安全/逻辑漏洞与冗余/无效代码并处理。
+- **方法：** 并行派 4 个专家 agent（security-reviewer / rust-reviewer / typescript-reviewer / refactor-cleaner）全量扫 Rust + TS，汇总去重后逐项人工核实行号再修。
+- **关键环境确认：** `rustup`/`cargo 1.96.0` 实际已装（CLAUDE.md「未装」过时），故 Rust 改动可编译验证；依赖 `log`/`chrono`/`rand` 均在，无 `zeroize`/`shell-words`/`scopeguard`。
+- **修复（安全）：**
+  - `main.rs` IPC 结构体类型漂移（**线上 bug**）：`CommandHistoryItem`/`QuickCommandItem`/`QuickCommandExecItem` 加 `#[serde(rename_all="camelCase")]`。此前 wire 发 snake_case 而前端按 camelCase 读，导致快捷命令 `isGlobal`/`sortOrder` 全 `undefined`（分组错乱 + 排序失效）。`ConnectionConfig`/`FileEntry` 维持 snake_case（前端有意如此，注释明示，不动）。
+  - `main.rs` 拒绝空密码 SSH 认证：keyring 缺项时原走 `unwrap_or_default()` 发空串（可能触发服务器账户锁定），改为返回明确错误。
+  - `main.rs` `read_text_file`/`read_file_base64` TOCTOU：改「开一次 + 句柄 `metadata()` + `Take` 限长读」，杜绝路径二次解析被掉包/增长绕过尺寸上限。
+  - `backup.rs` 回滚版本路径穿越（纵深防御）：`is_valid_version` 仅放行 `^\d+(\.\d+)*$`；回滚 marker 原写 `"X (rolled back)"` 永不等于 `APP_VERSION` 致每次启动都备份，改写 `APP_VERSION`。
+  - `db.rs` `rename_folder`/`folder_has_children` LIKE 通配符注入：含 `%`/`_` 的文件夹名会误匹配并改写 `group_path`（数据损坏），改 `like_prefix_pattern` 转义 + `ESCAPE '\'`。
+  - `vault.rs` `LockoutState::save` 原子化：tmp+rename（唯一临时名避并发 rename 丢失），防崩溃留半截文件解析为 default 静默重置暴力破解计数。
+  - `proxy.rs` 代理目标 host 校验：拦 `\r\n`/控制符/空白，防 `CONNECT`/`Host` 头请求走私。
+- **修复（逻辑/健壮性）：**
+  - `db.rs` `add_command_history` 去重加 `AND pinned=0`，防重跑已置顶命令时静默丢置顶。
+  - `ssh.rs` `exec_once` 输出加 4 MiB 上限（防 `yes`/`cat /dev/zero` 在 20s 探测窗内 OOM），与交互通道 `append_capped` 对齐。
+  - `ai.rs` `truncate` 步进到 UTF-8 字符边界（原 `&s[..max]` 在 CJK 错误体上 panic）；`inspect_health_local` 加 20s 超时（原 PowerShell 挂起则 UI 永转）。
+  - `ftp.rs` 删手写 `days_to_ymd`，改 `chrono`（与 `vault.rs` 同款反模式，注释已警示）。
+  - 前端 `cmd-buffer.ts` 处理 UTF-16 代理对（原 emoji/生僻 CJK 拆成 lone surrogate 污染命令历史）。
+  - `zmodem-bridge.ts` `joinPath` 拒 `""`/`.`/`..` 叶子（防逃出下载目录）；ZMODEM 发送失败由「仅 console.error」改为 `this.abort()`，防 UI 无限转圈。
+  - `CommandBar.tsx` 输入聚焦改用 `containerRef` 限定本组件（原 `document.querySelector` 在多 tab 时聚焦到首个 tab）。
+  - `App.tsx` 持久化 `aiPanelWidth` 读取时 clamp 到面板自身 [300,720]（原越界值致面板不可用）。
+  - `SettingsPanel.tsx` 导入/导出密码改 `finally` 清零（原失败路径残留）；自定义主题 hex 先 `normHex` 归一为 `#RRGGBB` 再拼 alpha 后缀（原 `#RGB`/`#RRGGBBAA` 拼出无效 CSS 被静默丢弃）。
+- **清理（冗余/死代码）：** 删 `components/PassphraseDialog.tsx`（零引用整文件）；删 `api.ts` 死导出 `lockVault`/`onSshExit`/`SshExitPayload`（后端 `lock_vault` 命令保留，属可未来接线的能力面）；删 `TerminalPanel.tsx` 空 `forEach`；删 `Sidebar.tsx` 两处只写不读的 `dataset.connId`；`ConnectionDialog.tsx` 原始 `invoke("read_text_file")` 改用新增的类型化 `readTextFile` 包装（补齐三处同步约定）。
+- **验证：** `cargo check` PASS（0 warning）；`npx tsc --noEmit` PASS（0 error）。
+- **遗留/未处理（评估后有意不动）：** FTP 明文（FTPS 未实现，属产品决策，非代码缺陷）；`shell_path` 任意可执行（本地终端威胁模型为用户自伤，且改之伤 UX，仅注释提示）；`get_connection_password` 明文回传渲染层 + AI `base_url` SSRF（威胁模型为「渲染层被攻陷」，桌面自有 UI 风险较低，需产品级确认后再做 scheme 白名单/重认证）；本地终端输出无 cap（xterm 滚动缓冲自有上限，且为用户自伤 DoS，加合并会引入刷屏延迟，性价比低）；SFTP 每调用新开 channel（已知设计取舍）；`channel.wait()` 取消安全（已注释标注，待高流量观察）。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 27 complete（安全+逻辑+冗余审计修复，cargo check + tsc 双绿） |
+| 我要去哪里？ | 用户 dev 实测：快捷命令分组/排序回归正常、导入导出/回滚/重命名文件夹/本地巡检路径无回归 |
+| 目标是什么？ | 清除安全漏洞与线上 bug（快捷命令类型漂移）、补齐健壮性、删冗余代码，全程零编译/类型回归 |
+| 我学到了什么？ | IPC 结构体命名两边必须同案（snake/camel 别混用，否则 TS 接口骗人、运行时 undefined）；`metadata(path)`+`read(path)` 是 TOCTOU，要开一次取句柄元数据；SQLite `LIKE` 的 `%`/`_` 在用户可控串里要 `ESCAPE`；原子写 lockout 等小文件别用裸 `fs::write`（崩溃留半截=静默重置安全计数）；rustup 实已装，CLAUDE.md 该条已过时 |
+| 我做了什么？ | 4 agent 并行扫 → 人工核实 → 修 12 处后端 + 12 处前端 + 删 1 文件/3 死导出，cargo check（0 warn）+ tsc（0 err）全绿，progress/README 同步 |

@@ -786,11 +786,32 @@ pub async fn exec_once(
         .await
         .map_err(|e| format!("exec failed: {}", e))?;
 
+    // Cap collected output so a chatty/malicious server can't OOM the app
+    // within the 20s probe window (e.g. `yes` / `cat /dev/zero` left running).
+    // Matches the spirit of the interactive channel's append_capped cap.
+    const MAX_EXEC_BYTES: usize = 4 * 1024 * 1024;
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut truncated = false;
     loop {
         match channel.wait().await {
-            Some(ChannelMsg::Data { ref data }) => buf.extend_from_slice(data),
-            Some(ChannelMsg::ExtendedData { ref data, .. }) => buf.extend_from_slice(data),
+            Some(ChannelMsg::Data { ref data }) => {
+                if buf.len() < MAX_EXEC_BYTES {
+                    let room = MAX_EXEC_BYTES - buf.len();
+                    buf.extend_from_slice(&data[..data.len().min(room)]);
+                    if buf.len() == MAX_EXEC_BYTES {
+                        truncated = true;
+                    }
+                }
+            }
+            Some(ChannelMsg::ExtendedData { ref data, .. }) => {
+                if buf.len() < MAX_EXEC_BYTES {
+                    let room = MAX_EXEC_BYTES - buf.len();
+                    buf.extend_from_slice(&data[..data.len().min(room)]);
+                    if buf.len() == MAX_EXEC_BYTES {
+                        truncated = true;
+                    }
+                }
+            }
             Some(ChannelMsg::ExitStatus { .. })
             | Some(ChannelMsg::Eof)
             | Some(ChannelMsg::Close)
@@ -798,5 +819,9 @@ pub async fn exec_once(
             Some(_) => {}
         }
     }
-    Ok(String::from_utf8_lossy(&buf).to_string())
+    let mut out = String::from_utf8_lossy(&buf).into_owned();
+    if truncated {
+        out.push_str("\n[output truncated]\n");
+    }
+    Ok(out)
 }

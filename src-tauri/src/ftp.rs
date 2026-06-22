@@ -175,41 +175,10 @@ fn format_pex(f: &FtpFile) -> String {
 }
 
 fn format_time(t: SystemTime) -> String {
-    let dur = match t.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(d) => d.as_secs(),
-        Err(_) => return String::new(),
-    };
-    // RFC3339-ish — Y-M-D H:M:S, computed without chrono to keep deps lean.
-    let days = dur / 86400;
-    let rem = dur % 86400;
-    let h = rem / 3600;
-    let m = (rem % 3600) / 60;
-    let s = rem % 60;
-    let (y, mo, d) = days_to_ymd(days as i64);
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, m, s)
-}
-
-/// Days since 1970-01-01 → (year, month, day). Proleptic Gregorian.
-fn days_to_ymd(mut days: i64) -> (i64, u32, u32) {
-    let mut year: i64 = 1970;
-    loop {
-        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-        let in_year = if leap { 366 } else { 365 };
-        if days < in_year {
-            break;
-        }
-        days -= in_year;
-        year += 1;
-    }
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut m: u32 = 0;
-    for (i, &mm) in months.iter().enumerate() {
-        if days < mm as i64 {
-            m = i as u32 + 1;
-            break;
-        }
-        days -= mm as i64;
-    }
-    (year, m, days as u32 + 1)
+    // chrono is already a dependency (used by vault.rs). The previous
+    // hand-rolled days_to_ymd was the same anti-pattern vault.rs warns
+    // about — it produced wrong month/day values for some timestamps.
+    chrono::DateTime::<chrono::Utc>::from(t)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }

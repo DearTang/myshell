@@ -121,6 +121,10 @@ export class ZmodemBridge {
       // zmodem.js produced protocol bytes — push them into the SSH channel.
       sshSendZmodem(this.sessionId, new Uint8Array(octets)).catch((e) => {
         console.error("sshSendZmodem failed:", e);
+        // Without this, zmodem.js blocks waiting for an ACK that will never
+        // arrive and the UI shows an infinite transfer. abort() is
+        // idempotent and tears down the session + resets status.
+        this.abort();
       });
     });
 
@@ -453,5 +457,12 @@ function joinPath(dir: string, name: string): string {
   const safeName = name.split(/[\\/]/).pop() || name;
   const sep = dir.includes("/") && !dir.includes("\\") ? "/" : "\\";
   const trimmed = dir.endsWith(sep) ? dir.slice(0, -1) : dir;
+  // Guard against traversal via a bare leaf: "" (empty/odd filename), "."
+  // (this dir), or ".." (parent dir). split/pop leaves these untouched
+  // because they contain no separator. Fall back to a benign name so we
+  // never write outside the chosen download directory.
+  if (!safeName || safeName === "." || safeName === "..") {
+    return `${trimmed}${sep}myshell-download.bin`;
+  }
   return `${trimmed}${sep}${safeName}`;
 }

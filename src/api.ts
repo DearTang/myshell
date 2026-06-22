@@ -115,10 +115,6 @@ export async function unlockVault(passphrase: string): Promise<void> {
   await invoke("unlock_vault", { passphrase });
 }
 
-export async function lockVault(): Promise<void> {
-  await invoke("lock_vault");
-}
-
 export async function changeMasterPassword(
   oldPassphrase: string,
   newPassphrase: string
@@ -482,11 +478,6 @@ export interface SshOutputPayload {
   data: number[];
 }
 
-export interface SshExitPayload {
-  sessionId: string;
-  code: number;
-}
-
 /**
  * Subscribe to terminal output for a specific session.
  * The handler receives raw bytes; pass them directly to xterm's term.write().
@@ -513,19 +504,6 @@ export function onSshClosed(
 ): Promise<UnlistenFn> {
   return listen<string>("ssh_closed", (event) => {
     if (event.payload === sessionId) handler();
-  });
-}
-
-/**
- * Subscribe to remote exit-status events for a specific session.
- * informational — emitted when the remote shell reports an exit code.
- */
-export function onSshExit(
-  sessionId: string,
-  handler: (code: number) => void
-): Promise<UnlistenFn> {
-  return listen<SshExitPayload>("ssh_exit", (event) => {
-    if (event.payload.sessionId === sessionId) handler(event.payload.code);
   });
 }
 
@@ -727,6 +705,15 @@ export async function szClose(id: string): Promise<void> {
  */
 export async function readFileBase64(path: string): Promise<string> {
   return await invoke("read_file_base64", { path });
+}
+
+/**
+ * Read a local text file (PEM private key, etc.) for the key picker.
+ * The backend rejects anything over 1 MiB, non-UTF-8, or not starting with
+ * a PEM `-----BEGIN` marker.
+ */
+export async function readTextFile(path: string): Promise<string> {
+  return await invoke("read_text_file", { path });
 }
 
 // ============ ZMODEM Event Subscriptions ============

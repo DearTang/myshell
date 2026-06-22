@@ -227,12 +227,15 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
     try {
       const n = await exportConnections(exportPass, path);
       setShowExportDialog(false);
-      setExportPass("");
       alert(`已导出 ${n} 个连接到\n${path}`);
     } catch (e) {
       setIoErr(String(e));
     } finally {
       setExportBusy(false);
+      // Clear the passphrase on every exit path so it never lingers in
+      // component state after a failed attempt (success already closed
+      // the dialog).
+      setExportPass("");
     }
   }
 
@@ -260,13 +263,16 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
       const n = await importConnections(importPass, importPath);
       setShowImportDialog(false);
       setImportPath(null);
-      setImportPass("");
       alert(`已导入 ${n} 个连接`);
       onRefresh();
     } catch (e) {
       setIoErr(String(e));
     } finally {
       setImportBusy(false);
+      // Clear the passphrase on every exit path — a failed import is most
+      // likely a wrong passphrase, so forcing re-entry is both safer and
+      // better UX than leaving the wrong value populated.
+      setImportPass("");
     }
   }
 
@@ -551,31 +557,48 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
                 onAccentChange={setCustomAccent}
                 onBgChange={setCustomBg}
                 onSave={() => {
+                  // Normalize to 7-char #RRGGBB before appending alpha
+                  // suffixes ("cc", "26", ...). A free-text hex like "#RGB"
+                  // shorthand or "#RRGGBBAA" would otherwise produce invalid
+                  // CSS colors (e.g. "#fffcc") that browsers silently drop.
+                  const normHex = (hex: string): string => {
+                    const h = hex.trim();
+                    if (/^#[0-9a-fA-F]{3}$/.test(h)) {
+                      return "#" + h
+                        .slice(1)
+                        .split("")
+                        .map((c) => c + c)
+                        .join("");
+                    }
+                    return /^#[0-9a-fA-F]{6}/.test(h) ? h.slice(0, 7) : h;
+                  };
+                  const accent = normHex(customAccent);
+                  const bg = normHex(customBg);
                   const id = `custom-${Date.now()}`;
                   const palette: ColorPalette = {
                     id,
                     name: "自定义主题",
                     dark: {
-                      terminal: { ...PRESETS[0].dark.terminal, background: customBg },
+                      terminal: { ...PRESETS[0].dark.terminal, background: bg },
                       ui: {
                         ...PRESETS[0].dark.ui,
-                        "--accent-primary": customAccent,
-                        "--accent-primary-hover": customAccent + "cc",
-                        "--accent-primary-muted": customAccent + "26",
-                        "--border-accent": customAccent + "66",
-                        "--shadow-glow": `0 0 20px ${customAccent}40`,
-                        "--bg-base": customBg,
+                        "--accent-primary": accent,
+                        "--accent-primary-hover": accent + "cc",
+                        "--accent-primary-muted": accent + "26",
+                        "--border-accent": accent + "66",
+                        "--shadow-glow": `0 0 20px ${accent}40`,
+                        "--bg-base": bg,
                       },
                     },
                     light: {
-                      terminal: { ...PRESETS[0].light.terminal, background: customBg },
+                      terminal: { ...PRESETS[0].light.terminal, background: bg },
                       ui: {
                         ...PRESETS[0].light.ui,
-                        "--accent-primary": customAccent,
-                        "--accent-primary-hover": customAccent + "cc",
-                        "--accent-primary-muted": customAccent + "1a",
-                        "--border-accent": customAccent + "66",
-                        "--shadow-glow": `0 0 20px ${customAccent}33`,
+                        "--accent-primary": accent,
+                        "--accent-primary-hover": accent + "cc",
+                        "--accent-primary-muted": accent + "1a",
+                        "--border-accent": accent + "66",
+                        "--shadow-glow": `0 0 20px ${accent}33`,
                       },
                     },
                   };

@@ -195,15 +195,10 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
       const targets = broadcastRef.current;
       const destinations =
         targets.length > 0 ? targets : [sessionIdRef.current];
-      Promise.allSettled(
-        destinations.map((sid) => sendTo(sid, data))
-      ).then((results) => {
-        results.forEach((r, i) => {
-          if (r.status === "rejected") {
-            // Silently ignore broadcast failures (session may have been closed)
-          }
-        });
-      });
+      // Fire-and-forget. Promise.allSettled already swallows per-target
+      // rejections (a target session may have just closed), so there's
+      // nothing to do on completion.
+      void Promise.allSettled(destinations.map((sid) => sendTo(sid, data)));
 
       // Record keystrokes for command-history. This runs AFTER the send
       // so we don't block the critical path. We only record for the

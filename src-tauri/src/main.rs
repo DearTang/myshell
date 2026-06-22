@@ -125,7 +125,13 @@ pub struct FileEntry {
 
 // ============ Command History Entry ============
 
+// rename_all = camelCase so the wire fields (createdAt) match the TS
+// interface in api.ts. ConnectionConfig/FileEntry stay snake_case by
+// intentional convention (documented in api.ts); these list-item structs
+// use camelCase because the frontend reads createdAt/connectionId/sortOrder/
+// isGlobal directly off the payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CommandHistoryItem {
     pub id: i64,
     pub command: String,
@@ -138,6 +144,7 @@ pub struct CommandHistoryItem {
 /// A quick command as stored/managed (global or per-connection). Used by the
 /// management panel. `connection_id` is None for global scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct QuickCommandItem {
     pub id: i64,
     pub connection_id: Option<String>,
@@ -149,6 +156,7 @@ pub struct QuickCommandItem {
 /// A quick command flattened for the terminal execution panel: the union of
 /// global + current-connection commands, with an `is_global` flag for grouping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct QuickCommandExecItem {
     pub id: i64,
     pub is_global: bool,
@@ -828,13 +836,19 @@ fn get_previous_version() -> Option<String> {
 ///      existence oracle.
 #[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
+    use std::io::Read;
     if path.bytes().any(|b| b == 0) {
         return Err("无效路径".to_string());
     }
     if path.len() > 4096 {
         return Err("路径过长".to_string());
     }
-    let meta = std::fs::metadata(&path).map_err(|_| "读取文件失败".to_string())?;
+    // Open once and stat the handle (not the path) so the size check and the
+    // read observe the same file — a path-based metadata() followed by read()
+    // is a TOCTOU window where the file can be swapped/truncated/grown
+    // between the two calls.
+    let file = std::fs::File::open(&path).map_err(|_| "读取文件失败".to_string())?;
+    let meta = file.metadata().map_err(|_| "读取文件失败".to_string())?;
     if !meta.is_file() {
         return Err("读取文件失败".to_string());
     }
@@ -842,7 +856,12 @@ fn read_text_file(path: String) -> Result<String, String> {
     if meta.len() > MAX_PEM_BYTES {
         return Err("文件过大".to_string());
     }
-    let content = std::fs::read(&path).map_err(|_| "读取文件失败".to_string())?;
+    // Take() bounds the read to MAX_PEM_BYTES even if the file grew between
+    // the stat above and here (defence-in-depth against the residual race).
+    let mut content = Vec::new();
+    file.take(MAX_PEM_BYTES)
+        .read_to_end(&mut content)
+        .map_err(|_| "读取文件失败".to_string())?;
     let text = String::from_utf8(content).map_err(|_| "文件编码无效".to_string())?;
     if !text.trim_start().starts_with("-----BEGIN") {
         return Err("文件格式无效".to_string());
@@ -855,6 +874,7 @@ fn read_text_file(path: String) -> Result<String, String> {
 #[tauri::command]
 fn read_file_base64(path: String) -> Result<String, String> {
     use base64::Engine as _;
+    use std::io::Read;
 
     if path.bytes().any(|b| b == 0) {
         return Err("无效路径".to_string());
@@ -862,7 +882,11 @@ fn read_file_base64(path: String) -> Result<String, String> {
     if path.len() > 4096 {
         return Err("路径过长".to_string());
     }
-    let meta = std::fs::metadata(&path).map_err(|_| "读取文件失败".to_string())?;
+    // Open once + stat the handle: avoids the TOCTOU window between a
+    // path-based metadata() and a separate read() (file could be swapped or
+    // grown in between, defeating the size cap).
+    let file = std::fs::File::open(&path).map_err(|_| "读取文件失败".to_string())?;
+    let meta = file.metadata().map_err(|_| "读取文件失败".to_string())?;
     if !meta.is_file() {
         return Err("读取文件失败".to_string());
     }
@@ -871,7 +895,10 @@ fn read_file_base64(path: String) -> Result<String, String> {
     if meta.len() > MAX_BYTES {
         return Err("文件过大（最大 8 MB）".to_string());
     }
-    let bytes = std::fs::read(&path).map_err(|_| "读取文件失败".to_string())?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "读取文件失败".to_string())?;
 
     // Simple extension-based MIME detection — avoids a dependency
     let ext = std::path::Path::new(&path)
@@ -1228,6 +1255,19 @@ async fn ssh_connect(
     if config.auth_method != "key" && config.password.is_none() {
         let key = require_dek(&state)?;
         config.password = secrets::get_password(&config.id, &key)?;
+    }
+    // Refuse to authenticate with an empty password. A missing keyring entry
+    // resolves to None (then ssh.rs would send "" via unwrap_or_default),
+    // which many servers count as a failed attempt and lock the account
+    // after N tries. Surface the real cause instead.
+    if config.auth_method == "password"
+        && config
+            .password
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true)
+    {
+        return Err("未找到保存的密码，请重新编辑该连接并输入密码".to_string());
     }
     // Same for proxy password: pull from keyring so ssh.rs sees a complete
     // proxy config and can hand it to proxy.rs without knowing about the
