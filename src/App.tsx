@@ -112,16 +112,34 @@ export default function App() {
   function getBroadcastTargets(tab: Tab): string[] {
     if (!tab.sessionId || !broadcastIds.has(tab.id)) return [];
     const targets: string[] = [];
+    // Don't broadcast to two sessions of the SAME connection: if the user
+    // opened the same host in two tabs and put both in the broadcast group,
+    // sending identical keystrokes to both is redundant and surprising
+    // (double-execution on one server). Keep one session per connectionId.
+    const seenConnections = new Set<string>();
+    // Seed with the origin's connection so OTHER tabs of the same server are
+    // excluded. The origin's own session is added unconditionally below
+    // (TerminalPanel sends only to `targets`, not also to self, so the origin
+    // must always be present or the user's typing wouldn't reach their own
+    // terminal).
+    if (tab.connectionId) seenConnections.add(tab.connectionId);
     for (const t of tabs) {
       if (
-        broadcastIds.has(t.id) &&
-        t.sessionId &&
-        t.type === "terminal" &&
-        t.connType === "ssh" &&
-        t.status === "connected"
+        !broadcastIds.has(t.id) ||
+        !t.sessionId ||
+        t.type !== "terminal" ||
+        t.connType !== "ssh" ||
+        t.status !== "connected"
       ) {
-        targets.push(t.sessionId);
+        continue;
       }
+      if (t.id === tab.id) {
+        targets.push(t.sessionId);
+        continue;
+      }
+      if (t.connectionId && seenConnections.has(t.connectionId)) continue;
+      if (t.connectionId) seenConnections.add(t.connectionId);
+      targets.push(t.sessionId);
     }
     return targets;
   }

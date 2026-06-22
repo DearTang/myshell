@@ -786,3 +786,22 @@
 | 目标是什么？ | 清除安全漏洞与线上 bug（快捷命令类型漂移）、补齐健壮性、删冗余代码，全程零编译/类型回归 |
 | 我学到了什么？ | IPC 结构体命名两边必须同案（snake/camel 别混用，否则 TS 接口骗人、运行时 undefined）；`metadata(path)`+`read(path)` 是 TOCTOU，要开一次取句柄元数据；SQLite `LIKE` 的 `%`/`_` 在用户可控串里要 `ESCAPE`；原子写 lockout 等小文件别用裸 `fs::write`（崩溃留半截=静默重置安全计数）；rustup 实已装，CLAUDE.md 该条已过时 |
 | 我做了什么？ | 4 agent 并行扫 → 人工核实 → 修 12 处后端 + 12 处前端 + 删 1 文件/3 死导出，cargo check（0 warn）+ tsc（0 err）全绿，progress/README 同步 |
+
+### 阶段 28：4 项体验优化（连接排序确认 / 广播去重 / 终端选区可见性 / Windows 任务栏图标）（2026-06-22）
+- **需求：** 用户提 4 点：①文件夹下连接是否按名排序 ②同连接开两 tab 时广播不应重复发 ③终端选中内容难以分辨（无选中色变化）④打包后任务栏显示默认图标（exe 图标正常）。
+- **改动：**
+  - **①连接排序——经核实已实现，无需改动。** `Sidebar.tsx:buildTree` 第 70-75 行 `sortRec` 已对 `n.children`（子文件夹）与 `n.conns`（连接）按 `name.localeCompare(..., "zh")` 排序；`:219` `useMemo(buildTree)` 重建；`:332-333` 非搜索态 `walk(tree)` 渲染的是排序后的树。结论：文件夹下连接已按名排序（中文 locale）。
+  - **②广播去重（`App.tsx:getBroadcastTargets`）：** 遍历广播组成员时按 `tab.connectionId` 去重——同连接开两 tab 只取首个 session，避免对同一台服务器重复发同一按键（双执行）。无 connectionId 的 tab 仍照常纳入。
+  - **③终端选区可见性（`TerminalPanel.tsx`）：** 根因——各主题 `selectionBackground` 多用低 alpha（`#RRGGBBAA` 末两位 `44`≈27% / `88`≈53%），在终端背景上几乎看不出。新增 `visibleSelection()` 把 alpha 提到 `cc`（≈80%，保留各主题原有色相），在 Terminal 构造处（`:143`）与重渲染处（`:408`）两处 `theme` spread 注入，覆盖普通/背景图两种渲染路径。
+  - **④Windows 任务栏图标（`main.rs` + `Cargo.toml`）：** exe 图标正常 ⇒ tauri-build 已正确嵌入图标资源；任务栏仍是默认 ⇒ 身份/分组问题。双保险：a) `run()` 起始处 `set_windows_app_user_model_id()` 经 shell32 内联 FFI 调 `SetCurrentProcessExplicitAppUserModelID("com.myshell.client")`（与 tauri.conf identifier 同值），必须在窗口创建前设置；b) `Cargo.toml` tauri 加 `image-ico` feature，`.setup()` 里 `window.set_icon(Image::from_bytes(include_bytes!("../icons/icon.ico")))` 显式给主窗口上图标。注意 Tauri 2.x 该版本 `set_icon` 直接吃 `Image` 非 `Option<Image>`（初版写 `Some(icon)` 编译报 E0308，已改）。
+- **验证：** `cargo check` PASS（0 warn，tauri 加 image-ico 重编 ~50s）；`npx tsc --noEmit` PASS（0 err）。
+- **遗留：** ④需用户重新 `cargo tauri build` 出包验证；若任务栏仍显示旧默认图标，多为 Windows 图标缓存（任务栏已固定快捷方式）/需取消固定重固定，或 `ie4uinit.exe -show` 刷新图标缓存。①确认无需改动。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 28 complete（4 项优化：排序确认/广播去重/选区可见/任务栏图标，cargo + tsc 双绿） |
+| 我要去哪里？ | 用户 dev 实测选区高亮 + 广播去重；出包验证任务栏图标 |
+| 目标是什么？ | 解决用户提的 4 个体验点，零回归 |
+| 我学到了什么？ | xterm `selectionBackground` 支持 8 位 hex `#RRGGBBAA`，alpha 太低则选区不可见；Windows「exe 图标对、任务栏默认」几乎都是缺 AUMID（`SetCurrentProcessExplicitAppUserModelID`，须窗口创建前设）；Tauri 2.x `WebviewWindow::set_icon` 签名是 `Image` 而非 `Option<Image>`（版本相关，报错为准）；`#[link(name="shell32")] extern "system"` 可免 winapi feature 直接调系统 API |
+| 我做了什么？ | ①确认已排序 ②getBroadcastTargets 按 connectionId 去重 ③visibleSelection 提 alpha 注入两处 ④AUMID + set_icon 双保险（+image-ico feature），cargo/tsc 双绿，progress/README 同步 |

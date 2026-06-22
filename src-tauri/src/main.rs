@@ -2258,6 +2258,40 @@ fn setup_file_logging() {
     );
 }
 
+/// Set a stable Windows AppUserModelID for the process. Without it the
+/// taskbar groups the window by executable path, which — especially right
+/// after an update or from a fresh install — surfaces the generic Windows
+/// icon in the taskbar even though the .exe's own icon resource is correct
+/// (so Explorer shows the right icon but the taskbar doesn't). Must be set
+/// before any window is created. Best-effort: a failure just leaves the
+/// default path-based identity (still works, may show a generic/cached icon).
+#[cfg(windows)]
+fn set_windows_app_user_model_id() {
+    use std::os::windows::ffi::OsStrExt;
+
+    // Inline FFI to shell32!SetCurrentProcessExplicitAppUserModelID. Declared
+    // directly (not via the `winapi` crate) to avoid adding a feature gate;
+    // shell32 is already linked transitively. HRESULT is a typed i32.
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SetCurrentProcessExplicitAppUserModelID(app_id: *const u16) -> i32;
+    }
+
+    // Matches `identifier` in tauri.conf.json — a stable reverse-DNS id.
+    let app_id: Vec<u16> = std::ffi::OsStr::new("com.myshell.client")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `app_id` is a valid NUL-terminated UTF-16 buffer owned by this
+    // scope; the pointer does not outlive the call.
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(app_id.as_ptr());
+    }
+}
+
+#[cfg(not(windows))]
+fn set_windows_app_user_model_id() {}
+
 pub fn run() {
     // Default INFO so log::info!/warn!/error! surface in the daily log file
     // (release dup2's stderr → file) / console (debug). RUST_LOG still wins
@@ -2267,6 +2301,10 @@ pub fn run() {
         .init();
     #[cfg(not(debug_assertions))]
     setup_file_logging();
+
+    // Set the Windows taskbar identity before any window is created, so the
+    // taskbar shows the MyShell icon instead of a generic one.
+    set_windows_app_user_model_id();
 
     // Check for version upgrade and backup if needed
     if let Err(e) = backup::check_and_backup() {
@@ -2371,6 +2409,26 @@ pub fn run() {
             get_ai_settings,
             save_ai_settings,
         ])
+        .setup(|app| {
+            // Explicitly set the main window's icon so the title bar + taskbar
+            // show the MyShell icon regardless of how tauri-build auto-embedded
+            // the default window icon. Pairs with set_windows_app_user_model_id()
+            // (called at the top of run()) to fully fix the Windows taskbar icon.
+            #[cfg(windows)]
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    match tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico")) {
+                        Ok(icon) => {
+                            if let Err(e) = window.set_icon(icon) {
+                                log::warn!("[startup] set window icon failed: {}", e);
+                            }
+                        }
+                        Err(e) => log::warn!("[startup] decode window icon failed: {}", e),
+                    }
+                }
+            }
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 

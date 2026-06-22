@@ -26,6 +26,23 @@ import { useTheme } from "../hooks/useTheme";
 import { useTerminalFont, resolveFontStack } from "../hooks/useTerminalFont";
 import "@xterm/xterm/css/xterm.css";
 
+/**
+ * Bump a selection color's alpha so the selected range is clearly visible.
+ * Many palettes set `selectionBackground` at ~27% alpha (#RRGGBBAA with AA=44),
+ * which renders nearly invisibly on the terminal background and makes it hard
+ * to tell what's selected. Raise low alpha to a clearly visible ~80% while
+ * preserving each palette's chosen hue.
+ */
+function visibleSelection(color: string | undefined): string | undefined {
+  if (!color) return color;
+  // 8-digit #RRGGBBAA → replace the alpha byte with cc (≈80%).
+  if (/^#[0-9a-fA-F]{8}$/.test(color)) {
+    return color.slice(0, 7) + "cc";
+  }
+  // 6-digit #RRGGBB (opaque) → already visible; keep as-is.
+  return color;
+}
+
 interface Props {
   sessionId: string;
   /** Tab connection type — selects ssh_* vs local_* backend commands.
@@ -140,7 +157,16 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
       cursorBlink: true,
       fontSize: 14,
       fontFamily,
-      theme: hasBgImage ? { ...terminalTheme, background: "rgba(0, 0, 0, 0)" } : terminalTheme,
+      theme: hasBgImage
+        ? {
+            ...terminalTheme,
+            background: "rgba(0, 0, 0, 0)",
+            selectionBackground: visibleSelection(terminalTheme.selectionBackground),
+          }
+        : {
+            ...terminalTheme,
+            selectionBackground: visibleSelection(terminalTheme.selectionBackground),
+          },
       allowProposedApi: true,
       allowTransparency: hasBgImage,
     });
@@ -405,7 +431,11 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
     // WebGL renderer can't parse "transparent" (canvas could), and falls back
     // to an opaque black clearColor, hiding the background image.
     const currentBg = hasBgImage ? "rgba(0, 0, 0, 0)" : terminalTheme.background;
-    term.options.theme = { ...terminalTheme, background: currentBg };
+    term.options.theme = {
+      ...terminalTheme,
+      background: currentBg,
+      selectionBackground: visibleSelection(terminalTheme.selectionBackground),
+    };
     term.options.allowTransparency = hasBgImage;
 
     // Also sync the container background
