@@ -805,3 +805,139 @@
 | 目标是什么？ | 解决用户提的 4 个体验点，零回归 |
 | 我学到了什么？ | xterm `selectionBackground` 支持 8 位 hex `#RRGGBBAA`，alpha 太低则选区不可见；Windows「exe 图标对、任务栏默认」几乎都是缺 AUMID（`SetCurrentProcessExplicitAppUserModelID`，须窗口创建前设）；Tauri 2.x `WebviewWindow::set_icon` 签名是 `Image` 而非 `Option<Image>`（版本相关，报错为准）；`#[link(name="shell32")] extern "system"` 可免 winapi feature 直接调系统 API |
 | 我做了什么？ | ①确认已排序 ②getBroadcastTargets 按 connectionId 去重 ③visibleSelection 提 alpha 注入两处 ④AUMID + set_icon 双保险（+image-ico feature），cargo/tsc 双绿，progress/README 同步 |
+
+### 阶段 29：SFTP 打开即报 "Read dir failed: No such file" + 版本号 1.4.2（2026-06-22）
+- **需求：** ①版本号改 1.4.2；②连接 `sftp_perceptualCenter@...` 后 SFTP 面板直接报 `Read dir failed: No such file: No such file`，用户反馈「连接 sftp 异常」。
+- **根因（②）：** `SftpPanel.tsx` 初始路径用 `~`（SSH/SFTP 惯用的 home 快捷），但 **SFTP 协议 + russh-sftp 把 `~` 当字面目录名**——没有 shell 做展开，服务器上又没有名为 `~` 的目录，于是 `read_dir("~")` 返回 `SSH_FX_NO_SUCH_FILE`，`format!("Read dir failed: {}", e)` 把 russh-sftp 的「状态码名: 服务器消息」渲染成 `No such file: No such file`（所以重复两次）。与 SFTP 子系统是否可用、shell 通道是否秒退（ExitStatus=1，该账号疑似 nologin/chroot 的 SFTP-only 账号）无关——子系统通道开得起来，错在路径。
+- **改动：**
+  - `src-tauri/src/sftp.rs` 新增 `resolve_path(sftp, path)`：遇 `~` / `~/` / `~/foo` 时先 `sftp.canonicalize(".")`（SFTP REALPATH，返回服务器默认目录=home）再拼后缀；绝对/相对路径原样透传。`list_dir` / `create_dir` / `remove` / `rename` 四处入口统一走它。`list_dir` 的子项 `full_path` 改用解析后的绝对路径，使从 `~` 进下一级后地址栏自然变成真实绝对路径（`/home/.../name`），而非停留在 `~`。
+  - 注意所有权：`read_dir`/`remove_file`/`remove_dir` 都是 `P: Into<String>`，传 owned `String` 会被 move 掉、之后再 `format!` 用就报 use-after-move；统一传 `resolved.as_str()`（`&str: Into<String>`，借用不 move）。`rename` 两参各 move 一次、用后不再访问，OK。
+  - 版本号 1.4.1 → 1.4.2：改 `Cargo.toml`（唯一真源）后跑 `npm run version:sync` 同步到 `package.json` + `package-lock.json`；`tauri.conf.json` 无需版本字段（Tauri v2 直接读 Cargo.toml）。
+  - **附带修复（阻断编译的遗留 typo）：** `Cargo.toml` 里 `rusqlite` 的 feature 写成了 `bundclaudled`（不存在的 feature），cargo 直接报 `does not have that feature` 全量编不过。改回正确的 `bundled`（与 CLAUDE.md「rusqlite (bundled)」一致）。该 typo 正是会话开始时 `git status` 里那个未提交的 `M src-tauri/Cargo.toml`。
+- **验证：** `npx tsc --noEmit` PASS（0 err）；`cargo check` PASS（0 warn，33.8s）。`canonicalize`/`read_dir`/`rename`/`remove_file`/`remove_dir`/`create_dir` 签名均已对照 russh-sftp 2.3.0 源码确认（`canonicalize` 在 `client/session.rs:127`，`read_dir` 返回可迭代的 `ReadDir`）。
+- **遗留 / 待用户实测：** chroot 型 SFTP-only 账号若 home 在 chroot 内不存在，服务器会把 CWD 落在 `/`，此时 `canonicalize(".")` 返回 `/`、列 `/`，不会再报 No such file（降级正确）。需用户 dev 实测该连接的 SFTP 面板能正常列目录。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 29 complete（SFTP `~` 展开修复 + 版本 1.4.2 + 顺手修 rusqlite feature typo），cargo + tsc 双绿 |
+| 我要去哪里？ | 用户 dev 实测 `sftp_perceptualCenter` 连接的 SFTP 面板能正常列目录、进退、增删改名 |
+| 目标是什么？ | 解决「连接 sftp 异常」线上 bug，版本号升 1.4.2，零回归 |
+| 我学到了什么？ | SFTP 协议无 shell，`~` 不展开——所有 `~` 都得用 REALPATH(canonicalize ".") 解析；russh-sftp 各方法多泛型 `Into<String>`，传 owned String 会 move，要 `.as_str()`；russh-sftp 错误显示是「状态码名: 服务器消息」故 No such file 重复两次；版本号单一真源在 Cargo.toml，sync-version.mjs 负责扩散 |
+| 我做了什么？ | sftp.rs 加 resolve_path 并接入四入口（含所有权修正）、版本 1.4.1→1.4.2（+sync）、修 `bundclaudled`→`bundled` 编译阻断 typo，cargo/tsc 双绿，progress/README 同步 |
+
+### 阶段 30：SFTP 点击目录报 "SSH session not found" —— shell 通道关闭误删整个 session（2026-06-22）
+- **需求：** 阶段 29 修完 `~` 展开后，用户实测 SFTP 面板能进入（列 home 成功），但「点击目录后提示 SSH session not found」。
+- **根因：** `channel_reader` 在 shell **通道**关闭时（EOF/Close/`exit`/ExitStatus）执行 `sessions.remove(&session_id)`，把整个 `SshSession` 连同 `Arc<Handle>` 一起从 map 删掉。但 russh 是「一条 SSH 连接多路复用多个通道」——shell 通道死了 ≠ SSH 连接死了，SFTP 子系统通道是 shell 通道的兄弟，靠同一个 `Arc<Handle>` 开新通道。该账号是 SFTP-only（nologin/chroot），shell 秒退（ExitStatus=1）→ reader 退出 → 删 session → 后续所有 SFTP 调用 `get_sftp_session` 找不到 session → "SSH session not found"。第一次列目录能成功只是因为面板挂载时抢在 reader 退出前完成了 `read_dir`。
+- **改动：**
+  - `src-tauri/src/ssh.rs`：
+    - `channel_reader` 不再接收 `sessions` 参数、不再在退出时 `map.remove`（删 `HashMap` import；`Mutex` 仍被 `SshClient.db` 用，保留）。改为只在 loop 内 emit `ssh_closed` 后退出。shell 通道关闭只是「终端断了」，session（连接）保留供 SFTP/exec 继续开新通道。
+    - `disconnect()` 成为唯一删 session 的点：`sessions.remove(session_id)` 取出所有权 → 给 reader 发 `Disconnect`（best-effort，SFTP-only 账号 reader 已退，no-op）→ 函数结束 drop `SshSession` → drop `Arc<Handle>` → 关闭 SSH 连接（任何在飞的 SFTP `Arc::clone` 释放后）。`ssh::disconnect` 因此变 idempotent（session 不在 map 返回 Ok）。
+    - `connect()` 同步去掉 `sessions_arc` 的 clone 与传参。
+  - `src/App.tsx::handleCloseTab`：原来仅在 `tab.status === "connected"` 时断开。但 SFTP-only 账号 shell 秒退后 `onSshClosed → onDisconnected` 把 status 置 "disconnected"，关 tab 时跳过 `sshDisconnect` → session 泄漏。改为：SSH/SFTP 分支无条件 `sshDisconnect`（依赖后端 idempotent）；FTP/local 仍只在 connected 时断（二者非 idempotent / 清理模型不同）。
+- **验证：** `npx tsc --noEmit` PASS（0 err）；`cargo check` PASS（0 warn，4.4s）。
+- **行为影响（正面）：** 普通账号在 shell 里敲 `exit` 后，SFTP 面板仍可用（连接未断，只是 shell 通道关了）——与 FinalShell 等一致。真正断开的连接会留在 map 里直到用户关 tab（终端已显示 [Connection closed]，对死 handle 的 SFTP 调用返回清晰错误而非崩溃），可接受。
+- **遗留 / 待实测：** 需用户 dev 实测该连接：①进 SFTP 面板能正常进退目录、增删改名 ②关 tab 后 session 被清理（无泄漏）。app 退出时 `drain_all_sessions` 仍只发 Disconnect 不清 map（依赖 OS 回收 TCP，与 FTP 一致，main.rs drain_all_sessions 上方注释已说明）。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 30 complete（session 生命周期与 shell 通道解耦 + 关 tab 清理），cargo + tsc 双绿 |
+| 我要去哪里？ | 用户 dev 实测 SFTP 进退/增删改名 + 关 tab 无泄漏 |
+| 目标是什么？ | 彻底修好 SFTP-only 账号「连接 sftp 异常」，零回归 |
+| 我学到了什么？ | russh 一条连接多路复用多通道，shell 通道死 ≠ 连接死，session 生命周期不能绑死在 shell reader 上；删 `HashMap` import 前要先确认没被 `SshClient.db` 之外的 Mutex 复用；改后端 cleanup 语义要顺带审前端的关 tab / status 门控，否则「后端保留 session、前端跳过 disconnect」会泄漏 |
+| 我做了什么？ | channel_reader 去掉 sessions 参数与 map.remove（+删 HashMap import）；disconnect() 改为唯一删 session 点并 idempotent；App.tsx 关 tab 时 SSH/SFTP 无条件断开；cargo/tsc 双绿，progress/README 同步 |
+
+### 阶段 31：SFTP 批量文件上传/下载（2026-06-22）
+- **需求：** SFTP 面板当前只有 删除 / 新建文件夹 / 重命名，缺少文件上传和下载能力。需要支持批量多选文件上传、批量下载到指定本地目录。文件夹递归可不做（YAGNI，v1 不含），覆盖策略采用直接覆盖（最简单）。
+- **改动：**
+  - `src-tauri/src/sftp.rs`（新增 ~210 行）：
+    - `upload(state, sid, local_paths: Vec<String>, remote_dest_dir, request_id, window)` — 预 stat（`tokio::fs::metadata` 取 size/total、跳过目录）、顺序传输每个文件（`sftp::create` = CREATE|TRUNCATE|WRITE → 32KB 缓冲循环 `AsyncReadExt::read`→`AsyncWriteExt::write_all`）、`flush()` 驱动 write acks 完成（russh-sftp 2.3 `File` 无显式 `close()`——`Drop` impl 用 `close_nowait` 释放 handle）、进度 emit 节流 120ms、单文件失败记录后继续下一个、收尾 `sftp_transfer_done`。
+    - `download(state, sid, remote_paths: Vec<String>, local_dest_dir, request_id, window)` — 对称：`sftp::open` = READ → `metadata().size` 累加 → `tokio::fs::create_dir_all` → 32KB 循环 `file.read`→`local.write_all` → `flush()`。
+    - 三个事件结构体（camelCase serde）：`TransferProgressPayload`、`TransferDonePayload`、`TransferErrorPayload`（后者在实现中未被直接构造——致命错误用 `sftp::upload`/`download` 返回 `Err` 由前端 `.catch` 处理——删掉了以消除 warning）。
+    - 辅助函数 `basename(path)`（用 `std::path::Path::file_name` 防路径逃逸）、`emit_transfer_progress`。
+    - 通道复用：一个 `SftpSession`（一条子系统通道）处理整批文件，各文件各自 open/close handle，开销可控。
+  - `src-tauri/src/main.rs`：
+    - `sftp_upload` / `sftp_download` 两个 `#[tauri::command]` 包装（`WebviewWindow` 注入，同 `ssh_connect` 范式）。
+    - `generate_handler!` 注册（紧跟 `sftp_rename` 之后）。
+  - `src/api.ts`：
+    - `sftpUpload(sessionId, localPaths, remoteDestDir, requestId)` / `sftpDownload(sessionId, remotePaths, localDestDir, requestId)` invoke 包装。
+    - 三个 requestId 过滤事件监听器：`onSftpTransferProgress`、`onSftpTransferDone`、`onSftpTransferError`（后者配套删除的后端事件）。
+    - 导出类型 `SftpTransferProgressPayload`、`SftpTransferDonePayload`。
+  - `src/components/SftpPanel.tsx`（全面改写）：
+    - **多选**：文件行加 `checkbox`（`selected: Set<string>` 存 `entry.path`），切换目录时清空选区。
+    - **工具栏**：⬆ 上传按钮（`open({ multiple: true })` 选本地文件 → `runTransfer` → `sftpUpload`）；⬇ 下载按钮（选中文件项数 > 0 时启用 → `open({ directory: true })` 选目标目录 → `sftpDownload`，仅收集 `!is_dir` 的选中项，文件夹合同不纳入）。
+    - **`runTransfer`**（上传/下载共享的事件生命周期）：`requestId = crypto.randomUUID()`；`setTransfer` 初始化状态 → `onSftpTransferProgress` + `onSftpTransferDone` 订阅（先于 invoke，防漏早期事件）→ 启动调用 → 完成标记 `done: true` → 回调刷新目录（上传时）。
+    - **`TransferOverlay`**：底部绝对定位浮层，显示阶段名（上传中/下载中/完成）、当前文件名、`fileIndex/fileCount`、总进度条 `bytesDone/bytesTotal`（百分比 width transition）、完成态列出前 3 条 per-file 错误（若有）；关闭按钮清掉监听器。外部点击不关闭（防误触中断用户读错误详情）。
+    - 原有工具栏 `ToolBtn` / 格式化 / 目录操作等保持不变。
+    - 仅 SSH source 显示上传/下载按钮（FTP source 为 `display: none` 的简并——本次未动 FTP，但二进制复用同一 `SftpPanel`）。
+- **已读 russh-sftp 2.3.0 源码核对（`~/.cargo/registry/src/…/russh-sftp-2.3.0/src/client/`）：**
+  - `session.rs:97` `create()` → `CREATE|TRUNCATE|WRITE` — 确认覆盖语义正确。
+  - `session.rs:90-91` `open()` → `OpenFlags::READ` — 确认只读。
+  - `fs/file.rs:135-142` `Drop` — `close_nowait(handle)` 释放 handle；无显式 `close()` 方法，初版编译报 `no method close`，改为仅 `flush()` + scope drop。
+  - `fs/file.rs:260-294` `AsyncWrite::poll_write` — 支持并发 write ack，`flush()` 驱动全部 ack 完成。
+- **验证：** `npx tsc --noEmit` PASS（0 err）；`cargo check` PASS（0 warn，8.6s）。对话内中断的 `cargo check` 已在续会重跑确认。
+- **遗留 / 待实测：** `cargo tauri dev` 手测——上传多选文件 → 进度浮层走完 → 目录刷新出现新文件；下载选中多文件 → 选目标目录 → 本地得到这些文件。覆盖已有文件生效。`sftpTransferError`（fatal channel error）在 `runTransfer` 的 `.catch` 里兜底，不一定有后端事件触发——设计上是双重保险。非 SSH source 面板无按钮，不做多余操作。
+
+### 阶段 32：连接类型图标替换为 iconfont 字体图标（2026-06-22）
+- **需求：** ftp / sftp / 本地 / ssh 的连接图标原先用 emoji（📤/📁/💻/🖥️），跨平台渲染不一致、不同系统字形差异大。用户提供了一份 iconfont.cn 字体包（`G:/桌面/font_tm10hhyy2ag`，4 个字形：电脑/ftp/服务器/SFTP），要求用这套字体图标替换。
+- **改动：**
+  - 新增 `src/assets/iconfont/iconfont.ttf` + `iconfont.css`（从字体包拷入；CSS 改为相对路径 `url("./iconfont.ttf")`，Vite 构建时 base64 内联进打包 CSS）。
+  - `src/styles/global.css` 顶部 `@import "../assets/iconfont/iconfont.css";`（仅引入一次）。
+  - 新增 `src/components/ConnIcon.tsx`：`ConnIcon` 组件（`connType` → `icon-*` class，`size` 控制 font-size，颜色走 `currentColor` 语义化映射 `CONN_COLOR`：ssh 主蓝 / sftp 副青 / ftp 警告黄 / local 次级灰）。
+  - `Sidebar.tsx`：删 `CONN_ICONS` emoji map，连接行 + 空状态用 `ConnIcon`。
+  - `ConnectionDialog.tsx`：`TYPE_OPTIONS` 去掉 emoji `icon` 字段，`TypeSelector` 按钮用 `ConnIcon`。
+  - `TabBar.tsx`：标签连接类型图标用 `ConnIcon`（颜色 `inherit`，跟随 tab 文字色）。
+  - `QuickCommandsPanel.tsx` 下拉里的 `🖥️` 是 `<option>` 文本（DOM `<option>` 无法用字体 class，只能放纯文本/emoji）——保留不动，不替换。
+- **验证：** `npx tsc --noEmit` PASS（0 err）；`npx vite build` PASS（CSS 13.65kB 含 base64 字体，无额外 ttf 产物）。
+- **设计取舍：** 颜色语义化集中到 `CONN_COLOR` 单一源，三处调用方（侧栏/对话框/标签栏）颜色一致；`color: inherit` 允许调用方覆盖（如对话框选中态用主色）。`<option>` 不替换是 DOM 限制，非遗漏。
+
+### 阶段 33：SFTP 连接一直提示重连（nologin 账户 shell 立即退出触发误报 ssh_closed）（2026-06-22）
+- **现象：** 打开一个 SFTP 连接，后端日志：`connected to sftp_xxx@host` → `channel_reader started` → `ExitStatus=1` → `Data 44 bytes` → `EOF` → `channel_reader exited`。前端 `SftpPanel` 收到 `ssh_closed`，状态变 `disconnected`，显示「连接已断开 / 重连」遮罩。但 SFTP 文件列表其实能正常拉。
+- **根因：** 该 SFTP 账户是 **nologin / SFTP-only** 账户（登录 shell 立即退出，ExitStatus=1）。`ssh::connect` 无条件 `request_pty` + `request_shell`——这种账户的 shell 一启动就退，`channel_reader` 走到 `Eof` 分支 emit `ssh_closed`。而 `SftpPanel`（作为独立 tab 渲染时）订阅了 `onSshClosed`（SftpPanel.tsx:121-139），把 shell 通道关闭误判成整个连接挂了 → 弹重连。阶段 30 的修复只让 `channel_reader` 不再从 map 删 session（所以 SFTP 操作还能用），但 `ssh_closed` 事件照样发，遮罩照样弹。
+- **关键认知：** SSH **连接** ≠ shell **通道**。russh 在一条 TCP 连接上多路复用多个通道；SFTP 子系统是 `get_sftp_session` 在同一 `Handle` 上新开的通道，完全不依赖那个 shell 通道。给 SFTP 连接请求 shell 本就没有意义，还撞上 nologin 账户的立即退出。
+- **修复（`src-tauri/src/ssh.rs::connect`）：** `conn_type == "sftp"` 时**跳过 PTY + shell 请求**——只 `channel_open_session`（验证连接可达 + 给 reader 一个通道用来探测真·TCP 断开），不附加任何程序。SFTP 实际走 `get_sftp_session` 自己开子系统通道。日志加 `[ssh:xxx] SFTP session — skipping PTY/shell request`。
+  - 保留 channel_reader 的 spawn：idle select! 循环代价可忽略，且当 TCP 真断时 `channel.wait()` 返回 None/Close → 发 `ssh_closed` → SftpPanel 正确提示重连（这是真断连，该提示）。nologin 账户的「shell 立即退出」误报被根除（不再请求 shell 就没有退出）。
+- **验证：** `cargo check` PASS（0 warn，12.7s）。待 dev 实测：SFTP 连接打开后不再弹重连遮罩、文件列表正常。
+- **影响面：** 仅 `ssh::connect` 一处分支；普通 SSH 终端连接路径完全不变（`is_sftp=false` 走原 PTY+shell 流程）。SFTP 的 disconnect 路径不变（reader 收 Disconnect → close channel；drop SshSession 关连接）。
+
+### 阶段 34：SFTP 文件面板视觉与 SSH 终端统一（2026-06-22）
+- **需求：** SFTP 文件列表的文件夹颜色（原先暖琥珀 `accent-secondary` 青绿）、类型 pill 徽章看着和 SSH 终端/侧栏风格不统一，整体偏「杂」。用户要求文件夹颜色和字体跟 SSH 一样，文件信息展示也重新优化。
+- **设计方向（high-end-visual-design 技能指引）：** 选 **Soft Structuralism** 质感（与现有 Carbon 设计系统一致——克制的中性灰 + 单一 accent-primary 蓝作为唯一强调色，避免多色噪点）。统一性优先于花哨：目录走 `accent-primary`（蓝），与 TerminalPanel/侧栏/TabBar 的 accent 语义完全一致。
+- **改动（`src/components/SftpPanel.tsx` 文件行 + 列头）：**
+  - **目录图标**：从「暖琥珀方块 + 双横线」改为标准文件夹轮廓（带淡 accent-primary 填充），描边/填充都用 `accent-primary` / `accent-primary-muted`——和 SSH 面板的 accent 蓝同一套语义。
+  - **目录名颜色**：`accent-secondary`（青绿）→ `accent-primary`（蓝），与图标同色。weight 保持 500。
+  - **类型列**：去掉「背景 pill 徽章」（`accent-secondary-muted` / `bg-surface-active` 底色 + 圆角）——这种多色徽章是视觉噪点。改为纯文本标签（目录 `accent-secondary` 文字、文件 `text-tertiary`），干净、把视觉焦点还给文件名。
+  - **文件图标**：精简为单页文档轮廓（去掉内部双横线细节），`text-tertiary` 描边，弱化到不抢戏。
+  - **选中态**：用 `accent-primary-muted` 底色整行高亮（替代仅 checkbox），hover 与 selected 互斥（selected 时 hover 不覆盖）。
+  - **间距/节奏**：列头/行 padding `5px 10px` → `5-6px 10px 5-6px 12px`（左侧多一点呼吸），gap `8` → `10`，列头字间距 `0.04em` → `0.06em`，过渡 `80ms ease` → `120ms cubic-bezier(0.4,0,0.2,1)`（与全局缓动一致）。
+  - **去掉每行 `borderBottom`**：消除密恐的横线网格，靠间距 + hover 区分行（更现代）。
+- **统一性兑现点：**
+  - 目录 accent 色现在 = TerminalPanel/侧栏/标签栏的 accent-primary 蓝（`CONN_COLOR.ssh`、`--accent-primary`）——SFTP 标签和 SSH 标签的「可交互/导航」视觉信号一致。
+  - 字体：文件名用应用 body 字体（`'Plus Jakarta Sans'` 栈，与全局一致），日期/权限用 `'JetBrains Mono'` 等宽——与 SSH 终端的等宽渲染呼应。
+- **验证：** `npx tsc --noEmit` PASS（0 err）。
+- **取舍：** 没动工具栏/路径栏/传输浮层——那些已经合理，本次聚焦用户指出的「文件夹颜色 + 文件信息展示」。类型列从徽章降级为文字是有意降噪；若后续要更丰富可按扩展名上语义色，但 YAGNI，先做克制版。
+
+### 阶段 35：FTP 连接失败「无后台日志 + 10060 裸错误」（2026-06-22）
+- **现象：** FTP 连不上，前端报 `FTP connect failed: Connection error: ...连接尝试失败 (os error 10060)`，且后台日志文件里**完全没有任何 ftp 相关记录**。用户问 IP/端口是否填错。
+- **根因 1（无日志）：** `ftp_connect`（main.rs）和 `ftp::connect`（ftp.rs）全程用 `eprintln!`/`Result?` —— 但 release 下 stderr 被 dup2 重定向到日志文件、debug 下打到控制台，且这些路径**根本没打任何日志**（ssh_connect 有 `log::info!`/`log::error!`，FTP 对应位置是空的）。所以「连不上 + 没日志」不是 bug，是 FTP 路径压根没接日志，与 SSH 不对称。
+- **根因 2（裸 10060）：** `os error 10060` = Windows `WSAETIMEDOUT`，TCP 三次握手在默认超时内没收到 SYN-ACK。**几乎从来不是密码错误**（密码错误会走到 `login()` 报 `FTP login failed`，不会到这一步），而是网络可达性：目标 IP/端口填错、防火墙拦截、FTP 服务没跑、或本机到服务器路由不通。但裸错误字符串没提示这点，用户只能瞎猜。
+- **改动：**
+  - `main.rs::ftp_connect`：入口加 `log::info!("[ftp] connect requested: user@host:port (tls=, passive=, proxy=)")`，结果分支 `log::info!`/`log::error!`（对称 ssh_connect 范式，与「日志按天滚动文件」一致）。
+  - `ftp.rs::connect`：直连分支 `AsyncFtpStream::connect` 失败时，**检测 10060/timeout 关键字**，改写错误为带中文诊断的提示：「TCP 连接超时（os error 10060）。通常不是密码错误，而是：目标 host:port 无法到达——防火墙拦截、IP/端口填错、或 FTP 服务未运行。先 ping/网络验证该地址端口是否可达」。代理分支保持原样（`connect_via_proxy` 已有 60s 超时 + 中文提示）。连接各阶段（connecting/TCP established/session ready）都打 `log::info!`。
+  - 把 `eprintln!` 换成 `log::info!`，这样 release 也能落盘日志文件（按天滚动）。
+- **验证：** `cargo check` PASS（0 warning，22.8s）。需重新 `cargo tauri dev` 才生效。
+- **给用户的排查指引（10060）：**
+  1. 确认 IP/端口——FTP 默认 21，但你这台用的非标端口要核实；`ftp_tls` 必须是 `none`（当前版本不支持 FTPS，填 implicit/explicit 会直接报「暂不支持」而非 10060）。
+  2. 网络可达性——在本机命令行 `Test-NetConnection <host> -Port <port>`（PowerShell）或 `telnet host port`，看 `TcpTestSucceeded` 是否 True。False 就是防火墙/路由/服务没起。
+  3. 是否走了代理——若 `proxy_type != none`，先关掉代理直连试，排除是代理环节超时。
+  4. 被动模式——`ftp_passive` 默认 true（NAT 友好），但 10060 发生在**控制连接建立阶段**，与被动/主动模式无关（那是数据连接的事），所以这个开关不影响本次报错。
+
+## 五问重启检查
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 35 complete（FTP 连接加日志 + 10060 诊断提示，cargo check 绿），待 dev 重连验证日志可见 |
+| 我要去哪里？ | 用户重新 `cargo tauri dev` 连 FTP，看日志文件是否出现 `[ftp] connect requested` + 带提示的错误；据此定位是 IP/端口/防火墙 |
+| 目标是什么？ | FTP 连不上时：(1) 后台有日志可查；(2) 错误信息说人话，指出 10060 是网络可达性问题非密码错误 |
+| 我学到了什么？ | 日志对称性——ssh_connect 有 info/error 日志，ftp_connect 没有，导致 FTP 路径「静默失败」；10060=WSAETIMEDOUT 是 TCP 握手超时，发生在 login 之前，与凭据无关，与被动/主动模式无关（那是数据连接阶段）；错误改写要放在产生错误的最近处（ftp.rs 的 connect 分支）而非外层，这样直连和代理两条路径都能覆盖 |
+| 我做了什么？ | main.rs ftp_connect 加 info/error 日志（对称 ssh_connect）；ftp.rs connect 直连失败检测 10060 改写为中文诊断提示、各阶段打 log::info!、eprintln→log；cargo check 绿，progress/README 同步 |

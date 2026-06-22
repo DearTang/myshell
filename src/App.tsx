@@ -331,13 +331,19 @@ export default function App() {
 
   async function handleCloseTab(tabId: string) {
     const tab = tabs.find((t) => t.id === tabId);
-    if (tab?.sessionId && tab.status === "connected") {
+    if (tab?.sessionId) {
       try {
         if (tab.connType === "ftp" && tab.ftpSessionId) {
-          await ftpDisconnect(tab.ftpSessionId);
+          if (tab.status === "connected") await ftpDisconnect(tab.ftpSessionId);
         } else if (tab.connType === "local") {
-          await localDisconnect(tab.sessionId);
+          if (tab.status === "connected") await localDisconnect(tab.sessionId);
         } else {
+          // SSH/SFTP: always disconnect on tab close. ssh::disconnect is
+          // idempotent (returns Ok if the session is already gone), and the
+          // session now survives a shell-channel close (status becomes
+          // "disconnected") so SFTP keeps working for SFTP-only accounts.
+          // Skipping this call would leak the backend session + its TCP
+          // connection until app exit.
           await sshDisconnect(tab.sessionId);
         }
       } catch (e) {
@@ -509,6 +515,15 @@ export default function App() {
                       sessionId={tab.sessionId!}
                       source={tab.type === "ftp" ? "ftp" : "ssh"}
                       fullHeight
+                      status={tab.status}
+                      onReconnect={() => handleReconnect(tab.id)}
+                      onDisconnected={() => {
+                        setTabs((prev) =>
+                          prev.map((t) =>
+                            t.id === tab.id ? { ...t, status: "disconnected" as const } : t
+                          )
+                        );
+                      }}
                     />
                   ) : (
                     <TerminalPanel

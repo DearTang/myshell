@@ -32,7 +32,7 @@ pub async fn connect(cfg: &ConnectionConfig) -> Result<FtpSession, String> {
     // connect_with_stream variant.
     let mut stream = match proxy::ProxyConfig::from_config(cfg)? {
         Some(proxy_cfg) => {
-            eprintln!(
+            log::info!(
                 "[ftp] connecting via {} proxy {}:{} → {}:{}",
                 cfg.proxy_type,
                 proxy_cfg.host(),
@@ -45,15 +45,34 @@ pub async fn connect(cfg: &ConnectionConfig) -> Result<FtpSession, String> {
                 .await
                 .map_err(|e| format!("FTP connect via proxy failed: {}", e))?
         }
-        None => AsyncFtpStream::connect(format!("{}:{}", cfg.host, port))
-            .await
-            .map_err(|e| format!("FTP connect failed: {}", e))?,
+        None => {
+            log::info!("[ftp] connecting to {}:{}", cfg.host, port);
+            AsyncFtpStream::connect(format!("{}:{}", cfg.host, port))
+                .await
+                .map_err(|e| {
+                    // 10060 = WSAETIMEDOUT on Windows: TCP connect timed out.
+                    // Surface a hint that it's almost always network reachability,
+                    // not a bad credential — the user can't tell from the raw
+                    // error string. Checked here (not in main.rs) so proxy-path
+                    // failures and direct-path failures both get the hint.
+                    let raw = e.to_string();
+                    if raw.contains("10060") || raw.contains("timed out") || raw.contains("timeout") {
+                        format!(
+                            "FTP connect failed: TCP 连接超时（os error 10060）。通常不是密码错误，而是：目标 {}:{} 无法到达——防火墙拦截、IP/端口填错、或 FTP 服务未运行。先 ping/网络验证该地址端口是否可达。原始错误：{}",
+                            cfg.host, port, raw
+                        )
+                    } else {
+                        format!("FTP connect failed: {}", raw)
+                    }
+                })?
+        }
     };
 
     // Caller (ftp_connect command) is expected to pre-resolve the password
     // from keyring into cfg.password. If absent (anonymous FTP) we fall
     // back to empty.
     let password = cfg.password.clone().unwrap_or_default();
+    log::info!("[ftp] TCP established, logging in as {}", cfg.username);
 
     stream
         .login(&cfg.username, &password)
@@ -68,6 +87,7 @@ pub async fn connect(cfg: &ConnectionConfig) -> Result<FtpSession, String> {
         .await
         .map_err(|e| format!("FTP binary type failed: {}", e))?;
 
+    log::info!("[ftp] session ready");
     Ok(FtpSession { stream })
 }
 

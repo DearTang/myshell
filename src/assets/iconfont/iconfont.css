@@ -1,0 +1,29 @@
+/* iconfont (iconfont.cn) — connection type icons
+   Usage: <i className="iconfont icon-ssh" />
+   Imported once from src/styles/global.css.
+   The url() is relative to this file (./iconfont.ttf) so Vite resolves and
+   hashes the font asset at build time. */
+
+@font-face {
+  font-family: "iconfont";
+  src: url("./iconfont.ttf") format("truetype");
+}
+
+.iconfont {
+  font-family: "iconfont" !important;
+  font-style: normal;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-weight: normal;
+  line-height: 1;
+  display: inline-block;
+}
+
+/* 电脑 — local terminal */
+.icon-diannao:before { content: "\e642"; }
+/* ftp */
+.icon-ftp:before { content: "\e6b2"; }
+/* 服务器 — ssh */
+.icon-fuwuqi:before { content: "\e661"; }
+/* SFTP */
+.icon-SFTP:before { content: "\e66c"; }

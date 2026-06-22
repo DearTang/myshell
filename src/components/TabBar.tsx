@@ -1,4 +1,5 @@
 import type { Tab } from "../api";
+import { ConnIcon } from "./ConnIcon";
 
 interface Props {
   tabs: Tab[];
@@ -99,19 +100,11 @@ export function TabBar({
               )}
 
               {/* Connection Type Icon */}
-              <span
-                style={{
-                  fontSize: 14,
-                  opacity: 0.85,
-                  color: tab.connType === "ftp"
-                    ? "var(--warning)"
-                    : tab.connType === "sftp"
-                      ? "var(--success)"
-                      : "var(--accent-primary)",
-                }}
-              >
-                {tab.connType === "ftp" ? "📤" : tab.connType === "sftp" ? "📁" : "🖥️"}
-              </span>
+              <ConnIcon
+                connType={tab.connType || "ssh"}
+                size={14}
+                style={{ opacity: 0.85, color: "inherit" }}
+              />
 
               {/* Tab Name */}
               <span

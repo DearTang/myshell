@@ -1835,6 +1835,51 @@ async fn sftp_rename(
     sftp::rename(&state, &session_id, &old_path, &new_path).await
 }
 
+/// Batch-upload local files into the remote dir. Progress streams via
+/// `sftp_transfer_progress`; completion (with per-file errors) via
+/// `sftp_transfer_done`. See `sftp::upload`.
+#[tauri::command]
+async fn sftp_upload(
+    session_id: String,
+    local_paths: Vec<String>,
+    remote_dest_dir: String,
+    request_id: String,
+    state: State<'_, AppState>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    sftp::upload(
+        &state,
+        &session_id,
+        local_paths,
+        &remote_dest_dir,
+        &request_id,
+        &window,
+    )
+    .await
+}
+
+/// Batch-download remote files into a local dir. Same event contract as
+/// `sftp_upload`. See `sftp::download`.
+#[tauri::command]
+async fn sftp_download(
+    session_id: String,
+    remote_paths: Vec<String>,
+    local_dest_dir: String,
+    request_id: String,
+    state: State<'_, AppState>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    sftp::download(
+        &state,
+        &session_id,
+        remote_paths,
+        &local_dest_dir,
+        &request_id,
+        &window,
+    )
+    .await
+}
+
 // ============ FTP Commands ============
 //
 // FTP sessions live in `AppState::ftp_sessions`, keyed by a fresh UUID that
@@ -1843,6 +1888,12 @@ async fn sftp_rename(
 
 #[tauri::command]
 async fn ftp_connect(mut config: ConnectionConfig, state: State<'_, AppState>) -> Result<String, String> {
+    let port = if config.port == 0 { 21 } else { config.port };
+    log::info!(
+        "[ftp] connect requested: {}@{}:{} (tls={}, passive={}, proxy={})",
+        config.username, config.host, port,
+        config.ftp_tls, config.ftp_passive, config.proxy_type
+    );
     // Resolve password from keyring here (same pattern as ssh_connect).
     if config.password.is_none() {
         let key = require_dek(&state)?;
@@ -1852,7 +1903,13 @@ async fn ftp_connect(mut config: ConnectionConfig, state: State<'_, AppState>) -
         let key = require_dek(&state)?;
         config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
     }
-    let session = ftp::connect(&config).await?;
+    let target = format!("{}@{}:{}", config.username, config.host, port);
+    let result = ftp::connect(&config).await;
+    match &result {
+        Ok(_) => log::info!("[ftp] connected to {}", target),
+        Err(e) => log::error!("[ftp] connect failed for {}: {}", target, e),
+    }
+    let session = result?;
     let id = uuid::Uuid::new_v4().to_string();
     {
         let mut sessions = state.ftp_sessions.lock().map_err(|e| e.to_string())?;
@@ -2391,6 +2448,8 @@ pub fn run() {
             sftp_mkdir,
             sftp_remove,
             sftp_rename,
+            sftp_upload,
+            sftp_download,
             ftp_connect,
             ftp_list_dir,
             ftp_mkdir,

@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { saveConnection, getConnectionPassword, getConnectionProxyPassword, readTextFile } from "../api";
 import type { ConnectionConfig, ConnType, FtpTls, ProxyType } from "../api";
 import { PasswordVerifyDialog } from "./PasswordVerifyDialog";
+import { ConnIcon } from "./ConnIcon";
 
 interface Props {
   config: ConnectionConfig | null;
@@ -14,11 +15,11 @@ interface Props {
   folders?: string[];
 }
 
-const TYPE_OPTIONS: { value: ConnType; label: string; icon: string; defaultPort: number }[] = [
-  { value: "ssh", label: "SSH", icon: "🖥️", defaultPort: 22 },
-  { value: "sftp", label: "SFTP", icon: "📁", defaultPort: 22 },
-  { value: "ftp", label: "FTP", icon: "📤", defaultPort: 21 },
-  { value: "local", label: "本地", icon: "💻", defaultPort: 0 },
+const TYPE_OPTIONS: { value: ConnType; label: string; defaultPort: number }[] = [
+  { value: "ssh", label: "SSH", defaultPort: 22 },
+  { value: "sftp", label: "SFTP", defaultPort: 22 },
+  { value: "ftp", label: "FTP", defaultPort: 21 },
+  { value: "local", label: "本地", defaultPort: 0 },
 ];
 
 /// Quick-pick shell presets for conn_type='local'. The user can still type a
@@ -758,7 +759,7 @@ function TypeSelector({
               boxShadow: active ? "var(--shadow-glow)" : "none",
             }}
           >
-            <span style={{ fontSize: 22 }}>{opt.icon}</span>
+            <ConnIcon connType={opt.value} size={24} style={{ color: active ? "var(--accent-primary)" : undefined }} />
             <span>{opt.label}</span>
           </button>
         );

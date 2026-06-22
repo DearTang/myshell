@@ -8,6 +8,7 @@ import {
 } from "../api";
 import { useTheme } from "../hooks/useTheme";
 import { BrandLogo } from "./BrandLogo";
+import { ConnIcon } from "./ConnIcon";
 
 interface Props {
   connections: ConnectionConfig[];
@@ -76,13 +77,8 @@ function buildTree(conns: ConnectionConfig[], folders: string[]): FolderNode {
   return root;
 }
 
-// 使用标准 emoji 图标，确保跨平台兼容
-const CONN_ICONS: Record<ConnType, string> = {
-  ssh: "🖥️",
-  sftp: "📁",
-  ftp: "📤",
-  local: "💻",
-};
+// 连接类型图标来自 src/assets/iconfont (iconfont.cn)。
+// Sidebar / TabBar / ConnectionDialog 统一用 ConnIcon 渲染，保证跨平台一致。
 
 const styles = {
   container: {
@@ -581,7 +577,7 @@ export function Sidebar({
         )}
         {connections.length === 0 && folders.length === 0 && !searchQuery && (
           <div style={styles.emptyState}>
-            <div style={{ fontSize: 32, opacity: 0.3, marginBottom: 12 }}>🖥️</div>
+            <ConnIcon connType="ssh" size={32} style={{ opacity: 0.3, marginBottom: 12, color: "var(--text-secondary)" }} />
             <div>暂无连接</div>
             <div style={{ marginTop: 4, color: "var(--text-muted)" }}>
               点击 + 新建
@@ -702,7 +698,7 @@ function ConnRow({
 }) {
   const [open, setOpen] = useState(false);
   const [anchor, setAnchor] = useState<{ x: number; y: number } | null>(null);
-  const icon = CONN_ICONS[(conn.conn_type as ConnType) || "ssh"];
+  const connType = (conn.conn_type as ConnType) || "ssh";
 
   function openMenu(e: React.MouseEvent<HTMLSpanElement>) {
     e.stopPropagation();
@@ -737,12 +733,7 @@ function ConnRow({
         onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-surface-hover)")}
         onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
       >
-        <span style={{
-          fontSize: 16,
-          opacity: 0.85,
-        }}>
-          {icon}
-        </span>
+        <ConnIcon connType={connType} size={16} style={{ opacity: 0.85 }} />
         <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", gap: 2 }}>
           <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {conn.name}

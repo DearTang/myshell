@@ -2,7 +2,6 @@ use crate::{AppState, ConnectionConfig};
 use crate::proxy;
 use russh::client::{self, Handle, Msg};
 use russh::{Channel, ChannelMsg};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, WebviewWindow};
@@ -324,19 +323,32 @@ pub async fn connect(
         .channel_open_session()
         .await
         .map_err(|e| format!("Channel open failed: {}", e))?;
-    eprintln!("[ssh:{}] channel opened; requesting PTY", sid);
 
-    channel
-        .request_pty(true, "xterm-256color", 80, 24, 640, 480, &[])
-        .await
-        .map_err(|e| format!("PTY request failed: {}", e))?;
-    eprintln!("[ssh:{}] PTY granted; requesting shell", sid);
+    // SFTP-only sessions don't use an interactive shell — russh-sftp opens its
+    // own fresh subsystem channel via `get_sftp_session` on the same `Handle`.
+    // Requesting a PTY + shell here is pointless AND actively harmful on
+    // SFTP-only / nologin accounts: the login shell exits immediately
+    // (ExitStatus=1), which used to make `channel_reader` emit `ssh_closed`,
+    // which the frontend's SftpPanel interpreted as the whole connection dying
+    // → false "连接已断开 / 重连" overlay even though SFTP works fine. So for
+    // SFTP we open the channel (validates the connection) but skip PTY/shell.
+    let is_sftp = config.conn_type == "sftp";
+    if is_sftp {
+        eprintln!("[ssh:{}] SFTP session — skipping PTY/shell request", sid);
+    } else {
+        eprintln!("[ssh:{}] channel opened; requesting PTY", sid);
+        channel
+            .request_pty(true, "xterm-256color", 80, 24, 640, 480, &[])
+            .await
+            .map_err(|e| format!("PTY request failed: {}", e))?;
+        eprintln!("[ssh:{}] PTY granted; requesting shell", sid);
 
-    channel
-        .request_shell(true)
-        .await
-        .map_err(|e| format!("Shell request failed: {}", e))?;
-    eprintln!("[ssh:{}] shell requested OK", sid);
+        channel
+            .request_shell(true)
+            .await
+            .map_err(|e| format!("Shell request failed: {}", e))?;
+        eprintln!("[ssh:{}] shell requested OK", sid);
+    }
 
     // Build command channel for the reader task
     let (command_tx, command_rx) = mpsc::unbounded_channel::<SessionCommand>();
@@ -355,12 +367,13 @@ pub async fn connect(
     // Spawn the channel reader task. It owns the Channel and multiplexes
     // incoming SSH data with commands from the frontend. Emits are scoped to
     // the originating window so a different webview can't read this session's
-    // output.
-    let sessions_arc = Arc::clone(&state.ssh_sessions);
+    // output. The reader intentionally does NOT remove the session from the
+    // map on exit — see the note in `channel_reader` and the removal in
+    // `disconnect()`.
     let reader_sid = sid.clone();
 
     async_runtime::spawn(async move {
-        channel_reader(window, reader_sid, sessions_arc, channel, command_rx).await;
+        channel_reader(window, reader_sid, channel, command_rx).await;
     });
 
     Ok(sid)
@@ -369,7 +382,6 @@ pub async fn connect(
 async fn channel_reader(
     window: WebviewWindow,
     session_id: String,
-    sessions: Arc<Mutex<HashMap<String, SshSession>>>,
     mut channel: Channel<Msg>,
     mut command_rx: mpsc::UnboundedReceiver<SessionCommand>,
 ) {
@@ -524,10 +536,18 @@ async fn channel_reader(
         }
     }
 
-    // Remove ourselves from the session map (covers server-side EOF/kill).
-    if let Ok(mut map) = sessions.lock() {
-        map.remove(&session_id);
-    }
+    // NOTE: we intentionally do NOT remove the session from AppState here.
+    // The shell channel closing (server EOF / `exit` / kill) is not the same
+    // as the SSH *connection* dying — russh multiplexes many channels over a
+    // single connection, so SFTP and exec can still open fresh channels on
+    // the same `Arc<Handle>`. This matters for SFTP-only accounts whose login
+    // shell exits immediately (ExitStatus=1, nologin/chroot): tearing the
+    // session down here would drop that handle and make every later SFTP op
+    // fail with "SSH session not found". Removal happens only on an explicit
+    // `ssh_disconnect` (see `disconnect()`). A connection that is genuinely
+    // dead lingers in the map until the user closes the tab, which is fine —
+    // the terminal already shows "[Connection closed]" and SFTP ops on a dead
+    // handle return a clean error instead of crashing.
     log::info!("[ssh:{}] channel_reader exited", session_id);
 }
 
@@ -702,19 +722,24 @@ pub async fn disconnect(
     state: &State<'_, AppState>,
     session_id: &str,
 ) -> Result<(), String> {
-    // Try to signal the reader task to close the channel gracefully.
-    // The reader task itself removes the session from the map on exit.
-    let sender = {
-        let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
-        sessions
-            .get(session_id)
-            .map(|s| s.command_tx.clone())
+    // This is the single point that removes an SSH session from the map.
+    // The channel_reader no longer removes on shell-channel close (see the
+    // note there): the shell channel dying is not the same as the SSH
+    // connection dying, and tearing the session down on shell close broke
+    // SFTP for SFTP-only accounts whose shell exits right after connect.
+    // Pulling the entry out drops the SshSession — and with it the
+    // `Arc<Handle>`, which closes the SSH connection once any in-flight SFTP
+    // clone of that Arc releases.
+    let session = {
+        let mut sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+        sessions.remove(session_id)
     };
 
-    if let Some(tx) = sender {
-        let _ = tx.send(SessionCommand::Disconnect);
-    } else {
-        // Already gone (server closed or never existed) — nothing to do.
+    if let Some(session) = session {
+        // Signal the reader to close the shell channel gracefully. Best-effort:
+        // for an SFTP-only account the reader already exited, so this send is a
+        // no-op. `session` is dropped at end of scope, dropping the Arc<Handle>.
+        let _ = session.command_tx.send(SessionCommand::Disconnect);
     }
 
     Ok(())

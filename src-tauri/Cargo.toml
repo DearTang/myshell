@@ -1,6 +1,6 @@
 [package]
 name = "myshell"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2021"
 description = "A Rust-based SSH/SFTP shell tool inspired by FinalShell"
 

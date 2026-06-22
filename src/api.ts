@@ -434,6 +434,68 @@ export async function sftpRename(
   await invoke("sftp_rename", { sessionId, oldPath, newPath });
 }
 
+// ============ SFTP Transfer (upload / download) ============
+//
+// Batch, files-only, overwrite. Progress streams via onSftpTransferProgress
+// (once per file + throttled within large files); completion — with any
+// per-file errors — via onSftpTransferDone. Fatal failures (no session,
+// channel can't open) reject the returned promise; there is no separate error
+// event. Subscribe BEFORE calling so early progress events aren't missed.
+
+export interface SftpTransferProgressPayload {
+  requestId: string;
+  /** "upload" | "download" — drives the overlay label. */
+  phase: string;
+  currentFile: string;
+  fileIndex: number;
+  fileCount: number;
+  bytesDone: number;
+  bytesTotal: number;
+}
+
+export interface SftpTransferDonePayload {
+  requestId: string;
+  errors: string[];
+}
+
+export async function sftpUpload(
+  sessionId: string,
+  localPaths: string[],
+  remoteDestDir: string,
+  requestId: string
+): Promise<void> {
+  await invoke("sftp_upload", { sessionId, localPaths, remoteDestDir, requestId });
+}
+
+export async function sftpDownload(
+  sessionId: string,
+  remotePaths: string[],
+  localDestDir: string,
+  requestId: string
+): Promise<void> {
+  await invoke("sftp_download", { sessionId, remotePaths, localDestDir, requestId });
+}
+
+/** Live progress for a transfer (filtered by requestId). */
+export function onSftpTransferProgress(
+  requestId: string,
+  handler: (p: SftpTransferProgressPayload) => void
+): Promise<UnlistenFn> {
+  return listen<SftpTransferProgressPayload>("sftp_transfer_progress", (event) => {
+    if (event.payload.requestId === requestId) handler(event.payload);
+  });
+}
+
+/** Transfer finished — handler receives the list of per-file errors (empty if all OK). */
+export function onSftpTransferDone(
+  requestId: string,
+  handler: (errors: string[]) => void
+): Promise<UnlistenFn> {
+  return listen<SftpTransferDonePayload>("sftp_transfer_done", (event) => {
+    if (event.payload.requestId === requestId) handler(event.payload.errors);
+  });
+}
+
 // ============ FTP API ============
 
 export async function ftpConnect(config: ConnectionConfig): Promise<string> {
