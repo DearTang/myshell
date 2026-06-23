@@ -1,7 +1,7 @@
 use crate::{AppState, ConnectionConfig};
 use crate::proxy;
 use russh::client::{self, Handle, Msg};
-use russh::{Channel, ChannelMsg};
+use russh::{Channel, ChannelMsg, Disconnect};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, WebviewWindow};
@@ -229,14 +229,23 @@ fn is_zmodem_end(buf: &[u8]) -> bool {
     false
 }
 
-pub async fn connect(
-    state: State<'_, AppState>,
-    window: WebviewWindow,
-    config: ConnectionConfig,
-) -> Result<String, String> {
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let sid = session_id.clone();
-
+/// Dial the SSH server (direct or via proxy) and authenticate, returning the
+/// authenticated `Handle` without registering a session, spawning a reader,
+/// requesting a PTY/shell, or emitting any events.
+///
+/// Extracted from `connect` so both the real connect path and the "test"
+/// probe share the exact same dial + auth + known_hosts TOFU logic — the test
+/// catches the same auth/network/host-key failures a real connect would.
+///
+/// `open_channel` opens one session channel and immediately drops it, which
+/// validates the multiplexed-channel path that real SFTP relies on (catches
+/// "authenticated but server rejects channels"). The real connect path passes
+/// `false` and opens its own channel afterwards instead.
+pub async fn dial_and_authenticate(
+    state: &State<'_, AppState>,
+    config: &ConnectionConfig,
+    open_channel: bool,
+) -> Result<Handle<SshClient>, String> {
     // Configure the russh client. `inactivity_timeout` ensures that a
     // server which goes silent (NAT timeout, suspended VM, dead WiFi) is
     // detected within ~3 minutes instead of holding the session in
@@ -258,11 +267,10 @@ pub async fn connect(
     // and hand the upgraded stream to russh's connect_stream variant. SFTP
     // reuses this same session (sftp.rs) so the proxy choice covers SFTP
     // automatically without a separate code path.
-    let mut handle = match proxy::ProxyConfig::from_config(&config)? {
+    let mut handle = match proxy::ProxyConfig::from_config(config)? {
         Some(proxy_cfg) => {
-            eprintln!(
-                "[ssh:{}] connecting via {} proxy {}:{} → {}:{}",
-                sid,
+            log::info!(
+                "[ssh] dialing via {} proxy {}:{} → {}:{}",
                 config.proxy_type,
                 proxy_cfg.host(),
                 proxy_cfg.port(),
@@ -290,10 +298,7 @@ pub async fn connect(
                 .ok_or_else(|| "未导入私钥（vault 中无私钥内容）".to_string())?;
             let key_pair = russh::keys::decode_secret_key(pem, None)
                 .map_err(|e| format!("解析私钥失败: {}", e))?;
-            let key_with_hash = russh::keys::PrivateKeyWithHashAlg::new(
-                Arc::new(key_pair),
-                None,
-            );
+            let key_with_hash = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), None);
             handle
                 .authenticate_publickey(&config.username, key_with_hash)
                 .await
@@ -302,10 +307,7 @@ pub async fn connect(
         _ => {
             // ssh_connect command already resolved the password from keyring
             // before calling us, so config.password is the plaintext secret.
-            let password = config
-                .password
-                .clone()
-                .unwrap_or_default();
+            let password = config.password.clone().unwrap_or_default();
             handle
                 .authenticate_password(&config.username, &password)
                 .await
@@ -316,6 +318,60 @@ pub async fn connect(
     if !auth_result.success() {
         return Err("Authentication failed".to_string());
     }
+
+    if open_channel {
+        // Validates that the server will hand us a session channel (the path
+        // real SFTP depends on). No PTY/shell — we drop it immediately so the
+        // test leaves no lingering session on the server.
+        let _ = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("Channel open failed: {}", e))?;
+    }
+
+    Ok(handle)
+}
+
+/// Probe an SSH/SFTP connection end-to-end WITHOUT registering a session.
+/// Dials, authenticates, opens one channel to validate reachability, then
+/// sends a graceful SSH disconnect (`ByApplication` = "we're done, not an
+/// error"). Returns a human-readable success message with the wall-clock
+/// latency. Used by the `test_connection` command for the dialog "测试" button.
+pub async fn test_connection(
+    state: &State<'_, AppState>,
+    config: &ConnectionConfig,
+) -> Result<String, String> {
+    let started = Instant::now();
+    let handle = dial_and_authenticate(state, config, true).await?;
+    // Best-effort graceful disconnect — the test already passed; a teardown
+    // hiccup must not turn a success into an error.
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, "test complete", "en")
+        .await;
+    let ms = started.elapsed().as_millis();
+    Ok(format!(
+        "连接成功（{} ms，认证方式={}）",
+        ms,
+        if config.auth_method == "key" {
+            "私钥"
+        } else {
+            "密码"
+        }
+    ))
+}
+
+pub async fn connect(
+    state: State<'_, AppState>,
+    window: WebviewWindow,
+    config: ConnectionConfig,
+) -> Result<String, String> {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let sid = session_id.clone();
+
+    // Dial + authenticate. The shared dial_and_authenticate helper is also
+    // used by `test_connection`, so a real connect and a connection test
+    // exercise the exact same dial/auth/host-key path.
+    let handle = dial_and_authenticate(&state, &config, false).await?;
 
     // Open channel and request PTY
     eprintln!("[ssh:{}] opening session channel", sid);

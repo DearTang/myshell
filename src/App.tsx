@@ -494,7 +494,7 @@ export default function App() {
                       broadcastTargets={getBroadcastTargets(tab)}
                       onTerminalReady={handleTerminalReady}
                       onTerminalGone={handleTerminalGone}
-                      onOpenAi={() => setShowAiPanel(true)}
+                      onOpenAi={() => setShowAiPanel((prev) => !prev)}
                       active={isActive}
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}
@@ -533,7 +533,7 @@ export default function App() {
                       fontOverride={connections.find((c) => c.id === (tab.connectionId || ""))?.terminal_font}
                       onTerminalReady={handleTerminalReady}
                       onTerminalGone={handleTerminalGone}
-                      onOpenAi={() => setShowAiPanel(true)}
+                      onOpenAi={() => setShowAiPanel((prev) => !prev)}
                       active={isActive}
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}

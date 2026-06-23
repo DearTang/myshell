@@ -504,6 +504,145 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+// ───────────────────────────── settings test ─────────────────────────────
+
+/// Form-level overrides for testing AI settings WITHOUT saving first. Any
+/// field that is None or empty-string falls back to the vault-stored value
+/// (via `load_settings`). `api_key` is the important one: the Settings form
+/// passes the unsaved typed key here so the user can validate it before
+/// committing; an empty string means "no override, use the vault key" — the
+/// same convention as `save_ai_settings`'s "empty key = keep existing".
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AiTestOverrides {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub proxy_url: Option<String>,
+    pub api_key: Option<String>,
+    pub temperature: Option<f64>,
+}
+
+/// Probe the AI config with a minimal non-streaming request. Used by the
+/// Settings panel's "测试" button. Reuses `load_settings` (vault config +
+/// decrypted key) and `Provider` (endpoint / auth headers / body shape).
+///
+/// Override semantics: a non-empty override field replaces the vault value;
+/// an empty/None field keeps the vault value. `api_key = Some("")` is treated
+/// as "no override" (matches the save flow's "empty key = keep existing").
+///
+/// Non-streaming (`stream:false`, `max_tokens:16`) on purpose: a single HTTP
+/// round-trip gives clean success/fail semantics, and crucially this never
+/// emits `ai_token`/`ai_done` events — so it can't interfere with an open
+/// AiPanel's streaming subscriptions.
+pub async fn test_settings(
+    state: &State<'_, AppState>,
+    overrides: AiTestOverrides,
+) -> Result<String, String> {
+    let mut s = load_settings(state)?;
+
+    // Apply overrides (empty strings are ignored → fall back to vault value).
+    if let Some(p) = overrides.provider.as_deref().filter(|p| !p.is_empty()) {
+        s.provider = Provider::parse(p)?;
+    }
+    if let Some(m) = overrides.model.as_deref().filter(|m| !m.is_empty()) {
+        s.model = m.to_string();
+    }
+    if let Some(b) = overrides.base_url.as_deref().filter(|b| !b.is_empty()) {
+        s.base_url = Some(b.to_string());
+    }
+    if let Some(p) = overrides.proxy_url.as_deref().filter(|p| !p.is_empty()) {
+        s.proxy_url = Some(p.to_string());
+    }
+    if let Some(t) = overrides.temperature {
+        s.temperature = t;
+    }
+    if let Some(k) = overrides.api_key.as_deref().filter(|k| !k.is_empty()) {
+        s.api_key = k.to_string();
+    }
+
+    // Minimal non-streaming body. `build_body` always sets stream:true, so we
+    // flip it to false afterwards and cap max_tokens to keep the probe cheap.
+    let mut body = s.provider.build_body(
+        &s.model,
+        &[ChatMessage {
+            role: "user".into(),
+            content: "ping".into(),
+        }],
+        &Some("Reply with the single word: ok".into()),
+        s.temperature,
+    );
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("stream".to_string(), serde_json::Value::Bool(false));
+        // Claude requires max_tokens; OpenAI/Ollama accept it. Overwriting the
+        // 4096 the Claude branch set keeps every provider to a tiny reply.
+        obj.insert("max_tokens".to_string(), serde_json::json!(16));
+    }
+
+    let endpoint = s.provider.endpoint(&s.base_url);
+
+    // reqwest client + optional proxy — same builder as run_chat_stream.
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+    if let Some(proxy_url) = s.proxy_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .map_err(|e| format!("代理配置无效 ({}): {}", proxy_url, e))?;
+        builder = builder.proxy(proxy);
+    }
+    let client = builder
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+
+    let mut req = client.post(&endpoint).json(&body);
+    for (name, value) in s.provider.auth_headers(&s.api_key) {
+        req = req.header(name, value.as_str());
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("请求 AI 接口失败: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("AI 接口返回 {}：{}", status, truncate(&text, 500)));
+    }
+
+    // 200 — auth + endpoint are validated by reaching here. Best-effort: try
+    // to surface a short reply snippet; if the body shape is unexpected, the
+    // success message just omits it.
+    let body_text = resp.text().await.unwrap_or_default();
+    let snippet = extract_reply_snippet(&s.provider, &body_text);
+    Ok(format!(
+        "✓ 测试成功（provider={}，model={}）{}",
+        match s.provider {
+            Provider::Claude => "claude",
+            Provider::OpenAi => "openai",
+            Provider::Ollama => "ollama",
+        },
+        s.model,
+        snippet
+    ))
+}
+
+/// Best-effort extraction of a short reply snippet from a non-streaming
+/// response body. Returns "" on any parse failure or empty reply — the caller
+/// treats a 200 as success regardless, so this is only for a richer message.
+fn extract_reply_snippet(provider: &Provider, body: &str) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return String::new();
+    };
+    let text = match provider {
+        Provider::Claude => v["content"][0]["text"].as_str(),
+        Provider::OpenAi => v["choices"][0]["message"]["content"].as_str(),
+        Provider::Ollama => v["message"]["content"].as_str(),
+    };
+    match text.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => format!("，回复：{}", truncate(t, 40)),
+        None => String::new(),
+    }
+}
+
 // ───────────────────────────── health inspection ─────────────────────────────
 
 const INSPECT_SYSTEM: &str = "你是一名经验丰富的运维工程师。下面是通过只读命令采集到的\

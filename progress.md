@@ -985,3 +985,39 @@
 | 目标是什么？ | 长按连接拖到文件夹即移动，防误操作（600ms+5px 阈值+ESC）；拖拽中只展示文件夹无需下滑找目标；重启后连接持久在目标文件夹 |
 | 我学到了什么？ | 移动连接应做专用单列 UPDATE（不碰 keyring/不重加密），比复用 save_connection 的 INSERT OR REPLACE 干净安全；长按拖拽用 pointer+setPointerCapture 两阶段（A 元素捕获检测长按、B 移到 document hit-test）；被拖行必须 pointerEvents:none 否则 elementFromPoint 命中自身（最常见 bug）；hit-test setState 必须 !== 守卫防每帧重渲整表；用户痛点「文件夹连接多要下滑找目标」用「拖拽时只渲染文件夹」优雅解决（walk 里 isDragging 分支强制展开+跳过 conns） |
 | 我做了什么？ | db.rs+main.rs move_connection 参数化单列更新并注册；api.ts moveConnection；新 useConnectionDrag hook（600ms/5px/两阶段/hit-test/in-flight 守卫）；Sidebar 接线+memo+data-folder-path+拖拽只显示文件夹+视觉+自动展开+onContext 早退；tsc+cargo check 双绿；progress 同步 |
+
+### 阶段 38：连接测试按钮 + AI 配置测试按钮 + AI 输入框加高（2026-06-23）
+- **需求（用户原话三条）：**
+  1. 新建/编辑连接对话框增加「测试」按钮——保存前先验证 ssh/sftp/ftp/local 能否连通。
+  2. 设置 → AI 助手，「保存 AI 配置」旁加「测试」按钮——验证当前填写的 provider/key/model/baseUrl 真能用，不必先保存。
+  3. 主页 AI 助手输入框加高——现在 `rows=2`，随便几个字就溢出。
+- **关键设计决策：**
+  - **连接测试抽公共拨号+认证段。** `ssh::connect` 原本把「拨号+认证」与「开 channel/PTY/shell/起 reader/插 session」揉在一起。抽出 `dial_and_authenticate(state, config, open_channel) -> Result<Handle, String>`（返回已认证 Handle，不注册 session、不起 reader、不请求 PTY/shell、不发事件），`connect` 与新增的 `ssh::test_connection` 都调它——**真实连接与测试走同一条认证/host-key TOFU 路径**，测试能抓到真实连接同样的失败。`open_channel=true` 时开一个 session channel 立即丢弃，校验「认证通过但服务器拒开 channel」（真实 SFTP 依赖的复用路径）。
+  - **AI 测试用非流式最小请求。** 复用 `load_settings`（vault 配置+解密 key）+ `Provider::{endpoint, auth_headers, build_body}` + `truncate`。`build_body` 默认 `stream:true`，测试里 `as_object_mut().insert("stream", false)` 覆盖 + `max_tokens=16`。prompt 用 `"ping"` + 系统提示「Reply with the single word: ok」。**非流式而非流式消费首 token**：单次 HTTP 往返，success/fail 语义干净，且**绝不 emit `ai_token`/`ai_done`**，不会干扰打开的 AiPanel 流式订阅。200 即视为认证+端点通过；`extract_reply_snippet` 尽力抽一行回复凑进成功消息，解析失败就降级。
+  - **AI 测试不自动保存。** 走 overrides：表单实时值（含未保存的 key）直传 `ai_test_settings`，空串/undefined 回退 vault 值（与保存的「空 key=保持不变」同语义）。用户可反复试 model/baseUrl/key 不落库。
+  - **AI 输入框用 `rows=4` + `minHeight:96` + `lineHeight:1.5`，不做 auto-grow。** auto-grow 要测 scrollHeight/处理 placeholder/shrink，得不偿失；固定 4 行 + minHeight 即解决「几个字溢出」。
+- **改动（后端）：**
+  - `ssh.rs` — 新增 `dial_and_authenticate`（从 `connect` 抽出拨号+认证）+ `test_connection`（dial+auth+开 channel+`handle.disconnect(Disconnect::ByApplication, ...)`，返回「连接成功（N ms，认证方式=密码/私钥）」）；`connect` 改调 helper；`use russh::Disconnect`。
+  - `ftp.rs` — `test_connection`（`connect`+`disconnect` QUIT，返回「连接成功（N ms，FTP 登录通过）」）；FTPS 会被 `connect` 直接拒。
+  - `local.rs` — `test_connection`（`spawn_blocking` 里 `native_pty_system().openpty`+`spawn_command`+立即 `child.kill()`+`wait`，返回「连接成功（N ms，shell 可启动）」；抓坏路径/缺可执行文件，不起 reader、不入 session map）。
+  - `ai.rs` — `AiTestOverrides` 结构 + `test_settings`（override→`load_settings`→`build_body`+`stream:false`+`max_tokens:16`→reqwest+可选 proxy→200 取 snippet / 非 200 截断报错）+ `extract_reply_snippet`。
+  - `main.rs` — `test_connection` 命令（复用 `ssh_connect`/`ftp_connect` 的 keyring 解析：表单密码优先、缺则按 `config.id` 取 keyring；password-auth 新建无 id 且无密码时拒绝测试防空密码触发锁号；整个探针套 15s `tokio::time::timeout`）+ `ai_test_settings` 命令；两命令注册进 `generate_handler!`。
+- **改动（前端）：**
+  - `api.ts` — `testConnection(config)`、`AiTestOverrides` 接口、`aiTestSettings(overrides?)`。
+  - `ConnectionDialog.tsx` — 抽 `buildConfig(): ConnectionConfig | null`（把 `handleSave` 的校验+配置组装搬出，`handleSave`/`handleTest` 共用，保证「测试的就是要保存的」）；新增 `testing`/`testResult` 状态 + `handleTest`；footer 改 `flexDirection:column`——上层放结果横幅（绿/红 + ✓/✗ + `word-break`，复用 `--success/--error` + `--success-muted/--error-muted`），下层按钮行在「取消」「保存」间插「测试」按钮（`marginRight:auto` 靠左、ghost 二级样式、`disabled=testing||saving`）。local 与 remote 共用同 footer（`buildConfig` 已按 connType 分支）。
+  - `SettingsPanel.tsx` — `aiTesting` 状态 + `handleTestAi`（表单值作 overrides 传 `aiTestSettings`，复用 `aiMsg` 显示，6s 清除）；「保存 AI 配置」前插「测试」按钮（ghost 二级，两按钮互 disabled）；import `aiTestSettings`。
+  - `AiPanel.tsx` — textarea `rows={2}→{4}`，`textareaStyle` 加 `lineHeight:1.5` + `minHeight:96`；不动 `btnStyle`（height:38）与 `alignItems:flex-end`，发送键自然贴底。
+- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS（0 warning，修了 `connect` 里 `let mut handle` → `let handle` 的未用 mut）。需 `cargo tauri dev` 手测三条交互。
+- **边界/错误处理要点：**
+  - 连接测试：空密码（新建无 id）先于网络返回「未填写密码，无法测试」（防空密码被计失败次数→锁号）；编辑模式无表单密码→按 id 取 keyring；Vault 锁定→`require_dek` 报错；FTPS→`connect` 直拒「暂不支持」原样透出；代理握手已有 10s 超时 + 外层 15s 兜底；任何分支都不入 session map（SSH `disconnect` / FTP QUIT / local `kill+wait`）；known_hosts TOFU 照常（MITM 主机键不匹配→测试失败）。
+  - AI 测试：未保存 key（表单有）→ override 直用；key 空+vault 有→用 vault；key 空+vault 空→`load_settings` 报「未配置 API key」；vault 锁→报「Vault 未解锁」；未知 provider→`Provider::parse` 报错；坏代理 URL→报「代理配置无效」；4xx/5xx→「AI 接口返回 {status}：{截断 body}」（典型 401 坏 key / 404 坏 baseUrl / 429 限流）；200 但 body 不可解析→snippet 空，成功消息降级；**无事件泄漏**。
+  - 输入框：Enter 仍发送、Shift+Enter 换行（现在多行更舒适）；placeholder 在 4 行内正常换行；巡检按钮/头部不受影响。
+
+## 五问重启检查（阶段 38）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 38 complete（连接测试按钮 ssh/sftp/ftp/local + AI 配置测试按钮 + AI 输入框加高；后端 dial_and_authenticate 抽取 + test_connection/ai::test_settings + 两命令注册；前端 api.ts 包装 + ConnectionDialog buildConfig 抽取 + SettingsPanel/AiPanel 改动；tsc/cargo check 双绿），待 dev 手测三条交互 |
+| 我要去哪里？ | 用户 `cargo tauri dev` 实测：①新建 SSH 填表→测试→绿「连接成功 N ms」/ 错密码→红 Authentication failed；编辑已有（密码留空）→测试→后端取 keyring 成功；sftp/ftp/local 各分支；②AI 假 model→红 4xx、改回绿、填有效未保存 key→绿（验证 override）；③AiPanel 输几个字不溢出、多行粘贴明显变高 |
+| 目标是什么？ | 保存前验证连接/AI 配置可用（避免反复保存-连接-改-再保存）；AI 输入框不再几个字就溢出 |
+| 我学到了什么？ | 连接测试应抽公共拨号+认证段（dial_and_authenticate）让真实连接与测试同路径、同 host-key TOFU 保证；连接测试必须复用 ssh_connect/ftp_connect 的 keyring 解析 + 防空密码锁号 + 外层超时兜底；AI 测试用非流式最小请求（stream:false+max_tokens:16）而非消费首 token——干净且绝不 emit 事件污染 AiPanel；AI 测试走 overrides 不自动保存，符合「试了再决定」心智；textarea 加高用 rows+minHeight 而非 auto-grow（简单且解决痛点）；ConnectionDialog 抽 buildConfig 让 save/test 共用配置组装防漂移 |
+| 我做了什么？ | ssh.rs 抽 dial_and_authenticate + test_connection + use Disconnect、connect 改调 helper（修未用 mut）；ftp.rs test_connection；local.rs test_connection（spawn+kill+wait）；ai.rs AiTestOverrides+test_settings+extract_reply_snippet；main.rs test_connection（keyring 解析+防空密码+15s 超时）+ ai_test_settings 命令 + 两处 generate_handler 注册；api.ts testConnection/AiTestOverrides/aiTestSettings；ConnectionDialog 抽 buildConfig+testing/testResult 状态+handleTest+footer 加测试按钮与结果横幅；SettingsPanel aiTesting+handleTestAi+测试按钮+import；AiPanel rows=4+textareaStyle 加 lineHeight/minHeight；tsc+cargo check 双绿；progress+README 同步 |

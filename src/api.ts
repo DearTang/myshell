@@ -397,6 +397,20 @@ export async function localDisconnect(sessionId: string): Promise<void> {
   await invoke("local_disconnect", { sessionId });
 }
 
+// ============ Connection Test ============
+
+/**
+ * Probe a connection config WITHOUT registering a persistent session or
+ * opening a tab. Mirrors the save flow's credential handling: typed
+ * password/proxy_password are passed inline; when absent and `config.id`
+ * exists, the backend resolves them from the keyring (edit mode). Wrapped in
+ * a server-side 15s timeout. Ok = success message (e.g. "连接成功（123 ms，认证方式=密码）");
+ * Err = failure reason (auth / network / timeout).
+ */
+export async function testConnection(config: ConnectionConfig): Promise<string> {
+  return await invoke("test_connection", { config });
+}
+
 // ============ Elevation (run as admin) ============
 
 /** Whether MyShell is running elevated (admin on Windows, root on Unix). */
@@ -682,6 +696,30 @@ export function saveAiSettings(
     apiKey,
     temperature,
   });
+}
+
+/** Optional per-field overrides for `aiTestSettings`. Any field that is
+ * undefined or empty-string falls back to the vault-stored value. `apiKey`
+ * is the key one: pass the unsaved typed key to validate before saving; pass
+ * "" / undefined to test the vault-stored key. */
+export interface AiTestOverrides {
+  provider?: string;
+  model?: string;
+  baseUrl?: string;
+  proxyUrl?: string;
+  apiKey?: string;
+  temperature?: number;
+}
+
+/**
+ * Probe the AI provider config with a minimal non-streaming request. Tests
+ * the CURRENT FORM VALUES when overrides are provided — does NOT require
+ * saving first. Empty/undefined override fields fall back to the vault-stored
+ * value. Returns a success message or throws the provider's error (status
+ * code + truncated body). Never emits ai_token/ai_done events.
+ */
+export async function aiTestSettings(overrides?: AiTestOverrides): Promise<string> {
+  return await invoke("ai_test_settings", { overrides: overrides ?? null });
 }
 
 /** Subscribe to streaming tokens for a specific request. */

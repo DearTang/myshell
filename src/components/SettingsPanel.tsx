@@ -18,6 +18,7 @@ import { useColorScheme } from "../hooks/useColorScheme";
 import { useTerminalFont } from "../hooks/useTerminalFont";
 import { useAiConfig } from "../hooks/useAiConfig";
 import type { AiProvider } from "../api";
+import { aiTestSettings } from "../api";
 import { PRESETS, type ColorPalette } from "../themes";
 import { FontField } from "./FontField";
 
@@ -90,6 +91,7 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   const [aiKey, setAiKey] = useState("");
   const [aiTemp, setAiTemp] = useState(0.7);
   const [aiSaving, setAiSaving] = useState(false);
+  const [aiTesting, setAiTesting] = useState(false);
   const [aiMsg, setAiMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const aiInitRef = useRef(false);
   useEffect(() => {
@@ -126,6 +128,31 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
     } finally {
       setAiSaving(false);
       window.setTimeout(() => setAiMsg(null), 3000);
+    }
+  };
+
+  // Test the AI config using the CURRENT FORM VALUES via overrides — does NOT
+  // save first, so the user can iterate on model/baseUrl/key without
+  // committing. An empty apiKey field falls through to the vault-stored key
+  // (same convention as save's "empty key = keep existing").
+  const handleTestAi = async () => {
+    setAiTesting(true);
+    setAiMsg(null);
+    try {
+      const msg = await aiTestSettings({
+        provider: aiProvider,
+        model: aiModel.trim() || undefined,
+        baseUrl: aiBaseUrl.trim() || undefined,
+        proxyUrl: aiProxy.trim() || undefined,
+        apiKey: aiKey,
+        temperature: aiTemp,
+      });
+      setAiMsg({ kind: "ok", text: msg });
+    } catch (e) {
+      setAiMsg({ kind: "err", text: `测试失败: ${e}` });
+    } finally {
+      setAiTesting(false);
+      window.setTimeout(() => setAiMsg(null), 6000);
     }
   };
 
@@ -948,8 +975,26 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
             </Field>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <button
+                onClick={handleTestAi}
+                disabled={aiTesting || aiSaving}
+                style={{
+                  background: "var(--bg-surface)",
+                  color: "var(--text-secondary)",
+                  border: "1px solid var(--border-default)",
+                  borderRadius: "var(--radius-md)",
+                  padding: "9px 16px",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: aiTesting ? "default" : "pointer",
+                  opacity: aiTesting ? 0.7 : 1,
+                }}
+                title="用当前填写的配置（含未保存的 key）发起一次最小请求验证"
+              >
+                {aiTesting ? "测试中…" : "测试"}
+              </button>
+              <button
                 onClick={handleSaveAi}
-                disabled={aiSaving}
+                disabled={aiSaving || aiTesting}
                 style={{
                   background: "var(--accent-primary)",
                   color: "#fff",

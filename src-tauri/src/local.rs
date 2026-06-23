@@ -326,3 +326,48 @@ pub async fn disconnect(state: &State<'_, AppState>, session_id: &str) -> Result
     }
     Ok(())
 }
+
+/// Probe a local-shell config by spawning it under a PTY and killing it
+/// immediately. Catches bad/missing executable paths and spawn-permission
+/// errors without opening a tab or registering a session. The spawn itself is
+/// the success signal — we don't wait for output (a shell that spawns but
+/// hangs on profile load still proves the path is valid and executable, which
+/// is what "测试" is really validating here). Used by `test_connection`.
+pub async fn test_connection(config: &ConnectionConfig) -> Result<String, String> {
+    let shell_path = config
+        .shell_path
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "未配置启动 shell 路径".to_string())?;
+
+    let started = std::time::Instant::now();
+    let cfg = config.clone();
+    let spawn = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let pair = native_pty_system()
+            .openpty(pty_size(80, 24))
+            .map_err(|e| format!("打开 PTY 失败: {}", e))?;
+        let mut cmd = CommandBuilder::new(&shell_path);
+        if let Some(args) = cfg.shell_args.as_ref() {
+            for arg in args.split_whitespace() {
+                cmd.arg(arg);
+            }
+        }
+        cmd.env("TERM", "xterm-256color");
+        let mut child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| format!("启动 shell 失败: {}（检查路径是否正确）", e))?;
+        // Drop our slave handle (same reason as `connect`) then reap the child
+        // so the test never leaves a lingering process.
+        drop(pair.slave);
+        let _ = child.kill();
+        let _ = child.wait();
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("测试线程失败: {}", e))?;
+    spawn?;
+    let ms = started.elapsed().as_millis();
+    Ok(format!("连接成功（{} ms，shell 可启动）", ms))
+}

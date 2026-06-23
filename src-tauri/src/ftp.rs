@@ -171,6 +171,19 @@ pub async fn disconnect(s: &mut FtpSession) -> Result<(), String> {
     Ok(())
 }
 
+/// Probe an FTP connection by establishing it then immediately tearing down.
+/// Reuses `connect` (proxy + login + transfer_type) and `disconnect` (QUIT),
+/// so the test exercises the same path a real connect takes. Returns a
+/// human-readable success message with latency. Used by `test_connection`.
+/// FTPS (tls != none) is rejected inside `connect` with a clear "暂不支持".
+pub async fn test_connection(cfg: &ConnectionConfig) -> Result<String, String> {
+    let started = std::time::Instant::now();
+    let mut session = connect(cfg).await?;
+    let _ = disconnect(&mut session).await;
+    let ms = started.elapsed().as_millis();
+    Ok(format!("连接成功（{} ms，FTP 登录通过）", ms))
+}
+
 fn format_pex(f: &FtpFile) -> String {
     use suppaftp::list::PosixPexQuery;
     let r = |who: PosixPexQuery| f.can_read(who);

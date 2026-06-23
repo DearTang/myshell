@@ -829,6 +829,7 @@ const ConnRow = memo(function ConnRow({
         </div>
         <span
           onClick={openMenu}
+          onPointerDown={(e) => e.stopPropagation()}
           title="更多操作"
           style={{
             fontSize: 12,

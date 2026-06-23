@@ -39,6 +39,9 @@ interface Msg {
   id: string;
   role: "user" | "assistant";
   content: string;
+  /** Context snapshot attached at send time — shown above the user message
+   * as a muted snippet so the user sees what was sent to the AI. */
+  selection?: string;
   error?: boolean;
   streaming?: boolean;
 }
@@ -124,6 +127,20 @@ export function AiPanel({
     return ctx;
   }, [activeConnType, activeTerm, attachedSelection]);
 
+  /** Snapshot the selection/context that will be sent alongside this message.
+   * Used to render a preview inside the user bubble so the user can see
+   * exactly what context the AI received. */
+  const snapshotSelection = useCallback((): string | undefined => {
+    if (attachedSelection) return attachedSelection;
+    if (activeTerm) {
+      const sel = activeTerm.getSelection();
+      if (sel && sel.trim()) return sel;
+      const out = readRecentLines(activeTerm, 40);
+      if (out) return out;
+    }
+    return undefined;
+  }, [activeTerm, attachedSelection]);
+
   const pasteToTerminal = useCallback(
     (text: string) => {
       // term.paste() drives xterm's onData → the same path as the user typing,
@@ -145,7 +162,8 @@ export function AiPanel({
     const text = input.trim();
     if (!text || streaming) return;
     const reqId = newId();
-    const userMsg: Msg = { id: `${reqId}-u`, role: "user", content: text };
+    const sel = snapshotSelection();
+    const userMsg: Msg = { id: `${reqId}-u`, role: "user", content: text, selection: sel };
     const aiMsg: Msg = { id: reqId, role: "assistant", content: "", streaming: true };
     setMessages((prev) => [...prev, userMsg, aiMsg]);
     setInput("");
@@ -189,7 +207,7 @@ export function AiPanel({
       );
       finish();
     });
-  }, [input, streaming, collectContext]);
+  }, [input, streaming, collectContext, snapshotSelection]);
 
   // Health inspection: the backend runs a preset read-only script (SSH over
   // exec_once, local via the OS shell) and streams an AI health report over
@@ -378,29 +396,25 @@ export function AiPanel({
             </button>
           </div>
         )}
-        <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+        <div style={{ position: "relative" }}>
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder="描述你想做的事…（Enter 发送，Shift+Enter 换行）"
-            rows={2}
+            title="Enter 发送
+Shift+Enter 换行"
+            placeholder="描述你想做的事…
+Enter 发送 ● Shift+Enter 换行"
+            rows={4}
             style={textareaStyle}
           />
-          {streaming ? (
-            <button onClick={cancelActive} style={btnStyle("var(--bg-surface-active)", false)}>
-              停止
-            </button>
-          ) : (
+          {streaming && (
             <button
-              onClick={send}
-              disabled={!input.trim()}
-              style={btnStyle(
-                input.trim() ? "var(--accent-primary)" : "var(--bg-surface-active)",
-                !input.trim()
-              )}
+              onClick={cancelActive}
+              style={stopBtnOverlayStyle}
+              title="停止生成"
             >
-              发送
+              ■
             </button>
           )}
         </div>
@@ -477,30 +491,40 @@ const inputBarStyle: CSSProperties = {
 };
 const textareaStyle: CSSProperties = {
   flex: 1,
-  resize: "none",
+  width: "100%",
+  resize: "vertical",
   background: "var(--bg-input)",
   color: "var(--text-primary)",
   border: "1px solid var(--border-default)",
   borderRadius: 8,
   padding: "8px 10px",
   fontSize: 13,
+  lineHeight: 1.5,
   fontFamily: "inherit",
   outline: "none",
+  minHeight: 48,
+  maxHeight: 300,
+  boxSizing: "border-box",
 };
 
-function btnStyle(bg: string, disabled: boolean): CSSProperties {
-  return {
-    background: bg,
-    color: disabled ? "var(--text-muted)" : "#fff",
-    border: "none",
-    borderRadius: 8,
-    padding: "8px 14px",
-    fontSize: 13,
-    fontWeight: 500,
-    cursor: disabled ? "default" : "pointer",
-    height: 38,
-  };
-}
+const stopBtnOverlayStyle: CSSProperties = {
+  position: "absolute",
+  right: 8,
+  bottom: 8,
+  width: 28,
+  height: 28,
+  background: "var(--error-muted)",
+  border: "1px solid var(--error)",
+  borderRadius: 6,
+  color: "var(--error)",
+  fontSize: 12,
+  lineHeight: 1,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  cursor: "pointer",
+  transition: "all 0.2s cubic-bezier(0.32,0.72,0,1)",
+};
 
 function MessageBubble({
   msg,
@@ -532,8 +556,31 @@ function MessageBubble({
           color: msg.error ? "var(--error)" : "var(--text-primary)",
           fontSize: 13,
           lineHeight: 1.6,
+          display: "flex",
+          flexDirection: "column",
+          gap: 6,
         }}
       >
+        {isUser && msg.selection && (
+          <div
+            style={{
+              fontSize: 11,
+              lineHeight: 1.5,
+              color: "var(--text-tertiary)",
+              background: "var(--bg-base)",
+              border: "1px solid var(--border-subtle)",
+              borderRadius: 6,
+              padding: "6px 8px",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              maxHeight: 120,
+              overflowY: "auto",
+              fontFamily: "'Cascadia Code', Consolas, monospace",
+            }}
+          >
+            {msg.selection}
+          </div>
+        )}
         {isUser ? (
           <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{msg.content}</div>
         ) : msg.content === "" && msg.streaming ? (

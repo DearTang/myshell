@@ -1548,6 +1548,80 @@ async fn save_ai_settings(
     Ok(())
 }
 
+/// Probe a connection config without registering a persistent session or
+/// opening a tab. Dispatches to the per-protocol `test_connection` probe
+/// (ssh/sftp share the SSH path; ftp + local have their own).
+///
+/// Credentials mirror `ssh_connect`/`ftp_connect`: the form's typed
+/// `password`/`proxy_password` win when present; otherwise we resolve from the
+/// keyring by `config.id` (edit mode, where the dialog shows "留空保持不变").
+/// For password auth in new-connection mode with no id and no typed password,
+/// we refuse to test rather than send an empty password (many servers count
+/// that as a failed attempt and lock the account). The whole probe is wrapped
+/// in a 15s timeout so a hung host returns a clean error instead of blocking
+/// the UI.
+#[tauri::command]
+async fn test_connection(
+    state: State<'_, AppState>,
+    mut config: ConnectionConfig,
+) -> Result<String, String> {
+    // ── 1. Resolve credentials (same rules as ssh_connect / ftp_connect) ──
+    if config.conn_type != "local" && config.auth_method != "key" && config.password.is_none() {
+        if !config.id.is_empty() {
+            let key = require_dek(&state)?;
+            config.password = secrets::get_password(&config.id, &key)?;
+        }
+        // Empty/missing password on password-auth: refuse to test. Sending an
+        // empty password would be counted as a failed attempt by many servers
+        // and can trigger lockout after N tries — same guard as ssh_connect.
+        if config.auth_method == "password"
+            && config
+                .password
+                .as_deref()
+                .map(str::is_empty)
+                .unwrap_or(true)
+        {
+            return Err("未填写密码，无法测试".to_string());
+        }
+    }
+    if config.conn_type != "local"
+        && config.proxy_type != "none"
+        && config.proxy_password.is_none()
+        && !config.id.is_empty()
+    {
+        let key = require_dek(&state)?;
+        config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
+    }
+
+    // ── 2. Dispatch under a 15s timeout ──
+    let probe = async {
+        match config.conn_type.as_str() {
+            "ssh" | "sftp" => ssh::test_connection(&state, &config).await,
+            "ftp" => ftp::test_connection(&config).await,
+            "local" => local::test_connection(&config).await,
+            other => Err(format!("未知连接类型: {}", other)),
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(15), probe)
+        .await
+        .map_err(|_| {
+            "连接测试超时（15s）— 通常网络不可达、防火墙拦截、或服务未运行".to_string()
+        })?
+}
+
+/// Test the AI provider config with a minimal non-streaming request. Accepts
+/// optional overrides so the user can validate the CURRENT FORM VALUES
+/// (including an unsaved typed API key) without saving first. When an
+/// override is None or empty, the vault-stored value is used.
+#[tauri::command]
+async fn ai_test_settings(
+    state: State<'_, AppState>,
+    overrides: Option<ai::AiTestOverrides>,
+) -> Result<String, String> {
+    let overrides = overrides.unwrap_or_default();
+    ai::test_settings(&state, overrides).await
+}
+
 // ============ Elevation (run as admin) ============
 
 /// Whether MyShell is running elevated (admin on Windows, root on Unix). Drives
@@ -2472,6 +2546,7 @@ pub fn run() {
             ftp_remove,
             ftp_rename,
             ftp_disconnect,
+            test_connection,
             rz_open_read,
             rz_read_chunk,
             rz_close,
@@ -2483,6 +2558,7 @@ pub fn run() {
             ai_inspect_health_local,
             get_ai_settings,
             save_ai_settings,
+            ai_test_settings,
         ])
         .setup(|app| {
             // Explicitly set the main window's icon so the title bar + taskbar

@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { FontField } from "./FontField";
 import { open } from "@tauri-apps/plugin-dialog";
-import { saveConnection, getConnectionPassword, getConnectionProxyPassword, readTextFile } from "../api";
+import { saveConnection, getConnectionPassword, getConnectionProxyPassword, readTextFile, testConnection } from "../api";
 import type { ConnectionConfig, ConnType, FtpTls, ProxyType } from "../api";
 import { PasswordVerifyDialog } from "./PasswordVerifyDialog";
 import { ConnIcon } from "./ConnIcon";
@@ -68,6 +68,8 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
   const [initCommand, setInitCommand] = useState(config?.init_command || "");
   const [terminalFont, setTerminalFont] = useState(config?.terminal_font || "");
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [showPassword, setShowPassword] = useState(false);
   const [showProxyPassword, setShowProxyPassword] = useState(false);
   const [passwordVerifyTarget, setPasswordVerifyTarget] = useState<"password" | "proxy" | null>(null);
@@ -105,118 +107,131 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
     });
   }
 
-  async function handleSave() {
+  // Build the ConnectionConfig exactly as `handleSave` would (so the test
+  // reflects precisely what would be committed). Returns null — and alerts
+  // the reason — when validation fails. Shared by both save and test so the
+  // two paths can't drift.
+  function buildConfig(): ConnectionConfig | null {
     // Local terminal — no host/port/auth, just a shell to spawn.
     if (connType === "local") {
       if (!name.trim()) {
         alert("请填写连接名称");
-        return;
+        return null;
       }
       if (!shellPath.trim()) {
         alert("请填写启动 shell 路径");
-        return;
+        return null;
       }
-      setSaving(true);
-      try {
-        const trimmedGroup = groupPath
-          .trim()
-          .replace(/^\/+|\/+$/g, "")
-          .replace(/\/+/g, "/");
-        const conn: ConnectionConfig = {
-          id: config?.id || crypto.randomUUID(),
-          name: name.trim(),
-          host: "",
-          port: 0,
-          username: "",
-          auth_method: "password", // unused for local, struct requires a value
-          conn_type: "local",
-          group_path: trimmedGroup ? `/${trimmedGroup}` : "/",
-          shell_path: shellPath.trim(),
-          shell_args: shellArgs.trim() || undefined,
-          init_command: initCommand.trim() || undefined,
-          terminal_font: terminalFont.trim() || undefined,
-          created_at: config?.created_at || new Date().toISOString(),
-        };
-        await saveConnection(conn);
-        onSave();
-      } catch (e) {
-        alert(`保存失败: ${e}`);
-      } finally {
-        setSaving(false);
-      }
-      return;
+      const trimmedGroup = groupPath
+        .trim()
+        .replace(/^\/+|\/+$/g, "")
+        .replace(/\/+/g, "/");
+      return {
+        id: config?.id || crypto.randomUUID(),
+        name: name.trim(),
+        host: "",
+        port: 0,
+        username: "",
+        auth_method: "password", // unused for local, struct requires a value
+        conn_type: "local",
+        group_path: trimmedGroup ? `/${trimmedGroup}` : "/",
+        shell_path: shellPath.trim(),
+        shell_args: shellArgs.trim() || undefined,
+        init_command: initCommand.trim() || undefined,
+        terminal_font: terminalFont.trim() || undefined,
+        created_at: config?.created_at || new Date().toISOString(),
+      };
     }
 
     if (!name.trim() || !host.trim() || !username.trim()) {
       alert("请填写必要字段");
-      return;
+      return null;
     }
 
     const portNum = parseInt(port, 10);
     if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
       alert("端口号必须为 1-65535 之间的整数");
-      return;
+      return null;
     }
 
     const isEditing = !!config?.id;
     if (authMethod === "password" && !isEditing && !password) {
       alert("请填写密码");
-      return;
+      return null;
     }
 
     let proxyPortNum: number | undefined;
     if (proxyType !== "none") {
       if (!proxyHost.trim()) {
         alert("代理主机地址不能为空");
-        return;
+        return null;
       }
       const pp = parseInt(proxyPort, 10);
       if (!Number.isInteger(pp) || pp < 1 || pp > 65535) {
         alert("代理端口必须为 1-65535 之间的整数");
-        return;
+        return null;
       }
       proxyPortNum = pp;
     }
 
+    const passwordToSend =
+      authMethod === "password" && password ? password : undefined;
+    const trimmedGroup = groupPath
+      .trim()
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/\/+/g, "/");
+    return {
+      id: config?.id || crypto.randomUUID(),
+      name: name.trim(),
+      host: host.trim(),
+      port: portNum,
+      username: username.trim(),
+      auth_method: authMethod,
+      password: passwordToSend,
+      private_key_pem: authMethod === "key" ? privateKeyPem : undefined,
+      conn_type: connType,
+      group_path: trimmedGroup ? `/${trimmedGroup}` : "/",
+      ftp_tls: connType === "ftp" ? ftpTls : "none",
+      ftp_passive: connType === "ftp" ? ftpPassive : true,
+      proxy_type: proxyType,
+      proxy_host: proxyType !== "none" ? proxyHost.trim() : undefined,
+      proxy_port: proxyPortNum,
+      proxy_username:
+        proxyType !== "none" && proxyUsername.trim()
+          ? proxyUsername.trim()
+          : undefined,
+      proxy_password: proxyType !== "none" && proxyPassword ? proxyPassword : undefined,
+      terminal_font: terminalFont.trim() || undefined,
+      created_at: config?.created_at || new Date().toISOString(),
+    };
+  }
+
+  async function handleSave() {
+    const conn = buildConfig();
+    if (!conn) return;
     setSaving(true);
     try {
-      const passwordToSend =
-        authMethod === "password" && password ? password : undefined;
-      const trimmedGroup = groupPath
-        .trim()
-        .replace(/^\/+|\/+$/g, "")
-        .replace(/\/+/g, "/");
-      const conn: ConnectionConfig = {
-        id: config?.id || crypto.randomUUID(),
-        name: name.trim(),
-        host: host.trim(),
-        port: portNum,
-        username: username.trim(),
-        auth_method: authMethod,
-        password: passwordToSend,
-        private_key_pem: authMethod === "key" ? privateKeyPem : undefined,
-        conn_type: connType,
-        group_path: trimmedGroup ? `/${trimmedGroup}` : "/",
-        ftp_tls: connType === "ftp" ? ftpTls : "none",
-        ftp_passive: connType === "ftp" ? ftpPassive : true,
-        proxy_type: proxyType,
-        proxy_host: proxyType !== "none" ? proxyHost.trim() : undefined,
-        proxy_port: proxyPortNum,
-        proxy_username:
-          proxyType !== "none" && proxyUsername.trim()
-            ? proxyUsername.trim()
-            : undefined,
-        proxy_password:
-          proxyType !== "none" && proxyPassword ? proxyPassword : undefined,
-        terminal_font: terminalFont.trim() || undefined,
-        created_at: config?.created_at || new Date().toISOString(),
-      };
       await saveConnection(conn);
       onSave();
     } catch (e) {
       alert(`保存失败: ${e}`);
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleTest() {
+    const conn = buildConfig();
+    if (!conn) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const msg = await testConnection(conn);
+      setTestResult({ kind: "ok", text: msg });
+    } catch (e) {
+      setTestResult({ kind: "err", text: String(e) });
+    } finally {
+      setTesting(false);
     }
   }
 
@@ -623,70 +638,121 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
             padding: "16px 24px",
             borderTop: "1px solid var(--border-subtle)",
             display: "flex",
-            justifyContent: "flex-end",
+            flexDirection: "column",
             gap: 10,
             background: "var(--bg-surface)",
             borderRadius: "0 0 var(--radius-xl) var(--radius-xl)",
-            // Sticky so Save/Cancel stay visible without scrolling to the
-            // bottom — the card above is the scroll container (overflowY auto).
+            // Sticky so Save/Cancel/Test stay visible without scrolling to
+            // the bottom — the card above is the scroll container (overflowY auto).
             position: "sticky",
             bottom: 0,
             flexShrink: 0,
             zIndex: 5,
           }}
         >
-          <button
-            onClick={onClose}
-            style={{
-              padding: "10px 20px",
-              background: "transparent",
-              color: "var(--text-secondary)",
-              border: "1px solid var(--border-default)",
-              borderRadius: "var(--radius-md)",
-              fontSize: 13,
-              cursor: "pointer",
-              transition: "all var(--duration-fast) var(--ease-in-out)",
-            }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.background = "var(--bg-surface-hover)";
-              e.currentTarget.style.borderColor = "var(--border-emphasis)";
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.background = "transparent";
-              e.currentTarget.style.borderColor = "var(--border-default)";
-            }}
-          >
-            取消
-          </button>
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            style={{
-              padding: "10px 28px",
-              background: "var(--accent-primary)",
-              color: "white",
-              border: "none",
-              borderRadius: "var(--radius-md)",
-              fontSize: 13,
-              fontWeight: 600,
-              cursor: saving ? "wait" : "pointer",
-              opacity: saving ? 0.7 : 1,
-              transition: "all var(--duration-fast) var(--ease-in-out)",
-              boxShadow: "var(--shadow-glow)",
-            }}
-            onMouseEnter={(e) => {
-              if (!saving) {
-                e.currentTarget.style.background = "var(--accent-primary-hover)";
-                e.currentTarget.style.transform = "translateY(-1px)";
-              }
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.background = "var(--accent-primary)";
-              e.currentTarget.style.transform = "translateY(0)";
-            }}
-          >
-            {saving ? "保存中..." : "保存"}
-          </button>
+          {testResult && (
+            <div
+              style={{
+                fontSize: 12,
+                lineHeight: 1.5,
+                color: testResult.kind === "ok" ? "var(--success)" : "var(--error)",
+                background:
+                  testResult.kind === "ok"
+                    ? "var(--success-muted)"
+                    : "var(--error-muted)",
+                border: `1px solid ${testResult.kind === "ok" ? "var(--success)" : "var(--error)"}`,
+                borderRadius: "var(--radius-md)",
+                padding: "8px 12px",
+                wordBreak: "break-word",
+              }}
+            >
+              {testResult.kind === "ok" ? "✓ " : "✗ "}
+              {testResult.text}
+            </div>
+          )}
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+            <button
+              onClick={handleTest}
+              disabled={testing || saving}
+              title="验证当前配置能否连通（不保存）"
+              style={{
+                padding: "10px 20px",
+                background: "var(--bg-surface)",
+                color: "var(--text-secondary)",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-md)",
+                fontSize: 13,
+                cursor: testing || saving ? "default" : "pointer",
+                opacity: testing ? 0.7 : 1,
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+                marginRight: "auto",
+              }}
+              onMouseEnter={(e) => {
+                if (!testing && !saving) {
+                  e.currentTarget.style.background = "var(--bg-surface-hover)";
+                  e.currentTarget.style.borderColor = "var(--border-emphasis)";
+                }
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "var(--bg-surface)";
+                e.currentTarget.style.borderColor = "var(--border-default)";
+              }}
+            >
+              {testing ? "测试中..." : "测试"}
+            </button>
+            <button
+              onClick={onClose}
+              style={{
+                padding: "10px 20px",
+                background: "transparent",
+                color: "var(--text-secondary)",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-md)",
+                fontSize: 13,
+                cursor: "pointer",
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = "var(--bg-surface-hover)";
+                e.currentTarget.style.borderColor = "var(--border-emphasis)";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "transparent";
+                e.currentTarget.style.borderColor = "var(--border-default)";
+              }}
+            >
+              取消
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={saving || testing}
+              style={{
+                padding: "10px 28px",
+                background: "var(--accent-primary)",
+                color: "white",
+                border: "none",
+                borderRadius: "var(--radius-md)",
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: saving ? "wait" : "pointer",
+                opacity: saving ? 0.7 : 1,
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+                boxShadow: "var(--shadow-glow)",
+              }}
+              onMouseEnter={(e) => {
+                if (!saving) {
+                  e.currentTarget.style.background = "var(--accent-primary-hover)";
+                  e.currentTarget.style.transform = "translateY(-1px)";
+                }
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "var(--accent-primary)";
+                e.currentTarget.style.transform = "translateY(0)";
+              }}
+            >
+              {saving ? "保存中..." : "保存"}
+            </button>
+          </div>
         </div>
       </div>
 
