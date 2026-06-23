@@ -933,11 +933,55 @@
   3. 是否走了代理——若 `proxy_type != none`，先关掉代理直连试，排除是代理环节超时。
   4. 被动模式——`ftp_passive` 默认 true（NAT 友好），但 10060 发生在**控制连接建立阶段**，与被动/主动模式无关（那是数据连接的事），所以这个开关不影响本次报错。
 
+### 阶段 36：启动白屏消除（2026-06-23）
+- **现象：** 应用启动、跳到登录页之前有一段白屏过程。
+- **根因：** Tauri 窗口默认 `visible: true`，WebView 在 React 挂载首帧之前就把窗口显示出来；`index.html` 没有任何内联样式，白底裸 `#root` 被画出来 → 白闪。CSS 用了 `@import "../assets/iconfont/iconfont.css"`，在 import 完成前 body 无背景色。
+- **方案（彻底消除）：** 窗口先隐藏，等前端首帧真正绘制完再显示。
+  1. `tauri.conf.json` 主窗口加 `"visible": false`。
+  2. `main.rs::setup` 里 `app.listen_any("dom-ready", …)` → 收到事件后 `window.show()` + `set_focus()`；另起一个 4s `tokio::time::sleep` 安全网，前端若没发事件也强制显示（防止 JS 报错把窗口卡成永久不可见）。需 `use tauri::Listener;` 才能用 `listen_any`。
+  3. `src/main.tsx` 在 `ReactDOM.render` 之后，等两个 `requestAnimationFrame`（确保浏览器已提交绘制而非仅排队 React 工作），再 `emit("dom-ready")`；用动态 `import("@tauri-apps/api/event")` + try/catch，保证在纯浏览器（`npm run dev` 直接开网页）下也不报错。
+  4. `index.html` 内联兜底：`html/body` 背景写死 `#0d1117`（= 深色主题 `--bg-base`），`#root:empty::after` 画一个 `--accent-primary` 色的旋转 spinner——即便窗口已显示但 React 还没挂载（比如慢机器/安全网触发），看到的也是深色 + 加载圈，而非白屏。React 一挂载 `#root` 不再 `:empty`，spinner 自动消失。
+- **修改的文件：**
+  - `index.html` — 内联 boot splash 样式（深色背景 + `#root:empty` spinner）
+  - `src-tauri/tauri.conf.json` — 主窗口 `"visible": false`
+  - `src-tauri/src/main.rs` — `use tauri::Listener`；setup 里注册 `dom-ready` 监听 + 4s 强制显示安全网
+  - `src/main.tsx` — 双 rAF 后 `emit("dom-ready")`
+- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS（0 warning）。需 `cargo tauri dev` / `cargo tauri build` 才能看到效果（改了 Rust）。
+- **权衡/注意：**
+  - 安全网的 4s 是**最坏兜底**，正常路径前端几十毫秒就 emit 了，窗口几乎是即时出现——不会真的等到 4s。
+  - 用 `listen_any`（any-target）而非 `listen`，避免 sender label 匹配问题；事件名 `dom-ready` 是自定义的，不和 Tauri 内置冲突。
+  - 浅色主题用户：兜底背景是深色 `#0d1117`，仅存在于「窗口已显示但 React 未挂载」的极短瞬间；React 挂载后 `ColorSchemeProvider` 立即覆盖为浅色。可接受（这瞬间肉眼基本不可见）。
+  - 若将来加多窗口，每个新窗口要复刻同样的 visible:false + dom-ready 模式，否则新窗口会白闪。
+
+### 阶段 37：长按拖动连接到文件夹移动（2026-06-23）
+- **现象/需求：** 连接管理目前只能进编辑对话框改 `group_path` 来移动连接，太笨重。用户要：**长按连接拖到文件夹上松手即移动**，并防止误操作；且拖动时希望**只展示文件夹**（隐藏文件夹下的连接），避免文件夹里连接太多、要一直下滑才能拖到目标文件夹。
+- **方案：**
+  1. **后端新增专用单列更新命令** `move_connection(conn_id, new_group_path)`：`UPDATE connections SET group_path=?1 WHERE id=?2`，参数化防注入，**只改一列**，不碰 keyring、不重新加密 host/user/key（不像 `save_connection` 走 `INSERT OR REPLACE` + secret 重处理，移动是纯文件夹重分配，专用命令最干净安全）。`new_group_path` 经 `normalize_folder_path` 归一（`/` = 取消归类）。db.rs + main.rs + generate_handler 注册。
+  2. **前端 API** `moveConnection(connId, newGroupPath)`（api.ts，invoke 参数 camelCase → Rust snake）。
+  3. **交互核心** `useConnectionDrag`（新文件 `src/hooks/`）：pointer 事件 + `setPointerCapture`，**长按 600ms**（移动端工业标准；用户原提 2s，权衡后改 600ms 更跟手，仍实现为可调常量）+ **5px 移动取消阈值**（普通点击/双击绝不会误触发）。两阶段：
+     - Phase A（0→600ms，监听在捕获元素上）：超时 → 进入 B；pointermove>5px / pointerup / pointercancel / window blur / ESC → 清理取消。
+     - Phase B（拖拽中，监听在 document）：hit-test `document.elementFromPoint(x,y)?.closest('[data-folder-path]')`，`hoverFolderPath` 变化才 setState（防每帧重渲）；pointerup → 目标非空且≠当前文件夹则 `await moveConnection` + 自动展开 + `onRefresh`，否则无操作；ESC / pointercancel / blur → 取消。`isMovingRef` 防连点竞态。
+  4. **Sidebar 接线**：`walk` 给 FolderRow 传 `isDropTarget` + 根 div 加 `data-folder-path`，给 ConnRow 传 `draggingConnId` + `onPointerDown={beginDrag}`。**拖拽激活时（`isDragging`）列表切换为「只文件夹」视图**——`walk` 里 `isDragging` 时强制 `isOpen=true` 且只递归 `children`、跳过 `conns`，这样目标文件夹立即可见无需下滑；松手恢复原视图。FolderRow/ConnRow 用 `React.memo` 包裹（拖拽 hover 变化只重渲源行+目标行）。搜索结果视图不接 `beginDrag`（depth=0 无文件夹，拖拽不连贯）。`onContext` 在拖拽中早退。
+  5. **视觉**：被拖行 `opacity:0.4`+`shadow-glow`+`scale(1.02)`+**`pointerEvents:none`**（关键，否则 elementFromPoint 命中自己）；目标文件夹 `--accent-primary-muted` bg + `inset border-accent`；body `cursor:grabbing`+`userSelect:none`。不做跟随光标的 ghost（v1）。
+- **修改的文件：**
+  - `src-tauri/src/db.rs` — `move_connection`（参数化单列 UPDATE）
+  - `src-tauri/src/main.rs` — `move_connection` 命令 + 注册 `generate_handler!`
+  - `src/api.ts` — `moveConnection`
+  - `src/hooks/useConnectionDrag.ts` — **新文件**
+  - `src/components/Sidebar.tsx` — 接线、memo、data-folder-path、拖拽时只渲染文件夹、视觉分支、自动展开、onContext 早退
+- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS（0 warning）。需 `cargo tauri dev` 手测全交互。
+- **补充：拖动提示横幅（2026-06-23）**
+  - **现象：** 拖动没有任何提示，用户不知道这个手势的作用、也不确定当前会落到哪个文件夹。
+  - **改动：** `Sidebar.tsx` 新增 `DragHint` 组件，`isDragging` 时在列表顶部渲染横幅：accent 色背景 + border-accent，三行——「正在移动「连接名」」（说明作用）/「拖到文件夹上松开即可移动…ESC 或空白处取消」（说明操作）/「当前目标：📁 文件夹名」（或「移到文件夹上以选择」当悬停空白）。目标随 `dragState.hoverFolderPath` 实时更新（hit-test 已有的状态）。复用现有 `fadeIn` 动画。
+  - **验证：** `npx tsc --noEmit` PASS。
+- **已知限制：** 拖到列表上下边缘不自动滚动（`listContainer` overflowY:auto，v1 不做）；拖拽中 ConnRow 的 ⋯ 菜单若已开会保持；600ms 常量可调。
+- **关键坑（已规避）：** 被拖行必须 `pointerEvents:none`，否则 `elementFromPoint` 命中被拖行自身而非下层文件夹（本模式最常见 bug）；hit-test setState 必须 `!==` 守卫防每帧重渲整表；Phase A→B 切换时 `dragActivated` 标志 + 两次 releaseCapture 防止重复释放/泄漏 capture。
+
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 阶段 35 complete（FTP 连接加日志 + 10060 诊断提示，cargo check 绿），待 dev 重连验证日志可见 |
-| 我要去哪里？ | 用户重新 `cargo tauri dev` 连 FTP，看日志文件是否出现 `[ftp] connect requested` + 带提示的错误；据此定位是 IP/端口/防火墙 |
-| 目标是什么？ | FTP 连不上时：(1) 后台有日志可查；(2) 错误信息说人话，指出 10060 是网络可达性问题非密码错误 |
-| 我学到了什么？ | 日志对称性——ssh_connect 有 info/error 日志，ftp_connect 没有，导致 FTP 路径「静默失败」；10060=WSAETIMEDOUT 是 TCP 握手超时，发生在 login 之前，与凭据无关，与被动/主动模式无关（那是数据连接阶段）；错误改写要放在产生错误的最近处（ftp.rs 的 connect 分支）而非外层，这样直连和代理两条路径都能覆盖 |
-| 我做了什么？ | main.rs ftp_connect 加 info/error 日志（对称 ssh_connect）；ftp.rs connect 直连失败检测 10060 改写为中文诊断提示、各阶段打 log::info!、eprintln→log；cargo check 绿，progress/README 同步 |
+| 我在哪里？ | 阶段 37 complete（长按拖连接到文件夹移动：后端 move_connection 单列更新 + 前端 useConnectionDrag 两阶段 + Sidebar 拖拽时只显示文件夹；tsc/cargo check 双绿），待 dev 手测全交互 |
+| 我要去哪里？ | 用户 `cargo tauri dev` 实测：长按 600ms 拖动、拖时只显示文件夹、松手移动+自动展开、ESC/空白区/同文件夹 无操作、点击/双击未被误伤 |
+| 目标是什么？ | 长按连接拖到文件夹即移动，防误操作（600ms+5px 阈值+ESC）；拖拽中只展示文件夹无需下滑找目标；重启后连接持久在目标文件夹 |
+| 我学到了什么？ | 移动连接应做专用单列 UPDATE（不碰 keyring/不重加密），比复用 save_connection 的 INSERT OR REPLACE 干净安全；长按拖拽用 pointer+setPointerCapture 两阶段（A 元素捕获检测长按、B 移到 document hit-test）；被拖行必须 pointerEvents:none 否则 elementFromPoint 命中自身（最常见 bug）；hit-test setState 必须 !== 守卫防每帧重渲整表；用户痛点「文件夹连接多要下滑找目标」用「拖拽时只渲染文件夹」优雅解决（walk 里 isDragging 分支强制展开+跳过 conns） |
+| 我做了什么？ | db.rs+main.rs move_connection 参数化单列更新并注册；api.ts moveConnection；新 useConnectionDrag hook（600ms/5px/两阶段/hit-test/in-flight 守卫）；Sidebar 接线+memo+data-folder-path+拖拽只显示文件夹+视觉+自动展开+onContext 早退；tsc+cargo check 双绿；progress 同步 |

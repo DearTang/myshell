@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tauri::{Manager, State};
+use tauri::{Listener, Manager, State};
 use rand::RngCore;
 
 mod ssh;
@@ -983,6 +983,21 @@ fn rename_folder(
     }
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db::rename_folder(&db, &old, &new).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn move_connection(
+    state: State<AppState>,
+    conn_id: String,
+    new_group_path: String,
+) -> Result<(), String> {
+    // Single-column rewrite of group_path by id equality. Parameterized, so
+    // injection-safe; does NOT touch the keyring or re-encrypt host/user/key
+    // (unlike save_connection). Moving into "/" is allowed (= unfile).
+    let target = normalize_folder_path(&new_group_path);
+    log::info!("[move_connection] {} -> group_path {}", conn_id, target);
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::move_connection(&db, &conn_id, &target).map_err(|e| e.to_string())
 }
 
 // ============ Command History Commands ============
@@ -2419,6 +2434,7 @@ pub fn run() {
             save_folder,
             delete_folder,
             rename_folder,
+            move_connection,
             add_command_history,
             list_command_history,
             set_command_history_pinned,
@@ -2485,6 +2501,35 @@ pub fn run() {
                         Err(e) => log::warn!("[startup] decode window icon failed: {}", e),
                     }
                 }
+            }
+
+            // No-white-screen splash: the main window starts hidden
+            // (`"visible": false` in tauri.conf.json). The frontend emits a
+            // "dom-ready" event (see src/main.tsx) once React has painted its
+            // first frame, so we reveal the window only after there's real
+            // content to show — eliminating the brief blank flash before
+            // login. Keep a 4s safety net in case the frontend never signals
+            // (dev error, broken JS) so the app can't get stuck invisible.
+            if let Some(window) = app.get_webview_window("main") {
+                let win = window.clone();
+                app.listen_any("dom-ready", move |_| {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                });
+                // Safety-net: force-show after 4s regardless, so a frontend
+                // bug can never leave the user with an invisible window.
+                let win_fallback = window.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                    if win_fallback.is_visible().unwrap_or(false) {
+                        return;
+                    }
+                    log::warn!("[startup] dom-ready not received within 4s; force-showing window");
+                    let _ = win_fallback.show();
+                    let _ = win_fallback.set_focus();
+                });
+            } else {
+                log::warn!("[startup] main window not found; cannot register dom-ready reveal");
             }
             Ok(())
         })

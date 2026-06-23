@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { ConnectionConfig, ConnType } from "../api";
 import {
   saveFolder,
@@ -7,6 +7,7 @@ import {
   copyConnection,
 } from "../api";
 import { useTheme } from "../hooks/useTheme";
+import { useConnectionDrag } from "../hooks/useConnectionDrag";
 import { BrandLogo } from "./BrandLogo";
 import { ConnIcon } from "./ConnIcon";
 
@@ -200,6 +201,26 @@ export function Sidebar({
   const [searchQuery, setSearchQuery] = useState("");
   const { theme, toggleTheme } = useTheme();
 
+  // Long-press-drag-to-folder. While dragState is active the list switches to
+  // a compact folders-only view so the user doesn't have to scroll past dozens
+  // of connections to reach the target folder. onMoved auto-expands the target
+  // (so the moved connection is immediately visible) and triggers a refresh.
+  const { dragState, beginDrag } = useConnectionDrag({
+    onMoved: (targetFolderPath) => {
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        next.add(targetFolderPath);
+        return next;
+      });
+      onRefresh();
+    },
+    onMoveError: (connId, err) => {
+      window.alert(`移动失败: ${err}`);
+      console.error("[move_connection] failed for", connId, err);
+    },
+  });
+  const isDragging = dragState !== null;
+
   // Filter connections based on search query
   const filteredConnections = useMemo(() => {
     if (!searchQuery.trim()) return connections;
@@ -268,19 +289,27 @@ export function Sidebar({
   const rows: React.ReactNode[] = [];
   const walk = (node: FolderNode) => {
     if (node.path !== "/") {
-      const isOpen = expanded.has(node.path);
+      const isOpen = isDragging ? true : expanded.has(node.path);
       rows.push(
         <FolderRow
           key={`f:${node.path}`}
           node={node}
           isOpen={isOpen}
+          isDropTarget={dragState?.hoverFolderPath === node.path}
           onToggle={() => toggle(node.path)}
           onContext={(e) => {
             e.preventDefault();
+            if (isDragging) return;
             setMenu({ x: e.clientX, y: e.clientY, kind: "folder", folderPath: node.path });
           }}
         />
       );
+      // While dragging, render folders only (expanded) so the user can reach
+      // any target folder without scrolling past the connections inside each.
+      if (isDragging) {
+        for (const child of node.children) walk(child);
+        return;
+      }
       if (!isOpen) return;
     }
     for (const c of node.conns) {
@@ -289,9 +318,12 @@ export function Sidebar({
           key={`c:${c.id}`}
           conn={c}
           depth={node.depth}
+          draggingConnId={dragState?.connId ?? null}
+          onPointerDown={(e) => beginDrag(c, e)}
           onConnect={() => onConnect(c)}
           onContext={(e) => {
             e.preventDefault();
+            if (isDragging) return;
             setMenu({ x: e.clientX, y: e.clientY, kind: "blank" });
           }}
           onEdit={() => onEdit(c)}
@@ -565,6 +597,10 @@ export function Sidebar({
           }
         }}
       >
+        {isDragging && <DragHint
+          hoverFolderPath={dragState?.hoverFolderPath ?? null}
+          sourceConnName={dragState?.connName ?? ""}
+        />}
         {searchQuery.trim() ? searchResults : rows}
         {filteredConnections.length === 0 && searchQuery && (
           <div style={styles.emptyState}>
@@ -615,19 +651,22 @@ export function Sidebar({
   );
 }
 
-function FolderRow({
+const FolderRow = memo(function FolderRow({
   node,
   isOpen,
+  isDropTarget,
   onToggle,
   onContext,
 }: {
   node: FolderNode;
   isOpen: boolean;
+  isDropTarget?: boolean;
   onToggle: () => void;
   onContext: (e: React.MouseEvent) => void;
 }) {
   return (
     <div
+      data-folder-path={node.path}
       onClick={onToggle}
       onContextMenu={onContext}
       style={{
@@ -640,12 +679,21 @@ function FolderRow({
         fontSize: 12,
         color: "var(--text-secondary)",
         userSelect: "none",
-        transition: "background var(--duration-fast) var(--ease-in-out)",
+        // Drop target highlight — only set when isDropTarget is true; left
+        // as `transparent` otherwise so the existing onMouseEnter/Leave hover
+        // background still works (it writes e.currentTarget.style.background).
+        background: isDropTarget ? "var(--accent-primary-muted)" : "transparent",
+        boxShadow: isDropTarget ? "inset 0 0 0 1px var(--border-accent)" : "none",
+        transition: "background var(--duration-fast) var(--ease-out-expo)",
         borderRadius: "0 var(--radius-md) var(--radius-md) 0",
         marginRight: 8,
       }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-surface-hover)")}
-      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+      onMouseEnter={(e) => {
+        if (!isDropTarget) e.currentTarget.style.background = "var(--bg-surface-hover)";
+      }}
+      onMouseLeave={(e) => {
+        if (!isDropTarget) e.currentTarget.style.background = "transparent";
+      }}
     >
       <span style={{
         fontSize: 8,
@@ -675,12 +723,14 @@ function FolderRow({
       )}
     </div>
   );
-}
+});
 
-function ConnRow({
+const ConnRow = memo(function ConnRow({
   conn,
   depth,
   showGroupPath,
+  draggingConnId,
+  onPointerDown,
   onConnect,
   onContext,
   onEdit,
@@ -690,6 +740,8 @@ function ConnRow({
   conn: ConnectionConfig;
   depth: number;
   showGroupPath?: boolean;
+  draggingConnId?: string | null;
+  onPointerDown?: (e: React.PointerEvent) => void;
   onConnect: () => void;
   onContext: (e: React.MouseEvent) => void;
   onEdit: () => void;
@@ -712,26 +764,40 @@ function ConnRow({
     ? conn.group_path.startsWith("/") ? conn.group_path.slice(1) : conn.group_path
     : null;
 
+  // True while THIS row is the one being dragged. We set pointerEvents:none so
+  // document.elementFromPoint sees the folder beneath it instead of this row,
+  // and dim+raise it as the "you're dragging this" affordance.
+  const isThisDragging = draggingConnId === conn.id;
+
   return (
     <>
       <div
+        onPointerDown={onPointerDown}
         onDoubleClick={onConnect}
         onContextMenu={onContext}
         style={{
           padding: "8px 16px 8px 24",
           paddingLeft: 24 + depth * 14,
-          cursor: "pointer",
+          cursor: isThisDragging ? "grabbing" : "grab",
           display: "flex",
           alignItems: "center",
           gap: 10,
           fontSize: 13,
           color: "var(--text-primary)",
+          opacity: isThisDragging ? 0.4 : 1,
+          pointerEvents: isThisDragging ? "none" : "auto",
+          transform: isThisDragging ? "scale(1.02)" : "none",
+          boxShadow: isThisDragging ? "var(--shadow-glow)" : "none",
           transition: "background var(--duration-fast) var(--ease-in-out)",
           borderRadius: "0 var(--radius-md) var(--radius-md) 0",
           marginRight: 8,
         }}
-        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--bg-surface-hover)")}
-        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        onMouseEnter={(e) => {
+          if (!isThisDragging) e.currentTarget.style.background = "var(--bg-surface-hover)";
+        }}
+        onMouseLeave={(e) => {
+          if (!isThisDragging) e.currentTarget.style.background = "transparent";
+        }}
       >
         <ConnIcon connType={connType} size={16} style={{ opacity: 0.85 }} />
         <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", gap: 2 }}>
@@ -811,6 +877,58 @@ function ConnRow({
         </>
       )}
     </>
+  );
+});
+
+// Banner shown at the top of the connection list while a long-press drag is
+// active. Tells the user (a) that dragging moves the connection into a folder,
+// and (b) the current drop target, so they're never guessing what the gesture
+// does or where they'll land.
+function DragHint({
+  hoverFolderPath,
+  sourceConnName,
+}: {
+  hoverFolderPath: string | null;
+  sourceConnName: string;
+}) {
+  const trimmed = hoverFolderPath && hoverFolderPath !== "/"
+    ? hoverFolderPath.startsWith("/")
+      ? hoverFolderPath.slice(1)
+      : hoverFolderPath
+    : null;
+  return (
+    <div
+      style={{
+        margin: "4px 8px 8px 8px",
+        padding: "8px 12px",
+        background: "var(--accent-primary-muted)",
+        border: "1px solid var(--border-accent)",
+        borderRadius: "var(--radius-md)",
+        fontSize: 11,
+        lineHeight: 1.5,
+        color: "var(--text-primary)",
+        display: "flex",
+        flexDirection: "column",
+        gap: 2,
+        animation: "fadeIn var(--duration-normal) var(--ease-out-expo)",
+      }}
+    >
+      <span style={{ fontWeight: 600, color: "var(--accent-primary)" }}>
+        正在移动「{sourceConnName}」
+      </span>
+      <span style={{ color: "var(--text-secondary)" }}>
+        拖到文件夹上松开即可移动到该文件夹；ESC 或松开在空白处取消
+      </span>
+      {trimmed ? (
+        <span style={{ color: "var(--text-tertiary)" }}>
+          当前目标：<span style={{ color: "var(--accent-secondary)" }}>📁 {trimmed}</span>
+        </span>
+      ) : (
+        <span style={{ color: "var(--text-muted)" }}>
+          当前目标：移到文件夹上以选择
+        </span>
+      )}
+    </div>
   );
 }
 

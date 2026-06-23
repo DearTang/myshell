@@ -665,6 +665,19 @@ pub fn rename_folder(conn: &Connection, old_path: &str, new_path: &str) -> Resul
     Ok(())
 }
 
+/// Move a single connection into another folder by rewriting only its
+/// `group_path` column. Parameterized equality on `id` (no LIKE needed),
+/// so the new path is bound as a plain literal — SQL-injection-safe by
+/// construction. Unlike `save_connection`, this does NOT touch the keyring
+/// or re-encrypt host/user/key fields; it's a pure folder reassignment.
+pub fn move_connection(conn: &Connection, conn_id: &str, new_group_path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE connections SET group_path = ?1 WHERE id = ?2",
+        params![new_group_path, conn_id],
+    )?;
+    Ok(())
+}
+
 pub fn folder_has_children(conn: &Connection, path: &str) -> Result<bool> {
     let pattern = like_prefix_pattern(path);
     let conn_count: i64 = conn.query_row(

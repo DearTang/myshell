@@ -183,6 +183,15 @@ export async function copyConnection(id: string): Promise<ConnectionConfig> {
   return await invoke("copy_connection", { srcId: id });
 }
 
+/**
+ * Move a connection into another folder by rewriting only its `group_path`.
+ * Single-column UPDATE by id equality — does NOT re-encrypt host/user/key or
+ * touch the OS keyring (unlike saveConnection). `newGroupPath` of "/" unfiles.
+ */
+export async function moveConnection(connId: string, newGroupPath: string): Promise<void> {
+  await invoke("move_connection", { connId, newGroupPath });
+}
+
 // ============ Import/Export API ============
 //
 // Encrypted dump format: AES-256-GCM(pbkdf2-hmac-sha256(passphrase, salt, 200k) || plaintext).

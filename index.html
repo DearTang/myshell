@@ -4,6 +4,39 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MyShell</title>
+    <style>
+      /* ── Boot splash (inlined so it paints before any CSS @import / JS runs).
+         The Tauri window starts hidden; when it shows, this dark surface +
+         spinner is already on screen — no white flash ever. #root is empty
+         only until React mounts, so the splash auto-vanishes on first render. ── */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #0d1117; /* matches --bg-base (dark default theme) */
+      }
+      #root {
+        height: 100%;
+      }
+      #root:empty::after {
+        content: "";
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        width: 28px;
+        height: 28px;
+        margin: -14px 0 0 -14px;
+        border-radius: 50%;
+        border: 3px solid rgba(88, 166, 255, 0.2);
+        border-top-color: #58a6ff; /* matches --accent-primary */
+        animation: myshell-boot-spin 0.8s linear infinite;
+      }
+      @keyframes myshell-boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
