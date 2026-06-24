@@ -27,11 +27,44 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, basename } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const OWNER = "argustang";
 const REPO = "myshell";
 const API = `https://gitee.com/api/v5/repos/${OWNER}/${REPO}`;
+
+/**
+ * Gitee's API can throw transient ConnectTimeoutError / socket hangups (we
+ * hit two in a row cutting v1.5.0). Wrap each network call in a small retry
+ * loop so a flaky link doesn't fail an otherwise-complete release. Retries
+ * only on network-type errors (fetch TypeError) — a 4xx/5xx HTTP response
+ * is returned to the caller as-is (it's a real failure, not a hiccup).
+ */
+const MAX_ATTEMPTS = 4;
+async function fetchWithRetry(url, init, label) {
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, init);
+      return res; // success or HTTP error — caller inspects res.ok
+    } catch (err) {
+      lastErr = err;
+      // fetch fails (TypeError) for DNS/connect/timeout/socket issues — retry.
+      // Readable body streams can't be reused, so retry is only safe when the
+      // body is a plain string (create-release). For multipart upload we
+      // rebuild the form on each attempt (handled at the call site).
+      if (attempt < MAX_ATTEMPTS) {
+        const waitMs = 2000 * attempt; // 2s, 4s, 6s
+        console.error(
+          `  [${label}] 网络错误(${attempt}/${MAX_ATTEMPTS})，${waitMs}ms 后重试: ${err.message || err}`
+        );
+        await sleep(waitMs);
+      }
+    }
+  }
+  throw lastErr;
+}
 
 const [rawVersion, notesFile, assetOverride] = process.argv.slice(2);
 
@@ -104,18 +137,22 @@ async function main() {
 
   // ── 3. Create the release (tag is created from target_commitish=main) ──
   console.log(`=== 创建 Gitee release ${TAG} ===`);
-  const createRes = await fetch(`${API}/releases`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json;charset=UTF-8" },
-    body: JSON.stringify({
-      access_token: token,
-      tag_name: TAG,
-      name: TAG,
-      body: notes,
-      target_commitish: "main",
-      prerelease: false,
-    }),
-  });
+  const createRes = await fetchWithRetry(
+    `${API}/releases`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json;charset=UTF-8" },
+      body: JSON.stringify({
+        access_token: token,
+        tag_name: TAG,
+        name: TAG,
+        body: notes,
+        target_commitish: "main",
+        prerelease: false,
+      }),
+    },
+    "create-release"
+  );
   const createJson = await createRes.json().catch(() => ({}));
   if (!createRes.ok || !createJson.id) {
     console.error("创建 release 失败:", JSON.stringify(createJson));
@@ -125,15 +162,36 @@ async function main() {
   console.log(`release id = ${releaseId}`);
 
   // ── 4. Upload the installer as a release attachment ───────────────────
+  // The multipart body is a stream and can't be reused across retries, so we
+  // rebuild the FormData inside the retry wrapper's try block.
   console.log(`=== 上传资产 ${basename(asset)} ===`);
   const fileBuf = await readFile(asset);
-  const form = new FormData();
-  form.append("access_token", token);
-  form.append("file", new Blob([fileBuf]), basename(asset));
-  const upRes = await fetch(`${API}/releases/${releaseId}/attach_files`, {
-    method: "POST",
-    body: form,
-  });
+  let upRes;
+  let lastUploadErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const form = new FormData();
+    form.append("access_token", token);
+    form.append("file", new Blob([fileBuf]), basename(asset));
+    try {
+      upRes = await fetch(`${API}/releases/${releaseId}/attach_files`, {
+        method: "POST",
+        body: form,
+      });
+      break; // got a response (ok or HTTP error) — stop retrying
+    } catch (err) {
+      lastUploadErr = err;
+      if (attempt < MAX_ATTEMPTS) {
+        const waitMs = 2000 * attempt;
+        console.error(
+          `  [upload] 网络错误(${attempt}/${MAX_ATTEMPTS})，${waitMs}ms 后重试: ${err.message || err}`
+        );
+        await sleep(waitMs);
+      }
+    }
+  }
+  if (!upRes) {
+    throw lastUploadErr;
+  }
   const upJson = await upRes.json().catch(() => ({}));
   if (!upRes.ok) {
     console.error("上传资产失败:", JSON.stringify(upJson));
