@@ -913,3 +913,40 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
 export async function openExternalUrl(url: string): Promise<void> {
   await invoke("open_external_url", { url });
 }
+
+/** Payload of the `update_download_progress` event from `downloadUpdate`. */
+export interface DownloadProgress {
+  downloaded: number;
+  total: number;
+}
+
+/**
+ * Download the installer `.exe` to the OS temp dir, streaming progress via the
+ * `update_download_progress` event. Resolves with the temp file path; pass it
+ * to `installUpdate`. Rejects on network/HTTP/write failure (caller falls
+ * back to a browser download).
+ */
+export async function downloadUpdate(url: string): Promise<string> {
+  return await invoke("download_update", { url });
+}
+
+/**
+ * Subscribe to download-progress events. `total` is 0 when the server didn't
+ * report Content-Length (indeterminate). Returns an unlisten fn.
+ */
+export function onUpdateDownloadProgress(
+  handler: (p: DownloadProgress) => void
+): Promise<UnlistenFn> {
+  return listen<DownloadProgress>("update_download_progress", (event) => {
+    handler(event.payload);
+  });
+}
+
+/**
+ * Launch the downloaded installer (NSIS) and exit the app so it can replace
+ * the binaries. The installer triggers a UAC prompt. This call does not
+ * return normally — the app exits during it.
+ */
+export async function installUpdate(path: string): Promise<void> {
+  await invoke("install_update", { path });
+}

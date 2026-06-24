@@ -10,6 +10,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { AiPanel } from "./components/AiPanel";
 import { QuickCommandsPanel } from "./components/QuickCommandsPanel";
 import { AboutDialog } from "./components/AboutDialog";
+import { UpdateNotification } from "./components/UpdateNotification";
 import { BrandLogo } from "./components/BrandLogo";
 import type { Terminal } from "@xterm/xterm";
 import {
@@ -124,27 +125,10 @@ export default function App() {
     };
   }, [vault]);
 
-  // One-time-per-new-version update toast: when the background check finds a
-  // newer release, pop the About dialog once per latest_version. Subsequent
-  // launches for the same version only leave the sidebar red dot.
-  useEffect(() => {
-    if (!updateInfo?.has_update) return;
-    // Don't fight the whats-new dialog if it's already showing.
-    if (about.open && about.mode === "whatsnew") return;
-    let lastNotified: string | null = null;
-    try {
-      lastNotified = localStorage.getItem("myshell.lastNotifiedUpdateVersion");
-    } catch {
-      lastNotified = null;
-    }
-    if (lastNotified === updateInfo.latest_version) return;
-    setAbout({ open: true, mode: "about" });
-    try {
-      localStorage.setItem("myshell.lastNotifiedUpdateVersion", updateInfo.latest_version);
-    } catch {
-      // best-effort
-    }
-  }, [updateInfo, about.open, about.mode]);
+  // When the background check finds a newer release, show the bottom-left
+  // UpdateNotification card (dismissable, per-version). This replaces the old
+  // auto-open About modal — less intrusive. The sidebar footer also shows a
+  // green dot. Manual re-check / changelog still live in the About dialog.
 
   const closeAbout = () => {
     // Closing the whats-new dialog acknowledges the version: stamp it so the
@@ -720,6 +704,12 @@ export default function App() {
           onDownload={(url) => {
             void openExternalUrl(url);
           }}
+        />
+      )}
+      {vault === "ready" && updateInfo?.has_update && (
+        <UpdateNotification
+          updateInfo={updateInfo}
+          onOpenAbout={() => setAbout({ open: true, mode: "about" })}
         />
       )}
     </div>

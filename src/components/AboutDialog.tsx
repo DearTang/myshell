@@ -136,7 +136,7 @@ export function AboutDialog({
                 <span style={{ fontSize: 16 }}>✨</span>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>
-                    发现新版本 v{updateInfo!.latest_version}
+                    发现新版本 {updateInfo!.latest_version}
                   </div>
                   <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 2 }}>
                     点击右侧按钮前往下载

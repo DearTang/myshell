@@ -1079,3 +1079,29 @@
 | 目标是什么？ | 一键可复现发版；开源前清掉个人路径/脱敏；既保留作者身份又让仓库对外干净 |
 | 我学到了什么？ | 发布脚本二进制上传用 Gitee `attach_files`（非 GitHub upload_url）；Node fetch 做 multipart 最稳（项目已保证有 Node）；安全分类器独立于用户授权会拦 push-main/公开发布，用 `!` 放行；`?raw` 导入路径要算对层级、tsc 不查运行期路径只查类型；开源审计要扫**全历史**而非仅工作区（但历史重写收益要看作者身份是否保留——保留则清文件内容收益≈0）；CRLF 警告无害（Windows）；确认门是好设计——无用户改动时如实建议跳过、用户仍要发就发 |
 | 我做了什么？ | publish-gitee-release.mjs（create release+attach_files+4次重试+token 解析 env/文件）；.gitignore 加 .gitee-token；CLAUDE.md 打包规则（8步含 3.5 确认门+分类器放行提示）+记忆/索引同步；6 脚本 cargo 路径脱敏+TerminalPanel 注释脱敏（提交 8ac7606）；发版 v1.5.0(723458)/v1.5.1(723544) 含 .exe；CHANGELOG/README/progress 同步 |
+
+### 阶段 41：每次登录检查更新 + 左下角提示 + 自动下载安装（2026-06-24）
+- **需求（用户原话）：** 每次登录进入主页后检查一次新版本；网络设置 30s 超时；检查到新版本→左下角提示「发现新版本」+绿点；用户确认后自动下载并安装，下载失败再由用户点击页面下载安装。
+- **方案选型：** 自动安装两选——A 后端下载 .exe + 启动 NSIS 安装器（无签名，HTTPS+用户确认）；B 集成 tauri-plugin-updater（签名密钥+manifest+CI 改造）。选 **A**（契合现有 Gitee release 流水线、免签名基建），下载失败回退浏览器下载（用户原话）。
+- **改动（后端）：**
+  - `main.rs` — `check_for_updates` 超时 10s→**30s**（client builder timeout 覆盖全请求生命周期，去掉多余 tokio wrapper）；新增 `download_update(window,url)`：reqwest 流式下载到 `temp_dir/myshell-update-setup.exe`，`bytes_stream` 逐块写 tokio fs，每 256KB `window.emit("update_download_progress",{downloaded,total})` 节流，末尾补发 100%，返回临时路径；新增 `install_update(app,path)`：校验路径非 NUL/是文件/`.exe` 后缀，Windows 用 `CommandExt::creation_flags(DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP)` 分离启动，再 `app.exit(0)` 让安装器接管替换文件；两命令注册 `generate_handler!`；`use tauri::Emitter`（emit 方法所在 trait，2.11 拆出）。
+- **改动（前端）：**
+  - `api.ts` — `DownloadProgress` 接口 + `downloadUpdate(url)`/`installUpdate(path)`/`onUpdateDownloadProgress(handler)`。
+  - `hooks/useUpdateCheck.ts` — **去掉 24h 节流**，改「每会话（每次 enabled→true 即登录进主页）自动检查一次」`autoRanRef`；保留 `checkNow` 手动。
+  - `components/UpdateNotification.tsx`（新）— 左下角 fixed 卡片（`left:16;bottom:16`），绿点 +「发现新版本 vX.X.X」+✕ 忽略；四态机 prompt→downloading(进度条，订阅事件)→ready(安装并重启)→failed(浏览器下载+重试)；忽略按 `latest_version` 存 localStorage（更新版本再现）。
+  - `App.tsx` — 删旧的「每版本弹一次 About 模态」effect（换成更轻的左下角卡片）；渲染 `<UpdateNotification>`（vault ready + has_update 时）；保留侧栏绿点 + About 手动检查 + whatsnew 升级后更新日志。
+- **验证：** `npx tsc --noEmit` + `cargo check` 双绿。需 dev 手测：登录后自动检查；Gitee 有更高版本→左下角卡片+绿点；点「立即更新」→进度条→「安装并重启」→App 退出+NSIS 安装器(UAC)接管；断网/下载失败→「浏览器下载」回退。
+- **边界/错误处理要点：**
+  - 下载：url 必须 http(s)；HTTP 非 2xx/读流失败/写盘失败→`Err`，前端进 failed 态回退浏览器；下载 client timeout 300s（安装包几 MB 但慢网要给余量）；进度 total=0（无 Content-Length）时 UI 显示「下载中…」无百分比。
+  - 安装：路径含 NUL/非文件/非 `.exe` 拒绝（防被当任意文件启动器）；app.exit(0) 后安装器独立运行；perMachine 安装器触发 UAC（正常 Windows 安装 UX）。
+  - 提示防 naggy：忽略按版本记忆，同版本忽略后不再弹，更新版本才再现；侧栏绿点常驻 + 卡片可关。
+  - 安全：A 方案无签名校验，靠 HTTPS（Gitee TLS）+ 用户显式确认；未来防 MITM 再上 B（tauri-plugin-updater 签名校验）。
+
+## 五问重启检查（阶段 41）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 41 complete（每次登录检查 + 30s 超时 + 左下角提示卡片 + 自动下载安装器+失败回退浏览器；后端 check 超时 30s + download_update 流式带进度 + install_update 分离启动+exit；前端 api 包装 + useUpdateCheck 改每会话 + UpdateNotification 四态机 + App 装配去旧弹窗；tsc/cargo check 双绿），待 dev 手测整条更新链路 |
+| 我要去哪里？ | 用户 `cargo tauri dev` 实测：①登录后自动检查（不再 24h 节流）；②Gitee 发更高版本→左下角卡片「发现新版本 vX.X.X」+绿点；③点「立即更新」→进度条到 100%→「安装并重启」→App 退出、NSIS 安装器(UAC)接管安装；④断网或下载失败→「浏览器下载」打开 release 页 + 「重试」；⑤点✕忽略该版本后不再弹 |
+| 目标是什么？ | 登录即检查、30s 超时、左下角非打扰提示、确认后自动下载安装、失败回退手动 |
+| 我学到了什么？ | Tauri 2.11 把 emit 拆到 `Emitter` trait 需单独 import（报错才知）；reqwest `bytes_stream` + tokio fs 流式下载 + 每 256KB 节流 emit 进度是干净模式；Windows 启动外部安装器要 `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP` 才在父进程 exit 后存活；自动安装选「下载+启动安装器」(A) 而非 plugin-updater(B) 是为契合现有 Gitee release 免签名；用「每会话 autoRanRef」实现「每次登录检查一次」比 localStorage 节流更贴合语义；UI 状态机 prompt/downloading/ready/failed 让下载-安装-失败回退三种路径清晰 |
+| 我做了什么？ | main.rs check 超时 30s+去 tokio wrapper、download_update（reqwest stream+tokio fs+256KB 节流 emit+末尾 100%）install_update（NUL/文件/.exe 校验+creation_flags 分离+app.exit）、Emitter import、两命令注册；api.ts DownloadProgress/downloadUpdate/installUpdate/onUpdateDownloadProgress；useUpdateCheck 去 24h 节流改 autoRanRef 每会话一次；UpdateNotification.tsx 左下角卡片四态机+进度条+按版本忽略；App.tsx 删每版本弹 About effect+渲染 UpdateNotification；tsc+cargo check 双绿；progress+README 同步 |

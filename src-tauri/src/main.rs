@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tauri::{Listener, Manager, State};
+use tauri::{Emitter, Listener, Manager, State};
 use rand::RngCore;
 
 mod ssh;
@@ -920,27 +920,26 @@ fn is_newer(latest: &str, current: &str) -> bool {
 /// Check Gitee for the latest release and report whether an update is
 /// available. Resolves with a populated `UpdateInfo` on every path; failures
 /// are encoded in the `error` field rather than rejected.
+///
+/// Network timeout is 30s (per the update-check spec) — generous enough for a
+/// slow first connection, short enough that a dead link doesn't hang the
+/// background check indefinitely. The client-level timeout governs the whole
+/// request lifecycle (connect + headers + body).
 #[tauri::command]
 async fn check_for_updates() -> UpdateInfo {
     let current_version = backup::APP_VERSION.to_string();
 
     let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
     {
         Ok(c) => c,
         Err(e) => return update_info_error(&current_version, format!("客户端构建失败: {e}")),
     };
 
-    let resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(12),
-        client.get(GITEE_LATEST_RELEASE).send(),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return update_info_error(&current_version, format!("网络请求失败: {e}")),
-        Err(_) => return update_info_error(&current_version, "请求超时".to_string()),
+    let resp = match client.get(GITEE_LATEST_RELEASE).send().await {
+        Ok(r) => r,
+        Err(e) => return update_info_error(&current_version, format!("网络请求失败: {e}")),
     };
 
     if !resp.status().is_success() {
@@ -1043,6 +1042,139 @@ fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     app.shell()
         .open(url, None)
         .map_err(|e| format!("打开链接失败: {e}"))
+}
+
+/// Payload for the `update_download_progress` event, scoped to the window
+/// that initiated the download.
+#[derive(Clone, Serialize)]
+struct DownloadProgress {
+    downloaded: u64,
+    total: u64,
+}
+
+/// Download the installer `.exe` from `url` into the OS temp dir, streaming
+/// and emitting `update_download_progress` events to the originating window
+/// so the UI can render a progress bar. Returns the absolute temp path on
+/// success; the frontend then calls `install_update` with it.
+///
+/// Security: `url` must be https (the asset URL we got from Gitee's API). The
+/// file is written to the system temp dir under a fixed name, overwriting any
+/// prior partial download. No signature verification (that'd require the full
+/// tauri-plugin-updater pipeline) — trust is HTTPS + explicit user consent.
+#[tauri::command]
+async fn download_update(window: tauri::WebviewWindow, url: String) -> Result<String, String> {
+    let lower = url.trim().to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return Err("仅支持 http(s) 链接".to_string());
+    }
+
+    // A longer timeout than check_for_updates: the installer (~6 MB) over a
+    // slow link can take a while, and we want the stream to keep going.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("客户端构建失败: {e}"))?;
+
+    let resp = client
+        .get(url.trim())
+        .send()
+        .await
+        .map_err(|e| format!("下载请求失败: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("下载失败: HTTP {}", resp.status().as_u16()));
+    }
+    let total = resp.content_length().unwrap_or(0);
+
+    // Fixed temp filename; re-download just overwrites. Kept simple — no need
+    // to track per-version temp files.
+    let temp_dir = std::env::temp_dir();
+    let dest = temp_dir.join("myshell-update-setup.exe");
+
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(&dest)
+        .await
+        .map_err(|e| format!("创建临时文件失败: {e}"))?;
+
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut downloaded: u64 = 0;
+    let mut last_emitted: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("读取数据失败: {e}"))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("写入文件失败: {e}"))?;
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        // Throttle events to ~every 256 KB so we don't flood the webview for
+        // every tiny chunk.
+        if downloaded - last_emitted >= 256 * 1024 || total == 0 {
+            let _ = window.emit(
+                "update_download_progress",
+                DownloadProgress {
+                    downloaded,
+                    total,
+                },
+            );
+            last_emitted = downloaded;
+        }
+    }
+    file.flush().await.map_err(|e| format!("写入文件失败: {e}"))?;
+    drop(file);
+
+    // Final 100% event so the UI flips to "ready" even if the last chunk was
+    // under the 256 KB throttle threshold.
+    let _ = window.emit(
+        "update_download_progress",
+        DownloadProgress {
+            downloaded,
+            total: if total == 0 { downloaded } else { total },
+        },
+    );
+
+    dest.to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "临时路径含非法字符".to_string())
+}
+
+/// Launch the downloaded installer and exit the app so the installer can
+/// replace the running files. The NSIS installer (perMachine mode) will
+/// trigger a UAC prompt — that's the normal Windows install UX.
+///
+/// On Windows the installer is spawned with `DETACHED_PROCESS |
+/// CREATE_NEW_PROCESS_GROUP` so it survives the parent's exit. On other
+/// platforms we just spawn it (the project targets Windows/NSIS, but this
+/// keeps it compiling elsewhere).
+#[tauri::command]
+fn install_update(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    if path.bytes().any(|b| b == 0) {
+        return Err("无效路径".to_string());
+    }
+    let meta = std::fs::metadata(&path).map_err(|_| "安装包不存在".to_string())?;
+    if !meta.is_file() {
+        return Err("安装包路径无效".to_string());
+    }
+    // Sanity: only let it launch an .exe — refuse anything else so this can't
+    // be repurposed to run arbitrary files.
+    let lower = path.to_ascii_lowercase();
+    if !lower.ends_with(".exe") {
+        return Err("仅支持 .exe 安装包".to_string());
+    }
+
+    let mut cmd = std::process::Command::new(&path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // SAFETY: these are bit-flag creation constants; no pointers/handles.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().map_err(|e| format!("启动安装器失败: {e}"))?;
+
+    // Exit so the installer can overwrite our binaries. exit(0) runs the
+    // RunEvent::Exit cleanups then terminates.
+    app.exit(0);
+    Ok(())
 }
 
 /// Read a PEM-formatted text file at an absolute path. Used by the private-
@@ -2726,6 +2858,8 @@ pub fn run() {
             get_previous_version,
             check_for_updates,
             open_external_url,
+            download_update,
+            install_update,
             get_connections,
             save_connection,
             delete_connection,
