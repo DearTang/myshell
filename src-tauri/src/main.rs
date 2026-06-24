@@ -1137,13 +1137,18 @@ async fn download_update(window: tauri::WebviewWindow, url: String) -> Result<St
 }
 
 /// Launch the downloaded installer and exit the app so the installer can
-/// replace the running files. The NSIS installer (perMachine mode) will
-/// trigger a UAC prompt — that's the normal Windows install UX.
+/// replace the running files. The NSIS installer (perMachine mode) requires
+/// admin privileges, so we use ShellExecuteW with the "runas" verb to trigger
+/// a UAC elevation prompt — that's the standard Windows install UX.
 ///
-/// On Windows the installer is spawned with `DETACHED_PROCESS |
-/// CREATE_NEW_PROCESS_GROUP` so it survives the parent's exit. On other
-/// platforms we just spawn it (the project targets Windows/NSIS, but this
-/// keeps it compiling elsewhere).
+/// `std::process::Command::spawn()` inherits the caller's token (os error 740
+/// when the App isn't elevated), while ShellExecuteW+runas asks Windows to
+/// elevate the child process even from a non-admin parent.
+///
+/// Security: the path must be a local `.exe` file — the `.exe` suffix check
+/// and file-existence check are the only gates. "runas" is Windows-only
+/// (no-op on other platforms in the broader sense, but this project only
+/// builds for Windows NSIS).
 #[tauri::command]
 fn install_update(app: tauri::AppHandle, path: String) -> Result<(), String> {
     if path.bytes().any(|b| b == 0) {
@@ -1153,23 +1158,47 @@ fn install_update(app: tauri::AppHandle, path: String) -> Result<(), String> {
     if !meta.is_file() {
         return Err("安装包路径无效".to_string());
     }
-    // Sanity: only let it launch an .exe — refuse anything else so this can't
-    // be repurposed to run arbitrary files.
     let lower = path.to_ascii_lowercase();
     if !lower.ends_with(".exe") {
         return Err("仅支持 .exe 安装包".to_string());
     }
 
-    let mut cmd = std::process::Command::new(&path);
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        // SAFETY: these are bit-flag creation constants; no pointers/handles.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        use std::ptr::null_mut;
+        use winapi::um::shellapi::ShellExecuteW;
+        use winapi::um::winuser::SW_SHOWNORMAL;
+
+        // Convert path to a wide-string (NUL-terminated) for the Windows API.
+        let path_wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        // "runas\0" — ask Windows to elevate the process.
+        let verb: Vec<u16> = "runas\0".encode_utf16().collect();
+        let empty: Vec<u16> = vec![0]; // empty NUL-terminated string
+
+        // SAFETY: ShellExecuteW is a Windows API; all pointers are to valid
+        // NUL-terminated wide strings; null_mut() for unused optional params.
+        let ret = unsafe {
+            ShellExecuteW(
+                null_mut(),        // hwnd
+                verb.as_ptr(),     // lpOperation = "runas" (elevate)
+                path_wide.as_ptr(),// lpFile = the installer exe
+                empty.as_ptr(),    // lpParameters = none
+                empty.as_ptr(),    // lpDirectory = none
+                SW_SHOWNORMAL,     // nShowCmd
+            )
+        };
+        // ShellExecuteW returns a value > 32 on success, <= 32 on failure.
+        if ret as usize <= 32 {
+            return Err(format!("启动安装器失败 (ShellExecuteW code: {})", ret as usize));
+        }
     }
-    cmd.spawn().map_err(|e| format!("启动安装器失败: {e}"))?;
+
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new(&path)
+            .spawn()
+            .map_err(|e| format!("启动安装器失败: {e}"))?;
+    }
 
     // Exit so the installer can overwrite our binaries. exit(0) runs the
     // RunEvent::Exit cleanups then terminates.

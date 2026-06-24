@@ -160,7 +160,7 @@ export function UpdateNotification({ updateInfo, onOpenAbout }: Props) {
         />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>
-            发现新版本 v{latest}
+            发现新版本 {latest}
           </div>
           <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 2 }}>
             {phase === "prompt" && "点击立即更新（自动下载并安装）"}
