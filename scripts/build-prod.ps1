@@ -2,7 +2,7 @@
 # 构建发布版本（安装包）
 
 # 添加 cargo 到 PATH
-$env:PATH += ";C:\Users\argus\.cargo\bin"
+$env:PATH += ";$env:USERPROFILE\.cargo\bin"
 
 Write-Host "=== TypeScript 检查 ===" -ForegroundColor Cyan
 npx tsc --noEmit

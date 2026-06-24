@@ -2,12 +2,15 @@
 # 生产打包脚本 - 构建发布版本
 set -e
 
+# 确保 cargo 在 PATH（标准 rustup 安装位置）
+export PATH="$HOME/.cargo/bin:$PATH"
+
 echo "=== TypeScript 检查 ==="
 npx tsc --noEmit
 
 echo "=== 生产构建 ==="
 cd src-tauri
-/c/Users/argus/.cargo/bin/cargo tauri build
+cargo tauri build
 
 echo ""
 echo "=== 构建完成 ==="

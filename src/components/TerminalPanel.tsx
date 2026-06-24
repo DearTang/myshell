@@ -246,7 +246,7 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
     const resizeObserver = new ResizeObserver(() => {
       // Guard against transient zero/tiny container sizes. We've seen the
       // terminal cols collapse mid-session (ls going from multi-column to
-      // one-per-line, PS1 truncated to "argus@fn-na") — symptom of fit()
+      // one-per-line, PS1 truncated to "user@host") — symptom of fit()
       // reading a momentarily-collapsed container (Sidebar collapse
       // animation, ServerInfoPanel mount transition, HMR re-render, etc.)
       // and shrinking cols to garbage. Skip the fit entirely when the
