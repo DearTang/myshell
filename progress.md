@@ -1125,3 +1125,24 @@
 | 目标是什么？ | 更新内容对话框不泄露 HTML 注释；省 token、更准、可复现的 changelog 生成流程 |
 | 我学到了什么？ | react-markdown 对 HTML 注释的处理不可靠，渲染前正则剥 `<!-- -->` 最稳；「每次问答记录」是行为规则非机械强制，绑已有稳定规则（doc-after-feature）搭车最可靠；staging 为主 + git diff 兜底是"准确描述"与"不漏"的互补组合；用户要的是 token 效率+准确性，事后反推 diff 既贵又易失真 |
 | 我做了什么？ | AboutDialog cleanChangelog 剥注释；RELEASE_NOTES_STAGING.md（baseline v1.6.0 + bug 修复种子条目）；CLAUDE.md doc-after-feature 加追加 staging + 打包流程改写（staging 为主/diff 防漏/版本号按类型/发布后清空+更新 baseline）；记忆 release-notes-staging + MEMORY 索引；progress 阶段42；tsc 绿 |
+
+### 阶段 43：发布 v1.6.2 —— 更新流程打磨 + 安装稳定性（2026-06-24）
+- **需求：** `打包` v1.6.2。本次内容全部为更新功能本身的体验打磨与稳定性修复（来自 staging 5 条）。
+- **发布内容（staging 主导 + git diff 防漏，5 条全映射，无遗漏）：**
+  - 🛠️ 更新弹窗简化为单层卡片（去双层玻璃外壳），按钮「忽略」/「更新」；AboutDialog「去下载」→「更新」（自动下载安装，失败回退浏览器）。
+  - 🐛 「安装并重启」os error 740（请求的操作需要提升）—— 非管理员用户点更新报错；改用 `ShellExecuteW` + `runas` 触发 UAC 提权（main.rs）。
+  - 🐛 更新弹窗版本号显示 `vv1.6.1`（tag 已含 v 前缀时重复添加）。
+  - 🐛 进度条点击更新时先跳中间再从 0 开始（`pct` 为 null 时初始宽度 30% → 0%）。
+- **版本号：** staging 全是 🐛/🛠️ 无 ✨ → patch：v1.6.1 → **v1.6.2**。
+- **流程执行：** 用户确认闸门通过后 —— `tsc` PASS / `cargo check` PASS / `tauri:build` 成功（installer `MyShell_1.6.2_x64-setup.exe` 5.99MB）/ commit `release: v1.6.2` + push / Gitee release id=724075 创建 + 资产上传成功 / staging 清空 + baseline→v1.6.2。
+- **决策要点：** staging 流程首次完整跑通（v1.6.1 是落地方案时种的种子）；`git diff --stat 37a3dba..HEAD` 显示 5 文件改动，逐一核对均被 staging 覆盖（含 App.tsx 删 1 行 onOpenAbout 属弹窗简化、main.rs 属 740 修复），无需补条目。
+- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS；`tauri:build` exit 0；发布 URL：https://gitee.com/argustang/myshell/releases/tag/v1.6.2
+
+## 五问重启检查（阶段 43）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 43 complete —— v1.6.2 已发布到 Gitee（installer 上传成功），staging 已清空、baseline→v1.6.2，release: v1.6.2 + 清空 staging 两个 commit 均已 push 到 main |
+| 我要去哪里？ | 下一项改动完成时按 doc-after-feature 追加 staging 条目；下次 `打包` 再走同流程（读 staging→定版本号→changelog→确认闸门→构建发布） |
+| 目标是什么？ | 让用户更新体验顺滑（弹窗不花哨、版本号正确、进度条不跳、非管理员也能一键升级） |
+| 我学到了什么？ | staging 驱动的发布流程首次端到端跑通，5 条种子全部准确映射、无补条需求；临时发布说明 `.release-notes-v1.6.2.md` 用完即弃（.gitignore 不在，但本地文件未提交、后续可删）；`git diff --stat baseline..HEAD` 作为兜底确实只起防漏校验、这次零补条 |
+| 我做了什么？ | 版本 bump 1.6.2 + sync；CHANGELOG/README 加 v1.6.2 节 + badge；tsc+cargo check+tauri:build；commit+push release: v1.6.2；Gitee 发布（id=724075，installer 上传）；staging 清空 + baseline→v1.6.2 commit+push；progress 阶段43 |
