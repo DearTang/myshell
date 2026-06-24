@@ -6,7 +6,7 @@
   <img src="src-tauri/icons/icon.png" width="120" alt="MyShell" />
 </p>
 
-![Version](https://img.shields.io/badge/version-1.6.1-blue)
+![Version](https://img.shields.io/badge/version-1.6.2-blue)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-green)
 ![React](https://img.shields.io/badge/React-18-blue)
 ![Rust](https://img.shields.io/badge/Rust-1.70+-orange)
@@ -78,6 +78,19 @@
 
 
 ## 更新日志
+
+### v1.6.2（2026-06-24）
+
+更新流程体验打磨与安装稳定性修复。
+
+#### 🛠️ 优化
+- **更新弹窗简化**：去掉双层玻璃外壳，改为单层卡片；按钮文案改为「忽略」和「更新」
+- **关于对话框「更新」按钮**：由「去下载」改为「更新」—— 点击后自动下载安装（进度条 + 安装并重启），下载失败才回退浏览器下载；同时保留「网页下载」按钮作为备选
+
+#### 🐛 修复
+- **「安装并重启」os error 740**：非管理员用户点「安装并重启」报错「请求的操作需要提升」—— 改用 `ShellExecuteW` + `runas` 触发 UAC 提权，普通用户也能正常升级
+- **更新弹窗版本号双 v**：tag 已含 `v` 前缀时不再重复添加，修复显示 `vv1.6.1`
+- **进度条先跳中间再从 0 开始**：点击更新时进度条会先跳到中间再回到 0 —— 下载进度 `pct` 为 null 时的初始宽度从 30% 改为 0%
 
 ### v1.6.1（2026-06-24）
 
