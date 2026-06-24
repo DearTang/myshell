@@ -10,49 +10,41 @@ import {
 
 interface Props {
   updateInfo: UpdateInfo;
-  /** Open the About dialog (e.g. to read the changelog). */
-  onOpenAbout?: () => void;
 }
 
 type Phase = "prompt" | "downloading" | "ready" | "failed";
 
 /**
- * Bottom-left update notification card.
+ * Centered modal update dialog.
  *
- * Shown when the background check finds a newer version. Phases, driven by the
- * user tapping "立即更新":
- *   - prompt      → "✨ 发现新版本 vX.X.X" + green dot + 立即更新
- *   - downloading → progress bar (subscribes to update_download_progress)
- *   - ready       → "下载完成" + 立即安装并重启 (launches the NSIS installer;
- *                   the app exits so the installer can replace files)
- *   - failed      → "下载失败" + 浏览器下载 (opens the release page) + 重试
+ * Shown once after login when the background check detects a newer version.
+ * Two actions:
+ *   - "更新" → auto-download the installer → progress bar → "安装并重启"
+ *   - "当前版本忽略" → remember this version in localStorage; never prompt
+ *     again for the same version. A newer version will re-trigger the dialog.
  *
- * Dismissible (×); dismissal is remembered per `latest_version` in localStorage
- * so the card only re-shows when an even-newer version appears.
- *
- * Auto download + launch-installer (no in-app silent install, no signature
- * verification): trust model is HTTPS + explicit user consent. Falls back to a
- * browser download on any download/install error, per spec.
+ * Trust model: HTTPS (Gitee) + explicit user consent. On download/install
+ * failure, falls back to a browser download button.
  */
-export function UpdateNotification({ updateInfo, onOpenAbout }: Props) {
+export function UpdateNotification({ updateInfo }: Props) {
   const latest = updateInfo.latest_version;
   const downloadUrl = updateInfo.download_url || updateInfo.release_url || "";
 
-  // Dismissal is per-version: once dismissed for `latest`, stay hidden until a
-  // different (newer) version shows up.
-  const DISMISS_KEY = "myshell.dismissedUpdateVersion";
-  const [dismissed, setDismissed] = useState<boolean>(() => {
+  // Per-version ignore: once set, this version is permanently skipped until a
+  // different (newer) version appears.
+  const IGNORE_KEY = "myshell.ignoredUpdateVersion";
+  const [ignored, setIgnored] = useState<boolean>(() => {
     try {
-      return localStorage.getItem(DISMISS_KEY) === latest;
+      return localStorage.getItem(IGNORE_KEY) === latest;
     } catch {
       return false;
     }
   });
 
-  // Re-show if a newer-than-dismissed version appears.
+  // If a new version replaces the ignored one, re-show the dialog.
   useEffect(() => {
     try {
-      if (localStorage.getItem(DISMISS_KEY) !== latest) setDismissed(false);
+      if (localStorage.getItem(IGNORE_KEY) !== latest) setIgnored(false);
     } catch {
       // ignore
     }
@@ -66,7 +58,7 @@ export function UpdateNotification({ updateInfo, onOpenAbout }: Props) {
   const [error, setError] = useState<string>("");
   const [downloadedPath, setDownloadedPath] = useState<string>("");
 
-  // Subscribe to progress events only while downloading.
+  // Subscribe to progress events while downloading.
   useEffect(() => {
     if (phase !== "downloading") return;
     let unlisten: UnlistenFn | null = null;
@@ -83,9 +75,9 @@ export function UpdateNotification({ updateInfo, onOpenAbout }: Props) {
     };
   }, [phase]);
 
-  if (dismissed) return null;
+  if (ignored) return null;
 
-  const handleDownload = async () => {
+  const handleUpdate = async () => {
     setPhase("downloading");
     setProgress({ downloaded: 0, total: 0 });
     setError("");
@@ -114,10 +106,10 @@ export function UpdateNotification({ updateInfo, onOpenAbout }: Props) {
     }
   };
 
-  const handleDismiss = () => {
-    setDismissed(true);
+  const handleIgnore = () => {
+    setIgnored(true);
     try {
-      localStorage.setItem(DISMISS_KEY, latest);
+      localStorage.setItem(IGNORE_KEY, latest);
     } catch {
       // best-effort
     }
@@ -130,124 +122,102 @@ export function UpdateNotification({ updateInfo, onOpenAbout }: Props) {
 
   return (
     <div
-      className="animate-scale-in"
       style={{
         position: "fixed",
-        left: 16,
-        bottom: 16,
+        inset: 0,
+        background: "var(--bg-overlay)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
         zIndex: 1500,
-        width: 300,
-        maxWidth: "calc(100vw - 32px)",
-        background: "var(--bg-elevated)",
-        border: "1px solid var(--border-emphasis)",
-        borderRadius: "var(--radius-lg)",
-        boxShadow: "var(--shadow-xl)",
-        overflow: "hidden",
+        backdropFilter: "blur(8px)",
       }}
     >
-      {/* Header row: green dot + headline + dismiss */}
-      <div style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "12px 14px 10px" }}>
-        <span
-          style={{
-            marginTop: 5,
-            width: 8,
-            height: 8,
-            borderRadius: "var(--radius-full)",
-            background: "var(--accent-secondary)",
-            boxShadow: "0 0 8px var(--accent-secondary)",
-            flexShrink: 0,
-          }}
-        />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>
-            发现新版本 {latest}
+      <div
+        className="animate-scale-in"
+        style={{
+          background: "var(--bg-elevated)",
+          border: "1px solid var(--border-emphasis)",
+          borderRadius: "var(--radius-xl)",
+          width: 380,
+          maxWidth: "90vw",
+          boxShadow: "var(--shadow-xl)",
+          overflow: "hidden",
+        }}
+      >
+        {/* Header */}
+        <div style={{ padding: "20px 24px 16px", textAlign: "center" }}>
+          <div style={{ fontSize: 28, marginBottom: 10 }}>✨</div>
+          <div style={{ fontSize: 16, fontWeight: 600, color: "var(--text-primary)" }}>
+            发现新版本 v{latest}
           </div>
-          <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 2 }}>
-            {phase === "prompt" && "点击立即更新（自动下载并安装）"}
+          <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 4 }}>
+            {phase === "prompt" && "是否更新？"}
             {phase === "downloading" && (pct !== null ? `下载中 ${pct}%` : "下载中…")}
             {phase === "ready" && "下载完成，可安装"}
             {phase === "failed" && (error || "下载失败")}
           </div>
         </div>
-        <button
-          onClick={handleDismiss}
-          title="忽略"
-          aria-label="忽略"
-          style={{
-            background: "transparent",
-            border: "none",
-            color: "var(--text-muted)",
-            cursor: "pointer",
-            fontSize: 14,
-            lineHeight: 1,
-            padding: 2,
-            flexShrink: 0,
-          }}
-        >
-          ✕
-        </button>
-      </div>
 
-      {/* Progress bar (downloading phase) */}
-      {phase === "downloading" && (
-        <div
-          style={{
-            height: 4,
-            background: "var(--bg-surface)",
-            margin: "0 14px 10px",
-            borderRadius: "var(--radius-full)",
-            overflow: "hidden",
-          }}
-        >
+        {/* Progress bar */}
+        {phase === "downloading" && (
           <div
             style={{
-              height: "100%",
-              width: pct !== null ? `${pct}%` : "30%",
-              background: "var(--accent-primary)",
+              height: 4,
+              background: "var(--bg-surface)",
+              margin: "0 24px 16px",
               borderRadius: "var(--radius-full)",
-              transition: "width 200ms linear",
+              overflow: "hidden",
             }}
-          />
-        </div>
-      )}
+          >
+            <div
+              style={{
+                height: "100%",
+                width: pct !== null ? `${pct}%` : "30%",
+                background: "var(--accent-primary)",
+                borderRadius: "var(--radius-full)",
+                transition: "width 200ms linear",
+              }}
+            />
+          </div>
+        )}
 
-      {/* Action row */}
-      <div style={{ display: "flex", gap: 8, padding: "0 14px 12px" }}>
-        {phase === "prompt" && (
-          <>
-            <button onClick={handleDownload} style={btnPrimary}>
-              立即更新
-            </button>
-            {onOpenAbout && (
-              <button onClick={onOpenAbout} style={btnGhost}>
-                更新内容
+        {/* Actions */}
+        <div style={{ padding: "0 24px 20px", display: "flex", gap: 10 }}>
+          {phase === "prompt" && (
+            <>
+              <button onClick={handleIgnore} style={btnGhost}>
+                当前版本忽略
               </button>
-            )}
-          </>
-        )}
-        {phase === "downloading" && (
-          <button style={btnGhost} disabled>
-            下载中…
-          </button>
-        )}
-        {phase === "ready" && (
-          <button onClick={handleInstall} style={btnPrimary}>
-            安装并重启
-          </button>
-        )}
-        {phase === "failed" && (
-          <>
-            <button
-              onClick={() => downloadUrl && openExternalUrl(downloadUrl)}
-              style={btnPrimary}
-            >
-              浏览器下载
+              <button onClick={handleUpdate} style={btnPrimary}>
+                更新
+              </button>
+            </>
+          )}
+          {phase === "downloading" && (
+            <div style={{ flex: 1, textAlign: "center", fontSize: 12, color: "var(--text-muted)" }}>
+              请稍候…
+            </div>
+          )}
+          {phase === "ready" && (
+            <button onClick={handleInstall} style={{ ...btnPrimary, flex: 1 }}>
+              安装并重启
             </button>
-            <button onClick={handleDownload} style={btnGhost}>
-              重试
-            </button>
-          </>
-        )}
+          )}
+          {phase === "failed" && (
+            <>
+              <button
+                onClick={() => downloadUrl && openExternalUrl(downloadUrl)}
+                style={btnPrimary}
+              >
+                浏览器下载
+              </button>
+              <button onClick={handleUpdate} style={btnGhost}>
+                重试
+              </button>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -255,24 +225,24 @@ export function UpdateNotification({ updateInfo, onOpenAbout }: Props) {
 
 const btnPrimary: React.CSSProperties = {
   flex: 1,
-  padding: "8px 12px",
+  padding: "10px 20px",
   background: "var(--accent-primary)",
   color: "#ffffff",
   border: "none",
   borderRadius: "var(--radius-md)",
-  fontSize: 12,
+  fontSize: 13,
   fontWeight: 600,
   cursor: "pointer",
   transition: "background var(--duration-fast) var(--ease-in-out)",
 };
 
 const btnGhost: React.CSSProperties = {
-  padding: "8px 12px",
+  padding: "10px 20px",
   background: "transparent",
   color: "var(--text-secondary)",
   border: "1px solid var(--border-default)",
   borderRadius: "var(--radius-md)",
-  fontSize: 12,
+  fontSize: 13,
   cursor: "pointer",
   transition: "all var(--duration-fast) var(--ease-in-out)",
 };

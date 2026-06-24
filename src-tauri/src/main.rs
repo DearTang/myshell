@@ -1062,7 +1062,7 @@ struct DownloadProgress {
 /// prior partial download. No signature verification (that'd require the full
 /// tauri-plugin-updater pipeline) — trust is HTTPS + explicit user consent.
 #[tauri::command]
-async fn download_update(window: tauri::WebviewWindow, url: String) -> Result<String, String> {
+async fn download_update(app: tauri::AppHandle, window: tauri::WebviewWindow, url: String) -> Result<String, String> {
     let lower = url.trim().to_ascii_lowercase();
     if !(lower.starts_with("https://") || lower.starts_with("http://")) {
         return Err("仅支持 http(s) 链接".to_string());
@@ -1086,11 +1086,22 @@ async fn download_update(window: tauri::WebviewWindow, url: String) -> Result<St
     let total = resp.content_length().unwrap_or(0);
 
     // Fixed temp filename; re-download just overwrites. Kept simple — no need
-    // to track per-version temp files.
-    let temp_dir = std::env::temp_dir();
-    let dest = temp_dir.join("myshell-update-setup.exe");
+    // to track per-version temp files. Use the app config dir instead of
+    // std::env::temp_dir() because some Windows environments return a temp
+    // path that doesn't actually exist or is on a network share.
+    let dest = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("获取应用目录失败: {e}"))?
+        .join("myshell-update-setup.exe");
 
     use tokio::io::AsyncWriteExt;
+    // Ensure the parent dir exists (it normally does, but be defensive).
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("创建目录失败: {e}"))?;
+    }
     let mut file = tokio::fs::File::create(&dest)
         .await
         .map_err(|e| format!("创建临时文件失败: {e}"))?;

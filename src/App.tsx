@@ -709,7 +709,6 @@ export default function App() {
       {vault === "ready" && updateInfo?.has_update && (
         <UpdateNotification
           updateInfo={updateInfo}
-          onOpenAbout={() => setAbout({ open: true, mode: "about" })}
         />
       )}
     </div>
