@@ -142,7 +142,7 @@ export function UpdateNotification({ updateInfo }: Props) {
             <div
               style={{
                 ...styles.progressFill,
-                width: pct !== null ? `${pct}%` : "30%",
+                width: pct !== null ? `${pct}%` : "0%",
               }}
             />
           </div>

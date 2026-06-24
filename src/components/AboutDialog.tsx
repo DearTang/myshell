@@ -219,7 +219,7 @@ export function AboutDialog({
                 {/* Progress bar */}
                 {aboutPhase === "downloading" && (
                   <div style={{ height: 3, background: "var(--bg-surface)", borderRadius: "var(--radius-full)", overflow: "hidden" }}>
-                    <div style={{ height: "100%", width: aboutPct !== null ? `${aboutPct}%` : "30%", background: "var(--accent-primary)", borderRadius: "var(--radius-full)", transition: "width 150ms cubic-bezier(0.32, 0.72, 0, 1)" }} />
+                    <div style={{ height: "100%", width: aboutPct !== null ? `${aboutPct}%` : "0%", background: "var(--accent-primary)", borderRadius: "var(--radius-full)", transition: "width 150ms cubic-bezier(0.32, 0.72, 0, 1)" }} />
                   </div>
                 )}
                 {/* Action buttons */}
