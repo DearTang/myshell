@@ -6,7 +6,7 @@
   <img src="src-tauri/icons/icon.png" width="120" alt="MyShell" />
 </p>
 
-![Version](https://img.shields.io/badge/version-1.6.0-blue)
+![Version](https://img.shields.io/badge/version-1.6.1-blue)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-green)
 ![React](https://img.shields.io/badge/React-18-blue)
 ![Rust](https://img.shields.io/badge/Rust-1.70+-orange)
@@ -78,6 +78,11 @@
 
 
 ## 更新日志
+
+### v1.6.1（2026-06-24）
+
+#### 🐛 修复
+- 修复「更新内容」对话框泄露 CHANGELOG 头部 HTML 注释（不再把 `<!-- 版本号须与… -->` 显示在更新日志里）
 
 ### v1.6.0（2026-06-24）
 

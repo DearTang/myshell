@@ -1,8 +1,8 @@
 [package]
 name = "myshell"
-version = "1.6.0"
+version = "1.6.1"
 edition = "2021"
-description = "A Rust-based SSH/SFTP shell tool inspired by FinalShell"
+description = "A Rust-based SSH/SFTP shell tool"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
