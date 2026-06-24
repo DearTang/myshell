@@ -9,6 +9,15 @@ import type { UpdateInfo } from "../api";
 // from src/components/.
 import changelog from "../../CHANGELOG.md?raw";
 
+// CHANGELOG.md carries a top-of-file guidance HTML comment (plus keepachangelog
+// notes) that must NOT appear in the in-app rendered view — react-markdown can
+// surface raw HTML-comment text. Strip every `<!-- … -->` (multiline-safe) and
+// collapse the resulting blank runs before handing the string to ReactMarkdown.
+const cleanChangelog = changelog
+  .replace(/<!--[\s\S]*?-->/g, "")
+  .replace(/\n{3,}/g, "\n\n")
+  .trim();
+
 type AboutMode = "whatsnew" | "about";
 
 interface Props {
@@ -186,7 +195,7 @@ export function AboutDialog({
             remarkPlugins={[remarkGfm]}
             components={markdownComponents}
           >
-            {changelog}
+            {cleanChangelog}
           </ReactMarkdown>
         </div>
 

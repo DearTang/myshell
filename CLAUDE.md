@@ -82,7 +82,10 @@ The frontend uses the session UUID as the tab ID, so `tab.id === sessionId` is a
 
 `findings.md`, `progress.md`, and `task_plan.md` at the repo root are the project's phase tracker and decision log. They are written and updated in Chinese. Per the docs' own instructions, update `progress.md` after each phase or error, and re-read `task_plan.md` before major decisions.
 
-**Doc-after-feature (standing rule):** every time a feature is finished, update the docs **directly, without asking** — append a `### 阶段 N` entry (+ 五问重启检查) to `progress.md`, and keep `README.md` in sync (功能特性 sections + 更新日志). This is a built-in final step of "feature done", same as running `npx tsc --noEmit`.
+**Doc-after-feature (standing rule):** every time a feature/fix/optimization is finished, update the docs **directly, without asking** — this is a built-in final step of "change done", same as running `npx tsc --noEmit`:
+1. append a `### 阶段 N` entry (+ 五问重启检查) to `progress.md`;
+2. keep `README.md` in sync (功能特性 sections);
+3. **append one line to `RELEASE_NOTES_STAGING.md`** under "待发布条目" — format `- <emoji> <one-sentence desc>` (✨新增 / 🛠️优化 / 🐛修复 / 🔒安全). This staging file is the primary source for the next release's changelog (see the `打包` rule) and is cleared after each release. Pure discussion / Q&A with no code change → don't append.
 
 ## Slash rule: `打包` / `帮我打包` (durable release authorization)
 
@@ -96,18 +99,16 @@ A Gitee personal access token with the `projects`/release scope must be availabl
 If neither is present when you reach the publish step, STOP at that step and tell the user how to create the token (Gitee → 设置 → 私人令牌 → 生成新令牌) and where to put it — do NOT proceed to a broken publish and do NOT invent a token.
 
 ### Pipeline (run in order)
-1. **Decide the version bump** (auto — the user delegated this). Read the current `src-tauri/Cargo.toml` version. Inspect changes since the last release tag (`git describe --tags --abbrev=0` then `git log`/`git_diff`). Bump by **semver scope**:
-   - any new user-facing **feature** → **minor** (`1.4.5 → 1.5.0`)
-   - only **bug fixes / minor tweaks** → **patch** (`1.4.5 → 1.4.6`)
-   - State the chosen version + one-line rationale before applying.
-2. **Bump the version** — edit `src-tauri/Cargo.toml` `version = "..."` ONLY (single source of truth), then run `npm run version:sync` (propagates to `package.json` / `package-lock.json`).
-3. **Generate the release notes** — prepend a new `## vX.Y.Z（YYYY-MM-DD）` section to `CHANGELOG.md` summarizing the changes (group as ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全), derived from the diff + your session knowledge. Keep the existing header comment intact. Also mirror into `README.md` 更新日志 (move the prior "下个版本（开发中）" items into the new versioned section as appropriate).
-3.5. **⚠️ CONFIRMATION GATE — STOP here.** Present to the user: (a) the chosen version number + rationale, (b) the full text of the new CHANGELOG section you just wrote. Explicitly ask for their go-ahead before building. **Do NOT start the build, commit, push, or publish until the user confirms** (e.g. "继续" / "可以" / "确认"). If they request edits, revise the changelog/version and re-present. Once they confirm, steps 4–8 run autonomously without further asking.
-4. **Pre-check** — `npx tsc --noEmit` and `cargo check` (in `src-tauri/`). Both must pass; fix before continuing.
-5. **Build the installer** — run `npm run tauri:build` from the repo root (or `cargo tauri build` from `src-tauri/` if the `cargo-tauri` subcommand is installed). Long (~10+ min first time); run in the background and use a generous timeout. Output: `src-tauri/target/release/bundle/nsis/MyShell_X.Y.Z_x64-setup.exe`.
-6. **Commit + push** — stage `Cargo.toml`, `package.json`, `package-lock.json`, `CHANGELOG.md`, `README.md`, `progress.md` (and any feature code), commit with message `release: vX.Y.Z`, push to the current branch's upstream. (Creating the Gitee release tags `main` HEAD, so the version bump must be on the remote first.) Don't commit `.gitee-token`. Note: the host's safety classifier may separately gate the push-to-default-branch; if it blocks, ask the user to authorize that one push (or run `! git push origin main`).
-7. **Publish to Gitee** — write the new version's CHANGELOG section to a temp notes file, then `node scripts/publish-gitee-release.mjs <version> <notes-file>` (creates the release + uploads the `.exe`; has built-in network retry). Report the release URL. Note: creating a public release is an outward-facing action the host classifier may gate; if blocked, hand the user the exact command to run via `!`.
-8. **Doc-after-feature** — per the standing rule, ensure `progress.md` has the stage entry and `README.md` 更新日志 is in sync.
+1. **Decide the version bump** (auto). Primary signal = the entry **types** in `RELEASE_NOTES_STAGING.md` (any ✨新增 → **minor**; only 🐛/🛠️/🔒 → **patch**). Read the current `src-tauri/Cargo.toml` version. State the chosen version + one-line rationale before applying.
+2. **Bump the version** — edit `src-tauri/Cargo.toml` `version = "..."` ONLY (single source of truth), then run `npm run version:sync`.
+3. **Generate the release notes** — **`RELEASE_NOTES_STAGING.md` is the PRIMARY source**: turn its "待发布条目" into the new `## vX.Y.Z（YYYY-MM-DD）` CHANGELOG section (group by ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全). Then run a **completeness check**: `git diff --stat <baseline>..HEAD` (baseline = the `baseline:` line in the staging file) — if changed files aren't covered by any staging entry, surface them and add entries (catches un-logged / out-of-session work). Keep CHANGELOG's existing header comment intact. Mirror into `README.md` 更新日志. Write the new section to the temp notes file used by publish.
+3.5. **⚠️ CONFIRMATION GATE — STOP here.** Present: (a) chosen version + rationale, (b) full text of the new CHANGELOG section. **Do NOT build/commit/push/publish until the user confirms.** If they edit, revise and re-present. On confirm, steps 4–9 run autonomously.
+4. **Pre-check** — `npx tsc --noEmit` and `cargo check` (in `src-tauri/`). Both must pass.
+5. **Build the installer** — `npm run tauri:build` from repo root. Long (~10+ min first time); background it. Output: `src-tauri/target/release/bundle/nsis/MyShell_X.Y.Z_x64-setup.exe`.
+6. **Commit + push** — stage `Cargo.toml`, `package.json`, `package-lock.json`, `CHANGELOG.md`, `README.md`, `progress.md`, `RELEASE_NOTES_STAGING.md` (and feature code), commit `release: vX.Y.Z`, push to upstream. (The Gitee release tags `main` HEAD, so the bump must be on the remote first.) Don't commit `.gitee-token`. The host classifier may gate push-to-default-branch → ask the user to authorize or run `! git push origin main`.
+7. **Publish to Gitee** — `node scripts/publish-gitee-release.mjs <version> <temp-notes-file>` (creates release + uploads `.exe`; built-in retry). Report the URL. Host classifier may gate the public release → hand the user the command to run via `!`.
+8. **Clear the staging buffer** — in `RELEASE_NOTES_STAGING.md`: empty the "待发布条目" section (leave the header/baseline structure) and update `baseline: v<X.Y.Z>` to the just-released version. Commit + push this cleanup (`chore: clear release staging after vX.Y.Z`).
+9. **Doc-after-feature** — ensure `progress.md` has the stage entry and `README.md` 更新日志 is in sync.
 
 ### Notes / safety
 - If a Gitee release for the tag already exists, the publish step will error on create — that's fine, report it; don't delete-and-recreate silently.

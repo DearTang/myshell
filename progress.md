@@ -1105,3 +1105,23 @@
 | 目标是什么？ | 登录即检查、30s 超时、左下角非打扰提示、确认后自动下载安装、失败回退手动 |
 | 我学到了什么？ | Tauri 2.11 把 emit 拆到 `Emitter` trait 需单独 import（报错才知）；reqwest `bytes_stream` + tokio fs 流式下载 + 每 256KB 节流 emit 进度是干净模式；Windows 启动外部安装器要 `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP` 才在父进程 exit 后存活；自动安装选「下载+启动安装器」(A) 而非 plugin-updater(B) 是为契合现有 Gitee release 免签名；用「每会话 autoRanRef」实现「每次登录检查一次」比 localStorage 节流更贴合语义；UI 状态机 prompt/downloading/ready/failed 让下载-安装-失败回退三种路径清晰 |
 | 我做了什么？ | main.rs check 超时 30s+去 tokio wrapper、download_update（reqwest stream+tokio fs+256KB 节流 emit+末尾 100%）install_update（NUL/文件/.exe 校验+creation_flags 分离+app.exit）、Emitter import、两命令注册；api.ts DownloadProgress/downloadUpdate/installUpdate/onUpdateDownloadProgress；useUpdateCheck 去 24h 节流改 autoRanRef 每会话一次；UpdateNotification.tsx 左下角卡片四态机+进度条+按版本忽略；App.tsx 删每版本弹 About effect+渲染 UpdateNotification；tsc+cargo check 双绿；progress+README 同步 |
+
+### 阶段 42：更新日志注释泄露修复 + 发布暂存缓冲区方案（2026-06-24）
+- **需求：** ①「更新内容」对话框把 CHANGELOG.md 头部 HTML 注释 `<!-- 版本号须与… -->` 当文本显示了，要去掉；②讨论并落地省 token 的更新内容生成方案——每完成一项改动追加到暂存 md，打包时基于暂存总结、不再反推 git diff，打包后清空。
+- **bug 修复：** `AboutDialog.tsx` 渲染 CHANGELOG 前用 `cleanChangelog = changelog.replace(/<!--[\s\S]*?-->/g,"").replace(/\n{3,}/g,"\n\n").trim()` 剥掉所有 HTML 注释（不依赖 react-markdown 对注释的处理行为，最稳）。
+- **发布暂存方案（用户确认三点：纳入 git / 绑 doc-after-feature / git diff 兜底）：**
+  - 新增 `RELEASE_NOTES_STAGING.md`（仓库根，git 跟踪）— terse 缓冲区：`baseline: v1.6.0` + 「待发布条目」（一行一条 `- <emoji> <一句话>`）。
+  - CLAUDE.md `doc-after-feature` 规则扩展：每完成改动，写 progress.md 阶段日志的**同时**追加一行到 staging。
+  - CLAUDE.md `打包` 流程改写：版本号由 staging 条目类型定（有 ✨→minor，纯修复→patch）；更新内容以 staging 为**主**、`git diff --stat baseline..HEAD` 仅作完整性校验防漏；发布后清空 staging 待发布条目并更新 baseline。
+  - 记忆 `release-notes-staging.md` + MEMORY.md 索引同步。
+- **决策要点：** 「保证每次问答都记录」无法机械强制（需 LLM 判断记不记/怎么概括），靠行为规则——绑已有 doc-after-feature 触发点搭车，可靠性最高；staging 只记会话内改动，故保留 git diff 兜底防漏。
+- **验证：** `npx tsc --noEmit` PASS。staging 已种入本次 bug 修复条目，待下次打包（v1.6.1 patch）。
+
+## 五问重启检查（阶段 42）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 42 complete（CHANGELOG 注释泄露修复 + 发布暂存方案落地：RELEASE_NOTES_STAGING.md + CLAUDE.md 规则 + 记忆；tsc 绿），staging 已种 bug 修复条目，待打包 |
+| 我要去哪里？ | 下次 `打包` → 读 staging 直接生成 v1.6.1 changelog（不再反推 diff）+ git diff 防漏 + 发布后清空 staging |
+| 目标是什么？ | 更新内容对话框不泄露 HTML 注释；省 token、更准、可复现的 changelog 生成流程 |
+| 我学到了什么？ | react-markdown 对 HTML 注释的处理不可靠，渲染前正则剥 `<!-- -->` 最稳；「每次问答记录」是行为规则非机械强制，绑已有稳定规则（doc-after-feature）搭车最可靠；staging 为主 + git diff 兜底是"准确描述"与"不漏"的互补组合；用户要的是 token 效率+准确性，事后反推 diff 既贵又易失真 |
+| 我做了什么？ | AboutDialog cleanChangelog 剥注释；RELEASE_NOTES_STAGING.md（baseline v1.6.0 + bug 修复种子条目）；CLAUDE.md doc-after-feature 加追加 staging + 打包流程改写（staging 为主/diff 防漏/版本号按类型/发布后清空+更新 baseline）；记忆 release-notes-staging + MEMORY 索引；progress 阶段42；tsc 绿 |
