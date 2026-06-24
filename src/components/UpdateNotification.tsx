@@ -118,124 +118,118 @@ export function UpdateNotification({ updateInfo }: Props) {
   return (
     <div style={styles.overlay}>
       <div className="animate-scale-in" style={styles.card}>
-        {/* ── Outer bezel (glass shell) ── */}
-        <div style={styles.shell}>
-          {/* ── Inner core ── */}
-          <div style={styles.core}>
-            {/* Header */}
-            <div style={styles.header}>
-              <div style={styles.iconCircle}>
-                <span style={{ fontSize: 22 }}>✨</span>
-              </div>
-              <div style={styles.title}>MyShell 有新版本可用</div>
-              <div style={styles.version}>{latestDisplay}</div>
-            </div>
-
-            {/* Subtitle / status */}
-            <div style={styles.subtitle}>
-              {phase === "prompt" && "新版本已就绪，是否立即更新？"}
-              {phase === "downloading" &&
-                (pct !== null ? `正在下载… ${pct}%` : "正在下载…")}
-              {phase === "ready" && "下载完成，点击安装并重启应用"}
-              {phase === "failed" && (error || "下载出现问题")}
-            </div>
-
-            {/* Progress bar */}
-            {phase === "downloading" && (
-              <div style={styles.progressTrack}>
-                <div
-                  style={{
-                    ...styles.progressFill,
-                    width: pct !== null ? `${pct}%` : "30%",
-                  }}
-                />
-              </div>
-            )}
-
-            {/* Actions */}
-            <div style={styles.actions}>
-              {phase === "prompt" && (
-                <>
-                  <button
-                    onClick={handleIgnore}
-                    style={styles.btnGhost}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.background =
-                        "var(--bg-surface-hover)";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.background = "transparent";
-                    }}
-                  >
-                    忽略
-                  </button>
-                  <button
-                    onClick={handleUpdate}
-                    style={styles.btnPrimary}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.background =
-                        "var(--accent-primary-hover)";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.background =
-                        "var(--accent-primary)";
-                    }}
-                  >
-                    更新
-                  </button>
-                </>
-              )}
-              {phase === "downloading" && (
-                <div style={styles.downloadingText}>请稍候，下载完成后将自动提示…</div>
-              )}
-              {phase === "ready" && (
-                <button
-                  onClick={handleInstall}
-                  style={{ ...styles.btnPrimary, width: "100%" }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.background =
-                      "var(--accent-primary-hover)";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.background = "var(--accent-primary)";
-                  }}
-                >
-                  安装并重启
-                </button>
-              )}
-              {phase === "failed" && (
-                <>
-                  <button
-                    onClick={() => downloadUrl && openExternalUrl(downloadUrl)}
-                    style={styles.btnPrimary}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.background =
-                        "var(--accent-primary-hover)";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.background =
-                        "var(--accent-primary)";
-                    }}
-                  >
-                    浏览器下载
-                  </button>
-                  <button
-                    onClick={handleUpdate}
-                    style={styles.btnGhost}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.background =
-                        "var(--bg-surface-hover)";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.background = "transparent";
-                    }}
-                  >
-                    重试
-                  </button>
-                </>
-              )}
-            </div>
+        {/* Header */}
+        <div style={styles.header}>
+          <div style={styles.iconCircle}>
+            <span style={{ fontSize: 22 }}>✨</span>
           </div>
+          <div style={styles.title}>MyShell 有新版本可用</div>
+          <div style={styles.version}>{latestDisplay}</div>
+        </div>
+
+        {/* Subtitle / status */}
+        <div style={styles.subtitle}>
+          {phase === "prompt" && "新版本已就绪，是否立即更新？"}
+          {phase === "downloading" &&
+            (pct !== null ? `正在下载… ${pct}%` : "正在下载…")}
+          {phase === "ready" && "下载完成，点击安装并重启应用"}
+          {phase === "failed" && (error || "下载出现问题")}
+        </div>
+
+        {/* Progress bar */}
+        {phase === "downloading" && (
+          <div style={styles.progressTrack}>
+            <div
+              style={{
+                ...styles.progressFill,
+                width: pct !== null ? `${pct}%` : "30%",
+              }}
+            />
+          </div>
+        )}
+
+        {/* Actions */}
+        <div style={styles.actions}>
+          {phase === "prompt" && (
+            <>
+              <button
+                onClick={handleIgnore}
+                style={styles.btnGhost}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background =
+                    "var(--bg-surface-hover)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "transparent";
+                }}
+              >
+                忽略
+              </button>
+              <button
+                onClick={handleUpdate}
+                style={styles.btnPrimary}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background =
+                    "var(--accent-primary-hover)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background =
+                    "var(--accent-primary)";
+                }}
+              >
+                更新
+              </button>
+            </>
+          )}
+          {phase === "downloading" && (
+            <div style={styles.downloadingText}>请稍候，下载完成后将自动提示…</div>
+          )}
+          {phase === "ready" && (
+            <button
+              onClick={handleInstall}
+              style={{ ...styles.btnPrimary, width: "100%" }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background =
+                  "var(--accent-primary-hover)";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "var(--accent-primary)";
+              }}
+            >
+              安装并重启
+            </button>
+          )}
+          {phase === "failed" && (
+            <>
+              <button
+                onClick={() => downloadUrl && openExternalUrl(downloadUrl)}
+                style={styles.btnPrimary}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background =
+                    "var(--accent-primary-hover)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background =
+                    "var(--accent-primary)";
+                }}
+              >
+                浏览器下载
+              </button>
+              <button
+                onClick={handleUpdate}
+                style={styles.btnGhost}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background =
+                    "var(--bg-surface-hover)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "transparent";
+                }}
+              >
+                重试
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -259,21 +253,11 @@ const styles: Record<string, React.CSSProperties> = {
   card: {
     width: 400,
     maxWidth: "90vw",
-  },
-  // Outer glass shell
-  shell: {
-    background: "var(--glass-bg, rgba(255,255,255,0.04))",
-    border: "1px solid var(--border-subtle)",
-    borderRadius: "var(--radius-xl)",
-    padding: 4,
-    boxShadow: "var(--shadow-xl)",
-  },
-  // Inner core
-  core: {
     background: "var(--bg-elevated)",
-    borderRadius: "calc(var(--radius-xl) - 4px)",
+    border: "1px solid var(--border-emphasis)",
+    borderRadius: "var(--radius-xl)",
+    boxShadow: "var(--shadow-xl)",
     overflow: "hidden",
-    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.05)",
   },
   header: {
     display: "flex",

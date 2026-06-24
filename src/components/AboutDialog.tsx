@@ -1,8 +1,15 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ReactNode } from "react";
+import { useState, useEffect } from "react";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { BrandLogo } from "./BrandLogo";
-import type { UpdateInfo } from "../api";
+import {
+  downloadUpdate,
+  installUpdate,
+  onUpdateDownloadProgress,
+  type UpdateInfo,
+} from "../api";
 // `?raw` bundles the file as a string at build time (see vite-env.d.ts).
 // Offline-safe and pinned to the installed version — no network needed to
 // show what changed. CHANGELOG.md lives at the repo root, two levels up
@@ -62,9 +69,62 @@ export function AboutDialog({
   const hasUpdate = !!updateInfo?.has_update;
 
   // Download destination: prefer the first asset's URL, fall back to the
-  // release page. Either is an https link the Rust opener will accept.
+  // release page.
   const downloadUrl =
     updateInfo?.download_url || updateInfo?.release_url || "";
+
+  // Auto-download+install state (mirrors UpdateNotification pattern).
+  type AboutUpdatePhase = "idle" | "downloading" | "ready" | "failed";
+  const [aboutPhase, setAboutPhase] = useState<AboutUpdatePhase>("idle");
+  const [aboutProgress, setAboutProgress] = useState({ downloaded: 0, total: 0 });
+  const [aboutError, setAboutError] = useState("");
+  const [aboutPath, setAboutPath] = useState("");
+
+  useEffect(() => {
+    if (aboutPhase !== "downloading") return;
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    onUpdateDownloadProgress((p) => {
+      setAboutProgress({ downloaded: p.downloaded, total: p.total });
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => { cancelled = true; unlisten?.(); };
+  }, [aboutPhase]);
+
+  const aboutPct =
+    aboutProgress.total > 0
+      ? Math.min(100, Math.round((aboutProgress.downloaded / aboutProgress.total) * 100))
+      : null;
+
+  const handleAboutUpdate = async () => {
+    setAboutPhase("downloading");
+    setAboutProgress({ downloaded: 0, total: 0 });
+    setAboutError("");
+    try {
+      const path = await downloadUpdate(downloadUrl);
+      setAboutPath(path);
+      setAboutPhase("ready");
+    } catch (e) {
+      setAboutError(String(e));
+      setAboutPhase("failed");
+    }
+  };
+
+  const handleAboutInstall = async () => {
+    if (!aboutPath) {
+      setAboutError("安装包路径丢失");
+      setAboutPhase("failed");
+      return;
+    }
+    try {
+      await installUpdate(aboutPath);
+    } catch (e) {
+      setAboutError(String(e));
+      setAboutPhase("failed");
+    }
+  };
 
   return (
     <div
@@ -134,29 +194,55 @@ export function AboutDialog({
               <div
                 style={{
                   display: "flex",
-                  alignItems: "center",
-                  gap: 12,
+                  flexDirection: "column",
+                  gap: 10,
                   padding: "12px 14px",
                   background: "var(--success-muted)",
                   border: "1px solid var(--success)",
                   borderRadius: "var(--radius-md)",
                 }}
               >
-                <span style={{ fontSize: 16 }}>✨</span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>
-                    发现新版本 {updateInfo!.latest_version.startsWith("v") ? updateInfo!.latest_version : `v${updateInfo!.latest_version}`}
-                  </div>
-                  <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 2 }}>
-                    点击右侧按钮前往下载
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <span style={{ fontSize: 16 }}>✨</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>
+                      发现新版本 {updateInfo!.latest_version.startsWith("v") ? updateInfo!.latest_version : `v${updateInfo!.latest_version}`}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 2 }}>
+                      {aboutPhase === "idle" && "可自动下载安装，也可前往网页下载"}
+                      {aboutPhase === "downloading" && (aboutPct !== null ? `正在下载… ${aboutPct}%` : "正在下载…")}
+                      {aboutPhase === "ready" && "下载完成，可安装"}
+                      {aboutPhase === "failed" && (aboutError || "下载失败")}
+                    </div>
                   </div>
                 </div>
-                <button
-                  onClick={() => downloadUrl && onDownload(downloadUrl)}
-                  style={btnPrimary}
-                >
-                  去下载
-                </button>
+                {/* Progress bar */}
+                {aboutPhase === "downloading" && (
+                  <div style={{ height: 3, background: "var(--bg-surface)", borderRadius: "var(--radius-full)", overflow: "hidden" }}>
+                    <div style={{ height: "100%", width: aboutPct !== null ? `${aboutPct}%` : "30%", background: "var(--accent-primary)", borderRadius: "var(--radius-full)", transition: "width 150ms cubic-bezier(0.32, 0.72, 0, 1)" }} />
+                  </div>
+                )}
+                {/* Action buttons */}
+                <div style={{ display: "flex", gap: 8 }}>
+                  {aboutPhase === "idle" && (
+                    <>
+                      <button onClick={handleAboutUpdate} style={btnPrimary}>更新</button>
+                      <button onClick={() => downloadUrl && onDownload(downloadUrl)} style={btnGhost}>网页下载</button>
+                    </>
+                  )}
+                  {aboutPhase === "downloading" && (
+                    <div style={{ flex: 1, textAlign: "center", fontSize: 12, color: "var(--text-muted)", padding: "6px 0" }}>请稍候…</div>
+                  )}
+                  {aboutPhase === "ready" && (
+                    <button onClick={handleAboutInstall} style={{ ...btnPrimary, flex: 1 }}>安装并重启</button>
+                  )}
+                  {aboutPhase === "failed" && (
+                    <>
+                      <button onClick={() => downloadUrl && onDownload(downloadUrl)} style={btnPrimary}>浏览器下载</button>
+                      <button onClick={handleAboutUpdate} style={btnGhost}>重试</button>
+                    </>
+                  )}
+                </div>
               </div>
             ) : (
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
