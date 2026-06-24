@@ -1064,3 +1064,18 @@
 | 目标是什么？ | 版本号常驻可见；自动检测新版本并提示一次（非 naggy）+ 可手动检查；版本升级后首次启动展示更新内容；字体字段不挡常用输入区 |
 | 我学到了什么？ | 更新检测 HTTP 必须放 Rust——CSP 锁紧 connect-src，前端 fetch 外站被拦，Rust reqwest 不受 CSP 约束且规避 CORS（关键正确决策，避免放宽安全 CSP）；更新检测要永不抛 Result 全降级 error 字段（前端契约干净）；更新内容「内置 CHANGELOG.md ?raw」与「远程 release body」是两条独立路径，前者对应已装版本、离线可用，后者对应已发布最新（语义不同不能混）；首启 whatsnew 用 knownVersion 比对，首次安装（null）要静默不打扰；提示要防 naggy——24h 节流 + 每版本只弹一次（lastNotifiedUpdateVersion）；轻量检测+提示优于集成 tauri-plugin-updater（免签名密钥/manifest/CI，契合 Gitee 托管）；打开外链复用已注册的 shell plugin 不引新 npm 包，仅 `#[allow(deprecated)]` 应对上游迁移 opener；字体字段移位是纯位置改动零逻辑风险 |
 | 我做了什么？ | main.rs UpdateInfo+GITEE_LATEST+check_for_updates（reqwest+timeout+serde_json 手取+永不抛）+open_external_url（http(s) 校验+ShellExt+allow deprecated）+parse_ver/is_newer/truncate_chars/unix_now_secs/update_info_error helper+两命令注册；api.ts UpdateInfo/checkForUpdates/openExternalUrl；vite-env.d.ts `*.md?raw` 声明；useUpdateCheck.ts（24h 节流+inFlight ref+静默）；AboutDialog.tsx（whatsnew/about 双 mode+ReactMarkdown inline components）；Sidebar.tsx version footer+红点+onOpenAbout；App.tsx appVersion+whatsnew effect+useUpdateCheck+每版本提示 effect+closeAbout+渲染；ConnectionDialog.tsx 字体 FieldGroup 移底；CHANGELOG.md 版本化种子；tsc+cargo check 双绿；progress+README 同步 |
+
+### 阶段 40：发布流水线 + 开源安全审计（2026-06-24）
+- **发布流水线（一键 `打包`）：** 新增 `scripts/publish-gitee-release.mjs`（Gitee API 创建 release + `attach_files` 上传 .exe，Node 18+ fetch，带 4 次网络重试）；`.gitee-token` gitignored（永不进仓库）；CLAUDE.md 加「打包」规则 + 持久记忆。规则演进：初版全自动 → 用户加**确认门**（写完更新内容后停下，给作者确认版本号+changelog 才继续 build/push/publish）。宿主安全分类器独立拦 push-to-main 与公开 release 发布（与用户授权无关），用 `!` 前缀亲手放行。**踩坑**：`cargo tauri` 子命令未装→改 `npm run tauri:build`；`AboutDialog` 的 `../CHANGELOG.md?raw` 路径错（应是 `../../`，tsc 没抓到、vite 打包才暴露）。
+- **开源安全审计：** 全历史扫密钥/口令/邮箱/IP/内网主机名。结论——`.gitee-token` 从未进历史（安全）、无硬编码密钥、`ai.rs` 无默认 key、`.serena/` 只跟踪默认配置、活文档无运营信息。**修复**：6 个脚本里硬编码 `C:\Users\argus\.cargo\bin`→`%USERPROFILE%`/`$HOME`（可移植+脱敏）；`TerminalPanel.tsx` 注释 `argus@fn-na`→`user@host`。**决策**：作者身份（`argus<argustang@qq.com>`/`Dear唐先生`/`tang.li`）用户选择保留；故**跳过历史重写**（作者邮箱已全公开，清旧脚本里的 argus 收益≈0，不值强推风险）。残留暴露面：作者 QQ 邮箱+姓名在提交元数据（已知情保留）。LICENSE 实为 Apache 2.0 但 README 写 MIT（未修，开源规范小瑕疵）。
+- **发版：** v1.5.0（feature：版本号展示+自动检测更新+首启更新内容+字体移底，release 723458）→ v1.5.1（patch：开源整理，二进制与 1.5.0 等价，release 723544）。首次 1.5.0 发布吃 2 次 Gitee 网络超时（促成脚本加 retry）。
+- **验证：** `npx tsc --noEmit` + `cargo check` 双绿；两个 release 均已发布含 .exe。
+
+## 五问重启检查（阶段 40）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 40 complete（发布流水线 publish-gitee-release.mjs + 打包规则含确认门 + 开源审计修复 + v1.5.0/v1.5.1 双发版），均已推送 origin/main |
+| 我要去哪里？ | 后续发版直接「打包」→确认更新内容→自动 build+push+发 Gitee；开源后关注是否有遗漏 PII 反馈 |
+| 目标是什么？ | 一键可复现发版；开源前清掉个人路径/脱敏；既保留作者身份又让仓库对外干净 |
+| 我学到了什么？ | 发布脚本二进制上传用 Gitee `attach_files`（非 GitHub upload_url）；Node fetch 做 multipart 最稳（项目已保证有 Node）；安全分类器独立于用户授权会拦 push-main/公开发布，用 `!` 放行；`?raw` 导入路径要算对层级、tsc 不查运行期路径只查类型；开源审计要扫**全历史**而非仅工作区（但历史重写收益要看作者身份是否保留——保留则清文件内容收益≈0）；CRLF 警告无害（Windows）；确认门是好设计——无用户改动时如实建议跳过、用户仍要发就发 |
+| 我做了什么？ | publish-gitee-release.mjs（create release+attach_files+4次重试+token 解析 env/文件）；.gitignore 加 .gitee-token；CLAUDE.md 打包规则（8步含 3.5 确认门+分类器放行提示）+记忆/索引同步；6 脚本 cargo 路径脱敏+TerminalPanel 注释脱敏（提交 8ac7606）；发版 v1.5.0(723458)/v1.5.1(723544) 含 .exe；CHANGELOG/README/progress 同步 |
