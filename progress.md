@@ -1021,3 +1021,46 @@
 | 目标是什么？ | 保存前验证连接/AI 配置可用（避免反复保存-连接-改-再保存）；AI 输入框不再几个字就溢出 |
 | 我学到了什么？ | 连接测试应抽公共拨号+认证段（dial_and_authenticate）让真实连接与测试同路径、同 host-key TOFU 保证；连接测试必须复用 ssh_connect/ftp_connect 的 keyring 解析 + 防空密码锁号 + 外层超时兜底；AI 测试用非流式最小请求（stream:false+max_tokens:16）而非消费首 token——干净且绝不 emit 事件污染 AiPanel；AI 测试走 overrides 不自动保存，符合「试了再决定」心智；textarea 加高用 rows+minHeight 而非 auto-grow（简单且解决痛点）；ConnectionDialog 抽 buildConfig 让 save/test 共用配置组装防漂移 |
 | 我做了什么？ | ssh.rs 抽 dial_and_authenticate + test_connection + use Disconnect、connect 改调 helper（修未用 mut）；ftp.rs test_connection；local.rs test_connection（spawn+kill+wait）；ai.rs AiTestOverrides+test_settings+extract_reply_snippet；main.rs test_connection（keyring 解析+防空密码+15s 超时）+ ai_test_settings 命令 + 两处 generate_handler 注册；api.ts testConnection/AiTestOverrides/aiTestSettings；ConnectionDialog 抽 buildConfig+testing/testResult 状态+handleTest+footer 加测试按钮与结果横幅；SettingsPanel aiTesting+handleTestAi+测试按钮+import；AiPanel rows=4+textareaStyle 加 lineHeight/minHeight；tsc+cargo check 双绿；progress+README 同步 |
+
+### 阶段 39：版本号展示 + 自动检测更新 + 首启更新内容 + 字体字段移到底部（2026-06-24）
+- **需求（用户原话四条）：**
+  1. 界面添加版本号信息。
+  2. 设计自动检测更新和更新提示功能。
+  3. 版本更新后首次展示更新内容。
+  4. 新建连接，字体选择放在最下面，不要放在上面。
+- **关键设计决策：**
+  - **更新机制 = 轻量检测+提示，不集成 tauri-plugin-updater。** 不引签名密钥/manifest/CI 产物，契合 Gitee 托管；Rust 用已有 `reqwest` 查 Gitee `/releases/latest`，比对版本号有新版就提示 + 「去下载」跳浏览器。无 in-app 自动安装。
+  - **更新检测 HTTP 放 Rust（reqwest）不放前端 fetch。** 因为 `tauri.conf.json` CSP `connect-src 'self' ipc: http://ipc.localhost` 锁得很紧，前端 fetch Gitee 会被拦；Rust reqwest 不受 CSP 约束、规避 CORS、复用已有依赖。→ **无需放宽 CSP**。
+  - **更新内容来源 = 内置 CHANGELOG.md + Vite `?raw`。** 构建期内联成字符串打包进前端，离线可用、与已装版本严格对应；用已有 `react-markdown`+`remark-gfm` 渲染，不新增依赖。更新检测的「新版本」走远程、首启「更新内容」走本地 CHANGELOG——两条独立路径，内容源不同（远程=已发布最新，本地=已装版本的变更）。
+  - **打开外链 = Rust `open_external_url` 命令。** 复用已注册的 `tauri_plugin_shell::ShellExt`，强制校验 `http(s)://` 前缀（防 file:/任意协议），不新增 `@tauri-apps/plugin-shell` npm 包。`Shell::open` 已 deprecated（推荐 tauri-plugin-opener），但为单次打开不引第二个插件，`#[allow(deprecated)]` 留注说明。
+  - **节流：每 24h 才自动检测一次**（`localStorage lastUpdateCheck`），避免每次启动打 Gitee API 触发限流；「检查更新」按钮不受节流。**每版本只弹一次更新提示**（`localStorage lastNotifiedUpdateVersion`），同版本后续启动只留侧栏红点不弹窗。
+  - **首启更新内容（whatsnew）：** `localStorage knownVersion` vs 运行版本，不同（刚升级）→ 弹 changelog 一次，关闭时回写 knownVersion；首次安装（knownVersion 为 null）静默写入不打扰。
+  - **版本号位置 = 侧边栏底部**（常驻可见，点击开 About/更新内容对话框，有新版本时显红点）；设置面板「版本备份」区版本号保持不变。
+  - **字体字段移到 ConnectionDialog 最底部**（「分组」FieldGroup 之后），仅位置移动、条件与逻辑不变。
+- **改动（后端）：**
+  - `main.rs` — `UpdateInfo` 结构 + `GITEE_LATEST_RELEASE` 常量 + `check_for_updates()` async 命令（reqwest 10s 客户端 + 12s tokio timeout 兜底 + serde_json::Value 手取字段容错 + `is_newer`/`parse_version`/`truncate_chars`/`unix_now_secs`/`update_info_error` helper，**永不抛 Result**，失败全部降级 has_update:false+error）+ `open_external_url()` 命令（AppHandle 注入 + http(s) 校验 + `#[allow(deprecated)]` ShellExt::open）；两命令注册进 `generate_handler!`。不新增 Cargo 依赖。
+- **改动（前端）：**
+  - `api.ts` — `UpdateInfo` 接口 + `checkForUpdates()` + `openExternalUrl(url)`。
+  - `vite-env.d.ts` — `declare module "*.md?raw"` 让 `?raw` 导入过 tsc。
+  - `hooks/useUpdateCheck.ts`（新）— `useUpdateCheck(enabled)` → `{info,loading,checkNow}`；24h localStorage 节流；inFlight ref 防 StrictMode 双触发；失败静默。
+  - `components/AboutDialog.tsx`（新）— 单组件两 mode（whatsnew/about）；ReactMarkdown + remarkGfm 渲染 `CHANGELOG.md?raw`（inline components map，无需全局 CSS 类）；about 模式含「检查更新」按钮 + has_update 时绿 banner「去下载」。
+  - `components/Sidebar.tsx` — 新 props `version/updateAvailable/onOpenAbout`；`listContainer` 后插 footer（仅展开态）`MyShell v{version}` + 红点；点击开 about。
+  - `App.tsx` — `appVersion` state（vault ready 后 `getAppVersion`）+ whatsnew effect（knownVersion 比对）+ `useUpdateCheck` + 每版本一次提示 effect（lastNotifiedUpdateVersion）+ `closeAbout`（whatsnew 关闭回写 knownVersion）；渲染 `<AboutDialog>`；Sidebar 注入 version/updateAvailable/onOpenAbout。
+  - `components/ConnectionDialog.tsx` — 「终端」FieldGroup（字体）从基本设置下移到「分组」之后、表单容器最底。
+  - `CHANGELOG.md`（新，仓库根）— 版本化更新日志（v1.4.5 → 历史回溯），头注版本须与 Cargo.toml 一致。
+- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS（0 warning）。需 `cargo tauri dev` 手测：侧栏底部版本号 + 点击开 about + 检查更新（Gitee 有更高版本→绿 banner 去下载；最新→「当前已是最新版本」）；改 `localStorage myshell.knownVersion` 为旧版刷新→弹 whatsnew；检测到新版本首启弹 about、后续启动仅红点；断网/无 release 静默降级无弹窗无红点；新建连接对话框字体在最底（SSH/Local 显示、FTP/SFTP 不显示）。
+- **边界/错误处理要点：**
+  - 更新检测：网络失败/超时/非 2xx/解析失败/无 tag → 全部降级 `error` 字段非空 + has_update:false，绝不 panic/抛 Result；notes 截断 2000 字防爆前端；download_url 缺省回退 release_url；CSP 不放宽（HTTP 走 Rust）。
+  - 打开外链：非 http(s) 前缀拒绝；ShellExt 缺失返回「无法打开链接」。
+  - whatsnew：首次安装（knownVersion null）静默不弹；断网/检测失败不影响 whatsnew（whatsnew 走本地 CHANGELOG 不依赖网络）。
+  - 每版本提示：whatsnew 正显示时不抢屏（about 让位 whatsnew）；同 latest_version 后续启动仅红点。
+  - 节流键写失败（localStorage 满/禁用）不影响检查，仅可能下次启动早查一次。
+
+## 五问重启检查（阶段 39）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 39 complete（侧栏版本号 + 轻量更新检测/提示 + 首启更新内容 + 字体移底；后端 check_for_updates/open_external_url + parse_ver/is_newer/truncate helper + 两命令注册；前端 UpdateInfo api 包装 + useUpdateCheck 节流 hook + AboutDialog 双 mode + CHANGELOG.md ?raw + Sidebar footer + App 装配 + ConnectionDialog 字段移位；tsc/cargo check 双绿），待 dev 手测 |
+| 我要去哪里？ | 用户 `cargo tauri dev` 实测：①侧栏底部 `MyShell v1.4.5` + 点击开 About；②About 点「检查更新」→Gitee 有更高版本→绿 banner「去下载」打开浏览器下载页 / 最新→「当前已是最新版本」/ 断网→「上次检查失败可重试」；③`localStorage.setItem("myshell.knownVersion","1.0.0")` 刷新→弹 whatsnew（changelog），关闭后回写、再刷新不弹；④字体字段在新建连接对话框最底（SSH/Local 显示、FTP/SFTP 不显示）；⑤每版本提示一次（检测到新版本首启弹 about，后续仅红点） |
+| 目标是什么？ | 版本号常驻可见；自动检测新版本并提示一次（非 naggy）+ 可手动检查；版本升级后首次启动展示更新内容；字体字段不挡常用输入区 |
+| 我学到了什么？ | 更新检测 HTTP 必须放 Rust——CSP 锁紧 connect-src，前端 fetch 外站被拦，Rust reqwest 不受 CSP 约束且规避 CORS（关键正确决策，避免放宽安全 CSP）；更新检测要永不抛 Result 全降级 error 字段（前端契约干净）；更新内容「内置 CHANGELOG.md ?raw」与「远程 release body」是两条独立路径，前者对应已装版本、离线可用，后者对应已发布最新（语义不同不能混）；首启 whatsnew 用 knownVersion 比对，首次安装（null）要静默不打扰；提示要防 naggy——24h 节流 + 每版本只弹一次（lastNotifiedUpdateVersion）；轻量检测+提示优于集成 tauri-plugin-updater（免签名密钥/manifest/CI，契合 Gitee 托管）；打开外链复用已注册的 shell plugin 不引新 npm 包，仅 `#[allow(deprecated)]` 应对上游迁移 opener；字体字段移位是纯位置改动零逻辑风险 |
+| 我做了什么？ | main.rs UpdateInfo+GITEE_LATEST+check_for_updates（reqwest+timeout+serde_json 手取+永不抛）+open_external_url（http(s) 校验+ShellExt+allow deprecated）+parse_ver/is_newer/truncate_chars/unix_now_secs/update_info_error helper+两命令注册；api.ts UpdateInfo/checkForUpdates/openExternalUrl；vite-env.d.ts `*.md?raw` 声明；useUpdateCheck.ts（24h 节流+inFlight ref+静默）；AboutDialog.tsx（whatsnew/about 双 mode+ReactMarkdown inline components）；Sidebar.tsx version footer+红点+onOpenAbout；App.tsx appVersion+whatsnew effect+useUpdateCheck+每版本提示 effect+closeAbout+渲染；ConnectionDialog.tsx 字体 FieldGroup 移底；CHANGELOG.md 版本化种子；tsc+cargo check 双绿；progress+README 同步 |

@@ -23,6 +23,12 @@ interface Props {
   onOpenQuickCommands: () => void;
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
+  /** Running app version, shown in the expanded-mode footer. */
+  version?: string;
+  /** When true, an accent dot is shown next to the version (update available). */
+  updateAvailable?: boolean;
+  /** Open the About / what's-new dialog. */
+  onOpenAbout?: () => void;
 }
 
 interface FolderNode {
@@ -193,6 +199,9 @@ export function Sidebar({
   onOpenQuickCommands,
   collapsed = false,
   onToggleCollapsed,
+  version,
+  updateAvailable,
+  onOpenAbout,
 }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [menu, setMenu] = useState<
@@ -621,6 +630,54 @@ export function Sidebar({
           </div>
         )}
       </div>
+
+      {/* Version footer — only in expanded mode (the collapsed rail is
+          44px wide and already drops the header/search for density). Shows
+          the running version; a small accent dot appears when a newer
+          release was detected. Click opens the About / what's-new dialog. */}
+      {version && (
+        <div
+          onClick={() => onOpenAbout?.()}
+          title={updateAvailable ? "发现新版本，点击查看" : "关于 MyShell"}
+          style={{
+            flexShrink: 0,
+            borderTop: "1px solid var(--border-subtle)",
+            padding: "9px 16px",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            cursor: "pointer",
+            userSelect: "none",
+            transition: "background var(--duration-fast) var(--ease-in-out)",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = "var(--bg-surface-hover)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "transparent";
+          }}
+        >
+          <span style={{ fontSize: 11, color: "var(--text-tertiary)" }}>
+            MyShell
+          </span>
+          <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+            v{version}
+          </span>
+          {updateAvailable && (
+            <span
+              title="发现新版本"
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: "var(--radius-full)",
+                background: "var(--accent-secondary)",
+                boxShadow: "0 0 6px var(--accent-secondary)",
+                marginLeft: "auto",
+              }}
+            />
+          )}
+        </div>
+      )}
 
       {menu && (
         <div

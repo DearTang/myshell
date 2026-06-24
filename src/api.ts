@@ -874,3 +874,42 @@ export function onZmodemEnd(
     if (event.payload === sessionId) handler();
   });
 }
+
+// ============ Update check ============
+
+/**
+ * Result of a single update check against Gitee's latest release.
+ * Mirrors the Rust `UpdateInfo` struct (snake_case kept intentionally — these
+ * field names carry no meaning conflict and match the wire payload exactly).
+ *
+ * On any failure (network/parse/no release) `error` is set and the rest are
+ * empty/false — the check never throws. Treat a non-empty `error` or
+ * `has_update === false` as "no actionable update info".
+ */
+export interface UpdateInfo {
+  current_version: string;
+  latest_version: string;
+  has_update: boolean;
+  /** html_url of the release; fallback destination for the download button. */
+  release_url: string;
+  /** First asset's browser_download_url, falling back to release_url. */
+  download_url: string;
+  /** Truncated release notes body (Markdown). */
+  notes: string;
+  /** created_at of the release, raw API string. */
+  published_at: string;
+  /** Unix seconds when the check ran. */
+  checked_at: number;
+  /** Present (non-empty) when the check failed. */
+  error: string | null;
+}
+
+/** Ask the Rust backend to fetch the latest Gitee release and compare. */
+export async function checkForUpdates(): Promise<UpdateInfo> {
+  return await invoke("check_for_updates");
+}
+
+/** Open an external http(s) URL in the system default browser. */
+export async function openExternalUrl(url: string): Promise<void> {
+  await invoke("open_external_url", { url });
+}

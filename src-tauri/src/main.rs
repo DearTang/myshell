@@ -819,6 +819,232 @@ fn get_previous_version() -> Option<String> {
     backup::get_previous_version()
 }
 
+// ============ Update check ============
+//
+// Lightweight update detection. We do NOT integrate tauri-plugin-updater
+// (no in-app auto-install, no signing keys, no CI manifest). Instead the Rust
+// backend does a single GET against the Gitee "latest release" API and
+// compares the reported tag against the running version. The frontend then
+// shows a prompt + "go download" button (opens the browser).
+//
+// Why backend and not frontend fetch: tauri.conf.json CSP pins
+// `connect-src 'self' ipc: http://ipc.localhost`, so a fetch() to Gitee from
+// the webview would be blocked. Rust's reqwest is unaffected by CSP and also
+// sidesteps CORS. reqwest is already a dependency (used by ai.rs).
+
+/// Gitee "latest release" endpoint for this repo. Returns a JSON object with
+/// `tag_name`, `assets[]`, `body`, `created_at`, `html_url`, etc. Public, no
+/// auth needed (subject to Gitee's unauthenticated rate limits).
+const GITEE_LATEST_RELEASE: &str =
+    "https://gitee.com/api/v5/repos/argustang/myshell/releases/latest";
+
+/// Release-notes body is capped before returning to the frontend so a giant
+/// changelog can't balloon the webview memory.
+const MAX_NOTES_CHARS: usize = 2000;
+
+#[derive(Debug, Clone, Serialize)]
+struct UpdateInfo {
+    current_version: String,
+    latest_version: String,
+    has_update: bool,
+    /// html_url of the release (fallback for the "download" button).
+    release_url: String,
+    /// browser_download_url of the first asset, falling back to release_url.
+    download_url: String,
+    /// Truncated release body (Markdown).
+    notes: String,
+    /// created_at of the release, raw string from the API.
+    published_at: String,
+    checked_at: u64,
+    /// Set when the check failed (network/parse/no release). Frontend treats
+    /// any non-empty `error` as "no info / stay silent".
+    error: Option<String>,
+}
+
+/// Build an UpdateInfo marked as failed. Never returns Result — the command
+/// contract is "always resolve with a struct", so transient network issues
+/// can't surface as unhandled promise rejections in the frontend.
+fn update_info_error(current_version: &str, message: impl Into<String>) -> UpdateInfo {
+    UpdateInfo {
+        current_version: current_version.to_string(),
+        latest_version: String::new(),
+        has_update: false,
+        release_url: String::new(),
+        download_url: String::new(),
+        notes: String::new(),
+        published_at: String::new(),
+        checked_at: unix_now_secs(),
+        error: Some(message.into()),
+    }
+}
+
+/// `std::time::SystemTime` seconds since the epoch. Used to stamp the check
+/// so the frontend can show "checked N minutes ago".
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse a dotted version like "v1.4.5" or "1.4.5" into numeric segments.
+/// Non-numeric trailing junk in a segment (e.g. "1.4.5-rc1" -> [1,4,5]) is
+/// truncated at the first non-digit. Empty/garbage input yields `vec![0]`.
+fn parse_version(raw: &str) -> Vec<u64> {
+    let cleaned = raw.trim().trim_start_matches('v').trim_start_matches('V');
+    cleaned
+        .split('.')
+        .map(|seg| {
+            let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u64>().unwrap_or(0)
+        })
+        .collect()
+}
+
+/// True if `latest` is strictly newer than `current` by dotted-numeric
+/// comparison. Equal or older -> false.
+fn is_newer(latest: &str, current: &str) -> bool {
+    let l = parse_version(latest);
+    let c = parse_version(current);
+    let n = l.len().max(c.len());
+    for i in 0..n {
+        let lv = l.get(i).copied().unwrap_or(0);
+        let cv = c.get(i).copied().unwrap_or(0);
+        if lv != cv {
+            return lv > cv;
+        }
+    }
+    false
+}
+
+/// Check Gitee for the latest release and report whether an update is
+/// available. Resolves with a populated `UpdateInfo` on every path; failures
+/// are encoded in the `error` field rather than rejected.
+#[tauri::command]
+async fn check_for_updates() -> UpdateInfo {
+    let current_version = backup::APP_VERSION.to_string();
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return update_info_error(&current_version, format!("客户端构建失败: {e}")),
+    };
+
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        client.get(GITEE_LATEST_RELEASE).send(),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return update_info_error(&current_version, format!("网络请求失败: {e}")),
+        Err(_) => return update_info_error(&current_version, "请求超时".to_string()),
+    };
+
+    if !resp.status().is_success() {
+        return update_info_error(
+            &current_version,
+            format!("接口返回状态 {}", resp.status().as_u16()),
+        );
+    }
+
+    let json: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return update_info_error(&current_version, format!("解析响应失败: {e}")),
+    };
+
+    // tag_name is the canonical version source on a Gitee release. Fall back
+    // to the deprecated `name` field only if tag is absent.
+    let tag = json
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| json.get("name").and_then(|v| v.as_str()).map(str::to_string));
+    let Some(latest_version) = tag else {
+        return update_info_error(&current_version, "未找到版本信息".to_string());
+    };
+
+    let release_url = json
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://gitee.com/argustang/myshell/releases")
+        .to_string();
+
+    // Prefer the first asset's download URL; otherwise the release page.
+    let download_url = json
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|asset| asset.get("browser_download_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| release_url.clone());
+
+    let published_at = json
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let notes_raw = json
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let notes = truncate_chars(&notes_raw, MAX_NOTES_CHARS);
+
+    let has_update = is_newer(&latest_version, &current_version);
+
+    UpdateInfo {
+        current_version,
+        latest_version,
+        has_update,
+        release_url,
+        download_url,
+        notes,
+        published_at,
+        checked_at: unix_now_secs(),
+        error: None,
+    }
+}
+
+/// Truncate a string to at most `max_chars` Unicode chars, appending an
+/// ellipsis marker if it was cut. Steps along `chars()` so we never split a
+/// multibyte UTF-8 sequence (avoids the panic from indexing mid-codepoint).
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push_str("\n…(已截断)");
+    out
+}
+
+/// Open an external URL in the user's default browser. The URL must be an
+/// absolute http(s) link — anything else (file:, javascript:, relative, etc.)
+/// is rejected so this can't be abused as a local-file-open primitive.
+///
+/// `Shell::open` is deprecated upstream in favour of the separate
+/// `tauri-plugin-opener`, but we intentionally stay on `tauri-plugin-shell`
+/// (already registered + already granted the `open` capability in
+/// tauri.conf.json) to avoid pulling in a second plugin for a single
+/// browser-open call. The deprecated method still routes through the OS
+/// default handler exactly as before.
+#[tauri::command]
+#[allow(deprecated)]
+fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let lower = url.trim().to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return Err("仅支持 http(s) 链接".to_string());
+    }
+    use tauri_plugin_shell::ShellExt;
+    app.shell()
+        .open(url, None)
+        .map_err(|e| format!("打开链接失败: {e}"))
+}
+
 /// Read a PEM-formatted text file at an absolute path. Used by the private-
 /// key picker in ConnectionDialog: the user picks a path via the dialog
 /// plugin, and this reads the content so we can stash it (encrypted) in
@@ -2498,6 +2724,8 @@ pub fn run() {
             rollback_backup,
             get_app_version,
             get_previous_version,
+            check_for_updates,
+            open_external_url,
             get_connections,
             save_connection,
             delete_connection,

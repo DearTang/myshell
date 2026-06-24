@@ -29,3 +29,4 @@ desktop.ini
 .env.*.local
 *.pem
 *.key
+.gitee-token

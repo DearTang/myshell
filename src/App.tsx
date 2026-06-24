@@ -9,6 +9,7 @@ import { MasterPasswordGate } from "./components/MasterPasswordGate";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { AiPanel } from "./components/AiPanel";
 import { QuickCommandsPanel } from "./components/QuickCommandsPanel";
+import { AboutDialog } from "./components/AboutDialog";
 import { BrandLogo } from "./components/BrandLogo";
 import type { Terminal } from "@xterm/xterm";
 import {
@@ -22,8 +23,11 @@ import {
   localConnect,
   localDisconnect,
   vaultStatus,
+  getAppVersion,
+  openExternalUrl,
 } from "./api";
 import type { ConnectionConfig, ConnType, Tab } from "./api";
+import { useUpdateCheck } from "./hooks/useUpdateCheck";
 
 export default function App() {
   const [connections, setConnections] = useState<ConnectionConfig[]>([]);
@@ -70,6 +74,91 @@ export default function App() {
   // ready, blocking all other UI so connection commands can't be invoked
   // without a derived key (which would just error with "Vault 未解锁").
   const [vault, setVault] = useState<"checking" | "setup" | "unlock" | "ready">("checking");
+
+  // ── Version + update check ──
+  // appVersion drives the sidebar footer label and the whats-new trigger.
+  // `knownVersion` in localStorage records the version we last showed the
+  // changelog for; on first launch after an upgrade it differs from the
+  // running version and we surface the changelog once.
+  const [appVersion, setAppVersion] = useState<string>("");
+  // about: a single dialog component used two ways — "whatsnew" (auto on
+  // upgrade) and "about" (manual, from the sidebar footer / update toast).
+  const [about, setAbout] = useState<{ open: boolean; mode: "whatsnew" | "about" }>({
+    open: false,
+    mode: "about",
+  });
+  const { info: updateInfo, loading: updateChecking, checkNow } = useUpdateCheck(vault === "ready");
+
+  useEffect(() => {
+    if (vault !== "ready") return;
+    let cancelled = false;
+    getAppVersion()
+      .then((v) => {
+        if (cancelled) return;
+        setAppVersion(v);
+        // First-run-after-upgrade changelog. Read what we last acknowledged.
+        let known: string | null = null;
+        try {
+          known = localStorage.getItem("myshell.knownVersion");
+        } catch {
+          known = null;
+        }
+        if (known === null) {
+          // First ever launch (or cleared storage): record silently, don't
+          // pester a brand-new user with a changelog popup.
+          try {
+            localStorage.setItem("myshell.knownVersion", v);
+          } catch {
+            // best-effort
+          }
+        } else if (known !== v) {
+          // Version changed since last run → show what's new.
+          setAbout({ open: true, mode: "whatsnew" });
+        }
+      })
+      .catch(() => {
+        // getVersion should not fail; if it does, just skip the feature.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vault]);
+
+  // One-time-per-new-version update toast: when the background check finds a
+  // newer release, pop the About dialog once per latest_version. Subsequent
+  // launches for the same version only leave the sidebar red dot.
+  useEffect(() => {
+    if (!updateInfo?.has_update) return;
+    // Don't fight the whats-new dialog if it's already showing.
+    if (about.open && about.mode === "whatsnew") return;
+    let lastNotified: string | null = null;
+    try {
+      lastNotified = localStorage.getItem("myshell.lastNotifiedUpdateVersion");
+    } catch {
+      lastNotified = null;
+    }
+    if (lastNotified === updateInfo.latest_version) return;
+    setAbout({ open: true, mode: "about" });
+    try {
+      localStorage.setItem("myshell.lastNotifiedUpdateVersion", updateInfo.latest_version);
+    } catch {
+      // best-effort
+    }
+  }, [updateInfo, about.open, about.mode]);
+
+  const closeAbout = () => {
+    // Closing the whats-new dialog acknowledges the version: stamp it so the
+    // changelog doesn't reappear on next launch.
+    if (about.mode === "whatsnew" && appVersion) {
+      try {
+        localStorage.setItem("myshell.knownVersion", appVersion);
+      } catch {
+        // best-effort
+      }
+    }
+    setAbout({ open: false, mode: "about" });
+  };
+
 
   useEffect(() => {
     if (vault !== "ready") {
@@ -429,6 +518,9 @@ export default function App() {
         }}
         collapsed={sidebarCollapsed}
         onToggleCollapsed={() => setSidebarCollapsed((v) => !v)}
+        version={appVersion}
+        updateAvailable={!!updateInfo?.has_update}
+        onOpenAbout={() => setAbout({ open: true, mode: "about" })}
       />
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <TabBar
@@ -615,6 +707,19 @@ export default function App() {
           connections={connections}
           initialConnectionId={qcInitialConnectionId}
           activeConnectionId={activeTab?.connectionId ?? null}
+        />
+      )}
+      {about.open && (
+        <AboutDialog
+          mode={about.mode}
+          version={appVersion}
+          updateInfo={updateInfo}
+          checking={updateChecking}
+          onClose={closeAbout}
+          onCheckUpdates={checkNow}
+          onDownload={(url) => {
+            void openExternalUrl(url);
+          }}
         />
       )}
     </div>

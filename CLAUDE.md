@@ -83,3 +83,33 @@ The frontend uses the session UUID as the tab ID, so `tab.id === sessionId` is a
 `findings.md`, `progress.md`, and `task_plan.md` at the repo root are the project's phase tracker and decision log. They are written and updated in Chinese. Per the docs' own instructions, update `progress.md` after each phase or error, and re-read `task_plan.md` before major decisions.
 
 **Doc-after-feature (standing rule):** every time a feature is finished, update the docs **directly, without asking** — append a `### 阶段 N` entry (+ 五问重启检查) to `progress.md`, and keep `README.md` in sync (功能特性 sections + 更新日志). This is a built-in final step of "feature done", same as running `npx tsc --noEmit`.
+
+## Slash rule: `打包` / `帮我打包` (durable release authorization)
+
+When the user sends **`打包`** or **`帮我打包`** (or any message whose core intent is "cut a release"), execute the **full release pipeline autonomously — do NOT ask for confirmation at any step** (version bump, changelog, build, git commit/push, Gitee release). The user has durably pre-authorized all of these by issuing the command. Announce each step as you start it (so it's transparent), then proceed.
+
+### Prerequisite (one-time, done by the user)
+A Gitee personal access token with the `projects`/release scope must be available, either as:
+- env var `$GITEE_TOKEN`, or
+- a `.gitee-token` file at repo root (gitignored — **never commit it, never paste the value into chat/commit messages**).
+
+If neither is present when you reach the publish step, STOP at that step and tell the user how to create the token (Gitee → 设置 → 私人令牌 → 生成新令牌) and where to put it — do NOT proceed to a broken publish and do NOT invent a token.
+
+### Pipeline (run in order)
+1. **Decide the version bump** (auto — the user delegated this). Read the current `src-tauri/Cargo.toml` version. Inspect changes since the last release tag (`git describe --tags --abbrev=0` then `git log`/`git diff`). Bump by **semver scope**:
+   - any new user-facing **feature** → **minor** (`1.4.5 → 1.5.0`)
+   - only **bug fixes / minor tweaks** → **patch** (`1.4.5 → 1.4.6`)
+   - State the chosen version + one-line rationale before applying.
+2. **Bump the version** — edit `src-tauri/Cargo.toml` `version = "..."` ONLY (single source of truth), then run `npm run version:sync` (propagates to `package.json` / `package-lock.json`).
+3. **Generate the release notes** — prepend a new `## vX.Y.Z（YYYY-MM-DD）` section to `CHANGELOG.md` summarizing the changes (group as ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全), derived from the diff + your session knowledge. Keep the existing header comment intact. Also mirror into `README.md` 更新日志 (move the prior "下个版本（开发中）" items into the new versioned section as appropriate).
+4. **Pre-check** — `npx tsc --noEmit` and `cargo check` (in `src-tauri/`). Both must pass; fix before continuing.
+5. **Build the installer** — run `cargo tauri build` from `src-tauri/` (or `./scripts/build-prod.ps1`). Long (~10+ min first time); use a generous timeout. Output: `src-tauri/target/release/bundle/nsis/MyShell_X.Y.Z_x64-setup.exe`.
+6. **Commit + push** — stage `Cargo.toml`, `package.json`, `package-lock.json`, `CHANGELOG.md`, `README.md`, `progress.md` (and any feature code), commit with message `release: vX.Y.Z`, push to the current branch's upstream. (Creating the Gitee release tags `main` HEAD, so the version bump must be on the remote first.) Don't commit `.gitee-token`.
+7. **Publish to Gitee** — write the new version's CHANGELOG section to a temp notes file, then `node scripts/publish-gitee-release.mjs <version> <notes-file>` (creates the release + uploads the `.exe`). Report the release URL.
+8. **Doc-after-feature** — per the standing rule, ensure `progress.md` has the stage entry and `README.md` 更新日志 is in sync.
+
+### Notes / safety
+- If a Gitee release for the tag already exists, the publish step will error on create — that's fine, report it; don't delete-and-recreate silently.
+- This rule authorizes git commit + push + public release **only** as part of this explicit `打包` flow. It does not extend to other tasks.
+- Never read, log, or print the token value; the script reads it directly.
+

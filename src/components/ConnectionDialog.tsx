@@ -334,21 +334,6 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
             )}
           </FieldGroup>
 
-          {(connType === "ssh" || connType === "local") && (
-            <FieldGroup label="终端">
-              <FormField label="字体（可选）">
-                <FontField
-                  value={terminalFont}
-                  onChange={setTerminalFont}
-                  placeholder="留空使用全局字体"
-                />
-              </FormField>
-              <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>
-                为该连接单独指定终端字体；留空则使用设置中的全局字体。
-              </div>
-            </FieldGroup>
-          )}
-
           {connType === "local" ? (
             <FieldGroup label="启动 Shell">
               <FormField label="Shell 类型（快速选择）">
@@ -630,6 +615,21 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
               </div>
             </FormField>
           </FieldGroup>
+
+          {(connType === "ssh" || connType === "local") && (
+            <FieldGroup label="终端">
+              <FormField label="字体（可选）">
+                <FontField
+                  value={terminalFont}
+                  onChange={setTerminalFont}
+                  placeholder="留空使用全局字体"
+                />
+              </FormField>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                为该连接单独指定终端字体；留空则使用设置中的全局字体。
+              </div>
+            </FieldGroup>
+          )}
         </div>
 
         {/* Footer */}
