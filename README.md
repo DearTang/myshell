@@ -6,7 +6,7 @@
   <img src="src-tauri/icons/icon.png" width="120" alt="MyShell" />
 </p>
 
-![Version](https://img.shields.io/badge/version-1.5.0-blue)
+![Version](https://img.shields.io/badge/version-1.5.1-blue)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-green)
 ![React](https://img.shields.io/badge/React-18-blue)
 ![Rust](https://img.shields.io/badge/Rust-1.70+-orange)
@@ -70,6 +70,17 @@
 - 最多保留 5 个备份版本
 
 ## 更新日志
+
+### v1.5.1（2026-06-24）
+
+开源准备与维护性更新（应用功能无变化，二进制行为与 v1.5.0 等价）。
+
+#### 🛠️ 优化
+- **发布脚本网络重试**：上传 Gitee release 遇连接超时自动重试 3 次，发布更稳
+- **开源仓库整理**：移除脚本里硬编码的个人 cargo 路径（改用 `%USERPROFILE%` / `$HOME`，跨机器可移植）；代码注释中脱敏用户名/主机名
+
+#### 🔒 安全
+- 应用逻辑与密钥存储无变化；本次为开源前仓库整理
 
 ### v1.5.0（2026-06-24）
 
