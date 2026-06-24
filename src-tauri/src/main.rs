@@ -1116,9 +1116,10 @@ async fn download_update(app: tauri::AppHandle, window: tauri::WebviewWindow, ur
             .await
             .map_err(|e| format!("写入文件失败: {e}"))?;
         downloaded = downloaded.saturating_add(chunk.len() as u64);
-        // Throttle events to ~every 256 KB so we don't flood the webview for
-        // every tiny chunk.
-        if downloaded - last_emitted >= 256 * 1024 || total == 0 {
+        // Throttle events to ~every 32 KB so the progress bar updates
+        // smoothly (~190 events for a 6 MB installer) without flooding the
+        // webview. 256 KB caused only ~24 events which looked jerky.
+        if downloaded - last_emitted >= 32 * 1024 || total == 0 {
             let _ = window.emit(
                 "update_download_progress",
                 DownloadProgress {
