@@ -125,7 +125,7 @@ export function UpdateNotification({ updateInfo }: Props) {
             {/* Header */}
             <div style={styles.header}>
               <div style={styles.iconCircle}>
-                <span style={{ fontSize: 20 }}>↑</span>
+                <span style={{ fontSize: 22 }}>✨</span>
               </div>
               <div style={styles.title}>MyShell 有新版本可用</div>
               <div style={styles.version}>{latestDisplay}</div>
