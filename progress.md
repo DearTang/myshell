@@ -1169,3 +1169,30 @@
 | 目标是什么？ | 表单交互体验一致化：必填字段有视觉反馈、AI 上下文不溢出 |
 | 我学到了什么？ | ConnectionDialog 的 validate() 改为全量校验（不 short-circuit），配合 fieldErrors + shakeNonce 实现多字段同时标红 + 抖动；连接名称自动填充的「骑手检测」（name === prevHost）比原来的 touchedRef 更精准 |
 | 我做了什么？ | 版本 bump 1.6.3 + sync；CHANGELOG/README 加 v1.6.3 节 + badge；tsc+cargo check+tauri:build；commit+push；Gitee 发布；staging 清空 + baseline→v1.6.3；progress 阶段44 |
+
+### 阶段 45：发布 v1.7.0 —— 侧栏交互增强 + 会话管理面板 + 广播级联重连（2026-06-25）
+- **需求：** `打包` v1.7.0。本次内容为侧栏拖拽调宽、会话/广播下拉面板、广播级联重连、AI 选区折叠等新功能，以及广播去重确认、连接校验增强、多项 bug 修复。
+- **发布内容（staging 主导 + git diff 防漏，11 条全映射，无遗漏）：**
+  - ✨ 侧栏拖拽调宽：连接管理面板支持拖拽调整宽度（宽度持久化），鼠标悬停连接名可查看全称及主机地址（Sidebar drag handle + localStorage + Tooltip）。
+  - ✨ 会话管理面板：新增「当前会话」与「广播」下拉面板，可查看全部标签页全称、快速切换与关闭，支持一键清理所有掉线会话（SessionDropdownPanel + TabBar）。
+  - ✨ 广播级联重连：点击重连一个掉线会话，同广播组其他掉线会话自动一起重连（App.tsx cascadeReconnect）。
+  - ✨ AI 选区预览折叠：AI 助手选区预览默认单行展示，双击展开完整内容（AiPanel MessageBubble）。
+  - 🛠️ 广播重复加入确认：同连接重复加入广播组时弹出确认对话框，支持「本次会话不再提醒」（BroadcastDupDialog + sessionStorage）。
+  - 🛠️ 连接对话框校验增强：必填项标注红色星号，校验不通过时字段红框抖动并精确提示缺失项（ConnectionDialog）。
+  - 🛠️ 主题色与快捷命令校验：自定义主题颜色输入增加 hex 格式校验，快捷命令必填项标注星号。
+  - 🐛 广播组重连脱组：修复广播组成员重连后因 sessionId 变更而脱组的问题。
+  - 🐛 连接名称同步中断：修复连接名称跟随主机地址输入时首个字符后停止同步的问题。
+  - 🐛 AI 上下文溢出：AI 助手自动附带的最近输出内容限制为 5K 字符，选区内容不受限。
+- **版本号：** staging 含 ✨新增 → minor：v1.6.3 → **v1.7.0**。
+- **流程执行：** 用户确认闸门通过后 —— `tsc` PASS / `cargo check` PASS / `tauri:build` 成功（installer `MyShell_1.7.0_x64-setup.exe`）/ commit + push / Gitee 发布 / staging 清空 + baseline→v1.7.0。
+- **决策要点：** 用户只要 CHANGELOG 放 ✨新增 4 条，🛠️/🐛 条目记录在 progress 但不写入 CHANGELOG。
+- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS；`tauri:build` exit 0
+
+## 五问重启检查（阶段 45）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 45 complete —— v1.7.0 已发布，staging 已清空、baseline→v1.7.0 |
+| 我要去哪里？ | 下一项改动完成时按 doc-after-feature 追加 staging 条目 |
+| 目标是什么？ | 侧栏可调宽、会话面板统一管理、广播级联重连减少手动操作 |
+| 我学到了什么？ | BroadcastDupDialog 用 sessionStorage 记忆"本次不再提醒"偏好（重启重置）；SessionDropdownPanel 统一管理当前会话和广播组；广播级联重连通过 groupId 过滤同组掉线会话 |
+| 我做了什么？ | 版本 bump 1.7.0 + sync；CHANGELOG/README 加 v1.7.0 节 + badge；tsc+cargo check+tauri:build；commit+push；Gitee 发布；staging 清空 + baseline→v1.7.0；progress 阶段45 |

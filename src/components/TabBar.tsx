@@ -1,5 +1,7 @@
+import { useEffect, useRef, useState } from "react";
 import type { Tab } from "../api";
 import { ConnIcon } from "./ConnIcon";
+import { SessionDropdownPanel, DropdownTrigger, readAnchorRect } from "./SessionDropdownPanel";
 
 interface Props {
   tabs: Tab[];
@@ -9,6 +11,9 @@ interface Props {
   onReconnect: (id: string) => void;
   broadcastIds: Set<string>;
   onToggleBroadcast: (id: string) => void;
+  /** Batch-close every offline (disconnected/error) tab. Powers the
+   * "清理掉线" button in the dropdown panels. */
+  onCloseDisconnected: () => void;
 }
 
 // Status indicator colors and icons
@@ -27,8 +32,41 @@ export function TabBar({
   onReconnect,
   broadcastIds,
   onToggleBroadcast,
+  onCloseDisconnected,
 }: Props) {
   const broadcastCount = broadcastIds.size;
+
+  // Which dropdown panel is open: "sessions" (all tabs), "broadcast"
+  // (broadcast-group tabs), or null. Only one at a time; clicking the same
+  // trigger again closes it.
+  const [openPanel, setOpenPanel] = useState<"sessions" | "broadcast" | null>(null);
+  const sessionsTriggerRef = useRef<HTMLButtonElement>(null);
+  const broadcastTriggerRef = useRef<HTMLButtonElement>(null);
+  const [anchor, setAnchor] = useState<{ right: number; top: number } | null>(null);
+
+  // Broadcast-group tabs (already connected SSH terminals), in bar order, for
+  // the broadcast dropdown.
+  const broadcastTabs = tabs.filter((t) => broadcastIds.has(t.id));
+
+  // Auto-close the broadcast panel only when the group becomes empty (the
+  // trigger button disappears, so the panel would be orphaned). We do NOT
+  // close on every tab-count change: a user closing tabs from the sessions
+  // panel expects it to stay open so they can close several in a row.
+  useEffect(() => {
+    if (openPanel === "broadcast" && broadcastCount === 0) {
+      setOpenPanel(null);
+    }
+  }, [openPanel, broadcastCount]);
+
+  function togglePanel(which: "sessions" | "broadcast", triggerEl: HTMLElement | null) {
+    if (openPanel === which) {
+      setOpenPanel(null);
+      return;
+    }
+    const rect = readAnchorRect(triggerEl);
+    if (rect) setAnchor(rect);
+    setOpenPanel(which);
+  }
 
   return (
     <div
@@ -108,6 +146,7 @@ export function TabBar({
 
               {/* Tab Name */}
               <span
+                title={tab.name}
                 style={{
                   overflow: "hidden",
                   textOverflow: "ellipsis",
@@ -209,27 +248,81 @@ export function TabBar({
         })}
       </div>
 
-      {/* Broadcast Indicator */}
+      {/* Right-side dropdown triggers.
+          - "当前会话": lists ALL tabs (full names, never clipped) with quick
+            switch + close. Solves the "too many tabs, names cut off" problem.
+          - "广播": lists broadcast-group tabs; each row can switch to it or
+            leave the broadcast group. Only shown when a broadcast is active. */}
+
+      {/* All-sessions trigger — always visible so the full tab list is one
+          click away regardless of how many tabs overflow the bar. */}
+      <DropdownTrigger
+        icon="📑"
+        label="当前会话"
+        count={tabs.length}
+        active={openPanel === "sessions"}
+        title="查看/切换/关闭所有标签页"
+        triggerRef={sessionsTriggerRef}
+        onClick={() => togglePanel("sessions", sessionsTriggerRef.current)}
+      />
+
+      {/* Broadcast trigger — replaces the old static badge; now clickable to
+          open the broadcast-group panel. */}
       {broadcastCount > 0 && (
-        <div
-          title={`${broadcastCount} 个 tab 在广播组中：输入将同步到所有成员`}
-          className="animate-slide-in-right"
-          style={{
-            padding: "0 14px",
-            height: "100%",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            borderLeft: "1px solid var(--border-default)",
-            background: "var(--accent-primary-muted)",
-            color: "var(--accent-primary)",
-            fontSize: 11,
-            fontWeight: 600,
-          }}
-        >
-          <span style={{ fontSize: 14 }}>📡</span>
-          <span>广播 × {broadcastCount}</span>
-        </div>
+        <DropdownTrigger
+          icon="📡"
+          label="广播"
+          count={broadcastCount}
+          active={openPanel === "broadcast"}
+          title={`${broadcastCount} 个标签页在广播组中，点击查看/管理`}
+          triggerRef={broadcastTriggerRef}
+          onClick={() => togglePanel("broadcast", broadcastTriggerRef.current)}
+          accent
+        />
+      )}
+
+      {/* Dropdown panels */}
+      {openPanel === "sessions" && anchor && (
+        <SessionDropdownPanel
+          title="当前会话"
+          icon="📑"
+          anchorRect={anchor}
+          activeTabId={activeTabId}
+          onSelect={(t) => onSelect(t.id)}
+          onClose={() => setOpenPanel(null)}
+          emptyHint="暂无打开的标签页"
+          onCloseDisconnected={onCloseDisconnected}
+          disconnectedCount={tabs.filter(
+            (t) => t.status === "disconnected" || t.status === "error"
+          ).length}
+          rows={tabs.map((t) => ({
+            tab: t,
+            actionLabel: "✕",
+            actionTitle: "关闭标签页",
+            onAction: (tab) => onClose(tab.id),
+          }))}
+        />
+      )}
+      {openPanel === "broadcast" && anchor && (
+        <SessionDropdownPanel
+          title="广播组成员"
+          icon="📡"
+          anchorRect={anchor}
+          activeTabId={activeTabId}
+          onSelect={(t) => onSelect(t.id)}
+          onClose={() => setOpenPanel(null)}
+          emptyHint="广播组为空"
+          onCloseDisconnected={onCloseDisconnected}
+          disconnectedCount={broadcastTabs.filter(
+            (t) => t.status === "disconnected" || t.status === "error"
+          ).length}
+          rows={broadcastTabs.map((t) => ({
+            tab: t,
+            actionLabel: "退出",
+            actionTitle: "退出广播组",
+            onAction: (tab) => onToggleBroadcast(tab.id),
+          }))}
+        />
       )}
     </div>
   );

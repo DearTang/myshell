@@ -6,7 +6,7 @@
   <img src="src-tauri/icons/icon.png" width="120" alt="MyShell" />
 </p>
 
-![Version](https://img.shields.io/badge/version-1.6.3-blue)
+![Version](https://img.shields.io/badge/version-1.7.0-blue)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-green)
 ![React](https://img.shields.io/badge/React-18-blue)
 ![Rust](https://img.shields.io/badge/Rust-1.70+-orange)
@@ -78,6 +78,16 @@
 
 
 ## 更新日志
+
+### v1.7.0（2026-06-25）
+
+侧栏交互增强、会话管理面板、广播级联重连等新功能。
+
+#### ✨ 新增
+- **侧栏拖拽调宽**：连接管理面板支持拖拽调整宽度（宽度持久化），鼠标悬停连接名可查看全称及主机地址
+- **会话管理面板**：新增「当前会话」与「广播」下拉面板，可查看全部标签页全称、快速切换与关闭，支持一键清理所有掉线会话
+- **广播级联重连**：点击重连一个掉线会话，同广播组其他掉线会话自动一起重连
+- **AI 选区预览折叠**：AI 助手选区预览默认单行展示，双击展开完整内容
 
 ### v1.6.3（2026-06-25）
 

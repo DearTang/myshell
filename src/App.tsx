@@ -10,6 +10,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { AiPanel } from "./components/AiPanel";
 import { QuickCommandsPanel } from "./components/QuickCommandsPanel";
 import { AboutDialog } from "./components/AboutDialog";
+import { BroadcastDupDialog } from "./components/BroadcastDupDialog";
 import { UpdateNotification } from "./components/UpdateNotification";
 import { BrandLogo } from "./components/BrandLogo";
 import type { Terminal } from "@xterm/xterm";
@@ -174,12 +175,71 @@ export default function App() {
   // input, so they're filtered out at target-collection time.
   const [broadcastIds, setBroadcastIds] = useState<Set<string>>(new Set());
 
-  function toggleBroadcast(tabId: string) {
+  // Session-scoped "don't remind me again" for the duplicate-connection
+  // broadcast prompt. Lives in a ref (NOT localStorage) so it resets on every
+  // app restart — the user's choice only sticks for the current session. Once
+  // true, adding any further same-connection tab to the broadcast group goes
+  // through without prompting.
+  const broadcastDupDismissedRef = useRef(false);
+  // Remembers the user's last "不再提醒" checkbox choice across prompts within
+  // the session. Starts true (default-checked) but if the user ever unchecks
+  // it, every later prompt reopens already unchecked — matching their stated
+  // preference. Session-scoped (ref, not storage) so it resets on restart.
+  const broadcastDupDontRemindPrefRef = useRef(true);
+  // Pending duplicate prompt: the tabId the user is trying to add, plus how
+  // many same-connection tabs are already in the group (for the dialog text),
+  // and the initial checkbox state (the user's last choice).
+  const [broadcastDupPrompt, setBroadcastDupPrompt] = useState<{
+    tabId: string;
+    connectionName: string;
+    existingCount: number;
+    initialDontRemind: boolean;
+  } | null>(null);
+
+  /** Actually add/remove a tab in the broadcast set. Split out from
+   * toggleBroadcast so the duplicate-confirm path can call it after the user
+   * has accepted. */
+  function setBroadcastMembership(tabId: string, inGroup: boolean) {
     setBroadcastIds((prev) => {
       const next = new Set(prev);
-      if (next.has(tabId)) next.delete(tabId);
-      else next.add(tabId);
+      if (inGroup) next.add(tabId);
+      else next.delete(tabId);
       return next;
+    });
+  }
+
+  function toggleBroadcast(tabId: string) {
+    const tab = tabs.find((t) => t.id === tabId);
+    if (!tab) return;
+    // Toggling OFF or a tab with no connection → no duplicate concern, just
+    // flip membership.
+    if (broadcastIds.has(tabId) || !tab.connectionId) {
+      setBroadcastMembership(tabId, !broadcastIds.has(tabId));
+      return;
+    }
+    // Count same-connection tabs already in the group. If none, no duplicate.
+    const dupCount = tabs.filter(
+      (t) => broadcastIds.has(t.id) && t.connectionId === tab.connectionId
+    ).length;
+    if (dupCount === 0) {
+      setBroadcastMembership(tabId, true);
+      return;
+    }
+    // Duplicate detected. If the user already silenced this prompt for the
+    // session, proceed without asking.
+    if (broadcastDupDismissedRef.current) {
+      setBroadcastMembership(tabId, true);
+      return;
+    }
+    // Otherwise surface the prompt. The dialog's confirm/cancel callbacks
+    // decide whether to actually add.
+    const connName =
+      connections.find((c) => c.id === tab.connectionId)?.name || tab.name;
+    setBroadcastDupPrompt({
+      tabId,
+      connectionName: connName,
+      existingCount: dupCount,
+      initialDontRemind: broadcastDupDontRemindPrefRef.current,
     });
   }
 
@@ -189,21 +249,17 @@ export default function App() {
    *  - Otherwise: empty array — TerminalPanel falls back to single-target.
    * The list is recomputed on every render so toggling membership is
    * reflected immediately; TerminalPanel reads it via a live ref so the
-   * onData handler doesn't need rebinding. */
+   * onData handler doesn't need rebinding.
+   *
+   * Note: we no longer de-dup by connectionId here. Two tabs of the same
+   * connection are allowed to both receive broadcast — the duplicate case is
+   * handled as a one-time prompt at toggle time (see toggleBroadcast), so by
+   * the time a tab is in the group the user has agreed it should receive
+   * keystrokes. This supports the jump-box pattern (one connection, several
+   * tabs each SSH'd onward to different hosts). */
   function getBroadcastTargets(tab: Tab): string[] {
     if (!tab.sessionId || !broadcastIds.has(tab.id)) return [];
     const targets: string[] = [];
-    // Don't broadcast to two sessions of the SAME connection: if the user
-    // opened the same host in two tabs and put both in the broadcast group,
-    // sending identical keystrokes to both is redundant and surprising
-    // (double-execution on one server). Keep one session per connectionId.
-    const seenConnections = new Set<string>();
-    // Seed with the origin's connection so OTHER tabs of the same server are
-    // excluded. The origin's own session is added unconditionally below
-    // (TerminalPanel sends only to `targets`, not also to self, so the origin
-    // must always be present or the user's typing wouldn't reach their own
-    // terminal).
-    if (tab.connectionId) seenConnections.add(tab.connectionId);
     for (const t of tabs) {
       if (
         !broadcastIds.has(t.id) ||
@@ -214,12 +270,6 @@ export default function App() {
       ) {
         continue;
       }
-      if (t.id === tab.id) {
-        targets.push(t.sessionId);
-        continue;
-      }
-      if (t.connectionId && seenConnections.has(t.connectionId)) continue;
-      if (t.connectionId) seenConnections.add(t.connectionId);
       targets.push(t.sessionId);
     }
     return targets;
@@ -331,9 +381,12 @@ export default function App() {
     }
   }
 
-  async function handleReconnect(tabId: string) {
+  /** Reconnect a single tab by its id. Returns true on success. Extracted from
+   * handleReconnect so the broadcast-cascade path can reuse it without
+   * re-triggering the cascade logic recursively. */
+  async function reconnectOne(tabId: string): Promise<boolean> {
     const tab = tabs.find((t) => t.id === tabId);
-    if (!tab || !tab.config) return;
+    if (!tab || !tab.config) return false;
 
     // Update status to connecting
     setTabs((prev) =>
@@ -347,9 +400,11 @@ export default function App() {
     try {
       const config = tab.config;
       const connType = config.conn_type ?? "ssh";
+      let newId = tabId;
 
       if (connType === "ftp") {
         const ftpId = await ftpConnect(config);
+        newId = ftpId;
         setTabs((prev) =>
           prev.map((t) =>
             t.id === tabId
@@ -367,6 +422,7 @@ export default function App() {
         setActiveTabId(ftpId);
       } else if (connType === "local") {
         const sessionId = await localConnect(config);
+        newId = sessionId;
         setTabs((prev) =>
           prev.map((t) =>
             t.id === tabId
@@ -383,6 +439,7 @@ export default function App() {
         setActiveTabId(sessionId);
       } else {
         const sessionId = await sshConnect(config);
+        newId = sessionId;
         setTabs((prev) =>
           prev.map((t) =>
             t.id === tabId
@@ -398,6 +455,21 @@ export default function App() {
         );
         setActiveTabId(sessionId);
       }
+      // A reconnect mints a fresh session id, so the tab's id changes. The
+      // broadcast group stores tab IDs — if we don't migrate, the old id stays
+      // in broadcastIds while no tab carries it anymore, so the reconnecting
+      // tab silently drops out of the group (and stops receiving broadcast
+      // keystrokes). Swap the old id for the new one to keep membership.
+      if (newId !== tabId) {
+        setBroadcastIds((prev) => {
+          if (!prev.has(tabId)) return prev;
+          const next = new Set(prev);
+          next.delete(tabId);
+          next.add(newId);
+          return next;
+        });
+      }
+      return true;
     } catch (e) {
       const errorMessage = String(e);
       setTabs((prev) =>
@@ -407,7 +479,39 @@ export default function App() {
             : t
         )
       );
+      return false;
     }
+  }
+
+  async function handleReconnect(tabId: string) {
+    await reconnectOne(tabId);
+    // Broadcast cascade: if the tab we just reconnected is in the broadcast
+    // group, reconnect every OTHER member of the same group that's also down
+    // (disconnected/error). This lets a user revive a whole jump-box fleet
+    // with a single click instead of reconnecting each tab one by one.
+    // Members already connected/connecting are left alone.
+    if (broadcastIds.has(tabId)) {
+      const downSiblings = tabs.filter(
+        (t) =>
+          t.id !== tabId &&
+          broadcastIds.has(t.id) &&
+          t.config &&
+          (t.status === "disconnected" || t.status === "error")
+      );
+      // Reconnect in parallel — they're independent sessions.
+      await Promise.all(downSiblings.map((t) => reconnectOne(t.id)));
+    }
+  }
+
+  /** Batch-close every tab that's currently offline (disconnected or error).
+   * Used by the "一键删除掉线会话" button in both dropdown panels. Reuses
+   * handleCloseTab per-id so each disconnect + broadcast cleanup + active-tab
+   * fallback runs identically to a manual close. */
+  async function handleCloseDisconnected() {
+    const down = tabs.filter(
+      (t) => t.status === "disconnected" || t.status === "error"
+    );
+    await Promise.all(down.map((t) => handleCloseTab(t.id)));
   }
 
   async function handleCloseTab(tabId: string) {
@@ -528,6 +632,7 @@ export default function App() {
           onReconnect={handleReconnect}
           broadcastIds={broadcastIds}
           onToggleBroadcast={toggleBroadcast}
+          onCloseDisconnected={handleCloseDisconnected}
         />
         <div
           style={{
@@ -722,6 +827,29 @@ export default function App() {
       {vault === "ready" && updateInfo?.has_update && (
         <UpdateNotification
           updateInfo={updateInfo}
+        />
+      )}
+      {broadcastDupPrompt && (
+        <BroadcastDupDialog
+          connectionName={broadcastDupPrompt.connectionName}
+          existingCount={broadcastDupPrompt.existingCount}
+          initialDontRemind={broadcastDupPrompt.initialDontRemind}
+          onConfirm={(dontRemindAgain) => {
+            // Remember the user's checkbox choice for the next prompt this
+            // session, then fold it into the session dismiss flag: checked ⇒
+            // all future duplicate adds skip the prompt; unchecked ⇒ only this
+            // add is allowed through, the next one will prompt again.
+            broadcastDupDontRemindPrefRef.current = dontRemindAgain;
+            if (dontRemindAgain) broadcastDupDismissedRef.current = true;
+            setBroadcastMembership(broadcastDupPrompt.tabId, true);
+            setBroadcastDupPrompt(null);
+          }}
+          onCancel={(lastDontRemind) => {
+            // Even on cancel we keep the user's checkbox preference so the
+            // next prompt reopens in the same state they left it.
+            broadcastDupDontRemindPrefRef.current = lastDontRemind;
+            setBroadcastDupPrompt(null);
+          }}
         />
       )}
     </div>
