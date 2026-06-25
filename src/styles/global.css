@@ -255,6 +255,16 @@ input, select, textarea {
   to { transform: rotate(360deg); }
 }
 
+/* Horizontal jitter used to flag a required field that's still empty when the
+   user hits Save — draws the eye to exactly which input needs filling. */
+@keyframes fieldShake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-6px); }
+  40% { transform: translateX(5px); }
+  60% { transform: translateX(-4px); }
+  80% { transform: translateX(3px); }
+}
+
 .animate-fade-in {
   animation: fadeIn var(--duration-normal) var(--ease-out-expo);
 }
@@ -269,6 +279,17 @@ input, select, textarea {
 
 .animate-slide-in-right {
   animation: slideInRight var(--duration-slow) var(--ease-out-expo);
+}
+
+/* Applied to a required field that failed Save validation. The inline red
+   border stays until the field is corrected; the shake plays once on attach. */
+.field-error {
+  border-color: var(--error) !important;
+  box-shadow: 0 0 0 3px var(--error-muted) !important;
+}
+
+.field-error-shake {
+  animation: fieldShake 0.4s var(--ease-in-out);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

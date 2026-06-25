@@ -1559,11 +1559,12 @@ function Divider() {
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, required, children }: { label: string; required?: boolean; children: React.ReactNode }) {
   return (
     <div style={{ marginBottom: 12 }}>
       <label style={{ display: "block", fontSize: 12, color: "var(--text-secondary)", marginBottom: 6, fontWeight: 500 }}>
         {label}
+        {required && <span style={{ color: "var(--error)", marginLeft: 3, fontWeight: 700 }}>*</span>}
       </label>
       {children}
     </div>
@@ -1578,6 +1579,7 @@ function Input({
   inputRef,
   autoFocus,
   error,
+  invalid,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -1586,7 +1588,12 @@ function Input({
   inputRef?: React.RefObject<HTMLInputElement>;
   autoFocus?: boolean;
   error?: string;
+  /** Red border/glow WITHOUT a trailing message — use when the error text is
+   * rendered elsewhere (e.g. beside a color picker). `error` is the older
+   * "red border + inline message" combo; pick one per field. */
+  invalid?: boolean;
 }) {
+  const bad = !!error || !!invalid;
   return (
     <>
       <input
@@ -1597,11 +1604,13 @@ function Input({
         placeholder={placeholder}
         autoFocus={autoFocus}
         onFocus={(e) => {
-          e.currentTarget.style.borderColor = "var(--accent-primary)";
-          e.currentTarget.style.boxShadow = "0 0 0 3px var(--accent-primary-muted)";
+          e.currentTarget.style.borderColor = bad ? "var(--error)" : "var(--accent-primary)";
+          e.currentTarget.style.boxShadow = bad
+            ? "0 0 0 3px var(--error-muted)"
+            : "0 0 0 3px var(--accent-primary-muted)";
         }}
         onBlur={(e) => {
-          e.currentTarget.style.borderColor = error ? "var(--error)" : "var(--border-default)";
+          e.currentTarget.style.borderColor = bad ? "var(--error)" : "var(--border-default)";
           e.currentTarget.style.boxShadow = "none";
         }}
         style={{
@@ -1609,7 +1618,7 @@ function Input({
           padding: "10px 12px",
           background: "var(--bg-input)",
           color: "var(--text-primary)",
-          border: `1px solid ${error ? "var(--error)" : "var(--border-default)"}`,
+          border: `1px solid ${bad ? "var(--error)" : "var(--border-default)"}`,
           borderRadius: "var(--radius-md)",
           fontSize: 13,
           outline: "none",
@@ -1731,17 +1740,24 @@ function CustomPaletteDialog({
   onSave: () => void;
   onClose: () => void;
 }) {
+  // Validate the hex inputs — the color picker always produces valid #RRGGBB,
+  // but the free-text Input next to it can hold anything. Rejecting invalid
+  // hex here prevents silently baking broken CSS colors into the saved theme.
+  const isValidHex = (h: string) => /^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/.test(h.trim());
+  const accentValid = isValidHex(accent);
+  const bgValid = isValidHex(bg);
+  const canSave = accentValid && bgValid;
   return (
     <Dialog title="自定义主题" icon="🎨" onClose={onClose}>
       <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
         选择主题色和终端背景色，保存为自定义主题
       </div>
 
-      <Field label="主题色">
+      <Field label="主题色" required>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <input
             type="color"
-            value={accent}
+            value={accentValid ? accent : "#6366f1"}
             onChange={(e) => onAccentChange(e.target.value)}
             style={{
               width: 36,
@@ -1757,15 +1773,21 @@ function CustomPaletteDialog({
             value={accent}
             onChange={onAccentChange}
             placeholder="#6366f1"
+            invalid={!accentValid}
           />
         </div>
+        {!accentValid && (
+          <div style={{ fontSize: 11, color: "var(--error)", marginTop: 4 }}>
+            请输入合法的颜色值，如 #6366f1 或 #f1f
+          </div>
+        )}
       </Field>
 
-      <Field label="终端背景色">
+      <Field label="终端背景色" required>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <input
             type="color"
-            value={bg}
+            value={bgValid ? bg : "#1e1e2e"}
             onChange={(e) => onBgChange(e.target.value)}
             style={{
               width: 36,
@@ -1781,8 +1803,14 @@ function CustomPaletteDialog({
             value={bg}
             onChange={onBgChange}
             placeholder="#1e1e2e"
+            invalid={!bgValid}
           />
         </div>
+        {!bgValid && (
+          <div style={{ fontSize: 11, color: "var(--error)", marginTop: 4 }}>
+            请输入合法的颜色值，如 #1e1e2e 或 #222
+          </div>
+        )}
       </Field>
 
       {/* Preview */}
@@ -1834,17 +1862,19 @@ function CustomPaletteDialog({
         </button>
         <button
           onClick={onSave}
+          disabled={!canSave}
+          title={canSave ? undefined : "请输入合法的主题色和背景色"}
           style={{
             padding: "10px 24px",
-            background: "var(--accent-primary)",
-            color: "white",
+            background: canSave ? "var(--accent-primary)" : "var(--bg-surface-hover)",
+            color: canSave ? "white" : "var(--text-muted)",
             border: "none",
             borderRadius: "var(--radius-md)",
             fontSize: 13,
             fontWeight: 600,
-            cursor: "pointer",
+            cursor: canSave ? "pointer" : "not-allowed",
+            boxShadow: canSave ? "var(--shadow-glow)" : "none",
             transition: "all var(--duration-fast) var(--ease-in-out)",
-            boxShadow: "var(--shadow-glow)",
           }}
         >
           保存

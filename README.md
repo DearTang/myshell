@@ -6,7 +6,7 @@
   <img src="src-tauri/icons/icon.png" width="120" alt="MyShell" />
 </p>
 
-![Version](https://img.shields.io/badge/version-1.6.2-blue)
+![Version](https://img.shields.io/badge/version-1.6.3-blue)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-green)
 ![React](https://img.shields.io/badge/React-18-blue)
 ![Rust](https://img.shields.io/badge/Rust-1.70+-orange)
@@ -78,6 +78,18 @@
 
 
 ## 更新日志
+
+### v1.6.3（2026-06-25）
+
+表单必填校验与 AI 交互细节优化。
+
+#### 🛠️ 优化
+- **AI 面板终端输出截断**：自动附带的终端输出限制为 5000 字符，超长时显示截断提示
+- **AI 面板引用内容折叠**：用户引用内容默认单行，双击展开完整内容
+- **新建连接必填校验**：保存时标红必填字段，自动聚焦首个未填项并抖动提示
+- **连接名称自动填充优化**：手动修改名称后不再被主机输入覆盖
+- **快捷命令必填标注**：名称和命令字段标注红色星号，未填写时禁用保存
+- **自定义主题色校验**：颜色值增加 HEX 格式校验，非法输入时禁用保存
 
 ### v1.6.2（2026-06-24）
 

@@ -460,13 +460,26 @@ function EditorForm({
             marginBottom: 4,
           }}
         >
-          名称
+          名称<span style={{ color: "var(--error)", marginLeft: 3, fontWeight: 700 }}>*</span>
         </label>
         <input
           value={label}
           onChange={(e) => onLabel(e.target.value)}
           placeholder="如：重启 nginx"
           autoFocus
+          className={!label.trim() ? "field-error" : undefined}
+          onFocus={(e) => {
+            if (label.trim()) {
+              e.currentTarget.style.borderColor = "var(--accent-primary)";
+              e.currentTarget.style.boxShadow = "0 0 0 3px var(--accent-primary-muted)";
+            }
+          }}
+          onBlur={(e) => {
+            if (label.trim()) {
+              e.currentTarget.style.borderColor = "var(--border-default)";
+              e.currentTarget.style.boxShadow = "none";
+            }
+          }}
           style={{
             width: "100%",
             boxSizing: "border-box",
@@ -490,12 +503,26 @@ function EditorForm({
           }}
         >
           命令（每行一条，按顺序执行；以 # 开头的行和空行会被跳过）
+          <span style={{ color: "var(--error)", marginLeft: 3, fontWeight: 700 }}>*</span>
         </label>
         <textarea
           value={command}
           onChange={(e) => onCommand(e.target.value)}
           placeholder={"sudo systemctl restart nginx\n# 清理 7 天前的日志\nfind /var/log -mtime +7 -delete"}
           rows={8}
+          className={!command.trim() ? "field-error" : undefined}
+          onFocus={(e) => {
+            if (command.trim()) {
+              e.currentTarget.style.borderColor = "var(--accent-primary)";
+              e.currentTarget.style.boxShadow = "0 0 0 3px var(--accent-primary-muted)";
+            }
+          }}
+          onBlur={(e) => {
+            if (command.trim()) {
+              e.currentTarget.style.borderColor = "var(--border-default)";
+              e.currentTarget.style.boxShadow = "none";
+            }
+          }}
           style={{
             width: "100%",
             boxSizing: "border-box",
@@ -530,6 +557,7 @@ function EditorForm({
         <button
           onClick={onSave}
           disabled={!canSave}
+          title={canSave ? undefined : "请填写名称和命令（标 * 的必填项）"}
           style={{
             padding: "8px 16px",
             background: canSave ? "var(--accent-primary)" : "var(--bg-surface-hover)",

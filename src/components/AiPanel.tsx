@@ -75,6 +75,20 @@ function readRecentLines(term: Terminal, n: number): string {
   return lines.slice(-n).join("\n");
 }
 
+/** Cap auto-attached recent terminal output so we never flood the system
+ * prompt. Keeps the most recent `max` characters and stamps a truncation note
+ * at the top when something was dropped. User selections are NOT capped — the
+ * user explicitly chose that text, so we send it verbatim. */
+const RECENT_OUTPUT_MAX = 5000;
+function capRecentOutput(s: string): string {
+  if (s.length <= RECENT_OUTPUT_MAX) return s;
+  const dropped = s.length - RECENT_OUTPUT_MAX;
+  return (
+    `…（已省略较早的 ${dropped} 个字符，仅保留最近输出）\n` +
+    s.slice(s.length - RECENT_OUTPUT_MAX)
+  );
+}
+
 export function AiPanel({
   activeConnType,
   activeConnectionName,
@@ -121,7 +135,7 @@ export function AiPanel({
       if (sel && sel.trim()) ctx.selection = sel;
       else {
         const out = readRecentLines(activeTerm, 40);
-        if (out) ctx.terminalOutput = out;
+        if (out) ctx.terminalOutput = capRecentOutput(out);
       }
     }
     return ctx;
@@ -136,7 +150,7 @@ export function AiPanel({
       const sel = activeTerm.getSelection();
       if (sel && sel.trim()) return sel;
       const out = readRecentLines(activeTerm, 40);
-      if (out) return out;
+      if (out) return capRecentOutput(out);
     }
     return undefined;
   }, [activeTerm, attachedSelection]);
@@ -538,6 +552,7 @@ function MessageBubble({
   canPaste: boolean;
 }) {
   const isUser = msg.role === "user";
+  const [selExpanded, setSelExpanded] = useState(false);
   return (
     <div style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start" }}>
       <div
@@ -563,6 +578,8 @@ function MessageBubble({
       >
         {isUser && msg.selection && (
           <div
+            onDoubleClick={() => setSelExpanded((v) => !v)}
+            title={selExpanded ? "双击收起为单行" : "双击展开完整内容"}
             style={{
               fontSize: 11,
               lineHeight: 1.5,
@@ -571,14 +588,17 @@ function MessageBubble({
               border: "1px solid var(--border-subtle)",
               borderRadius: 6,
               padding: "6px 8px",
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              maxHeight: 120,
-              overflowY: "auto",
+              whiteSpace: selExpanded ? "pre-wrap" : "nowrap",
+              overflow: selExpanded ? "auto" : "hidden",
+              textOverflow: selExpanded ? undefined : "ellipsis",
+              wordBreak: selExpanded ? "break-word" : undefined,
+              maxHeight: selExpanded ? 240 : undefined,
               fontFamily: "'Cascadia Code', Consolas, monospace",
+              cursor: "default",
+              userSelect: "none",
             }}
           >
-            {msg.selection}
+            {selExpanded ? msg.selection : msg.selection.replace(/\s+/g, " ").trim()}
           </div>
         )}
         {isUser ? (

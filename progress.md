@@ -1146,3 +1146,26 @@
 | 目标是什么？ | 让用户更新体验顺滑（弹窗不花哨、版本号正确、进度条不跳、非管理员也能一键升级） |
 | 我学到了什么？ | staging 驱动的发布流程首次端到端跑通，5 条种子全部准确映射、无补条需求；临时发布说明 `.release-notes-v1.6.2.md` 用完即弃（.gitignore 不在，但本地文件未提交、后续可删）；`git diff --stat baseline..HEAD` 作为兜底确实只起防漏校验、这次零补条 |
 | 我做了什么？ | 版本 bump 1.6.2 + sync；CHANGELOG/README 加 v1.6.2 节 + badge；tsc+cargo check+tauri:build；commit+push release: v1.6.2；Gitee 发布（id=724075，installer 上传）；staging 清空 + baseline→v1.6.2 commit+push；progress 阶段43 |
+
+### 阶段 44：发布 v1.6.3 —— 表单必填校验 + AI 交互细节（2026-06-25）
+- **需求：** `打包` v1.6.3。本次内容为表单必填校验体系与 AI 面板交互细节优化（来自 staging 6 条）。
+- **发布内容（staging 主导 + git diff 防漏，6 条全映射，无遗漏）：**
+  - 🛠️ AI 面板终端输出截断：自动附带的终端输出限制 5000 字符，超长时显示截断提示（AiPanel.tsx `capRecentOutput`）。
+  - 🛠️ AI 面板引用内容折叠：用户引用内容默认单行，双击展开完整内容（MessageBubble 双击切换）。
+  - 🛠️ 新建连接必填校验：保存时标红必填字段、自动聚焦首个未填项并抖动（ConnectionDialog validate() + fieldErrors + shakeNonce）。
+  - 🛠️ 连接名称自动填充优化：手动修改名称后不再被主机输入覆盖（handleHostChange 基于 prevHost 判断）。
+  - 🛠️ 快捷命令必填标注：名称和命令字段标红星号，未填写时禁用保存（QuickCommandsPanel field-error）。
+  - 🛠️ 自定义主题色校验：HEX 格式校验，非法输入时禁用保存（SettingsPanel isValidHex + canSave）。
+- **版本号：** staging 全是 �️ 无 ✨ → patch：v1.6.2 → **v1.6.3**。
+- **流程执行：** 用户确认闸门通过后 —— `tsc` PASS / `cargo check` PASS / `tauri:build` 成功（installer `MyShell_1.6.3_x64-setup.exe`）/ commit + push / Gitee 发布 / staging 清空 + baseline→v1.6.3。
+- **决策要点：** 5 个文件改动（AiPanel/ConnectionDialog/QuickCommandsPanel/SettingsPanel/global.css），逐一核对均被 staging 覆盖，无需补条目。
+- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS；`tauri:build` exit 0。
+
+## 五问重启检查（阶段 44）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 44 complete —— v1.6.3 已发布，staging 已清空、baseline→v1.6.3 |
+| 我要去哪里？ | 下一项改动完成时按 doc-after-feature 追加 staging 条目 |
+| 目标是什么？ | 表单交互体验一致化：必填字段有视觉反馈、AI 上下文不溢出 |
+| 我学到了什么？ | ConnectionDialog 的 validate() 改为全量校验（不 short-circuit），配合 fieldErrors + shakeNonce 实现多字段同时标红 + 抖动；连接名称自动填充的「骑手检测」（name === prevHost）比原来的 touchedRef 更精准 |
+| 我做了什么？ | 版本 bump 1.6.3 + sync；CHANGELOG/README 加 v1.6.3 节 + badge；tsc+cargo check+tauri:build；commit+push；Gitee 发布；staging 清空 + baseline→v1.6.3；progress 阶段44 |

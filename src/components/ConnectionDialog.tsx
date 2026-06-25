@@ -32,6 +32,20 @@ const SHELL_PRESETS: { value: string; label: string }[] = [
   { value: "C:\\Program Files\\Git\\bin\\bash.exe", label: "Git Bash" },
 ];
 
+/// Validation field keys in the order we want to focus them when Save fails.
+/// Matches the keys emitted by `validate()` and consumed by the Input `error`
+/// props. Used to drop the cursor into the first empty required field.
+const FIELD_FOCUS_ORDER = [
+  "name",
+  "host",
+  "port",
+  "username",
+  "password",
+  "shellPath",
+  "proxyHost",
+  "proxyPort",
+] as const;
+
 export function ConnectionDialog({ config, onClose, onSave, initialConnType, initialFolderPath, folders = [] }: Props) {
   const [connType, setConnType] = useState<ConnType>(
     (config?.conn_type as ConnType) || initialConnType || "ssh"
@@ -73,7 +87,29 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
   const [showPassword, setShowPassword] = useState(false);
   const [showProxyPassword, setShowProxyPassword] = useState(false);
   const [passwordVerifyTarget, setPasswordVerifyTarget] = useState<"password" | "proxy" | null>(null);
-  const nameTouchedRef = useRef(!!config?.name);
+
+  // refs to the actual DOM inputs, keyed by the validate() field keys so we
+  // can focus the first invalid field on Save. Registered by each Input via
+  // the `errorKey` prop.
+  const fieldRefs = useRef<Record<string, HTMLElement | null>>({});
+  function registerField(key: string, el: HTMLElement | null) {
+    fieldRefs.current[key] = el;
+  }
+  function focusField(key: string) {
+    fieldRefs.current[key]?.focus();
+  }
+
+  // Fields currently flagged as invalid. Keys are stable strings; a value of
+  // true means "show red border + shake". Bumped whenever Save hits a fresh
+  // validation failure so the shake animation replays even if the same field
+  // was already in the error set.
+  const [fieldErrors, setFieldErrors] = useState<Record<string, boolean>>({});
+  const [shakeNonce, setShakeNonce] = useState(0);
+
+  /** Mark a field as valid again as soon as the user touches/edits it. */
+  function clearFieldError(key: string) {
+    setFieldErrors((prev) => (prev[key] ? { ...prev, [key]: false } : prev));
+  }
 
   useEffect(() => {
     return () => {
@@ -86,17 +122,32 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
   }, []);
 
   function handleHostChange(v: string) {
+    const prevHost = host;
     setHost(v);
-    if (!nameTouchedRef.current) setName(v);
+    clearFieldError("host");
+    clearFieldError("name");
+    // Auto-fill the connection name from the host while the user is still
+    // "riding" the auto-fill — i.e. the name so far equals the host's prefix.
+    // We detect this by checking whether name === prevHost (the host value one
+    // keystroke ago): if so, the name was auto-mirroring and should keep
+    // tracking the host. The moment the user edits the name independently it
+    // diverges from that prefix and we stop syncing, so their manual edit
+    // sticks. Typing then clearing the host fully resets to auto-fill.
+    if (name === prevHost || name.trim() === "") {
+      setName(v);
+    }
   }
 
   function handleNameChange(v: string) {
-    nameTouchedRef.current = true;
     setName(v);
+    clearFieldError("name");
   }
 
   function handleTypeChange(t: ConnType) {
     setConnType(t);
+    // Required fields differ per type (e.g. local has no host/port), so any
+    // stale per-field flags are meaningless now — clear them all.
+    setFieldErrors({});
     setPort((prev) => {
       const n = parseInt(prev, 10);
       const isDefault = n === 22 || n === 21 || prev === "";
@@ -107,25 +158,61 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
     });
   }
 
-  // Build the ConnectionConfig exactly as `handleSave` would (so the test
-  // reflects precisely what would be committed). Returns null — and alerts
-  // the reason — when validation fails. Shared by both save and test so the
-  // two paths can't drift.
-  function buildConfig(): ConnectionConfig | null {
+  // Validate the form. Returns a map of { fieldKey -> message } for every
+  // problem found; empty map = valid. Runs ALL checks (doesn't short-circuit)
+  // so Save can flag every missing field at once instead of one alert at a
+  // time. Keyed by the same stable ids used by the Input `error` props.
+  function validate(): Record<string, string> {
+    const errs: Record<string, string> = {};
+
     // Local terminal — no host/port/auth, just a shell to spawn.
     if (connType === "local") {
-      if (!name.trim()) {
-        alert("请填写连接名称");
-        return null;
+      if (!name.trim()) errs.name = "请填写连接名称";
+      if (!shellPath.trim()) errs.shellPath = "请填写启动 shell 路径";
+      return errs;
+    }
+
+    if (!name.trim()) errs.name = "请填写连接名称";
+    if (!host.trim()) errs.host = "请填写主机地址";
+    if (!username.trim()) errs.username = "请填写用户名";
+
+    const portNum = parseInt(port, 10);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+      errs.port = "端口必须为 1-65535 之间的整数";
+    }
+
+    const isEditing = !!config?.id;
+    if (authMethod === "password" && !isEditing && !password) {
+      errs.password = "请填写密码";
+    }
+
+    if (proxyType !== "none") {
+      if (!proxyHost.trim()) errs.proxyHost = "代理主机地址不能为空";
+      const pp = parseInt(proxyPort, 10);
+      if (!Number.isInteger(pp) || pp < 1 || pp > 65535) {
+        errs.proxyPort = "代理端口必须为 1-65535 之间的整数";
       }
-      if (!shellPath.trim()) {
-        alert("请填写启动 shell 路径");
-        return null;
-      }
-      const trimmedGroup = groupPath
-        .trim()
-        .replace(/^\/+|\/+$/g, "")
-        .replace(/\/+/g, "/");
+    }
+    return errs;
+  }
+
+  // Build the ConnectionConfig exactly as `handleSave` would (so the test
+  // reflects precisely what would be committed). Returns null when validation
+  // fails — the caller is expected to have run `validate()` first and surfaced
+  // the per-field errors. Shared by both save and test so the two paths can't
+  // drift.
+  function buildConfig(): ConnectionConfig | null {
+    const errs = validate();
+    if (Object.keys(errs).length > 0) return null;
+
+    const trimmedGroup = groupPath
+      .trim()
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/\/+/g, "/");
+    const group = trimmedGroup ? `/${trimmedGroup}` : "/";
+
+    // Local terminal — no host/port/auth, just a shell to spawn.
+    if (connType === "local") {
       return {
         id: config?.id || crypto.randomUUID(),
         name: name.trim(),
@@ -134,7 +221,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
         username: "",
         auth_method: "password", // unused for local, struct requires a value
         conn_type: "local",
-        group_path: trimmedGroup ? `/${trimmedGroup}` : "/",
+        group_path: group,
         shell_path: shellPath.trim(),
         shell_args: shellArgs.trim() || undefined,
         init_command: initCommand.trim() || undefined,
@@ -143,43 +230,14 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
       };
     }
 
-    if (!name.trim() || !host.trim() || !username.trim()) {
-      alert("请填写必要字段");
-      return null;
-    }
-
     const portNum = parseInt(port, 10);
-    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
-      alert("端口号必须为 1-65535 之间的整数");
-      return null;
-    }
-
     const isEditing = !!config?.id;
-    if (authMethod === "password" && !isEditing && !password) {
-      alert("请填写密码");
-      return null;
-    }
-
-    let proxyPortNum: number | undefined;
-    if (proxyType !== "none") {
-      if (!proxyHost.trim()) {
-        alert("代理主机地址不能为空");
-        return null;
-      }
-      const pp = parseInt(proxyPort, 10);
-      if (!Number.isInteger(pp) || pp < 1 || pp > 65535) {
-        alert("代理端口必须为 1-65535 之间的整数");
-        return null;
-      }
-      proxyPortNum = pp;
-    }
-
     const passwordToSend =
       authMethod === "password" && password ? password : undefined;
-    const trimmedGroup = groupPath
-      .trim()
-      .replace(/^\/+|\/+$/g, "")
-      .replace(/\/+/g, "/");
+
+    let proxyPortNum: number | undefined;
+    if (proxyType !== "none") proxyPortNum = parseInt(proxyPort, 10);
+
     return {
       id: config?.id || crypto.randomUUID(),
       name: name.trim(),
@@ -190,7 +248,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
       password: passwordToSend,
       private_key_pem: authMethod === "key" ? privateKeyPem : undefined,
       conn_type: connType,
-      group_path: trimmedGroup ? `/${trimmedGroup}` : "/",
+      group_path: group,
       ftp_tls: connType === "ftp" ? ftpTls : "none",
       ftp_passive: connType === "ftp" ? ftpPassive : true,
       proxy_type: proxyType,
@@ -206,7 +264,26 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
     };
   }
 
+  // Surface validation errors inline (red border + shake) and focus the first
+  // invalid field. Returns true when the form is valid, false otherwise.
+  // Shared by Save and Test so both flag missing fields the same way.
+  function showValidationErrors(): boolean {
+    const errs = validate();
+    if (Object.keys(errs).length === 0) {
+      setFieldErrors({});
+      return true;
+    }
+    const next: Record<string, boolean> = {};
+    for (const k of Object.keys(errs)) next[k] = true;
+    setFieldErrors(next);
+    setShakeNonce((n) => n + 1);
+    const firstKey = FIELD_FOCUS_ORDER.find((k) => next[k]);
+    if (firstKey) focusField(firstKey);
+    return false;
+  }
+
   async function handleSave() {
+    if (!showValidationErrors()) return;
     const conn = buildConfig();
     if (!conn) return;
     setSaving(true);
@@ -221,6 +298,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
   }
 
   async function handleTest() {
+    if (!showValidationErrors()) return;
     const conn = buildConfig();
     if (!conn) return;
     setTesting(true);
@@ -301,34 +379,64 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
         {/* Form */}
         <div style={{ padding: "12px 24px 20px", display: "flex", flexDirection: "column", gap: 16 }}>
           <FieldGroup label="基本设置">
-            <FormField label="连接名称">
+            <FormField label="连接名称" required>
               <Input
                 value={name}
                 onChange={handleNameChange}
                 placeholder={connType === "local" ? "本地终端" : `${connType}_${host || "server"}`}
+                errorKey="name"
+                error={fieldErrors.name}
+                shakeNonce={shakeNonce}
+                registerField={registerField}
               />
             </FormField>
             {connType !== "local" && (
               <>
                 <div style={{ display: "flex", gap: 12 }}>
                   <div style={{ flex: 2 }}>
-                    <FormField label="主机地址">
+                    <FormField label="主机地址" required>
                       <Input
                         value={host}
                         onChange={handleHostChange}
                         placeholder="192.168.1.100"
                         autoFocus
+                        errorKey="host"
+                        error={fieldErrors.host}
+                        shakeNonce={shakeNonce}
+                        registerField={registerField}
                       />
                     </FormField>
                   </div>
                   <div style={{ flex: 1 }}>
-                    <FormField label="端口">
-                      <Input value={port} onChange={setPort} placeholder="22" />
+                    <FormField label="端口" required>
+                      <Input
+                        value={port}
+                        onChange={(v) => {
+                          setPort(v);
+                          clearFieldError("port");
+                        }}
+                        placeholder="22"
+                        errorKey="port"
+                        error={fieldErrors.port}
+                        shakeNonce={shakeNonce}
+                        registerField={registerField}
+                      />
                     </FormField>
                   </div>
                 </div>
-                <FormField label="用户名">
-                  <Input value={username} onChange={setUsername} placeholder="root" />
+                <FormField label="用户名" required>
+                  <Input
+                    value={username}
+                    onChange={(v) => {
+                      setUsername(v);
+                      clearFieldError("username");
+                    }}
+                    placeholder="root"
+                    errorKey="username"
+                    error={fieldErrors.username}
+                    shakeNonce={shakeNonce}
+                    registerField={registerField}
+                  />
                 </FormField>
               </>
             )}
@@ -343,12 +451,19 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
                   options={[{ value: "", label: "— 自定义路径 —" }, ...SHELL_PRESETS]}
                 />
               </FormField>
-              <FormField label="可执行文件路径">
+              <FormField label="可执行文件路径" required>
                 <Input
                   value={shellPath}
-                  onChange={setShellPath}
+                  onChange={(v) => {
+                    setShellPath(v);
+                    clearFieldError("shellPath");
+                  }}
                   placeholder="pwsh.exe 或完整路径"
                   autoFocus
+                  errorKey="shellPath"
+                  error={fieldErrors.shellPath}
+                  shakeNonce={shakeNonce}
+                  registerField={registerField}
                 />
               </FormField>
               <FormField label="启动参数（可选）">
@@ -389,14 +504,21 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
               />
             </FormField>
             {authMethod === "password" ? (
-              <FormField label="密码">
+              <FormField label="密码" required={!config}>
                 <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                   <div style={{ flex: 1 }}>
                     <Input
                       value={password}
-                      onChange={setPassword}
+                      onChange={(v) => {
+                        setPassword(v);
+                        clearFieldError("password");
+                      }}
                       type={showPassword ? "text" : "password"}
                       placeholder={config ? "留空保持不变" : "••••••"}
+                      errorKey="password"
+                      error={fieldErrors.password}
+                      shakeNonce={shakeNonce}
+                      registerField={registerField}
                     />
                   </div>
                   {config && (
@@ -485,20 +607,34 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
               <>
                 <div style={{ display: "flex", gap: 12 }}>
                   <div style={{ flex: 2 }}>
-                    <FormField label="代理主机">
+                    <FormField label="代理主机" required>
                       <Input
                         value={proxyHost}
-                        onChange={setProxyHost}
+                        onChange={(v) => {
+                          setProxyHost(v);
+                          clearFieldError("proxyHost");
+                        }}
                         placeholder="127.0.0.1"
+                        errorKey="proxyHost"
+                        error={fieldErrors.proxyHost}
+                        shakeNonce={shakeNonce}
+                        registerField={registerField}
                       />
                     </FormField>
                   </div>
                   <div style={{ flex: 1 }}>
-                    <FormField label="端口">
+                    <FormField label="端口" required>
                       <Input
                         value={proxyPort}
-                        onChange={setProxyPort}
+                        onChange={(v) => {
+                          setProxyPort(v);
+                          clearFieldError("proxyPort");
+                        }}
                         placeholder={proxyType === "http" ? "8080" : "1080"}
+                        errorKey="proxyPort"
+                        error={fieldErrors.proxyPort}
+                        shakeNonce={shakeNonce}
+                        registerField={registerField}
                       />
                     </FormField>
                   </div>
@@ -863,10 +999,13 @@ function FieldGroup({ label, children }: { label: string; children: React.ReactN
   );
 }
 
-function FormField({ label, children }: { label: string; children: React.ReactNode }) {
+function FormField({ label, required, children }: { label: string; required?: boolean; children: React.ReactNode }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-      <label style={{ fontSize: 12, color: "var(--text-secondary)", fontWeight: 500 }}>{label}</label>
+      <label style={{ fontSize: 12, color: "var(--text-secondary)", fontWeight: 500 }}>
+        {label}
+        {required && <span style={{ color: "var(--error)", marginLeft: 3, fontWeight: 700 }}>*</span>}
+      </label>
       {children}
     </div>
   );
@@ -878,32 +1017,71 @@ function Input({
   placeholder,
   type,
   autoFocus,
+  errorKey,
+  error,
+  shakeNonce,
+  registerField,
 }: {
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
   type?: string;
   autoFocus?: boolean;
+  /** Stable id shared with validate() so this input can be flagged + focused. */
+  errorKey?: string;
+  /** When true the input renders the red error border/glow. */
+  error?: boolean;
+  /** Bumped on each Save validation failure; when it changes while `error` is
+   * set, the shake animation replays. */
+  shakeNonce?: number;
+  registerField?: (key: string, el: HTMLElement | null) => void;
 }) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const errStyle = error
+    ? { borderColor: "var(--error)", boxShadow: "0 0 0 3px var(--error-muted)" }
+    : { borderColor: "var(--border-default)", boxShadow: "none" };
+
+  // Register the DOM node so handleSave can focus the first invalid field.
+  useEffect(() => {
+    if (errorKey) registerField?.(errorKey, inputRef.current);
+  });
+
+  // Replay the shake whenever a new validation failure (shakeNonce bump)
+  // lands on a field that's currently flagged. Toggling the class off→on
+  // restarts the CSS animation without remounting (which would lose focus).
+  useEffect(() => {
+    if (!error || !shakeNonce || !inputRef.current) return;
+    const el = inputRef.current;
+    el.classList.remove("field-error-shake");
+    // force reflow so the browser registers the class removal
+    void el.offsetWidth;
+    el.classList.add("field-error-shake");
+  }, [error, shakeNonce]);
+
   return (
     <input
+      ref={inputRef}
       value={value}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
       type={type || "text"}
       autoFocus={autoFocus}
       onFocus={(e) => {
-        e.currentTarget.style.borderColor = "var(--accent-primary)";
-        e.currentTarget.style.boxShadow = "0 0 0 3px var(--accent-primary-muted)";
+        // Error inputs keep a red focus ring so they stay visually distinct.
+        const accentBorder = error ? "var(--error)" : "var(--accent-primary)";
+        const accentGlow = error ? "var(--error-muted)" : "var(--accent-primary-muted)";
+        e.currentTarget.style.borderColor = accentBorder;
+        e.currentTarget.style.boxShadow = `0 0 0 3px ${accentGlow}`;
       }}
       onBlur={(e) => {
-        e.currentTarget.style.borderColor = "var(--border-default)";
-        e.currentTarget.style.boxShadow = "none";
+        e.currentTarget.style.borderColor = errStyle.borderColor;
+        e.currentTarget.style.boxShadow = errStyle.boxShadow;
       }}
       style={{
         width: "100%",
         background: "var(--bg-input)",
-        border: "1px solid var(--border-default)",
+        border: `1px solid ${errStyle.borderColor}`,
+        boxShadow: errStyle.boxShadow,
         borderRadius: "var(--radius-md)",
         padding: "10px 12px",
         color: "var(--text-primary)",
