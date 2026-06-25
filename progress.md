@@ -1156,10 +1156,10 @@
   - 🛠️ 连接名称自动填充优化：手动修改名称后不再被主机输入覆盖（handleHostChange 基于 prevHost 判断）。
   - 🛠️ 快捷命令必填标注：名称和命令字段标红星号，未填写时禁用保存（QuickCommandsPanel field-error）。
   - 🛠️ 自定义主题色校验：HEX 格式校验，非法输入时禁用保存（SettingsPanel isValidHex + canSave）。
-- **版本号：** staging 全是 �️ 无 ✨ → patch：v1.6.2 → **v1.6.3**。
+- **版本号：** staging 全是 🛠️ 无 ✨ → patch：v1.6.2 → **v1.6.3**。
 - **流程执行：** 用户确认闸门通过后 —— `tsc` PASS / `cargo check` PASS / `tauri:build` 成功（installer `MyShell_1.6.3_x64-setup.exe`）/ commit + push / Gitee 发布 / staging 清空 + baseline→v1.6.3。
 - **决策要点：** 5 个文件改动（AiPanel/ConnectionDialog/QuickCommandsPanel/SettingsPanel/global.css），逐一核对均被 staging 覆盖，无需补条目。
-- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS；`tauri:build` exit 0。
+- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS；`tauri:build` exit 0；发布 URL：https://gitee.com/argustang/myshell/releases/tag/v1.6.3
 
 ## 五问重启检查（阶段 44）
 | 问题 | 答案 |
