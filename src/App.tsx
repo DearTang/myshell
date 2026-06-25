@@ -40,6 +40,14 @@ export default function App() {
   const [initialConnType, setInitialConnType] = useState<ConnType | undefined>(undefined);
   const [initialFolderPath, setInitialFolderPath] = useState<string | undefined>(undefined);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // Sidebar width persists in localStorage so a user who widens it to read long
+  // connection names doesn't lose that on reload. Clamped to Sidebar's [200,560]
+  // bounds (see Sidebar.onResizeStart) so a stale value can't render it broken.
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const stored = Number(localStorage.getItem("myshell.sidebarWidth"));
+    if (!Number.isFinite(stored)) return 240;
+    return Math.min(560, Math.max(200, stored));
+  });
   const [showSettings, setShowSettings] = useState(false);
   const [showQuickCommands, setShowQuickCommands] = useState(false);
   // AI assistant panel (global docked-right chat bar). Width persists in
@@ -502,6 +510,11 @@ export default function App() {
         }}
         collapsed={sidebarCollapsed}
         onToggleCollapsed={() => setSidebarCollapsed((v) => !v)}
+        width={sidebarWidth}
+        onWidthChange={(w) => {
+          setSidebarWidth(w);
+          localStorage.setItem("myshell.sidebarWidth", String(w));
+        }}
         version={appVersion}
         updateAvailable={!!updateInfo?.has_update}
         onOpenAbout={() => setAbout({ open: true, mode: "about" })}

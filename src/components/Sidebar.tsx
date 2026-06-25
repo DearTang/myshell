@@ -1,4 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import type { ConnectionConfig, ConnType } from "../api";
 import {
   saveFolder,
@@ -23,6 +24,11 @@ interface Props {
   onOpenQuickCommands: () => void;
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
+  /** Expanded sidebar width in px. The resize handle on the right edge drives
+   * this; persisted by the parent so it survives reloads. Ignored when
+   * collapsed (the collapsed rail is a fixed 44px). */
+  width?: number;
+  onWidthChange?: (w: number) => void;
   /** Running app version, shown in the expanded-mode footer. */
   version?: string;
   /** When true, an accent dot is shown next to the version (update available). */
@@ -90,8 +96,8 @@ function buildTree(conns: ConnectionConfig[], folders: string[]): FolderNode {
 const styles = {
   container: {
     position: "relative" as const,
-    width: 240,
-    minWidth: 240,
+    // width / minWidth are set inline from the `width` prop so the sidebar is
+    // resizable; the static 240 default lives there too.
     background: "var(--bg-elevated)",
     borderRight: "1px solid var(--border-default)",
     display: "flex",
@@ -199,10 +205,40 @@ export function Sidebar({
   onOpenQuickCommands,
   collapsed = false,
   onToggleCollapsed,
+  width,
+  onWidthChange,
   version,
   updateAvailable,
   onOpenAbout,
 }: Props) {
+  // Resizable sidebar width. Defaults to 240 when the parent doesn't manage it;
+  // clamped to [200, 560] in onResizeStart so it can't get unusably narrow or
+  // eat the whole window. Long connection names become fully visible once the
+  // user drags the handle wider.
+  const SIDEBAR_DEFAULT_WIDTH = 240;
+  const sidebarWidth = width ?? SIDEBAR_DEFAULT_WIDTH;
+
+  const onResizeStart = (e: ReactMouseEvent) => {
+    if (!onWidthChange) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sidebarWidth;
+    const onMove = (ev: globalThis.MouseEvent) => {
+      const w = Math.min(560, Math.max(200, startW + (ev.clientX - startX)));
+      onWidthChange(w);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [menu, setMenu] = useState<
     { x: number; y: number; kind: "blank" | "folder"; folderPath?: string } | null
@@ -423,7 +459,7 @@ export function Sidebar({
 
   return (
     <div
-      style={styles.container}
+      style={{ ...styles.container, width: sidebarWidth, minWidth: sidebarWidth }}
       onClick={() => setMenu(null)}
       onContextMenu={(e) => {
         if (e.target === e.currentTarget) {
@@ -703,6 +739,33 @@ export function Sidebar({
           )}
         </div>
       )}
+      {/* Right-edge resize handle — drag horizontally to widen the sidebar so
+          long connection names become visible. Mirrors AiPanel's resizer. Only
+          rendered when the parent actually manages width. */}
+      {onWidthChange && (
+        <div
+          onMouseDown={onResizeStart}
+          title="拖动调整侧栏宽度"
+          style={{
+            position: "absolute",
+            right: 0,
+            top: 0,
+            bottom: 0,
+            width: 5,
+            cursor: "col-resize",
+            zIndex: 6,
+            // A faint hit area; brighten on hover so the affordance is discoverable.
+            background: "transparent",
+            transition: "background var(--duration-fast) var(--ease-in-out)",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = "var(--accent-primary-muted)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "transparent";
+          }}
+        />
+      )}
       {toggleBtn}
     </div>
   );
@@ -764,7 +827,7 @@ const FolderRow = memo(function FolderRow({
       <span style={{ fontSize: 14, opacity: isOpen ? 1 : 0.7 }}>
         {isOpen ? "📂" : "📁"}
       </span>
-      <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+      <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={node.name}>
         {node.name}
       </span>
       {node.conns.length > 0 && (
@@ -857,7 +920,9 @@ const ConnRow = memo(function ConnRow({
         }}
       >
         <ConnIcon connType={connType} size={16} style={{ opacity: 0.85 }} />
-        <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", gap: 2 }}>
+        <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", gap: 2 }}
+          title={`${conn.name}${conn.host ? `\n${conn.host}${conn.port ? `:${conn.port}` : ""}` : ""}`}
+        >
           <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             {conn.name}
           </span>
