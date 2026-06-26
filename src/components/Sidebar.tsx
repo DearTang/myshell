@@ -6,11 +6,13 @@ import {
   deleteFolder,
   renameFolder,
   copyConnection,
+  renameConnection,
 } from "../api";
 import { useTheme } from "../hooks/useTheme";
 import { useConnectionDrag } from "../hooks/useConnectionDrag";
 import { BrandLogo } from "./BrandLogo";
 import { ConnIcon } from "./ConnIcon";
+import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 
 interface Props {
   connections: ConnectionConfig[];
@@ -246,6 +248,16 @@ export function Sidebar({
   const [searchQuery, setSearchQuery] = useState("");
   const { theme, toggleTheme } = useTheme();
 
+  // Confirm gates for destructive actions. `window.confirm` is silently
+  // swallowed by some Tauri WebViews, so we drive a real React modal
+  // (ConfirmDialog) from these states instead. Each holds the action's
+  // payload (connection / folder path) and is cleared on confirm or cancel.
+  const [deleteConnConfirm, setDeleteConnConfirm] = useState<ConfirmState<ConnectionConfig> | null>(null);
+  const [deleteFolderConfirm, setDeleteFolderConfirm] = useState<
+    | (ConfirmState<{ path: string }> & { connCount: number; subFolderCount: number })
+    | null
+  >(null);
+
   // Long-press-drag-to-folder. While dragState is active the list switches to
   // a compact folders-only view so the user doesn't have to scroll past dozens
   // of connections to reach the target folder. onMoved auto-expands the target
@@ -321,9 +333,113 @@ export function Sidebar({
     }
   }
 
-  async function handleDeleteFolder(path: string) {
-    if (!window.confirm(`确定删除文件夹 ${path}？（仅空文件夹可删除）`)) return;
+  /** Rename a connection via the lightweight rename command (name is a plaintext
+   * column, no full re-save needed). Prompted from the connection's right-click
+   * menu. */
+  async function handleRenameConnection(id: string, currentName: string) {
+    const next = window.prompt("重命名连接", currentName);
+    if (!next || next.trim() === currentName) return;
     try {
+      await renameConnection(id, next.trim());
+      onRefresh();
+    } catch (e) {
+      window.alert(`重命名失败: ${e}`);
+    }
+  }
+
+  /** Open the delete-connection confirm modal. The actual delete + recycle-bin
+   * logic lives in App (onDelete); we only gate it here via a React modal
+   * (window.confirm is unreliable in Tauri WebViews) so the prompt always
+   * shows regardless of entry point (⋯ menu, etc.). */
+  function handleDeleteConnection(conn: ConnectionConfig) {
+    setDeleteConnConfirm({
+      title: "删除连接",
+      message: `确定删除连接「${conn.name}」？\n删除后可在「设置 → 找回连接」中恢复。`,
+      confirmLabel: "删除",
+      danger: true,
+      payload: conn,
+    });
+  }
+
+  /** Actually run the connection delete after the user confirmed. */
+  function confirmDeleteConnection() {
+    if (!deleteConnConfirm) return;
+    onDelete(deleteConnConfirm.payload.id);
+    setDeleteConnConfirm(null);
+  }
+
+  async function handleDeleteFolder(path: string) {
+    // Count connections + sub-folders under this path (recursively, so nested
+    // children are caught too) to show a precise warning. window.confirm is
+    // swallowed by some Tauri WebViews, so we open a React modal instead.
+    // Match rule mirrors the backend like_prefix_pattern: a row belongs under
+    // `path` if its group/path equals `path` or starts with `path + "/"`.
+    const prefix = path.endsWith("/") ? path : path + "/";
+    const isUnder = (p: string) => p === path || p.startsWith(prefix);
+    const connCount = connections.filter((c) => isUnder(c.group_path || "/")).length;
+    const subFolders = folders.filter((f) => f !== path && isUnder(f));
+
+    // Red bold inline span — used to emphasize the connection count inside
+    // the message when the folder actually contains connections (the real
+    // risk). Per spec: only emphasize when there ARE connections; an empty
+    // folder or one with only sub-folders doesn't need the alarm.
+    const hl = (text: string) => (
+      <span style={{ color: "var(--error)", fontWeight: 700 }}>{text}</span>
+    );
+
+    let message: React.ReactNode;
+    if (connCount > 0) {
+      // Connections present → emphasize the count + "包含连接" so the user
+      // can't miss that real connections will be moved to the recycle bin.
+      const connPart = hl(`${connCount} 个连接`);
+      const folderPart =
+        subFolders.length > 0 ? <>、{hl(`${subFolders.length} 个子文件夹`)}</> : null;
+      message = (
+        <>
+          文件夹「{path}」{hl("下包含 ")}
+          {connPart}
+          {folderPart}
+          。删除后这些子文件夹将一并移除，其中的连接会移入回收站（可在「设置 → 找回连接」恢复）。
+          <br />
+          确定删除？
+        </>
+      );
+    } else if (subFolders.length > 0) {
+      // Only sub-folders, no connections → no emphasis needed.
+      message = (
+        <>
+          文件夹「{path}」下包含 {subFolders.length} 个子文件夹。
+          <br />
+          确定删除？
+        </>
+      );
+    } else {
+      message = (
+        <>
+          确定删除空文件夹「{path}」？
+        </>
+      );
+    }
+
+    setDeleteFolderConfirm({
+      title: connCount > 0 || subFolders.length > 0 ? "删除文件夹" : "删除空文件夹",
+      message,
+      confirmLabel: "删除",
+      danger: true,
+      payload: { path },
+      connCount,
+      subFolderCount: subFolders.length,
+    });
+  }
+
+  /** Actually run the folder delete after the user confirmed. */
+  async function confirmDeleteFolder() {
+    if (!deleteFolderConfirm) return;
+    const path = deleteFolderConfirm.payload.path;
+    setDeleteFolderConfirm(null);
+    try {
+      // One backend call soft-deletes child connections (into the recycle bin)
+      // and physically drops this folder + all descendants, transaction-safe.
       await deleteFolder(path);
       onRefresh();
     } catch (e) {
@@ -367,13 +483,16 @@ export function Sidebar({
           onPointerDown={(e) => beginDrag(c, e)}
           onConnect={() => onConnect(c)}
           onContext={(e) => {
+            // Suppress the browser context menu on connections, but don't open
+            // our own menu either — connection actions (rename/edit/copy/delete)
+            // live in the ⋯ button per spec. Right-click is reserved so it
+            // doesn't duplicate the ⋯ menu.
             e.preventDefault();
-            if (isDragging) return;
-            setMenu({ x: e.clientX, y: e.clientY, kind: "blank" });
           }}
           onEdit={() => onEdit(c)}
           onCopy={() => handleCopy(c.id)}
-          onDelete={() => onDelete(c.id)}
+          onDelete={() => handleDeleteConnection(c)}
+          onRename={() => handleRenameConnection(c.id, c.name)}
         />
       );
     }
@@ -392,11 +511,11 @@ export function Sidebar({
         onConnect={() => onConnect(conn)}
         onContext={(e) => {
           e.preventDefault();
-          setMenu({ x: e.clientX, y: e.clientY, kind: "blank" });
         }}
         onEdit={() => onEdit(conn)}
         onCopy={() => handleCopy(conn.id)}
-        onDelete={() => onDelete(conn.id)}
+        onDelete={() => handleDeleteConnection(conn)}
+        onRename={() => handleRenameConnection(conn.id, conn.name)}
       />
     ));
   }, [filteredConnections, searchQuery, onConnect, onEdit, handleCopy, onDelete]);
@@ -739,6 +858,26 @@ export function Sidebar({
           )}
         </div>
       )}
+      {deleteConnConfirm && (
+        <ConfirmDialog
+          title={deleteConnConfirm.title}
+          message={deleteConnConfirm.message}
+          confirmLabel={deleteConnConfirm.confirmLabel}
+          danger={deleteConnConfirm.danger}
+          onConfirm={confirmDeleteConnection}
+          onCancel={() => setDeleteConnConfirm(null)}
+        />
+      )}
+      {deleteFolderConfirm && (
+        <ConfirmDialog
+          title={deleteFolderConfirm.title}
+          message={deleteFolderConfirm.message}
+          confirmLabel={deleteFolderConfirm.confirmLabel}
+          danger={deleteFolderConfirm.danger}
+          onConfirm={confirmDeleteFolder}
+          onCancel={() => setDeleteFolderConfirm(null)}
+        />
+      )}
       {/* Right-edge resize handle — drag horizontally to widen the sidebar so
           long connection names become visible. Mirrors AiPanel's resizer. Only
           rendered when the parent actually manages width. */}
@@ -856,6 +995,7 @@ const ConnRow = memo(function ConnRow({
   onEdit,
   onCopy,
   onDelete,
+  onRename,
 }: {
   conn: ConnectionConfig;
   depth: number;
@@ -867,6 +1007,7 @@ const ConnRow = memo(function ConnRow({
   onEdit: () => void;
   onCopy: () => void;
   onDelete: () => void;
+  onRename: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [anchor, setAnchor] = useState<{ x: number; y: number } | null>(null);
@@ -994,6 +1135,7 @@ const ConnRow = memo(function ConnRow({
           >
             <MenuItem icon="🔌" label="连接" onClick={() => { onConnect(); setOpen(false); }} />
             <MenuItem icon="✏️" label="编辑" onClick={() => { onEdit(); setOpen(false); }} />
+            <MenuItem icon="🏷️" label="重命名" onClick={() => { onRename(); setOpen(false); }} />
             <MenuItem icon="📋" label="复制" onClick={() => { onCopy(); setOpen(false); }} />
             <MenuItem icon="🗑️" label="删除" danger onClick={() => { onDelete(); setOpen(false); }} />
           </div>

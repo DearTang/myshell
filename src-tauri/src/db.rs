@@ -208,6 +208,12 @@ pub fn migrate_legacy_schema(conn: &Connection) -> Result<()> {
     if !column_exists(&tx, "connections", "terminal_font") {
         tx.execute("ALTER TABLE connections ADD COLUMN terminal_font TEXT", [])?;
     }
+    // Soft-delete timestamp (nullable; NULL = active, ISO timestamp = moved to
+    // the recycle bin). A deleted connection stays in the table so it can be
+    // restored; get_all_connections filters on `deleted_at IS NULL`.
+    if !column_exists(&tx, "connections", "deleted_at") {
+        tx.execute("ALTER TABLE connections ADD COLUMN deleted_at TEXT", [])?;
+    }
 
     tx.execute(
         "CREATE TABLE IF NOT EXISTS folders (path TEXT PRIMARY KEY, created_at TEXT NOT NULL)",
@@ -404,7 +410,7 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
         "SELECT id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
                 private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
                 proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font
-         FROM connections ORDER BY group_path, name"
+         FROM connections WHERE deleted_at IS NULL ORDER BY group_path, name"
     )?;
 
     // Pull every column out of the Row inside the closure — we can't return
@@ -534,7 +540,7 @@ pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Opt
         "SELECT id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
                 private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
                 proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font
-         FROM connections WHERE id = ?1"
+         FROM connections WHERE id = ?1 AND deleted_at IS NULL"
     )?;
     let mut rows = stmt.query_map(params![id], |row| {
         Ok((
@@ -610,15 +616,211 @@ pub fn connection_name_exists(conn: &Connection, name: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
-pub fn delete_connection(conn: &Connection, id: &str) -> Result<()> {
-    // Cascade: remove the connection's per-server quick_commands in the same
-    // transaction. command_history is intentionally NOT cascaded (preserves
-    // existing behavior — it self-trims to 50 rows anyway).
+/// Soft-delete a connection: stamp `deleted_at` instead of removing the row,
+/// so it can be restored from the recycle bin. quick_commands and command_history
+/// are intentionally left intact (restore needs them). Returns the ids of any
+/// previously-soft-deleted connections that were auto-purged to respect the
+/// 30-row cap — the caller must clean their keyring entries.
+pub fn delete_connection(conn: &Connection, id: &str) -> Result<Vec<String>> {
+    let tx = conn.unchecked_transaction()?;
+    let now = now_iso();
+    tx.execute(
+        "UPDATE connections SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+        params![now, id],
+    )?;
+    // Enforce the recycle-bin cap: keep at most 30 soft-deleted rows. The 30th
+    // newest by deleted_at is the cutoff; anything older is hard-deleted. We
+    // collect their ids first so the caller can purge their keyring entries.
+    let purge_ids = collect_overflow_deleted(&tx, 30)?;
+    for pid in &purge_ids {
+        tx.execute("DELETE FROM connections WHERE id = ?1", params![pid])?;
+        tx.execute("DELETE FROM quick_commands WHERE connection_id = ?1", params![pid])?;
+    }
+    tx.commit()?;
+    Ok(purge_ids)
+}
+
+/// Hard-delete a single connection by id (used by purge_connection). Also drops
+/// its per-server quick_commands. Does NOT touch the keyring — the caller owns
+/// that cleanup (it needs the keyring crate, not the db module).
+pub fn hard_delete_connection(conn: &Connection, id: &str) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM quick_commands WHERE connection_id = ?1", params![id])?;
     tx.execute("DELETE FROM connections WHERE id = ?1", params![id])?;
     tx.commit()?;
     Ok(())
+}
+
+/// Hard-delete every soft-deleted connection. Returns their ids so the caller
+/// can purge keyring entries (the db module has no keyring dependency).
+pub fn purge_all_deleted(conn: &Connection) -> Result<Vec<String>> {
+    let tx = conn.unchecked_transaction()?;
+    let ids: Vec<String> = tx
+        .prepare("SELECT id FROM connections WHERE deleted_at IS NOT NULL")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    for id in &ids {
+        tx.execute("DELETE FROM quick_commands WHERE connection_id = ?1", params![id])?;
+    }
+    tx.execute("DELETE FROM connections WHERE deleted_at IS NOT NULL", [])?;
+    tx.commit()?;
+    Ok(ids)
+}
+
+/// Restore a soft-deleted connection: clear its `deleted_at`. Its group_path is
+/// left as-is, but since the folder it lived under may have been deleted, the
+/// frontend's buildTree will surface it under its (possibly orphaned) path or
+/// root — either way it's visible and usable again.
+pub fn restore_connection(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE connections SET deleted_at = NULL WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// All soft-deleted connections, newest-deleted first, with their deleted_at
+/// timestamp. Returns (config, deleted_at) tuples; main.rs pairs these into the
+/// serde `DeletedConnection` the frontend consumes.
+pub fn get_deleted_connections(
+    conn: &Connection,
+    key: &[u8; 32],
+) -> Result<Vec<(ConnectionConfig, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
+                private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
+                proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font, deleted_at
+         FROM connections WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, i64>(11)?,
+            row.get::<_, String>(12)?,
+            row.get::<_, Option<String>>(13)?,
+            row.get::<_, Option<i64>>(14)?,
+            row.get::<_, Option<String>>(15)?,
+            row.get::<_, Option<String>>(16)?,
+            row.get::<_, Option<String>>(17)?,
+            row.get::<_, Option<String>>(18)?,
+            row.get::<_, String>(19)?,
+            row.get::<_, Option<String>>(20)?,
+            row.get::<_, String>(21)?, // deleted_at
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, name, host_enc, port_i, user_enc, auth_method, pem_enc,
+             conn_type, group_path, ftp_tls, ftp_passive,
+             proxy_type, proxy_host_enc, proxy_port_i, proxy_username,
+             shell_path, shell_args, init_command, created_at, terminal_font,
+             deleted_at) = row?;
+        let host = decrypt_field(key, host_enc)?.unwrap_or_default();
+        let username = decrypt_field(key, user_enc)?.unwrap_or_default();
+        let private_key_pem = decrypt_field(key, pem_enc)?;
+        let proxy_host = decrypt_field(key, proxy_host_enc)?;
+        let port: u16 = port_i.try_into().unwrap_or(0);
+        let proxy_port = proxy_port_i.and_then(|p| p.try_into().ok());
+        let config = ConnectionConfig {
+            id,
+            name,
+            host,
+            port,
+            username,
+            auth_method,
+            password: None,
+            private_key_pem,
+            conn_type,
+            group_path,
+            ftp_tls,
+            ftp_passive: ftp_passive != 0,
+            proxy_type,
+            proxy_host,
+            proxy_port,
+            proxy_username,
+            shell_path,
+            shell_args,
+            init_command,
+            proxy_password: None,
+            created_at,
+            terminal_font,
+        };
+        out.push((config, deleted_at));
+    }
+    Ok(out)
+}
+
+/// Return the ids of soft-deleted connections beyond the cap (the oldest
+/// `cap`-excess rows by deleted_at), ready to be hard-deleted. Helper for the
+/// 30-row cap enforcement.
+fn collect_overflow_deleted(tx: &Connection, cap: usize) -> Result<Vec<String>> {
+    // Count first; skip the subquery work when under cap.
+    let total: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM connections WHERE deleted_at IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if (total as usize) <= cap {
+        return Ok(Vec::new());
+    }
+    // Order ASC so the oldest come first; skip the newest `cap`, hard-delete
+    // the rest.
+    let mut stmt = tx.prepare(
+        "SELECT id FROM connections WHERE deleted_at IS NOT NULL ORDER BY deleted_at ASC",
+    )?;
+    let all: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(all.into_iter().skip(cap).collect())
+}
+
+fn now_iso() -> String {
+    // RFC3339/ISO8601 UTC, lexicographically sortable (older < newer), which
+    // makes ORDER BY deleted_at a simple string sort.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Build a fixed-width UTC timestamp without pulling in chrono just for
+    // this. Days-since-epoch → Y/M/D via the civil-from-days algorithm.
+    let days = (secs / 86400) as i64;
+    let (y, m, d) = civil_from_days(days);
+    let s = secs % 86400;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        s / 3600,
+        (s / 60) % 60,
+        s % 60
+    )
+}
+
+/// Howard Hinnant's civil-from-days: days since 1970-01-01 → (year, month, day).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 // ============ Folders ============
@@ -641,8 +843,82 @@ pub fn save_folder(conn: &Connection, path: &str, created_at: &str) -> Result<()
     Ok(())
 }
 
-pub fn delete_folder(conn: &Connection, path: &str) -> Result<()> {
-    conn.execute("DELETE FROM folders WHERE path = ?1", params![path])?;
+/// Outcome of a folder cascade-delete: what was soft-deleted (connections,
+/// available for restore) and what had to be hard-purged to respect the
+/// recycle-bin cap (ids whose keyring entries the caller must now clean).
+pub struct FolderDeleteOutcome {
+    /// Connections soft-deleted into the recycle bin (restoreable).
+    pub soft_deleted_conn_ids: Vec<String>,
+    /// Connections hard-purged (beyond the 30-row cap) — caller cleans keyring.
+    pub purged_conn_ids: Vec<String>,
+    /// Folder rows physically deleted (this folder + descendants).
+    pub folders_deleted: i64,
+}
+
+/// Cascade-delete a folder AND everything under it in one transaction-safe
+/// pass. Connections whose group_path is `path` or beneath it are SOFT-deleted
+/// (stamped deleted_at) so they land in the recycle bin and can be restored —
+/// per the requirement that folder deletion must include its connections.
+/// Every folder at/under `path` is physically dropped from the folders table.
+/// The 30-row recycle-bin cap is enforced here too: overflow connections are
+/// hard-deleted and their ids returned for keyring cleanup.
+pub fn delete_folder_recursive(
+    conn: &Connection,
+    path: &str,
+) -> Result<FolderDeleteOutcome> {
+    let pattern = like_prefix_pattern(path);
+    let tx = conn.unchecked_transaction()?;
+    let now = now_iso();
+
+    // Collect the connection ids we're about to soft-delete (for the outcome),
+    // then stamp them deleted_at. Only currently-active rows are touched.
+    let conn_ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM connections
+             WHERE (group_path = ?1 OR group_path LIKE ?2 ESCAPE '\\') AND deleted_at IS NULL",
+        )?;
+        let mapped = stmt.query_map(params![path, pattern], |row| row.get::<_, String>(0))?;
+        let mut v = Vec::new();
+        for r in mapped {
+            v.push(r?);
+        }
+        v
+    };
+    tx.execute(
+        "UPDATE connections SET deleted_at = ?1
+         WHERE (group_path = ?2 OR group_path LIKE ?3 ESCAPE '\\') AND deleted_at IS NULL",
+        params![now, path, pattern],
+    )?;
+
+    // Enforce the recycle-bin cap (same as delete_connection).
+    let purged_conn_ids = collect_overflow_deleted(&tx, 30)?;
+    for pid in &purged_conn_ids {
+        tx.execute("DELETE FROM connections WHERE id = ?1", params![pid])?;
+        tx.execute("DELETE FROM quick_commands WHERE connection_id = ?1", params![pid])?;
+    }
+
+    // Drop this folder + all descendants physically.
+    let folders_deleted = tx.execute(
+        "DELETE FROM folders WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+        params![path, pattern],
+    )? as i64;
+
+    tx.commit()?;
+    Ok(FolderDeleteOutcome {
+        soft_deleted_conn_ids: conn_ids,
+        purged_conn_ids,
+        folders_deleted,
+    })
+}
+
+/// Rename a connection by id. `name` is a plaintext column (unlike host/user
+/// which are encrypted), so this is a single UPDATE with no key needed — safe
+/// to expose as a lightweight rename without re-saving the whole encrypted row.
+pub fn rename_connection(conn: &Connection, id: &str, new_name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE connections SET name = ?1 WHERE id = ?2",
+        params![new_name, id],
+    )?;
     Ok(())
 }
 
@@ -676,24 +952,6 @@ pub fn move_connection(conn: &Connection, conn_id: &str, new_group_path: &str) -
         params![new_group_path, conn_id],
     )?;
     Ok(())
-}
-
-pub fn folder_has_children(conn: &Connection, path: &str) -> Result<bool> {
-    let pattern = like_prefix_pattern(path);
-    let conn_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM connections WHERE group_path = ?1 OR group_path LIKE ?2 ESCAPE '\\'",
-        params![path, pattern],
-        |row| row.get(0),
-    )?;
-    if conn_count > 0 {
-        return Ok(true);
-    }
-    let folder_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM folders WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
-        params![path, pattern],
-        |row| row.get(0),
-    )?;
-    Ok(folder_count > 0)
 }
 
 /// Build a LIKE pattern matching `prefix` itself plus everything under it

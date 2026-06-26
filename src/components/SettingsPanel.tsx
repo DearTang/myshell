@@ -18,6 +18,8 @@ import { useColorScheme } from "../hooks/useColorScheme";
 import { useTerminalFont } from "../hooks/useTerminalFont";
 import { useAiConfig } from "../hooks/useAiConfig";
 import type { AiProvider } from "../api";
+import { RecycleDialog } from "./RecycleDialog";
+import { compressImageDataUrl } from "../utils/image";
 import { aiTestSettings } from "../api";
 import { PRESETS, type ColorPalette } from "../themes";
 import { FontField } from "./FontField";
@@ -167,6 +169,8 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
 
   // Custom palette dialog state
   const [showCustomDialog, setShowCustomDialog] = useState(false);
+  // Recycle bin (restore deleted connections) dialog state
+  const [showRecycleDialog, setShowRecycleDialog] = useState(false);
   const [customAccent, setCustomAccent] = useState(
     customPalette?.dark.ui?.["--accent-primary"]?.toString() || "#6366f1"
   );
@@ -656,7 +660,12 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
                     ],
                   });
                   if (selected && !Array.isArray(selected)) {
-                    const dataUrl = await readFileBase64(selected);
+                    const raw = await readFileBase64(selected);
+                    // Compress before storing: raw base64 of a multi-MB photo
+                    // blows past the localStorage ~5 MB quota (setItem throws,
+                    // is silently swallowed, and the image never persists).
+                    // Downscale to ≤1920px + JPEG keeps it well under quota.
+                    const dataUrl = await compressImageDataUrl(raw);
                     setBgImagePath(dataUrl);
                     // Auto-apply immediately
                     setBgImage({ dataUrl: dataUrl, opacity: bgOpacity / 100 });
@@ -1238,6 +1247,38 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
             <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 10, textAlign: "center" }}>
               当前共有 {connectionCount} 个连接
             </div>
+
+            {/* Recycle bin entry — restore or purge soft-deleted connections. */}
+            <button
+              onClick={() => setShowRecycleDialog(true)}
+              style={{
+                width: "100%",
+                marginTop: 12,
+                padding: "11px 16px",
+                background: "var(--bg-surface)",
+                color: "var(--text-secondary)",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-md)",
+                fontSize: 13,
+                fontWeight: 500,
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 8,
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = "var(--bg-surface-hover)";
+                e.currentTarget.style.borderColor = "var(--border-emphasis)";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "var(--bg-surface)";
+                e.currentTarget.style.borderColor = "var(--border-default)";
+              }}
+            >
+              🗑️ 找回连接 / 回收站
+            </button>
           </Section>
 
           <Divider />
@@ -1519,6 +1560,12 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
             </button>
           </div>
         </Dialog>
+      )}
+      {showRecycleDialog && (
+        <RecycleDialog
+          onChanged={onRefresh}
+          onClose={() => setShowRecycleDialog(false)}
+        />
       )}
     </div>
   );

@@ -254,22 +254,27 @@ fn save_connection(state: State<AppState>, mut config: ConnectionConfig) -> Resu
 
 #[tauri::command]
 fn delete_connection(state: State<AppState>, id: String) -> Result<(), String> {
-    // Best-effort keyring cleanup — the DB row is the source of truth for
-    // existence, so a missing credential is not a failure. We log unexpected
-    // errors (not "not found") so a leaked credential isn't silently left
-    // in the OS keyring when the user thought they'd deleted the connection.
-    if let Err(e) = secrets::delete_password(&id) {
-        log::warn!("[delete_connection] keyring delete password failed for {}: {}", id, e);
-    }
-    if let Err(e) = secrets::delete_proxy_password(&id) {
-        log::warn!("[delete_connection] keyring delete proxy password failed for {}: {}", id, e);
-    }
+    // Soft-delete: the row is kept (stamped deleted_at) so it can be restored
+    // from the recycle bin, and its keyring credentials are KEPT so a restore
+    // works without re-entering the password. The db layer returns the ids of
+    // any connections hard-purged to respect the 30-row cap — only those get a
+    // keyring cleanup (they're gone for good).
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let result = db::delete_connection(&db, &id).map_err(|e| e.to_string());
-    if result.is_ok() {
-        log::info!("[delete_connection] removed {} (cascaded per-server quick commands)", id);
+    let purged_ids = db::delete_connection(&db, &id).map_err(|e| e.to_string())?;
+    for pid in &purged_ids {
+        if let Err(e) = secrets::delete_password(pid) {
+            log::warn!("[delete_connection] keyring purge password failed for {}: {}", pid, e);
+        }
+        if let Err(e) = secrets::delete_proxy_password(pid) {
+            log::warn!("[delete_connection] keyring purge proxy password failed for {}: {}", pid, e);
+        }
     }
-    result
+    log::info!(
+        "[delete_connection] soft-deleted {} (purged {} overflow recycle rows)",
+        id,
+        purged_ids.len()
+    );
+    Ok(())
 }
 
 /// Clone a connection: same config, new UUID + incremented name suffix.
@@ -1356,13 +1361,102 @@ fn save_folder(state: State<AppState>, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn delete_folder(state: State<AppState>, path: String) -> Result<(), String> {
+fn delete_folder(state: State<AppState>, path: String) -> Result<String, String> {
     let trimmed = normalize_folder_path(&path);
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    if db::folder_has_children(&db, &trimmed).map_err(|e| e.to_string())? {
-        return Err("文件夹非空，请先删除子项".to_string());
+    // Cascade delete: soft-deletes child connections into the recycle bin
+    // (restoreable) and physically drops this folder + all descendants. The
+    // frontend has already asked the user to confirm when the folder is
+    // non-empty (showing the exact counts), so we don't block here. Overflow
+    // connections (beyond the 30-row cap) are hard-purged and their keyring
+    // entries cleaned here.
+    let outcome = db::delete_folder_recursive(&db, &trimmed).map_err(|e| e.to_string())?;
+    for pid in &outcome.purged_conn_ids {
+        if let Err(e) = secrets::delete_password(pid) {
+            log::warn!("[delete_folder] keyring purge password failed for {}: {}", pid, e);
+        }
+        if let Err(e) = secrets::delete_proxy_password(pid) {
+            log::warn!("[delete_folder] keyring purge proxy password failed for {}: {}", pid, e);
+        }
     }
-    db::delete_folder(&db, &trimmed).map_err(|e| e.to_string())
+    Ok(format!(
+        "已删除 {} 个文件夹，{} 个连接移入回收站",
+        outcome.folders_deleted,
+        outcome.soft_deleted_conn_ids.len()
+    ))
+}
+
+/// A connection in the recycle bin: its config + when it was soft-deleted.
+/// Used by the RecycleDialog so the user can see name/host and deletion time.
+#[derive(serde::Serialize)]
+pub struct DeletedConnection {
+    #[serde(flatten)]
+    pub config: ConnectionConfig,
+    pub deleted_at: String,
+}
+
+#[tauri::command]
+fn get_deleted_connections(state: State<AppState>) -> Result<Vec<DeletedConnection>, String> {
+    let key = require_dek(&state)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let rows = db::get_deleted_connections(&db, &key).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(config, deleted_at)| DeletedConnection { config, deleted_at })
+        .collect())
+}
+
+#[tauri::command]
+fn restore_connection(state: State<AppState>, id: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::restore_connection(&db, &id).map_err(|e| e.to_string())
+}
+
+/// Permanently delete a single recycled connection (from the RecycleDialog's
+/// per-row "彻底删除"). Hard-deletes the row + quick_commands and purges its
+/// keyring entries.
+#[tauri::command]
+fn purge_connection(state: State<AppState>, id: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::hard_delete_connection(&db, &id).map_err(|e| e.to_string())?;
+    if let Err(e) = secrets::delete_password(&id) {
+        log::warn!("[purge_connection] keyring purge password failed for {}: {}", id, e);
+    }
+    if let Err(e) = secrets::delete_proxy_password(&id) {
+        log::warn!("[purge_connection] keyring purge proxy password failed for {}: {}", id, e);
+    }
+    Ok(())
+}
+
+/// Empty the recycle bin (from the RecycleDialog's "清空回收站"). Hard-deletes
+/// every soft-deleted row + its quick_commands, then purges their keyring.
+#[tauri::command]
+fn purge_all_deleted_connections(state: State<AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let ids = db::purge_all_deleted(&db).map_err(|e| e.to_string())?;
+    for id in &ids {
+        if let Err(e) = secrets::delete_password(id) {
+            log::warn!("[purge_all_deleted_connections] keyring purge password failed for {}: {}", id, e);
+        }
+        if let Err(e) = secrets::delete_proxy_password(id) {
+            log::warn!("[purge_all_deleted_connections] keyring purge proxy password failed for {}: {}", id, e);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn rename_connection(
+    state: State<AppState>,
+    id: String,
+    new_name: String,
+) -> Result<(), String> {
+    let trimmed = new_name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("名称不能为空".to_string());
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::rename_connection(&db, &id, &trimmed).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2907,10 +3001,15 @@ pub fn run() {
             copy_connection,
             export_connections,
             import_connections,
+            get_deleted_connections,
+            restore_connection,
+            purge_connection,
+            purge_all_deleted_connections,
             list_folders,
             save_folder,
             delete_folder,
             rename_folder,
+            rename_connection,
             move_connection,
             add_command_history,
             list_command_history,

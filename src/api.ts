@@ -217,12 +217,47 @@ export async function saveFolder(path: string): Promise<void> {
   await invoke("save_folder", { path });
 }
 
-export async function deleteFolder(path: string): Promise<void> {
-  await invoke("delete_folder", { path });
+/** Delete a folder. Cascade-deletes descendants and moves any child
+ * connections to root; the backend returns a one-line summary of what it did.
+ * The frontend confirms with the user first when the folder is non-empty. */
+export async function deleteFolder(path: string): Promise<string> {
+  return invoke("delete_folder", { path });
 }
 
 export async function renameFolder(oldPath: string, newPath: string): Promise<void> {
   await invoke("rename_folder", { oldPath, newPath });
+}
+
+/** Rename a connection without re-saving the full encrypted row. `name` is a
+ * plaintext column, so this is a lightweight single-column UPDATE. */
+export async function renameConnection(id: string, newName: string): Promise<void> {
+  await invoke("rename_connection", { id, newName });
+}
+
+/** A connection in the recycle bin. The backend flattens its ConnectionConfig
+ * fields alongside `deleted_at`, so this mirrors that shape. */
+export interface DeletedConnection extends ConnectionConfig {
+  deletedAt: string;
+}
+
+/** List soft-deleted connections (newest-deleted first) for the recycle bin. */
+export async function getDeletedConnections(): Promise<DeletedConnection[]> {
+  return invoke("get_deleted_connections");
+}
+
+/** Restore a soft-deleted connection by clearing its deleted_at. */
+export async function restoreConnection(id: string): Promise<void> {
+  await invoke("restore_connection", { id });
+}
+
+/** Permanently delete a single recycled connection (also purges its keyring). */
+export async function purgeConnection(id: string): Promise<void> {
+  await invoke("purge_connection", { id });
+}
+
+/** Empty the recycle bin: hard-delete every soft-deleted connection + keyring. */
+export async function purgeAllDeletedConnections(): Promise<void> {
+  await invoke("purge_all_deleted_connections");
 }
 
 // ============ Command History API ============

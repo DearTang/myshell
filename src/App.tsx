@@ -602,6 +602,9 @@ export default function App() {
         onConnect={handleConnect}
         onEdit={handleEdit}
         onDelete={async (id) => {
+          // Soft-delete (move to recycle bin). The confirm gate lives in
+          // Sidebar.handleDeleteConnection (closer to the UI / naming), so by
+          // the time we reach here the user has already confirmed.
           await deleteConnection(id);
           reload();
         }}

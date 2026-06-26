@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
+import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -31,16 +32,44 @@ import "@xterm/xterm/css/xterm.css";
  * Many palettes set `selectionBackground` at ~27% alpha (#RRGGBBAA with AA=44),
  * which renders nearly invisibly on the terminal background and makes it hard
  * to tell what's selected. Raise low alpha to a clearly visible ~80% while
- * preserving each palette's chosen hue.
+ * preserving each palette's chosen hue. For colors that are already opaque
+ * (6-digit hex), keep them; for ones with high alpha, keep them too.
  */
 function visibleSelection(color: string | undefined): string | undefined {
   if (!color) return color;
-  // 8-digit #RRGGBBAA → replace the alpha byte with cc (≈80%).
+  // 8-digit #RRGGBBAA → replace a low alpha byte with cc (≈80%).
   if (/^#[0-9a-fA-F]{8}$/.test(color)) {
     return color.slice(0, 7) + "cc";
   }
   // 6-digit #RRGGBB (opaque) → already visible; keep as-is.
   return color;
+}
+
+/**
+ * Force the cursor color to the terminal's foreground color, and cursorAccent
+ * (the block's interior text color) to the background. This guarantees the
+ * cursor is visible in every environment — some users reported the cursor
+ * being near-invisible (palette cursor color too close to the background on
+ * their display/GPU), and `cursorBlink` under certain WebGL drivers can
+ * render a low-contrast cursor as effectively invisible. Since `foreground`
+ * is, by definition, the color chosen to be legible against `background`,
+ * using it for the cursor guarantees the same contrast regardless of display
+ * or driver. We also set `cursorStyle: "bar"` (a 1-cell-wide vertical line)
+ * at Terminal construction, which stays continuously visible even where a
+ * solid block might blend in.
+ *
+ * Returns the cursor overrides to merge into the xterm theme.
+ */
+function forceVisibleCursor(theme: ITheme): { cursor?: string; cursorAccent?: string } {
+  const out: { cursor?: string; cursorAccent?: string } = {};
+  // Always force cursor → foreground: it's the canonical legible-on-bg color,
+  // so this is the most reliable cross-environment fix. A palette's own cursor
+  // color can still be too low-contrast on some monitors.
+  if (theme.foreground) out.cursor = theme.foreground;
+  // cursorAccent = color of the glyph under the cursor; contrast it with the
+  // (forced foreground) cursor fill by using the background.
+  if (theme.background) out.cursorAccent = theme.background;
+  return out;
 }
 
 interface Props {
@@ -157,16 +186,12 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
       cursorBlink: true,
       fontSize: 14,
       fontFamily,
-      theme: hasBgImage
-        ? {
-            ...terminalTheme,
-            background: "rgba(0, 0, 0, 0)",
-            selectionBackground: visibleSelection(terminalTheme.selectionBackground),
-          }
-        : {
-            ...terminalTheme,
-            selectionBackground: visibleSelection(terminalTheme.selectionBackground),
-          },
+      theme: {
+        ...terminalTheme,
+        ...forceVisibleCursor(terminalTheme),
+        selectionBackground: visibleSelection(terminalTheme.selectionBackground),
+        ...(hasBgImage ? { background: "rgba(0, 0, 0, 0)" } : {}),
+      },
       allowProposedApi: true,
       allowTransparency: hasBgImage,
     });
@@ -433,6 +458,7 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
     const currentBg = hasBgImage ? "rgba(0, 0, 0, 0)" : terminalTheme.background;
     term.options.theme = {
       ...terminalTheme,
+      ...forceVisibleCursor(terminalTheme),
       background: currentBg,
       selectionBackground: visibleSelection(terminalTheme.selectionBackground),
     };
