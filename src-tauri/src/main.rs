@@ -1223,6 +1223,150 @@ fn install_update(app: tauri::AppHandle, path: String) -> Result<(), String> {
     Ok(())
 }
 
+// ============ GPU acceleration toggle ============
+//
+// WebView2 (Windows) / WebKitGTK (Linux) render via the GPU. On some GPU +
+// driver combinations the WebGL/canvas compositing misbehaves — the root cause
+// behind the "terminal cursor invisible / selection highlight invisible"
+// reports. We let the user disable GPU acceleration as an escape hatch.
+//
+// On Windows this is achieved by seeding the WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+// environment variable with --disable-gpu BEFORE WebView2 initializes (i.e.
+// before the first window is created). Because the env var must be set that
+// early, the flag is persisted to a plain file the Rust side reads at the very
+// top of run(), so it takes effect on the NEXT app launch — not the current
+// one. The frontend surfaces this "restart to apply" caveat in the UI.
+//
+// The flag lives at <config_dir>/myshell/gpu-disabled (presence = disabled),
+// deliberately OUTSIDE the versioned backup set so an emergency GPU-off isn't
+// rolled back by a version restore.
+
+/// Path of the GPU-off marker file. Presence of the file (regardless of
+/// contents) means "disable GPU on next launch".
+fn gpu_disabled_flag_path() -> Option<std::path::PathBuf> {
+    let mut path = dirs::config_dir()?;
+    path.push("myshell");
+    path.push("gpu-disabled");
+    Some(path)
+}
+
+/// Read the persisted GPU-off flag. `true` when the marker file exists (GPU
+/// should be disabled). Defaults to `false` (GPU on — the historical default)
+/// on any IO error, since disabling GPU has a perf cost and shouldn't happen
+/// accidentally.
+#[tauri::command]
+fn get_gpu_acceleration_disabled() -> bool {
+    gpu_disabled_flag_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Set the persisted GPU-off flag. `disabled = true` creates the marker file
+/// (GPU off on next launch); `false` removes it. Idempotent. The change takes
+/// effect only on the next app restart.
+#[tauri::command]
+fn set_gpu_acceleration_disabled(disabled: bool) -> Result<(), String> {
+    let path = gpu_disabled_flag_path().ok_or_else(|| "无法定位配置目录".to_string())?;
+    // Ensure the parent dir exists (it normally does, but be defensive — a
+    // first-ever launch with no DB yet has never created it).
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    }
+    if disabled {
+        // Write a tiny, human-readable note so a user poking around the config
+        // dir understands what this mystery file is.
+        std::fs::write(&path, "1\n").map_err(|e| format!("写入标志文件失败: {e}"))?;
+    } else {
+        // RemoveFile is fine if the file is absent (no-op-ish); only treat a
+        // non-NotFound error as real.
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("删除标志文件失败: {e}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ============ Frontend log forwarding ============
+//
+// The webview's JS runtime (console) isn't persisted on the user's machine —
+// they'd have to open devtools, which they won't. To diagnose frontend-side
+// anomalies (the "cursor invisible" class of report, a render crash, an
+// unhandled promise rejection), the frontend forwards its errors here so they
+// land in the SAME daily log file as the Rust backend output. The two then
+// share a timeline, so a frontend render error can be correlated with the
+// backend SSH/PTY event that preceded it.
+//
+// Every line is tagged `[frontend]` so a reader can tell at a glance which
+// side of the IPC boundary produced it.
+
+/// Severity the frontend may forward. Anything outside this set is coerced to
+/// `info` so a typo can't be used to suppress an error via an invalid level.
+fn frontend_log_level(raw: &str) -> log::Level {
+    match raw.to_ascii_lowercase().as_str() {
+        "error" => log::Level::Error,
+        "warn" => log::Level::Warn,
+        "info" => log::Level::Info,
+        "debug" => log::Level::Debug,
+        _ => log::Level::Info,
+    }
+}
+
+/// Write a single frontend log line into the shared log file. `message` should
+/// already be a single line (the frontend joins multi-line stacks); we replace
+/// any residual newlines so one event = one log line, keeping the file greppable.
+#[tauri::command]
+fn write_frontend_log(level: String, message: String) {
+    let one_line = message.replace(['\n', '\r'], " ⏎ ");
+    let lvl = frontend_log_level(&level);
+    match lvl {
+        log::Level::Error => log::error!("[frontend] {}", one_line),
+        log::Level::Warn => log::warn!("[frontend] {}", one_line),
+        log::Level::Info => log::info!("[frontend] {}", one_line),
+        log::Level::Debug => log::debug!("[frontend] {}", one_line),
+        // trace isn't reachable from frontend_log_level, but match must be exhaustive.
+        log::Level::Trace => log::trace!("[frontend] {}", one_line),
+    }
+}
+
+/// Read the GPU-off flag at the very top of run() and, when set, seed the
+/// WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS env var so WebView2 boots without GPU
+/// compositing. Runs before any window is created — that ordering is what makes
+/// it actually work (the env var is read once during WebView2 environment
+/// creation). Idempotent + silent on non-Windows (the env var is harmless
+/// there but also pointless, so we skip it to avoid surprises).
+fn apply_gpu_pref_if_disabled() {
+    let disabled = gpu_disabled_flag_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    if !disabled {
+        return;
+    }
+    // Only meaningful on Windows (WebView2). WebKitGTK on Linux/macOS doesn't
+    // honor this env var, so don't set it there.
+    #[cfg(windows)]
+    {
+        // Append rather than overwrite: respect any user/system value already in
+        // the environment (e.g. a proxy flag set externally) and just tack
+        // --disable-gpu on if it isn't already present.
+        const FLAG: &str = "--disable-gpu";
+        let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+            .unwrap_or_default();
+        let merged = if existing.split_whitespace().any(|f| f == FLAG) {
+            existing
+        } else if existing.trim().is_empty() {
+            FLAG.to_string()
+        } else {
+            format!("{existing} {FLAG}")
+        };
+        // SAFETY: setenv of a thread-local-ish env var before any WebView2
+        // thread spawns. We're still single-threaded at the top of run().
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", merged);
+        log::info!("[startup] GPU acceleration disabled via gpu-disabled flag (applies to WebView2 on next window creation)");
+    }
+}
+
 /// Read a PEM-formatted text file at an absolute path. Used by the private-
 /// key picker in ConnectionDialog: the user picks a path via the dialog
 /// plugin, and this reads the content so we can stash it (encrypted) in
@@ -1818,7 +1962,16 @@ async fn ssh_resize(
 #[tauri::command]
 async fn ssh_disconnect(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
     log::info!("[ssh:{}] disconnect requested", session_id);
-    ssh::disconnect(&state, &session_id).await
+    match ssh::disconnect(&state, &session_id).await {
+        Ok(()) => {
+            log::info!("[ssh:{}] disconnected", session_id);
+            Ok(())
+        }
+        Err(e) => {
+            log::warn!("[ssh:{}] disconnect failed: {}", session_id, e);
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1862,7 +2015,13 @@ async fn local_connect(
     // No DEK/keyring resolution — a local shell has no credentials. The vault
     // must still be unlocked to list the connection row (enforced by
     // get_connections), but local_connect itself needs no secret.
-    local::connect(state, window, config, 80, 24).await
+    match local::connect(state, window, config, 80, 24).await {
+        Ok(sid) => {
+            log::info!("[local:{}] connected", sid);
+            Ok(sid)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[tauri::command]
@@ -1896,7 +2055,16 @@ async fn local_disconnect(
     session_id: String,
 ) -> Result<(), String> {
     log::info!("[local:{}] disconnect requested", session_id);
-    local::disconnect(&state, &session_id).await
+    match local::disconnect(&state, &session_id).await {
+        Ok(()) => {
+            log::info!("[local:{}] disconnected", session_id);
+            Ok(())
+        }
+        Err(e) => {
+            log::warn!("[local:{}] disconnect failed: {}", session_id, e);
+            Err(e)
+        }
+    }
 }
 
 // ============ AI assistant ============
@@ -2932,6 +3100,13 @@ fn set_windows_app_user_model_id() {
 fn set_windows_app_user_model_id() {}
 
 pub fn run() {
+    // GPU acceleration escape hatch — MUST run before any window is created.
+    // WebView2 reads WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS once during its
+    // environment creation (triggered by the first window), so seeding it here
+    // at the very top of run() is what actually makes --disable-gpu take
+    // effect. See apply_gpu_pref_if_disabled.
+    apply_gpu_pref_if_disabled();
+
     // Default INFO so log::info!/warn!/error! surface in the daily log file
     // (release dup2's stderr → file) / console (debug). RUST_LOG still wins
     // for ad-hoc verbose debugging (e.g. RUST_LOG=myshell=debug).
@@ -2995,6 +3170,9 @@ pub fn run() {
             open_external_url,
             download_update,
             install_update,
+            get_gpu_acceleration_disabled,
+            set_gpu_acceleration_disabled,
+            write_frontend_log,
             get_connections,
             save_connection,
             delete_connection,

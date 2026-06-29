@@ -142,7 +142,7 @@ fn backup_config(new_version: &str) -> Result<String, String> {
 
         if src.exists() {
             if let Err(e) = fs::copy(&src, &dst) {
-                eprintln!("[backup] 警告: 无法备份 {}: {}", file, e);
+                log::warn!("[backup] 警告: 无法备份 {}: {}", file, e);
             } else {
                 backed_up_files.push(file.to_string());
             }
@@ -174,7 +174,7 @@ fn backup_config(new_version: &str) -> Result<String, String> {
         new_version,
         backed_up_files.len()
     );
-    eprintln!("[backup] {}", msg);
+    log::info!("[backup] {}", msg);
 
     Ok(msg)
 }
@@ -193,9 +193,9 @@ fn cleanup_old_backups() -> Result<(), String> {
         for backup in to_remove {
             let dir = backup_dir(&backup.version);
             if let Err(e) = fs::remove_dir_all(&dir) {
-                eprintln!("[backup] 警告: 无法删除旧备份 {}: {}", backup.version, e);
+                log::warn!("[backup] 警告: 无法删除旧备份 {}: {}", backup.version, e);
             } else {
-                eprintln!("[backup] 已清理旧备份: {}", backup.version);
+                log::info!("[backup] 已清理旧备份: {}", backup.version);
             }
         }
 
@@ -266,14 +266,14 @@ pub fn rollback(version: &str) -> Result<String, String> {
     // The rolled-back state is already captured by the restored files.
     fs::write(version_marker_path(), APP_VERSION)
         .map_err(|e| format!("更新版本标记失败: {}", e))?;
-    eprintln!("[backup] rolled back config to version {}", version);
+    log::info!("[backup] rolled back config to version {}", version);
 
     let msg = format!(
         "已回退到版本 {}，恢复了 {} 个文件",
         version,
         restored_files.len()
     );
-    eprintln!("[backup] {}", msg);
+    log::info!("[backup] {}", msg);
 
     Ok(msg)
 }

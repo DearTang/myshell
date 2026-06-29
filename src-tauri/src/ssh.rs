@@ -60,7 +60,7 @@ impl client::Handler for SshClient {
                     // Mutex poisoned = a previous command panicked mid-DB-op.
                     // Fail closed — accepting here would mean trusting a host
                     // without ever checking the fingerprint store.
-                    eprintln!(
+                    log::warn!(
                         "[ssh] known_hosts mutex poisoned; rejecting key for {}:{}",
                         self.host, self.port
                     );
@@ -72,7 +72,7 @@ impl client::Handler for SshClient {
                     if known_fp == fingerprint {
                         true
                     } else {
-                        eprintln!(
+                        log::warn!(
                             "[ssh] host key mismatch for {}:{}: stored={} got={}",
                             self.host, self.port, known_fp, fingerprint
                         );
@@ -95,7 +95,7 @@ impl client::Handler for SshClient {
                         // Couldn't persist new host → fail closed. Surfacing
                         // the error to the user is better than accepting and
                         // silently losing TOFU for this host.
-                        eprintln!("[ssh] known_hosts insert failed: {}", e);
+                        log::warn!("[ssh] known_hosts insert failed: {}", e);
                         return Ok(false);
                     }
                     true
@@ -104,7 +104,7 @@ impl client::Handler for SshClient {
                     // DB query error — fail closed. Don't trust the host on
                     // an unreadable store, even though the read failure is
                     // likely transient.
-                    eprintln!(
+                    log::warn!(
                         "[ssh] known_hosts query failed for {}:{}: {} — rejecting",
                         self.host, self.port, e
                     );
@@ -374,11 +374,14 @@ pub async fn connect(
     let handle = dial_and_authenticate(&state, &config, false).await?;
 
     // Open channel and request PTY
-    eprintln!("[ssh:{}] opening session channel", sid);
+    log::info!("[ssh:{}] opening session channel", sid);
     let channel = handle
         .channel_open_session()
         .await
-        .map_err(|e| format!("Channel open failed: {}", e))?;
+        .map_err(|e| {
+            log::error!("[ssh:{}] channel open failed: {}", sid, e);
+            format!("Channel open failed: {}", e)
+        })?;
 
     // SFTP-only sessions don't use an interactive shell — russh-sftp opens its
     // own fresh subsystem channel via `get_sftp_session` on the same `Handle`.
@@ -390,20 +393,26 @@ pub async fn connect(
     // SFTP we open the channel (validates the connection) but skip PTY/shell.
     let is_sftp = config.conn_type == "sftp";
     if is_sftp {
-        eprintln!("[ssh:{}] SFTP session — skipping PTY/shell request", sid);
+        log::info!("[ssh:{}] SFTP session — skipping PTY/shell request", sid);
     } else {
-        eprintln!("[ssh:{}] channel opened; requesting PTY", sid);
+        log::info!("[ssh:{}] channel opened; requesting PTY", sid);
         channel
             .request_pty(true, "xterm-256color", 80, 24, 640, 480, &[])
             .await
-            .map_err(|e| format!("PTY request failed: {}", e))?;
-        eprintln!("[ssh:{}] PTY granted; requesting shell", sid);
+            .map_err(|e| {
+                log::error!("[ssh:{}] PTY request failed: {}", sid, e);
+                format!("PTY request failed: {}", e)
+            })?;
+        log::info!("[ssh:{}] PTY granted; requesting shell", sid);
 
         channel
             .request_shell(true)
             .await
-            .map_err(|e| format!("Shell request failed: {}", e))?;
-        eprintln!("[ssh:{}] shell requested OK", sid);
+            .map_err(|e| {
+                log::error!("[ssh:{}] shell request failed: {}", sid, e);
+                format!("Shell request failed: {}", e)
+            })?;
+        log::info!("[ssh:{}] shell requested OK", sid);
     }
 
     // Build command channel for the reader task
@@ -478,18 +487,18 @@ async fn channel_reader(
             cmd = command_rx.recv() => match cmd {
                 Some(SessionCommand::Input(data)) => {
                     if let Err(e) = channel.data(&data[..]).await {
-                        eprintln!("[ssh] data send failed for {}: {}", session_id, e);
+                        log::warn!("[ssh:{}] data send failed: {}", session_id, e);
                         break;
                     }
                 }
                 Some(SessionCommand::Resize { cols, rows }) => {
                     if let Err(e) = channel.window_change(cols, rows, 0, 0).await {
-                        eprintln!("[ssh] window_change failed for {}: {}", session_id, e);
+                        log::warn!("[ssh:{}] window_change failed: {}", session_id, e);
                     }
                 }
                 Some(SessionCommand::ZmodemBytes(data)) => {
                     if let Err(e) = channel.data(&data[..]).await {
-                        eprintln!("[ssh] zmodem send failed for {}: {}", session_id, e);
+                        log::warn!("[ssh:{}] zmodem send failed: {}", session_id, e);
                     }
                 }
                 Some(SessionCommand::ZmodemAbort) => {
@@ -509,7 +518,7 @@ async fn channel_reader(
             // Incoming SSH messages from the server.
             msg = channel.wait() => match msg {
                 Some(ChannelMsg::Data { ref data }) => {
-                    eprintln!("[ssh:{}] Data {} bytes", session_id, data.len());
+                    log::debug!("[ssh:{}] Data {} bytes", session_id, data.len());
                     // Strip leading OO (Over and Out) bytes that follow a ZMODEM
                     // session end. These arrive in Normal mode but are protocol
                     // tail bytes, not user-visible output.
@@ -538,19 +547,19 @@ async fn channel_reader(
                     }
                 }
                 Some(ChannelMsg::ExtendedData { ref data, .. }) => {
-                    eprintln!("[ssh:{}] ExtendedData {} bytes", session_id, data.len());
+                    log::debug!("[ssh:{}] ExtendedData {} bytes", session_id, data.len());
                     // stderr — treat as ordinary terminal output, never as ZMODEM.
                     append_capped(&window, &session_id, &mut buffer, &data[..], &mut last_flush);
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    eprintln!("[ssh:{}] ExitStatus={}", session_id, exit_status);
+                    log::info!("[ssh:{}] ExitStatus={}", session_id, exit_status);
                     let _ = window.emit("ssh_exit", serde_json::json!({
                         "sessionId": session_id,
                         "code": exit_status
                     }));
                 }
                 Some(ChannelMsg::Eof) => {
-                    eprintln!("[ssh:{}] EOF", session_id);
+                    log::info!("[ssh:{}] EOF", session_id);
                     flush_buffer(&window, &session_id, &mut buffer);
                     if mode == TermMode::Zmodem {
                         let _ = window.emit("zmodem_end", &session_id);
@@ -559,7 +568,7 @@ async fn channel_reader(
                     break;
                 }
                 Some(ChannelMsg::Close) => {
-                    eprintln!("[ssh:{}] Close", session_id);
+                    log::info!("[ssh:{}] Close", session_id);
                     flush_buffer(&window, &session_id, &mut buffer);
                     if mode == TermMode::Zmodem {
                         let _ = window.emit("zmodem_end", &session_id);
@@ -568,7 +577,7 @@ async fn channel_reader(
                     break;
                 }
                 None => {
-                    eprintln!("[ssh:{}] channel.wait returned None", session_id);
+                    log::info!("[ssh:{}] channel.wait returned None", session_id);
                     flush_buffer(&window, &session_id, &mut buffer);
                     if mode == TermMode::Zmodem {
                         let _ = window.emit("zmodem_end", &session_id);
@@ -577,7 +586,7 @@ async fn channel_reader(
                     break;
                 }
                 Some(other) => {
-                    eprintln!("[ssh:{}] other msg: {:?}", session_id, std::mem::discriminant(&other));
+                    log::debug!("[ssh:{}] other msg: {:?}", session_id, std::mem::discriminant(&other));
                 }
             },
 
@@ -688,9 +697,9 @@ fn flush_buffer(window: &WebviewWindow, session_id: &str, buffer: &mut Vec<u8>) 
         session_id: session_id.to_string(),
         data: std::mem::take(buffer),
     };
-    eprintln!("[ssh:{}] flush {} bytes → ssh_output", session_id, payload.data.len());
+    log::debug!("[ssh:{}] flush {} bytes → ssh_output", session_id, payload.data.len());
     if let Err(e) = window.emit("ssh_output", payload) {
-        eprintln!("[ssh:{}] emit ssh_output FAILED: {}", session_id, e);
+        log::warn!("[ssh:{}] emit ssh_output FAILED: {}", session_id, e);
     }
 }
 
@@ -861,11 +870,17 @@ pub async fn exec_once(
     let mut channel = handle
         .channel_open_session()
         .await
-        .map_err(|e| format!("Open exec channel failed: {}", e))?;
+        .map_err(|e| {
+            log::warn!("[ssh:{}] exec channel open failed: {}", session_id, e);
+            format!("Open exec channel failed: {}", e)
+        })?;
     channel
         .exec(true, command)
         .await
-        .map_err(|e| format!("exec failed: {}", e))?;
+        .map_err(|e| {
+            log::warn!("[ssh:{}] exec failed: {}", session_id, e);
+            format!("exec failed: {}", e)
+        })?;
 
     // Cap collected output so a chatty/malicious server can't OOM the app
     // within the 20s probe window (e.g. `yes` / `cat /dev/zero` left running).

@@ -42,11 +42,16 @@ struct AiErrorPayload {
 }
 
 fn emit_error(window: &WebviewWindow, request_id: &str, error: impl Into<String>) {
+    let msg: String = error.into();
+    // Every AI failure path (chat stream, health inspect, test) funnels
+    // through here, so log once to capture the provider/HTTP reason for
+    // post-mortem when a user reports "AI 不工作".
+    log::warn!("[ai:{}] error: {}", request_id, msg);
     let _ = window.emit(
         "ai_error",
         AiErrorPayload {
             request_id: request_id.to_string(),
-            error: error.into(),
+            error: msg,
         },
     );
 }
@@ -94,7 +99,7 @@ struct LoadedSettings {
 
 // ───────────────────────────── provider abstraction ─────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Provider {
     Claude,
     OpenAi,
@@ -600,11 +605,15 @@ pub async fn test_settings(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("请求 AI 接口失败: {}", e))?;
+        .map_err(|e| {
+            log::warn!("[ai] test request failed ({:?}): {}", s.provider, e);
+            format!("请求 AI 接口失败: {}", e)
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        log::warn!("[ai] test returned {} ({:?}): {}", status, s.provider, truncate(&text, 200));
         return Err(format!("AI 接口返回 {}：{}", status, truncate(&text, 500)));
     }
 

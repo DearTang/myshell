@@ -176,11 +176,11 @@ pub async fn connect(
                         data: buf[..n].to_vec(),
                     };
                     if let Err(e) = reader_window.emit("ssh_output", payload) {
-                        eprintln!("[local:{}] emit ssh_output FAILED: {}", reader_sid, e);
+                        log::warn!("[local:{}] emit ssh_output FAILED: {}", reader_sid, e);
                     }
                 }
                 Err(e) => {
-                    eprintln!("[local:{}] read error: {}", reader_sid, e);
+                    log::warn!("[local:{}] read error: {}", reader_sid, e);
                     break;
                 }
             }
@@ -207,7 +207,7 @@ pub async fn connect(
         let mut writer = match master.take_writer() {
             Ok(w) => w,
             Err(e) => {
-                eprintln!("[local:{}] take_writer failed: {}", writer_sid, e);
+                log::error!("[local:{}] take_writer failed: {}", writer_sid, e);
                 return;
             }
         };
@@ -219,7 +219,7 @@ pub async fn connect(
         // already UTF-8.
         if let Some(prelude) = utf8_prelude.as_ref() {
             if let Err(e) = writer.write_all(prelude) {
-                eprintln!("[local:{}] utf8 prelude write failed: {}", writer_sid, e);
+                log::warn!("[local:{}] utf8 prelude write failed: {}", writer_sid, e);
             }
             let _ = writer.flush();
         }
@@ -248,7 +248,7 @@ pub async fn connect(
             bytes.extend_from_slice(init.as_bytes());
             bytes.push(b'\r');
             if let Err(e) = writer.write_all(&bytes) {
-                eprintln!("[local:{}] init_command write failed: {}", writer_sid, e);
+                        log::warn!("[local:{}] init_command write failed: {}", writer_sid, e);
             }
             let _ = writer.flush();
         }
@@ -257,14 +257,14 @@ pub async fn connect(
             match cmd {
                 LocalCommand::Input(data) => {
                     if let Err(e) = writer.write_all(&data) {
-                        eprintln!("[local:{}] write failed: {}", writer_sid, e);
+                        log::warn!("[local:{}] write failed: {}", writer_sid, e);
                         break;
                     }
                     let _ = writer.flush();
                 }
                 LocalCommand::Resize { cols, rows } => {
                     if let Err(e) = master.resize(pty_size(cols, rows)) {
-                        eprintln!("[local:{}] resize failed: {}", writer_sid, e);
+                        log::warn!("[local:{}] resize failed: {}", writer_sid, e);
                     }
                 }
                 LocalCommand::Disconnect => {

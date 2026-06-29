@@ -23,16 +23,25 @@ async fn get_sftp_session(
     let channel = handle
         .channel_open_session()
         .await
-        .map_err(|e| format!("SFTP channel open failed: {}", e))?;
+        .map_err(|e| {
+            log::error!("[sftp:{}] channel open failed: {}", session_id, e);
+            format!("SFTP channel open failed: {}", e)
+        })?;
 
     channel
         .request_subsystem(true, "sftp")
         .await
-        .map_err(|e| format!("SFTP subsystem request failed: {}", e))?;
+        .map_err(|e| {
+            log::error!("[sftp:{}] subsystem request failed: {}", session_id, e);
+            format!("SFTP subsystem request failed: {}", e)
+        })?;
 
     let sftp = SftpSession::new(channel.into_stream())
         .await
-        .map_err(|e| format!("SFTP session init failed: {}", e))?;
+        .map_err(|e| {
+            log::error!("[sftp:{}] session init failed: {}", session_id, e);
+            format!("SFTP session init failed: {}", e)
+        })?;
 
     Ok(sftp)
 }
@@ -320,26 +329,38 @@ async fn upload_one(
     let name = basename(local_path);
     let mut local = tokio::fs::File::open(local_path)
         .await
-        .map_err(|e| format!("{}: 打开本地文件失败: {}", name, e))?;
+        .map_err(|e| {
+            log::warn!("[sftp] upload {} open local failed: {}", name, e);
+            format!("{}: 打开本地文件失败: {}", name, e)
+        })?;
     // create() = CREATE|TRUNCATE|WRITE → overwrite semantics.
     let mut remote = sftp
         .create(remote_path)
         .await
-        .map_err(|e| format!("{}: 打开远端文件失败: {}", name, e))?;
+        .map_err(|e| {
+            log::warn!("[sftp] upload {} open remote failed: {}", name, e);
+            format!("{}: 打开远端文件失败: {}", name, e)
+        })?;
 
     let mut buf = vec![0u8; TRANSFER_CHUNK];
     loop {
         let n = local
             .read(&mut buf)
             .await
-            .map_err(|e| format!("{}: 读取失败: {}", name, e))?;
+            .map_err(|e| {
+                log::warn!("[sftp] upload {} read failed: {}", name, e);
+                format!("{}: 读取失败: {}", name, e)
+            })?;
         if n == 0 {
             break;
         }
         remote
             .write_all(&buf[..n])
             .await
-            .map_err(|e| format!("{}: 写入失败: {}", name, e))?;
+            .map_err(|e| {
+                log::warn!("[sftp] upload {} write failed: {}", name, e);
+                format!("{}: 写入失败: {}", name, e)
+            })?;
         *bytes_done = bytes_done.saturating_add(n as u64);
         if last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
             emit_transfer_progress(
@@ -445,25 +466,37 @@ async fn download_one(
     let mut remote = sftp
         .open(remote_path)
         .await
-        .map_err(|e| format!("{}: 打开远端文件失败: {}", name, e))?;
+        .map_err(|e| {
+            log::warn!("[sftp] download {} open remote failed: {}", name, e);
+            format!("{}: 打开远端文件失败: {}", name, e)
+        })?;
     // File::create = CREATE|TRUNCATE|WRITE → overwrite.
     let mut local = tokio::fs::File::create(local_path)
         .await
-        .map_err(|e| format!("{}: 创建本地文件失败: {}", name, e))?;
+        .map_err(|e| {
+            log::warn!("[sftp] download {} create local failed: {}", name, e);
+            format!("{}: 创建本地文件失败: {}", name, e)
+        })?;
 
     let mut buf = vec![0u8; TRANSFER_CHUNK];
     loop {
         let n = remote
             .read(&mut buf)
             .await
-            .map_err(|e| format!("{}: 读取失败: {}", name, e))?;
+            .map_err(|e| {
+                log::warn!("[sftp] download {} read failed: {}", name, e);
+                format!("{}: 读取失败: {}", name, e)
+            })?;
         if n == 0 {
             break;
         }
         local
             .write_all(&buf[..n])
             .await
-            .map_err(|e| format!("{}: 写入失败: {}", name, e))?;
+            .map_err(|e| {
+                log::warn!("[sftp] download {} write failed: {}", name, e);
+                format!("{}: 写入失败: {}", name, e)
+            })?;
         *bytes_done = bytes_done.saturating_add(n as u64);
         if last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
             emit_transfer_progress(

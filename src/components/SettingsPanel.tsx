@@ -16,6 +16,12 @@ import type { BackupInfo } from "../api";
 import { useTheme } from "../hooks/useTheme";
 import { useColorScheme } from "../hooks/useColorScheme";
 import { useTerminalFont } from "../hooks/useTerminalFont";
+import {
+  useRendererPref,
+  useGpuPref,
+  readGpuDisabled,
+  type RendererBackend,
+} from "../hooks/useRendererPref";
 import { useAiConfig } from "../hooks/useAiConfig";
 import type { AiProvider } from "../api";
 import { RecycleDialog } from "./RecycleDialog";
@@ -23,6 +29,14 @@ import { compressImageDataUrl } from "../utils/image";
 import { aiTestSettings } from "../api";
 import { PRESETS, type ColorPalette } from "../themes";
 import { FontField } from "./FontField";
+
+const categories = [
+  { id: "appearance", label: "外观", icon: "🎨" },
+  { id: "ai", label: "AI 助手", icon: "🤖" },
+  { id: "security", label: "安全", icon: "🔒" },
+  { id: "data", label: "数据管理", icon: "💾" },
+  { id: "quickCommands", label: "快捷命令", icon: "⚡" },
+];
 
 interface Props {
   onClose: () => void;
@@ -70,6 +84,7 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   const [rollbackBusy, setRollbackBusy] = useState(false);
   const [rollbackResult, setRollbackResult] = useState<string | null>(null);
   const oldPassRef = useRef<HTMLInputElement>(null);
+  const [activeCategory, setActiveCategory] = useState("appearance");
   const { theme, toggleTheme } = useTheme();
   const {
     paletteId,
@@ -81,6 +96,29 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
     setBgImage,
   } = useColorScheme();
   const { primaryFont, setPrimaryFont } = useTerminalFont();
+  // Terminal renderer backend + GPU-off escape hatch (see useRendererPref).
+  // rendererBackend is pure-frontend (localStorage) and applies to NEW tabs.
+  // gpuDisabled is Rust-backed and applies on the NEXT launch — we load its
+  // persisted value from the flag file once on mount.
+  const { rendererBackend, setRendererBackend } = useRendererPref();
+  const [gpuDisabledInit, setGpuDisabledInit] = useState(false);
+  const { gpuDisabled, setGpuDisabled } = useGpuPref(gpuDisabledInit);
+  useEffect(() => {
+    let cancelled = false;
+    readGpuDisabled()
+      .then((v) => {
+        if (!cancelled) setGpuDisabledInit(v);
+      })
+      .catch(() => {
+        /* default false is fine */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  // The GPU flag only takes effect on next launch. Track whether the in-memory
+  // toggle disagrees with what's persisted so we can show "重启生效" / "已生效".
+  const gpuPendingRestart = gpuDisabled !== gpuDisabledInit;
 
   // ── AI assistant config ── editable local state, initialized once from the
   // vault-backed settings, persisted via useAiConfig.save (key re-encrypted
@@ -345,7 +383,7 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
           background: "var(--bg-elevated)",
           border: "1px solid var(--border-emphasis)",
           borderRadius: "var(--radius-xl)",
-          width: 520,
+          width: 850,
           maxHeight: "85vh",
           overflow: "hidden",
           boxShadow: "var(--shadow-xl)",
@@ -401,45 +439,20 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
           </button>
         </div>
 
-        {/* Content */}
-        <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
-          {/* Theme Section */}
-          <Section title="快捷命令">
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 12,
-              }}
-            >
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 13, color: "var(--text-primary)" }}>
-                  全局与服务器专属快捷命令
-                </div>
-                <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
-                  定义可复用的命令片段，支持多行按顺序执行，终端中一键运行
-                </div>
-              </div>
-              <button
-                onClick={onOpenQuickCommands}
-                style={{
-                  padding: "8px 14px",
-                  background: "var(--accent-primary)",
-                  color: "white",
-                  border: "none",
-                  borderRadius: "var(--radius-md)",
-                  fontSize: 13,
-                  fontWeight: 600,
-                  cursor: "pointer",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                🧩 管理
-              </button>
-            </div>
-          </Section>
+        {/* Main Content Area */}
+        <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+          {/* Left Navigation */}
+          <SettingsNavigation
+            activeCategory={activeCategory}
+            onCategoryChange={setActiveCategory}
+          />
 
+          {/* Right Content */}
+          <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
+
+          {/* Appearance Category — 配色 / 背景图 / 字体 / 渲染后端 */}
+          {activeCategory === "appearance" && (
+            <>
           {/* Color Scheme Section */}
           <Section title="配色方案">
             <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
@@ -905,6 +918,79 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
             </div>
           </Section>
 
+          {/* Terminal Rendering Section — renderer backend + GPU escape hatch.
+              Targets the "cursor invisible / selection highlight invisible"
+              reports: those trace to xterm.js's renderer layer, and this lets
+              a user on a misbehaving GPU recover. */}
+          <Section title="终端渲染">
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.6 }}>
+              若出现光标不显示、选中区域看不到高亮等问题，可在此切换渲染后端或关闭 GPU 加速。仅影响新打开的终端标签页。
+            </div>
+            <Field label="渲染后端">
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {(
+                  [
+                    { id: "auto", label: "自动（推荐）", desc: "默认 Canvas，透明背景时用 WebGL" },
+                    { id: "canvas", label: "Canvas", desc: "最稳定，光标/选区直接画在画布上" },
+                    { id: "webgl", label: "WebGL", desc: "性能最佳，依赖 GPU 合成" },
+                    { id: "dom", label: "DOM", desc: "最轻量，仅聚焦时显示光标" },
+                  ] as { id: RendererBackend; label: string; desc: string }[]
+                ).map((opt) => {
+                  const active = rendererBackend === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      title={opt.desc}
+                      onClick={() => setRendererBackend(opt.id)}
+                      style={{
+                        padding: "8px 14px",
+                        background: active ? "var(--accent-primary-muted)" : "var(--bg-input)",
+                        color: active ? "var(--accent-primary)" : "var(--text-secondary)",
+                        border: `1px solid ${active ? "var(--accent-primary)" : "var(--border-default)"}`,
+                        borderRadius: "var(--radius-md)",
+                        fontSize: 12,
+                        fontWeight: active ? 600 : 400,
+                        cursor: "pointer",
+                        transition: "all var(--duration-fast) var(--ease-in-out)",
+                      }}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </Field>
+
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                marginTop: 14,
+                padding: "12px 14px",
+                background: "var(--bg-input)",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-md)",
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, color: "var(--text-primary)" }}>
+                  禁用 GPU 硬件加速
+                </div>
+                <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 3, lineHeight: 1.5 }}>
+                  切换 WebGL/canvas 合成异常（光标/选区消失）时的最终手段。{gpuPendingRestart ? "更改需重启应用后生效。" : "当前设置已生效。"}
+                </div>
+              </div>
+              <Toggle checked={gpuDisabled} onChange={setGpuDisabled} />
+            </div>
+          </Section>
+            </>
+          )}
+
+          {/* AI Category */}
+          {activeCategory === "ai" && (
+            <>
           {/* AI Assistant Section */}
           <Section title="🤖 AI 助手">
             <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.6 }}>
@@ -1030,8 +1116,12 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
               )}
             </div>
           </Section>
-          <Divider />
+            </>
+          )}
 
+          {/* Security Category — 管理员权限 / 修改登录密码 */}
+          {activeCategory === "security" && (
+            <>
           {/* Admin / Elevation Section */}
           <Section title="🛡️ 管理员权限">
             <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.6 }}>
@@ -1173,9 +1263,12 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
               {passwordBusy ? "处理中..." : "修改密码"}
             </button>
           </Section>
+            </>
+          )}
 
-          <Divider />
-
+          {/* Data Category — 配置导入导出 / 版本备份与回退 */}
+          {activeCategory === "data" && (
+            <>
           {/* Export/Import Section */}
           <Section title="配置导入导出">
             <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14 }}>
@@ -1453,6 +1546,50 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
               </div>
             )}
           </Section>
+            </>
+          )}
+
+          {/* Quick Commands Category — 全局与服务器专属快捷命令入口 */}
+          {activeCategory === "quickCommands" && (
+            <>
+          <Section title="快捷命令">
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, color: "var(--text-primary)" }}>
+                  全局与服务器专属快捷命令
+                </div>
+                <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+                  定义可复用的命令片段，支持多行按顺序执行，终端中一键运行
+                </div>
+              </div>
+              <button
+                onClick={onOpenQuickCommands}
+                style={{
+                  padding: "8px 14px",
+                  background: "var(--accent-primary)",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                🧩 管理
+              </button>
+            </div>
+          </Section>
+            </>
+          )}
+          </div>
         </div>
       </div>
 
@@ -1603,6 +1740,53 @@ function Divider() {
         margin: "20px 0",
       }}
     />
+  );
+}
+
+/**
+ * Compact on/off switch built on the design-system CSS variables. Used for the
+ * GPU-acceleration toggle. `onChange` is async so the caller can persist via a
+ * Tauri command before the UI settles; the switch optimistically reflects the
+ * new state immediately.
+ */
+function Toggle({
+  checked,
+  onChange,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void | Promise<void>;
+}) {
+  return (
+    <button
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      style={{
+        flexShrink: 0,
+        width: 40,
+        height: 22,
+        padding: 2,
+        background: checked ? "var(--accent-primary)" : "var(--bg-surface-active)",
+        border: "none",
+        borderRadius: "var(--radius-full)",
+        cursor: "pointer",
+        transition: "background var(--duration-fast) var(--ease-in-out)",
+        display: "flex",
+        alignItems: "center",
+      }}
+    >
+      <span
+        style={{
+          width: 18,
+          height: 18,
+          background: "#ffffff",
+          borderRadius: "50%",
+          transform: checked ? "translateX(18px)" : "translateX(0)",
+          transition: "transform var(--duration-fast) var(--ease-in-out)",
+          boxShadow: "var(--shadow-sm)",
+        }}
+      />
+    </button>
   );
 }
 
@@ -1928,5 +2112,75 @@ function CustomPaletteDialog({
         </button>
       </div>
     </Dialog>
+  );
+}
+
+function SettingsNavigation({
+  activeCategory,
+  onCategoryChange,
+}: {
+  activeCategory: string;
+  onCategoryChange: (category: string) => void;
+}) {
+  return (
+    <div
+      style={{
+        width: 200,
+        borderRight: "1px solid var(--border-subtle)",
+        background: "var(--bg-surface)",
+        padding: "16px 0",
+        display: "flex",
+        flexDirection: "column",
+        gap: 2,
+        overflowY: "auto",
+      }}
+    >
+      {categories.map((category) => {
+        const isActive = activeCategory === category.id;
+        return (
+          <button
+            key={category.id}
+            onClick={() => onCategoryChange(category.id)}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              padding: "10px 16px",
+              margin: "0 8px",
+              background: isActive ? "var(--accent-primary-muted)" : "transparent",
+              border: "none",
+              borderRadius: "var(--radius-md)",
+              cursor: "pointer",
+              transition: "all var(--duration-fast) var(--ease-in-out)",
+              textAlign: "left",
+              width: "calc(100% - 16px)",
+            }}
+            onMouseEnter={(e) => {
+              if (!isActive) {
+                e.currentTarget.style.background = "var(--bg-surface-hover)";
+              }
+            }}
+            onMouseLeave={(e) => {
+              if (!isActive) {
+                e.currentTarget.style.background = "transparent";
+              }
+            }}
+          >
+            <span style={{ fontSize: 16, width: 20, textAlign: "center" }}>
+              {category.icon}
+            </span>
+            <span
+              style={{
+                fontSize: 13,
+                fontWeight: isActive ? 600 : 400,
+                color: isActive ? "var(--accent-primary)" : "var(--text-secondary)",
+              }}
+            >
+              {category.label}
+            </span>
+          </button>
+        );
+      })}
+    </div>
   );
 }

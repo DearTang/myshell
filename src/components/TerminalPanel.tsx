@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { CanvasAddon } from "@xterm/addon-canvas";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -25,6 +26,10 @@ import { recordKeystroke } from "../utils/cmd-buffer";
 import { useColorScheme } from "../hooks/useColorScheme";
 import { useTheme } from "../hooks/useTheme";
 import { useTerminalFont, resolveFontStack } from "../hooks/useTerminalFont";
+import {
+  type RendererBackend,
+  resolveRenderer,
+} from "../hooks/useRendererPref";
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -54,9 +59,11 @@ function visibleSelection(color: string | undefined): string | undefined {
  * render a low-contrast cursor as effectively invisible. Since `foreground`
  * is, by definition, the color chosen to be legible against `background`,
  * using it for the cursor guarantees the same contrast regardless of display
- * or driver. We also set `cursorStyle: "bar"` (a 1-cell-wide vertical line)
- * at Terminal construction, which stays continuously visible even where a
- * solid block might blend in.
+ * or driver.
+ *
+ * The cursor SHAPE is set separately at Terminal construction (see the
+ * `cursorStyle: "bar"` / `cursorWidth` options below) — this function only
+ * owns the colors.
  *
  * Returns the cursor overrides to merge into the xterm theme.
  */
@@ -85,6 +92,12 @@ interface Props {
   /** Per-connection terminal font override (family name). When set, wins over
    * the global terminal font for this tab. Undefined/empty → use global. */
   fontOverride?: string;
+  /** Terminal renderer backend preference ("auto" | "dom" | "canvas" |
+   * "webgl"). "auto" = canvas by default, WebGL when a background image needs
+   * transparency. See useRendererPref for the full rationale. Fixed per app
+   * (not per-connection), but threaded through here so each tab reads the
+   * current pref at mount. */
+  rendererBackend?: RendererBackend;
   /** When non-empty (and contains more than just this tab's own sessionId),
    * every keystroke is mirrored to all listed sessions in addition to the
    * local one. The list is read live from a ref so toggling broadcast on/
@@ -114,7 +127,7 @@ interface Props {
   onTerminalGone?: (sessionId: string) => void;
 }
 
-export function TerminalPanel({ sessionId, connType, connectionId, fontOverride, broadcastTargets, active = true, onDisconnected, status, onReconnect, onTerminalReady, onTerminalGone, onOpenQuickCommandsManage, onOpenAi }: Props) {
+export function TerminalPanel({ sessionId, connType, connectionId, fontOverride, rendererBackend, broadcastTargets, active = true, onDisconnected, status, onReconnect, onTerminalReady, onTerminalGone, onOpenQuickCommandsManage, onOpenAi }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -184,6 +197,15 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
 
     const term = new Terminal({
       cursorBlink: true,
+      // Bar cursor (a 1-cell-wide vertical line) instead of the default solid
+      // block. The bar stays continuously visible even where a filled block
+      // would blend into a similar-colored background, and it doesn't depend
+      // on focus to render (the DOM renderer only paints the block cursor
+      // while focused). Pairs with forceVisibleCursor() — that owns the
+      // color, this owns the shape. cursorWidth is in CSS px (1 is a hairline;
+      // 2 reads clearly without eating the next glyph).
+      cursorStyle: "bar",
+      cursorWidth: 2,
       fontSize: 14,
       fontFamily,
       theme: {
@@ -203,26 +225,61 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
     term.loadAddon(webLinksAddon);
     term.open(containerRef.current);
 
-    // Renderer choice depends on whether a background image is active:
+    // Renderer choice drives the "cursor / selection invisible" reports, so
+    // it's user-overridable (see useRendererPref). Default behavior:
     //  • Background image set → WebGL renderer. It redraws every frame, which
     //    is required for clean compositing under allowTransparency: the canvas
     //    renderer leaves ghosts/smearing on transparent backgrounds (input
     //    chars appear to "jump", worst on the local ConPTY path).
-    //  • No background image → canvas renderer (xterm default). On an opaque
-    //    terminal it has zero ghosting, AND it sidesteps the WebGL renderer's
-    //    known wrap-edge / glyph-atlas offset artifacts that can shift a
-    //    repainted wrapped line ("background shifts left"). Robustness over
-    //    FPS when we don't need transparency.
-    // Falls back to canvas if WebGL isn't usable (old GPU/drivers). Toggling
-    // the background-image setting after open needs a tab reopen to switch
-    // renderers (this runs once at mount).
-    if (hasBgImage) {
-      try {
-        term.loadAddon(new WebglAddon());
-      } catch (e) {
-        console.warn("[TerminalPanel] WebGL renderer unavailable, using canvas:", e);
+    //  • No background image → Canvas renderer (addon-canvas). It paints the
+    //    cursor AND the selection directly onto the same canvas as the text —
+    //    unlike the WebGL renderer, which draws the cursor on a SEPARATE
+    //    transparent 2D-canvas overlay (xtermjs/xterm.js#2614) that can fail
+    //    to composite on some GPU/driver + WebView2 combos, making the cursor
+    //    and selection never appear. The canvas renderer has no such overlay,
+    //    so it's the most robust against this whole class of bug. It also
+    //    beats the xterm 5.x default DOM renderer, which only shows the cursor
+    //    while focused and has its own known cursor bugs (#3271).
+    //  • The DOM renderer is opt-in only (for a user who hits trouble with the
+    //    other two). It's the lightest, no-canvas path.
+    // Falls back to canvas if a forced WebGL/Canvas renderer isn't usable
+    // (old GPU/drivers). Toggling the background-image setting or the
+    // renderer pref after open needs a tab reopen to switch renderers (this
+    // runs once at mount).
+    const renderer = resolveRenderer(
+      rendererBackend ?? "auto",
+      hasBgImage
+    );
+    const loadRenderer = (): void => {
+      if (renderer === "webgl") {
+        try {
+          term.loadAddon(new WebglAddon());
+          return;
+        } catch (e) {
+          console.warn(
+            "[TerminalPanel] WebGL renderer unavailable, falling back to canvas:",
+            e
+          );
+        }
       }
-    }
+      if (renderer === "dom") {
+        // No addon to load — xterm 5.x's built-in DOM renderer is the default
+        // when no renderer addon is registered. Intentionally load nothing.
+        return;
+      }
+      // canvas (default + webgl/canvas fallback)
+      try {
+        term.loadAddon(new CanvasAddon());
+      } catch (e) {
+        // Extremely unlikely (canvas is the most compatible), but don't let a
+        // renderer failure kill the terminal — fall through to the DOM default.
+        console.warn(
+          "[TerminalPanel] Canvas renderer unavailable, using DOM default:",
+          e
+        );
+      }
+    };
+    loadRenderer();
 
     // Block OSC 52 clipboard writes from the remote side. Without this,
     // a malicious SSH server can silently replace the user's clipboard

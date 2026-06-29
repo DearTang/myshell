@@ -30,6 +30,7 @@ import {
 } from "./api";
 import type { ConnectionConfig, ConnType, Tab } from "./api";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
+import { useRendererPref } from "./hooks/useRendererPref";
 
 export default function App() {
   const [connections, setConnections] = useState<ConnectionConfig[]>([]);
@@ -98,6 +99,10 @@ export default function App() {
     mode: "about",
   });
   const { info: updateInfo, loading: updateChecking, checkNow } = useUpdateCheck(vault === "ready");
+  // Terminal renderer backend (dom/canvas/webgl) — global pref, threaded into
+  // every TerminalPanel so each tab picks the same renderer at mount. Changing
+  // it only affects NEWLY opened tabs (a renderer is chosen once per terminal).
+  const { rendererBackend } = useRendererPref();
 
   useEffect(() => {
     if (vault !== "ready") return;
@@ -688,6 +693,7 @@ export default function App() {
                       connectionId={tab.connectionId || ""}
                       connType={tab.connType}
                       fontOverride={connections.find((c) => c.id === (tab.connectionId || ""))?.terminal_font}
+                      rendererBackend={rendererBackend}
                       broadcastTargets={getBroadcastTargets(tab)}
                       onTerminalReady={handleTerminalReady}
                       onTerminalGone={handleTerminalGone}
@@ -728,6 +734,7 @@ export default function App() {
                       connectionId={tab.connectionId || ""}
                       connType={tab.connType}
                       fontOverride={connections.find((c) => c.id === (tab.connectionId || ""))?.terminal_font}
+                      rendererBackend={rendererBackend}
                       onTerminalReady={handleTerminalReady}
                       onTerminalGone={handleTerminalGone}
                       onOpenAi={() => setShowAiPanel((prev) => !prev)}

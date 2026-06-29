@@ -985,3 +985,49 @@ export function onUpdateDownloadProgress(
 export async function installUpdate(path: string): Promise<void> {
   await invoke("install_update", { path });
 }
+
+// ============ Renderer / GPU acceleration ============
+//
+// WebView2 (the system webview on Windows) renders via the GPU. On some
+// GPU/driver combinations the WebGL/canvas compositing misbehaves — which is
+// the root cause behind the "terminal cursor invisible / selection highlight
+// invisible" reports. This toggle persists a flag to a Rust-managed file so
+// the Rust side can read it on the NEXT launch (before WebView2 is created)
+// and seed WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--disable-gpu. The flag
+// therefore only takes effect after an app restart, which the UI surfaces.
+
+/** Read the persisted GPU-off flag. True = --disable-gpu applies on launch. */
+export async function getGpuAccelerationDisabled(): Promise<boolean> {
+  return invoke<boolean>("get_gpu_acceleration_disabled");
+}
+
+/**
+ * Persist the GPU-off flag. Takes effect on the NEXT app launch (the env var
+ * must be set before WebView2 initializes). Returns nothing on success.
+ */
+export async function setGpuAccelerationDisabled(disabled: boolean): Promise<void> {
+  await invoke("set_gpu_acceleration_disabled", { disabled });
+}
+
+// ============ Frontend log forwarding ============
+//
+// The webview's console isn't persisted on the user's machine, so to diagnose
+// frontend-side anomalies (render crashes, unhandled promise rejections) we
+// forward them to the Rust backend, which writes them into the SAME daily log
+// file as the Rust output — tagged `[frontend]`. main.tsx wires the global
+// error/rejection handlers to this.
+
+/** Severity levels accepted by the backend. Anything else is coerced to info. */
+export type FrontendLogLevel = "error" | "warn" | "info" | "debug";
+
+/**
+ * Forward a single frontend log line into the shared backend log file.
+ * `message` should already be a single line (multi-line stacks pre-joined);
+ * the backend re-scrubs newlines defensively. Fire-and-forget — a logging
+ * failure must never throw (it would itself become an uncaught error).
+ */
+export function writeFrontendLog(level: FrontendLogLevel, message: string): void {
+  invoke("write_frontend_log", { level, message }).catch(() => {
+    /* Swallow — logging must never throw. */
+  });
+}

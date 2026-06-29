@@ -3,17 +3,65 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import { ThemeProvider } from "./hooks/useTheme";
 import { ColorSchemeProvider } from "./hooks/useColorScheme";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { writeFrontendLog } from "./api";
 import "./styles/global.css";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <ThemeProvider>
-      <ColorSchemeProvider>
-        <App />
-      </ColorSchemeProvider>
-    </ThemeProvider>
+    <ErrorBoundary>
+      <ThemeProvider>
+        <ColorSchemeProvider>
+          <App />
+        </ColorSchemeProvider>
+      </ThemeProvider>
+    </ErrorBoundary>
   </React.StrictMode>,
 );
+
+// ── Global frontend error capture ──────────────────────────────────────────
+//
+// The WebView2 console isn't persisted on the user's machine, so to diagnose
+// frontend-side anomalies (the "cursor invisible" class of report, an
+// unhandled async rejection) we forward these to the Rust backend, which
+// writes them into the SAME daily log file as the Rust output (tagged
+// `[frontend]`). The backend trace and the frontend trace then share a
+// timeline. writeFrontendLog is fire-and-forget and swallows its own errors,
+// so a logging failure can never itself become an uncaught error.
+//
+// (React render crashes are caught separately by ErrorBoundary above; these
+// listeners cover async callbacks + event handlers the boundary can't reach.)
+if (typeof window !== "undefined") {
+  // Uncaught synchronous errors + resource-load errors.
+  window.addEventListener("error", (event) => {
+    const msg = event.error instanceof Error
+      ? `${event.error.message}${event.error.stack ? ` | ${event.error.stack.replace(/\s+/g, " ").trim()}` : ""}`
+      : String(event.message || "unknown error");
+    writeFrontendLog("error", `uncaught: ${msg} @ ${event.filename}:${event.lineno}`);
+  });
+  // Unhandled promise rejections (the common case for failed async/await).
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason instanceof Error
+      ? `${event.reason.message}${reasonStack(event.reason)}`
+      : typeof event.reason === "string"
+        ? event.reason
+        : safeStringify(event.reason);
+    writeFrontendLog("error", `unhandledrejection: ${reason}`);
+  });
+}
+
+function reasonStack(e: Error): string {
+  return e.stack ? ` | ${e.stack.replace(/\s+/g, " ").trim()}` : "";
+}
+
+/** JSON.stringify that can't throw on cyclic / non-serializable values. */
+function safeStringify(v: unknown): string {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
 
 // Tell the Rust backend the first frame is painted so it can reveal the
 // window. The main window starts hidden (visible:false) to avoid a white

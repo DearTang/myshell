@@ -174,11 +174,17 @@ async fn socks5_connect(
         let p = password.unwrap();
         tokio_socks::tcp::Socks5Stream::connect_with_password(proxy, target, u, p)
             .await
-            .map_err(|e| format!("SOCKS5 认证握手失败: {}", e))?
+            .map_err(|e| {
+                log::warn!("[proxy] SOCKS5 auth handshake failed {:?}: {}", proxy, e);
+                format!("SOCKS5 认证握手失败: {}", e)
+            })?
     } else {
         tokio_socks::tcp::Socks5Stream::connect(proxy, target)
             .await
-            .map_err(|e| format!("SOCKS5 握手失败: {}", e))?
+            .map_err(|e| {
+                log::warn!("[proxy] SOCKS5 handshake failed {:?}: {}", proxy, e);
+                format!("SOCKS5 握手失败: {}", e)
+            })?
     };
     Ok(stream.into_inner())
 }
@@ -219,7 +225,10 @@ async fn http_connect_handshake(
     stream
         .write_all(request.as_bytes())
         .await
-        .map_err(|e| format!("HTTP CONNECT 写入失败: {}", e))?;
+        .map_err(|e| {
+            log::warn!("[proxy] HTTP CONNECT write failed → {}: {}", target, e);
+            format!("HTTP CONNECT 写入失败: {}", e)
+        })?;
 
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
@@ -227,8 +236,12 @@ async fn http_connect_handshake(
         let n = stream
             .read(&mut byte)
             .await
-            .map_err(|e| format!("HTTP CONNECT 读取失败: {}", e))?;
+            .map_err(|e| {
+                log::warn!("[proxy] HTTP CONNECT read failed → {}: {}", target, e);
+                format!("HTTP CONNECT 读取失败: {}", e)
+            })?;
         if n == 0 {
+            log::warn!("[proxy] HTTP CONNECT proxy closed early → {}", target);
             return Err("HTTP CONNECT 代理提前关闭连接".to_string());
         }
         buf.push(byte[0]);
@@ -244,6 +257,7 @@ async fn http_connect_handshake(
     let status_line = response.lines().next().unwrap_or("");
     let status_code = status_line.split_whitespace().nth(1).unwrap_or("");
     if status_code != "200" {
+        log::warn!("[proxy] HTTP CONNECT failed ({}) → {}: {}", status_code, target, status_line);
         return Err(format!("HTTP CONNECT 失败 ({}): {}", status_code, status_line));
     }
 

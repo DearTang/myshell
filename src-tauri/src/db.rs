@@ -129,7 +129,7 @@ pub fn migrate_legacy_schema(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     if column_exists(&tx, "connections", "password") {
         tx.execute("ALTER TABLE connections DROP COLUMN password", [])?;
-        eprintln!("[db] dropped legacy password column");
+        log::info!("[db] dropped legacy password column");
     }
 
     if column_exists(&tx, "connections", "group_name") {
@@ -145,7 +145,7 @@ pub fn migrate_legacy_schema(conn: &Connection) -> Result<()> {
         )?;
         tx.execute("ALTER TABLE connections DROP COLUMN group_name", [])?;
         tx.execute("ALTER TABLE connections RENAME COLUMN group_path_new TO group_path", [])?;
-        eprintln!("[db] migrated group_name -> group_path");
+        log::info!("[db] migrated group_name -> group_path");
     }
 
     if !column_exists(&tx, "connections", "conn_type") {
@@ -241,7 +241,7 @@ pub fn migrate_legacy_schema(conn: &Connection) -> Result<()> {
                  SELECT host, 22, fingerprint, key_type, first_seen FROM known_hosts_old_v1;
              DROP TABLE known_hosts_old_v1;",
         )?;
-        eprintln!("[db] known_hosts: rebuilt with (host, port) primary key");
+        log::info!("[db] known_hosts: rebuilt with (host, port) primary key");
     }
 
     tx.commit()?;
@@ -363,7 +363,7 @@ pub fn migrate_to_vault(conn: &mut Connection, key: &[u8; 32]) -> Result<usize> 
         tx.execute("ALTER TABLE connections DROP COLUMN private_key_path", [])?;
     }
     tx.commit()?;
-    eprintln!("[db] vault migration: {} rows encrypted", migrated);
+    log::info!("[db] vault migration: {} rows encrypted", migrated);
     Ok(migrated)
 }
 
