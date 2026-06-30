@@ -1196,3 +1196,19 @@
 | 目标是什么？ | 侧栏可调宽、会话面板统一管理、广播级联重连减少手动操作 |
 | 我学到了什么？ | BroadcastDupDialog 用 sessionStorage 记忆"本次不再提醒"偏好（重启重置）；SessionDropdownPanel 统一管理当前会话和广播组；广播级联重连通过 groupId 过滤同组掉线会话 |
 | 我做了什么？ | 版本 bump 1.7.0 + sync；CHANGELOG/README 加 v1.7.0 节 + badge；tsc+cargo check+tauri:build；commit+push；Gitee 发布；staging 清空 + baseline→v1.7.0；progress 阶段45 |
+
+
+### 闃舵 46锛氬彂甯?v1.9.0 鈥斺€?缁堢娓叉煋鍋ュ．鎬?+ 鍏ㄩ摼璺棩蹇楃洃鎺э紙2026-06-29锛?- **闇€姹傦細** 鎺ヨ繛涓や釜鏀瑰姩鏀跺熬鍙戝竷銆傗憼淇閮ㄥ垎鐢ㄦ埛缁堢鍏夋爣/閫夊尯涓嶅彲瑙侊紙xterm 娓叉煋鍣ㄥ眰闂锛夛紱鈶″悗鍙版棩蹇楃洃鎺у寮猴紝渚夸簬寮傚父璇婃柇銆傞檮甯︽妸璁剧疆闈㈡澘閲嶆瀯涓哄垎绫诲鑸€?- **鍙戝竷鍐呭锛坰taging 涓绘簮锛夛細**
+  - 鉁ㄦ柊澧?璁剧疆闈㈡澘宸﹀彸鍒嗘爮瀵艰埅锛堝瑙?AI/瀹夊叏/鏁版嵁绠＄悊/蹇嵎鍛戒护锛?  - 鉁ㄦ柊澧?缁堢娓叉煋鍚庣鍙€夛紙鑷姩/Canvas/WebGL/DOM锛?  - 鉁ㄦ柊澧?鍏ㄥ眬鏃ュ織鐩戞帶锛堝墠绔穿婧?鏈崟鑾峰紓甯歌浆鍙戝埌鍚庡彴鏃ュ織锛?  - 馃洜锔忎紭鍖?缁堢榛樿鏀圭敤 Canvas 娓叉煋鍣?+ 鏉″舰鍏夋爣锛坈ursorStyle:bar锛夛紝鍏夋爣绋冲畾鍙涓斾繚鐣欓棯鐑?  - 馃洜锔忎紭鍖?鍚庣鍏抽敭璺緞琛ュ叏鏃ュ織锛圫SH/SFTP/鏈湴缁堢/鏁版嵁搴?澶囦唤/AI/浠ｇ悊锛?  - 馃洜锔忎紭鍖?璁剧疆鏂板銆岀鐢?GPU 纭欢鍔犻€熴€嶅紑鍏筹紙閲嶅惎鐢熸晥锛孏PU 鍚堟垚寮傚父鍏滃簳锛?  - 馃悰淇 forceVisibleCursor 娉ㄩ噴澹版槑 cursorStyle:bar 浣嗕唬鐮佷粠鏈缃殑閬楃暀缂洪櫡
+- **鐗堟湰鍙凤細** staging 鍚?鉁ㄦ柊澧?鈫?minor锛歷1.8.0 鈫?**v1.9.0**
+- **娴佺▼鎵ц锛?* 瀹屾暣鎬ф牳鏌ワ紙18 鏂囦欢鍚?2 鏂版枃浠讹紝鍏ㄥ湪宸ヤ綔鍖烘湭鎻愪氦锛屽崟鐙?git status 妫€鏌ワ級鈫?鐢ㄦ埛纭闂ㄩ€氳繃 鈫?tsc PASS / cargo check PASS / tauri:build exit 0锛圡yShell_1.9.0_x64-setup.exe锛夆啋 commit+push锛坮elease: v1.9.0, 21 鏂囦欢 +1064/-133锛夆啋 Gitee 鍙戝竷 release id=728056 鈫?staging 娓呯┖ + baseline鈫抳1.9.0
+- **鍐崇瓥瑕佺偣锛?* 鈶犲厜鏍囬棶棰樻牴鍥犲湪 xterm.js 娓叉煋鍣ㄥ眰锛圵ebGL 鍏夋爣鍙犲姞灞傚悎鎴愬け璐ャ€丏OM 娓叉煋鍣?focus 渚濊禆锛夛紝闈?WebView/Electron 涔嬮€夛紝鍥犳涓嶈縼绉?Electron锛汣anvas 娓叉煋鍣ㄦ妸鍏夋爣鐩存帴鐢诲湪鐢诲竷涓婃渶绋冲仴銆傗憽GPU 寮€鍏崇敤 Rust 鏍囧織鏂囦欢锛堥潪 localStorage锛夛紝鍥犻渶鍦?WebView2 鍒涘缓鍓嶈銆傗憿鍓嶇閿欒杞彂鍒板悓涓€浠芥棩蹇楁枃浠讹紝鍓嶅悗绔椂闂寸嚎鍙榻愩€?- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛沗cargo check` PASS锛沗tauri:build` exit 0锛涘彂甯?URL锛歨ttps://gitee.com/argustang/myshell/releases/tag/v1.9.0
+
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 46锛?| 闂 | 绛旀 |
+|------|------|
+| 鎴戝湪鍝噷锛?| 闃舵 46 complete 鈥斺€?v1.9.0 宸插彂甯冿紝staging 宸叉竻绌恒€乥aseline鈫抳1.9.0 |
+| 鎴戣鍘诲摢閲岋紵 | 涓嬩竴椤规敼鍔ㄥ畬鎴愭椂鎸?doc-after-feature 杩藉姞 staging 鏉＄洰 |
+| 鐩爣鏄粈涔堬紵 | 缁堢鍏夋爣/閫夊尯鍙鎬ф牴鍥犱慨澶?+ 寮傚父鍙瘖鏂紙鏃ュ織鍏ㄩ摼璺鐩栵級 |
+| 鎴戝鍒颁簡浠€涔堬紵 | xterm 娓叉煋鍣ㄩ€夋嫨鏄厜鏍囬棶棰樼殑鏍稿績锛岄潪 webview 鏂规锛汫PU 绂佺敤椤诲湪 webview 鍒涘缓鍓嶈鐜鍙橀噺锛涘墠绔敊璇浆鍙戝埌 Rust 鏃ュ織鏄瘖鏂墠绔紓甯哥殑鏈夋晥鎵嬫 |
+| 鎴戝仛浜嗕粈涔堬紵 | 鐗堟湰 bump 1.9.0+sync锛汣HANGELOG/README 鍔?v1.9.0 鑺傦紱Canvas 娓叉煋鍣?cursorStyle 淇+娓叉煋鍣?GPU 寮€鍏筹紱Rust 7 妯″潡+鍓嶇鍏ㄥ眬鏃ュ織锛泃sc+cargo+tauri:build锛沜ommit+push锛汫itee 鍙戝竷锛泂taging 娓呯┖锛沵emory 鍚屾 CLAUDE.md 缁忛獙锛沺rogress 闃舵46 |
+
