@@ -133,6 +133,10 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
   const fitRef = useRef<FitAddon | null>(null);
   const sessionIdRef = useRef(sessionId);
   const connTypeRef = useRef(connType);
+  // Mirror of the `active` prop for use inside the mount effect's window-focus
+  // listener (which is bound once at mount but must read the current active
+  // state on every focus event to avoid stealing focus from another tab).
+  const activeRef = useRef(active);
   const broadcastRef = useRef<string[]>(broadcastTargets || []);
   const bridgeRef = useRef<ZmodemBridge | null>(null);
   const isZmodemRef = useRef(false);
@@ -155,6 +159,7 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
   // mount) sees updates without rebinding.
   broadcastRef.current = broadcastTargets || [];
   connectionIdRef.current = connectionId;
+  activeRef.current = active;
 
   // Color scheme & background image from context
   const { getActivePalette, bgImage } = useColorScheme();
@@ -478,9 +483,33 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
     onTerminalReady?.(sessionId, term);
 
     term.focus();
+    // Retry focus after a short delay. The initial term.focus() above can run
+    // before the xterm DOM layers are fully attached, so the internal cursor
+    // blink state machine never starts — leaving the cursor frozen (not
+    // blinking) until something else (tab switch, clicking into the app)
+    // re-triggers focus. The retry ensures the blink timer is armed even on a
+    // slow first paint. 150ms is well past xterm's own open/refresh cycle.
+    const focusRetry = setTimeout(() => {
+      if (!closed) term.focus();
+    }, 150);
+
+    // Window focus/blur — Chromium suspends timers (including xterm's cursor
+    // blink interval) when the window loses focus, and does NOT automatically
+    // resume the blink state machine when focus returns. Without re-focusing
+    // here, the cursor stays frozen (solid or invisible) after switching away
+    // from the app and back. Only act when this tab is the active one, so we
+    // don't steal focus from another tab the user switched to.
+    const onWindowFocus = () => {
+      if (activeRef.current && !closed) {
+        term.focus();
+      }
+    };
+    window.addEventListener("focus", onWindowFocus);
 
     return () => {
       closed = true;
+      clearTimeout(focusRetry);
+      window.removeEventListener("focus", onWindowFocus);
       unlistenOutput?.();
       unlistenClosed?.();
       unlistenZmodemStart?.();

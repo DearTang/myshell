@@ -99,6 +99,15 @@ export function AiPanel({
   onClose,
 }: Props) {
   const [messages, setMessages] = useState<Msg[]>([]);
+  // Mirror of `messages` for reading inside async callbacks without waiting for
+  // the next render (setMessages is async). The send() handler reads this to
+  // build the full conversation history for the backend — without it, each
+  // request would only carry the latest user turn and the AI would lose all
+  // prior context (the reported "no memory" symptom).
+  const messagesRef = useRef<Msg[]>([]);
+  // Keep the ref in sync with the state so async callbacks read the latest
+  // conversation history without waiting for a re-render.
+  messagesRef.current = messages;
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [attachedSelection, setAttachedSelection] = useState<string | null>(null);
@@ -212,8 +221,17 @@ export function AiPanel({
     activeReqRef.current = { reqId, unlistens: subs };
 
     const context = collectContext();
-    const payload: ChatMessage = { role: "user", content: text };
-    aiChat(reqId, [payload], null, context).catch((e) => {
+    // Build the FULL conversation history to send to the backend. Previously
+    // this only sent `[payload]` (the latest user turn), so the AI had zero
+    // memory of earlier turns — the reported "no context continuity" bug.
+    // We read from messagesRef (not `messages`, which may be stale in this
+    // callback) and filter out failed/incomplete turns: an errored assistant
+    // reply or a still-streaming bubble carries no usable answer to build on.
+    const history: ChatMessage[] = messagesRef.current
+      .filter((m) => !m.error && !m.streaming && m.content.trim().length > 0)
+      .map((m) => ({ role: m.role, content: m.content }));
+    history.push({ role: "user", content: text });
+    aiChat(reqId, history, null, context).catch((e) => {
       setMessages((prev) =>
         prev.map((m) =>
           m.id === reqId ? { ...m, content: `请求失败: ${e}`, error: true, streaming: false } : m
