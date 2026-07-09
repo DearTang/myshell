@@ -11,6 +11,12 @@ import { AiPanel } from "./components/AiPanel";
 import { QuickCommandsPanel } from "./components/QuickCommandsPanel";
 import { AboutDialog } from "./components/AboutDialog";
 import { FeedbackDialog } from "./components/FeedbackDialog";
+import { StatsConsentDialog } from "./components/StatsConsentDialog";
+import {
+  checkReportNeeded,
+  reportVersion,
+  setStatsConsent,
+} from "./lib/usageStats";
 import { BroadcastDupDialog } from "./components/BroadcastDupDialog";
 import { UpdateNotification } from "./components/UpdateNotification";
 import { BrandLogo } from "./components/BrandLogo";
@@ -54,6 +60,9 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showQuickCommands, setShowQuickCommands] = useState(false);
   const [showFeedback, setShowFeedback] = useState(false);
+  // Anonymous usage stats consent dialog. Shown on first launch of each new
+  // version (if the user hasn't previously agreed). See lib/usageStats.ts.
+  const [statsPrompt, setStatsPrompt] = useState<{ version: string } | null>(null);
   // AI assistant panel (global docked-right chat bar). Width persists in
   // localStorage so it survives reloads.
   const [showAiPanel, setShowAiPanel] = useState(false);
@@ -131,6 +140,18 @@ export default function App() {
         } else if (known !== v) {
           // Version changed since last run → show what's new.
           setAbout({ open: true, mode: "whatsnew" });
+        }
+
+        // ── Anonymous per-version usage stats ──
+        // Check whether the current version needs to be reported. If the user
+        // has previously agreed, report silently. Otherwise, prompt.
+        const { shouldReport, hasConsent } = checkReportNeeded(v);
+        if (shouldReport) {
+          if (hasConsent) {
+            void reportVersion(v, navigator.platform);
+          } else {
+            setStatsPrompt({ version: v });
+          }
         }
       })
       .catch(() => {
@@ -841,6 +862,20 @@ export default function App() {
         <FeedbackDialog
           version={appVersion}
           onClose={() => setShowFeedback(false)}
+        />
+      )}
+      {statsPrompt && (
+        <StatsConsentDialog
+          version={statsPrompt.version}
+          onAgree={() => {
+            setStatsConsent(true);
+            void reportVersion(statsPrompt.version, navigator.platform);
+            setStatsPrompt(null);
+          }}
+          onDecline={() => {
+            setStatsConsent(false);
+            setStatsPrompt(null);
+          }}
         />
       )}
       {vault === "ready" && updateInfo?.has_update && (

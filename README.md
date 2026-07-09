@@ -6,7 +6,7 @@
   <img src="src-tauri/icons/icon.png" width="120" alt="MyShell" />
 </p>
 
-![Version](https://img.shields.io/badge/version-1.10.0-blue)
+![Version](https://img.shields.io/badge/version-1.10.1-blue)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-green)
 ![React](https://img.shields.io/badge/React-18-blue)
 ![Rust](https://img.shields.io/badge/Rust-1.70+-orange)
@@ -80,6 +80,11 @@
 
 
 ## 更新日志
+
+### v1.10.1（2026-07-09）
+
+#### ✨ 新增
+- **匿名版本统计**：新版本首次启动时征求同意后，匿名上报一次（随机设备 ID + 版本号 + 操作系统，不含任何连接信息），帮助了解各版本的真实用户覆盖量；同意后记住偏好，后续版本自动统计不再打扰
 
 ### v1.10.0（2026-07-09）
 
