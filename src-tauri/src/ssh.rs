@@ -62,7 +62,7 @@ impl client::Handler for SshClient {
                     // without ever checking the fingerprint store.
                     log::warn!(
                         "[ssh] known_hosts mutex poisoned; rejecting key for {}:{}",
-                        self.host, self.port
+                        crate::redact::host(&self.host), self.port
                     );
                     return Ok(false);
                 }
@@ -74,7 +74,7 @@ impl client::Handler for SshClient {
                     } else {
                         log::warn!(
                             "[ssh] host key mismatch for {}:{}: stored={} got={}",
-                            self.host, self.port, known_fp, fingerprint
+                            crate::redact::host(&self.host), self.port, known_fp, fingerprint
                         );
                         false
                     }
@@ -106,7 +106,7 @@ impl client::Handler for SshClient {
                     // likely transient.
                     log::warn!(
                         "[ssh] known_hosts query failed for {}:{}: {} — rejecting",
-                        self.host, self.port, e
+                        crate::redact::host(&self.host), self.port, e
                     );
                     return Ok(false);
                 }
@@ -272,9 +272,9 @@ pub async fn dial_and_authenticate(
             log::info!(
                 "[ssh] dialing via {} proxy {}:{} → {}:{}",
                 config.proxy_type,
-                proxy_cfg.host(),
+                crate::redact::host(proxy_cfg.host()),
                 proxy_cfg.port(),
-                config.host,
+                crate::redact::host(&config.host),
                 config.port
             );
             let stream = proxy::connect_via_proxy(&proxy_cfg, &config.host, config.port).await?;

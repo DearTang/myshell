@@ -860,6 +860,69 @@ export async function readTextFile(path: string): Promise<string> {
   return await invoke("read_text_file", { path });
 }
 
+// ============ Feedback / Diagnostics ============
+
+/** Log info returned by `get_feedback_log` for the feedback dialog. */
+export interface FeedbackLogInfo {
+  /** Absolute path to the logs dir, for the "open folder" button. */
+  logDir: string;
+  /** Today's (+ yesterday's) log content, already scrubbed of hosts/IPs. */
+  content: string;
+  /** True if the content was tail-truncated (log was larger than 200 KiB). */
+  truncated: boolean;
+}
+
+/**
+ * Read the current + previous day's log for the feedback dialog. The backend
+ * scrubs IPs / `user@host` targets a second time, so the content is safe to
+ * ship in a feedback email without leaking server addresses.
+ */
+export async function getFeedbackLog(): Promise<FeedbackLogInfo> {
+  return await invoke("get_feedback_log");
+}
+
+/**
+ * Reveal a path in the OS file explorer. Backend whitelists the MyShell log
+ * dir only — arbitrary paths are rejected. Used by the feedback dialog's
+ * "open feedback / log folder" button.
+ */
+export async function revealPath(path: string): Promise<void> {
+  await invoke("reveal_path", { path });
+}
+
+/**
+ * Save a feedback zip (built in the frontend with fflate) into the MyShell
+ * feedback dir. Returns the full saved path so the UI can offer "open folder".
+ * The filename is sanitized server-side; only alphanumerics / - _ . survive.
+ */
+export async function saveFeedbackZip(
+  filename: string,
+  data: Uint8Array,
+): Promise<string> {
+  // Tauri serializes Vec<u8> from a JS array of numbers, not a Uint8Array
+  // directly — convert to a plain array.
+  return await invoke("save_feedback_zip", {
+    filename,
+    data: Array.from(data),
+  });
+}
+
+/**
+ * Upload a single screenshot to a free image host (Telegraph — no account
+ * needed) via the Rust backend, returning the hosted image URL. This lets
+ * the screenshot appear in the Web3Forms email body (free tier has no
+ * attachment support). On failure, throws — caller falls back to local zip.
+ */
+export async function uploadScreenshot(
+  data: Uint8Array,
+  mime: string,
+): Promise<string> {
+  return await invoke("upload_screenshot", {
+    data: Array.from(data),
+    mime,
+  });
+}
+
 // ============ ZMODEM Event Subscriptions ============
 
 export interface ZmodemStartPayload {

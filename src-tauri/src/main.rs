@@ -23,6 +23,7 @@ mod local;
 mod fonts;
 mod elevation;
 mod ai;
+mod redact;
 
 // ============ Connection Config ============
 
@@ -1047,6 +1048,280 @@ fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     app.shell()
         .open(url, None)
         .map_err(|e| format!("打开链接失败: {e}"))
+}
+
+/// Returns the canonical log directory path, mirroring `setup_file_logging`.
+/// Kept as a free function so both `setup_file_logging` (release startup) and
+/// `get_feedback_log` (user-triggered) agree on the location without sharing
+/// mutable state.
+fn log_dir_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("myshell")
+        .join("logs")
+}
+
+/// Payload for `get_feedback_log` — what the feedback dialog needs to show
+/// the user their log content and to reveal the folder in the file explorer.
+#[derive(Clone, Serialize)]
+struct FeedbackLogInfo {
+    /// Absolute path to the logs dir, for the "open folder" button.
+    log_dir: String,
+    /// Today's (+ optionally yesterday's) log content, already scrubbed by
+    /// `redact::scrub_log_text` so point-of-origin misses / third-party
+    /// crate output can't leak hosts or IPs into a feedback email.
+    content: String,
+    /// True if the content was truncated from its full size.
+    truncated: bool,
+}
+
+/// Read the current (and previous day's) log file for the feedback dialog.
+///
+/// Security: the content is scrubbed a second time via `redact::scrub_log_text`
+/// — even if a code path forgot to mask a host at its log site, or a log file
+/// predates the redaction work, no IP / user@host survives into the feedback
+/// payload. Capped at 200 KiB (tail) so a runaway log can't OOM the email or
+/// the webview.
+#[tauri::command]
+fn get_feedback_log() -> Result<FeedbackLogInfo, String> {
+    const MAX_BYTES: usize = 200 * 1024;
+
+    let log_dir = log_dir_path();
+    let log_dir_str = log_dir.to_string_lossy().to_string();
+
+    if !log_dir.exists() {
+        // Debug builds don't set up file logging (setup_file_logging is
+        // #[cfg(not(debug_assertions))]). Return empty rather than erroring —
+        // the feedback dialog shows a "logs unavailable in dev build" note.
+        return Ok(FeedbackLogInfo {
+            log_dir: log_dir_str,
+            content: String::new(),
+            truncated: false,
+        });
+    }
+
+    // Day index since epoch, same formula as setup_file_logging.
+    let day = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86400)
+        .unwrap_or(0);
+
+    // Read today + yesterday so a late-night report written just past
+    // midnight still has context. Yesterday first so chronology reads top-down.
+    let mut combined = String::new();
+    for offset in [1u64, 0] {
+        let path = log_dir.join(format!("myshell-{}.log", day.saturating_sub(offset)));
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if !combined.is_empty() {
+                combined.push_str("\n\n");
+            }
+            combined.push_str(&format!("===== {} =====\n", path.display()));
+            combined.push_str(&text);
+        }
+    }
+
+    // Tail-truncate if oversized (keep the most recent entries — those are
+    // what's relevant to a just-encountered bug).
+    let truncated = combined.len() > MAX_BYTES;
+    if truncated {
+        // Walk forward from the byte cut point to the next UTF-8 boundary so
+        // we never split a multibyte codepoint (logs may contain Chinese).
+        let mut start = combined.len() - MAX_BYTES;
+        while !combined.is_char_boundary(start) {
+            start += 1;
+        }
+        combined = format!("[…earlier log truncated, showing last {} KiB…]\n", MAX_BYTES / 1024)
+            + &combined[start..];
+    }
+
+    // Defence-in-depth scrub: mask any IP / user@host that slipped through.
+    let content = redact::scrub_log_text(&combined);
+
+    Ok(FeedbackLogInfo {
+        log_dir: log_dir_str,
+        content,
+        truncated,
+    })
+}
+
+/// Reveal a path in the OS file explorer. Whitelisted to the MyShell log dir
+/// ONLY — arbitrary path opening would be a footgun (could be tricked into
+/// running a malicious explorer registered for a path type). The feedback
+/// dialog uses this for its "open feedback / log folder" button.
+#[tauri::command]
+#[allow(deprecated)]
+fn reveal_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    // Canonicalize both sides so the allowlist isn't defeated by `..`, symlinks,
+    // or differing separators. A non-existent path canonicalizes to itself on
+    // Windows, which still fails the contains() check for a bogus path.
+    let target = std::fs::canonicalize(&path).unwrap_or_else(|_| std::path::PathBuf::from(&path));
+    let allowed_root = std::fs::canonicalize(log_dir_path())
+        .unwrap_or_else(|_| log_dir_path());
+
+    if !target.starts_with(&allowed_root) {
+        return Err("仅允许打开日志目录".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use tauri_plugin_shell::ShellExt;
+        app.shell()
+            .command("explorer.exe")
+            .args([target.to_string_lossy().to_string()])
+            .spawn()
+            .map_err(|e| format!("打开文件夹失败: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use tauri_plugin_shell::ShellExt;
+        app.shell()
+            .command("open")
+            .args([target.to_string_lossy().to_string()])
+            .spawn()
+            .map_err(|e| format!("打开文件夹失败: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use tauri_plugin_shell::ShellExt;
+        app.shell()
+            .command("xdg-open")
+            .args([target.to_string_lossy().to_string()])
+            .spawn()
+            .map_err(|e| format!("打开文件夹失败: {e}"))?;
+        Ok(())
+    }
+}
+
+/// Save a feedback package (zip) built by the frontend (fflate) into a
+/// `feedback/` subfolder of the log dir. Returns the full path so the UI can
+/// show it and offer "open folder". This avoids pulling in a Tauri fs plugin
+/// — the write is sandboxed to the feedback dir, not an arbitrary path.
+///
+/// The filename is supplied by the caller but sanitized: only alphanumerics,
+/// `-`, `_`, `.` survive; a `.zip` extension is enforced. A collision
+/// (unlikely with the timestamp) appends a counter.
+#[tauri::command]
+fn save_feedback_zip(filename: String, data: Vec<u8>) -> Result<String, String> {
+    // Sanitize filename — strip anything that could escape the dir or confuse
+    // the filesystem (path separators, control chars, etc.).
+    let safe_name: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_name = if safe_name.ends_with(".zip") {
+        safe_name
+    } else {
+        format!("{safe_name}.zip")
+    };
+
+    let dir = log_dir_path()
+        .parent() // …/myshell/  (logs/ is one level down)
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("feedback");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建反馈目录失败: {e}"))?;
+
+    // Disambiguate collisions with a counter.
+    let mut path = dir.join(&safe_name);
+    let mut counter = 1;
+    while path.exists() {
+        let stem = safe_name.trim_end_matches(".zip");
+        path = dir.join(format!("{stem}-{counter}.zip"));
+        counter += 1;
+    }
+
+    std::fs::write(&path, &data).map_err(|e| format!("写入反馈包失败: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// ImgBB API key (free tier, register at imgbb.com — reachable from mainland
+/// China without a proxy, unlike Telegraph). The key is public-by-design for
+/// a client app (it only allows uploads to YOUR account; worst case on leak
+/// is someone filling your quota). TODO: replace placeholder with real key.
+const IMGBB_API_KEY: &str = "39049cc05bc225d7e0cf72236dece2c1";
+
+/// Upload a single screenshot to ImgBB so the image URL can be embedded in
+/// the Web3Forms email body (free tier has no attachment support). Uploaded
+/// via the Rust backend (reqwest) to avoid CORS / origin issues the webview
+/// would face.
+///
+/// Returns the hosted image URL on success. On any failure, returns Err so
+/// the frontend can fall back to the local-zip path (the screenshot is never
+/// lost — it's already in the local feedback zip).
+///
+/// Privacy note: ImgBB is a public image host. The screenshot should not
+/// contain secrets — the feedback dialog already warns the user that images
+/// are uploaded.
+#[tauri::command]
+async fn upload_screenshot(data: Vec<u8>, _mime: String) -> Result<String, String> {
+    use base64::Engine;
+
+    // ImgBB expects the raw image bytes as a base64 string (no data: prefix).
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP 客户端构造失败: {e}"))?;
+
+    let url = format!("https://api.imgbb.com/1/upload?key={IMGBB_API_KEY}");
+
+    let res = client
+        .post(&url)
+        .form(&[("image", b64.as_str())])
+        .send()
+        .await
+        .map_err(|e| format!("上传失败（网络）: {e}"))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(format!("上传失败: HTTP {status} — {body}"));
+    }
+
+    // ImgBB returns: { "data": { "url": "https://...png", ... }, "success": true }
+    #[derive(serde::Deserialize)]
+    struct ImgbbResponse {
+        data: Option<ImgbbData>,
+        success: Option<bool>,
+        #[serde(default)]
+        error: Option<ImgbbError>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ImgbbData {
+        url: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ImgbbError {
+        message: Option<String>,
+    }
+
+    let parsed: ImgbbResponse = res
+        .json()
+        .await
+        .map_err(|e| format!("解析上传响应失败: {e}"))?;
+
+    if parsed.success == Some(true) {
+        parsed
+            .data
+            .and_then(|d| d.url)
+            .ok_or_else(|| "上传响应缺少图片地址".to_string())
+    } else {
+        Err(parsed
+            .error
+            .and_then(|e| e.message)
+            .unwrap_or_else(|| "图床返回失败但未说明原因".to_string()))
+    }
 }
 
 /// Payload for the `update_download_progress` event, scoped to the window
@@ -3239,6 +3514,10 @@ pub fn run() {
             get_ai_settings,
             save_ai_settings,
             ai_test_settings,
+            get_feedback_log,
+            reveal_path,
+            save_feedback_zip,
+            upload_screenshot,
         ])
         .setup(|app| {
             // Explicitly set the main window's icon so the title bar + taskbar

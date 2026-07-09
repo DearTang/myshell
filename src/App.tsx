@@ -10,6 +10,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 import { AiPanel } from "./components/AiPanel";
 import { QuickCommandsPanel } from "./components/QuickCommandsPanel";
 import { AboutDialog } from "./components/AboutDialog";
+import { FeedbackDialog } from "./components/FeedbackDialog";
 import { BroadcastDupDialog } from "./components/BroadcastDupDialog";
 import { UpdateNotification } from "./components/UpdateNotification";
 import { BrandLogo } from "./components/BrandLogo";
@@ -52,6 +53,7 @@ export default function App() {
   });
   const [showSettings, setShowSettings] = useState(false);
   const [showQuickCommands, setShowQuickCommands] = useState(false);
+  const [showFeedback, setShowFeedback] = useState(false);
   // AI assistant panel (global docked-right chat bar). Width persists in
   // localStorage so it survives reloads.
   const [showAiPanel, setShowAiPanel] = useState(false);
@@ -630,6 +632,7 @@ export default function App() {
         version={appVersion}
         updateAvailable={!!updateInfo?.has_update}
         onOpenAbout={() => setAbout({ open: true, mode: "about" })}
+        onOpenFeedback={() => setShowFeedback(true)}
       />
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         <TabBar
@@ -832,6 +835,12 @@ export default function App() {
           onDownload={(url) => {
             void openExternalUrl(url);
           }}
+        />
+      )}
+      {showFeedback && (
+        <FeedbackDialog
+          version={appVersion}
+          onClose={() => setShowFeedback(false)}
         />
       )}
       {vault === "ready" && updateInfo?.has_update && (

@@ -1212,3 +1212,31 @@
 | 鎴戝鍒颁簡浠€涔堬紵 | xterm 娓叉煋鍣ㄩ€夋嫨鏄厜鏍囬棶棰樼殑鏍稿績锛岄潪 webview 鏂规锛汫PU 绂佺敤椤诲湪 webview 鍒涘缓鍓嶈鐜鍙橀噺锛涘墠绔敊璇浆鍙戝埌 Rust 鏃ュ織鏄瘖鏂墠绔紓甯哥殑鏈夋晥鎵嬫 |
 | 鎴戝仛浜嗕粈涔堬紵 | 鐗堟湰 bump 1.9.0+sync锛汣HANGELOG/README 鍔?v1.9.0 鑺傦紱Canvas 娓叉煋鍣?cursorStyle 淇+娓叉煋鍣?GPU 寮€鍏筹紱Rust 7 妯″潡+鍓嶇鍏ㄥ眬鏃ュ織锛泃sc+cargo+tauri:build锛沜ommit+push锛汫itee 鍙戝竷锛泂taging 娓呯┖锛沵emory 鍚屾 CLAUDE.md 缁忛獙锛沺rogress 闃舵46 |
 
+
+### 阶段 47：日志脱敏 + 左下角反馈入口（2026-07-09）
+- **需求：** 完善日志输出并对核心信息脱敏；左下角增加反馈入口，允许用户提交反馈（填写描述 + 添加图片 + 自动附上脱敏后的日志），通过 Web3Forms 提交到指定邮箱。
+- **架构（根据前期讨论调整）：**
+  - **提交渠道：选定 Web3Forms。** issue 直连的 token 打包进 app 会泄露，不能用；SMTP 凭据密码同问题，排除；后端中转要部署，排除了。Web3Forms access_key 公开安全（官方模型，泄漏最多致收件箱垃圾，不会账号被盗），选中。
+  - **图片处理：免费版不支持附件，因此图片打包成本地 zip（用 fflate），用户可选手动附带。
+  - **Origin 风险：** Tauri 桌面端 origin 未被官方证实，先实现后实测；被拦截则用本地 zip 兜底，并提示联系 Web3Forms 放行 tauri.localhost。
+- **实现：**
+  - **日志脱敏（模块①）：** 新增 redact.rs，提供 host()、user()、scrub_log_text()。策略：IP 保留首+尾段，中间掩码（例如 192.168.1.10→192.*.*.10）；主机名/用户名保留首尾字符；长度≤2 字符整体掩码为 ***。
+  - **脱敏触点：** ssh.rs:272（已知主机地址日志，含代理主机+目标主机）、ftp.rs:49（连接日志，含主机名）、ftp.rs:75（登录日志，含用户名）、ssh.rs known_hosts 3 条日志（含主机名）。密码/密钥本身不记录，维持现状。
+  - **暴露日志给前端（模块②）：** 新增 3 个 tauri command：get_feedback_log（返回脱敏后的日志，含当天+昨天，最大 200KB，尾部截断）、reveal_path（打开日志目录，白名单校验）、save_feedback_zip（将前端 zip 存入 feedback/ 子目录，文件名过滤）。
+  - **反馈入口（模块③a）：** Sidebar 版权 footer 上方加"反馈与建议"行，镜像现有 footer 模式，点击打开 FeedbackDialog。
+  - **FeedbackDialog 组件（模块③b）：** 类型（问题报告/功能建议/其他）+ 描述（必填）+ 联系方式（选填）+ 截图（getDisplayMedia 截屏，不可用时降级为本地选图）+ 本地选图（用 plugin-dialog open）+ 自动附上日志（可展开查看/编辑，可取消）。
+  - **提交逻辑：** 始终先存本地 zip（含 feedback.txt + 日志+ 图片，保底通道）；再 fetch Web3Forms POST（文本+ 日志，免费版无附件）；成功则提示打开文件夹；失败（含 403 Origin 拦截）显示错误+ 本地 zip 兜底。
+  - **App.tsx 接线（模块③c）：** showFeedback state + Sidebar onOpenFeedback prop + 渲染 FeedbackDialog。
+- **安全：** ⑴ 密码本身不记录；⑵ host/user/proxy 在点重 API 离开前脱敏；⑶ get_feedback_log 读出后再跑 scrub_log_text 二次脱敏（防住历史日志/第三方库输出）；⑷ reveal_path 白名单限制到 myshell/logs（不 xml 允许任意路径）；⑸ save_feedback_zip 文件名过滤（只 alphanum/-/_/.）。
+- **验证：** `npx tsc --noEmit` PASS（前端已通过）；Rust 侧未编译（环境无 rustup），待 cargo check 验证；待填入 Web3Forms access_key 后实测提交。
+- **优先级：** ①为最高，用户需要反馈通道；②必须实测 Origin（不知是否上线）。
+- **已知限制：** Web3Forms 实测如果被 403 拦截，则需 ⑴联系 Web3Forms 支持放行 tauri.localhost，或 ⑵切换到企业微信/钉钉 webhook（但图片需额外图床）。
+
+## 五问重启检查（阶段 47）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 47 complete —— 日志脱敏+ 反馈面板已写完，tsc PASS；Rust 侧未编译（环境无 rustup）。 |
+| 我要去哪里？ | ⑴ 安装 Rust 后 cargo check 验证 Rust 侧；⑵ 填入真实 Web3Forms key 后实测提交是否受 Origin 限制；⑶ 如果被拦截，联系支持或切换方案。 |
+| 目标是什么？ | 让用户能方便地报告问题/ 提建议，同时不泄露 token 精机密码/私有接场码。 |
+| 我学到了什么？ | 设计时的讨论：弄清 Gitee token 不能打包进 app，所以放弃 issue 方案；选用 Web3Forms（邮箱，access_key 公开安全）；图片用本地 zip 因路径简单，会为用户多 redux 同一组件（镜像现有 about/feedback 行）。 |
+| 我做了什么？ | redact.rs 脱敏模块（二次脱敏）；5 处日志点+ 1 处脱敏；get_feedback_log/ reveal_path/ save_feedback_zip 3 个 command；FeedbackDialog 全套；Sidebar 入口+ App.tsx 接线；fflate 依赖；tsc PASS。 |

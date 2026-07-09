@@ -35,9 +35,9 @@ pub async fn connect(cfg: &ConnectionConfig) -> Result<FtpSession, String> {
             log::info!(
                 "[ftp] connecting via {} proxy {}:{} → {}:{}",
                 cfg.proxy_type,
-                proxy_cfg.host(),
+                crate::redact::host(proxy_cfg.host()),
                 proxy_cfg.port(),
-                cfg.host,
+                crate::redact::host(&cfg.host),
                 port
             );
             let stream = proxy::connect_via_proxy(&proxy_cfg, &cfg.host, port).await?;
@@ -46,7 +46,7 @@ pub async fn connect(cfg: &ConnectionConfig) -> Result<FtpSession, String> {
                 .map_err(|e| format!("FTP connect via proxy failed: {}", e))?
         }
         None => {
-            log::info!("[ftp] connecting to {}:{}", cfg.host, port);
+            log::info!("[ftp] connecting to {}:{}", crate::redact::host(&cfg.host), port);
             AsyncFtpStream::connect(format!("{}:{}", cfg.host, port))
                 .await
                 .map_err(|e| {
@@ -55,6 +55,12 @@ pub async fn connect(cfg: &ConnectionConfig) -> Result<FtpSession, String> {
                     // not a bad credential — the user can't tell from the raw
                     // error string. Checked here (not in main.rs) so proxy-path
                     // failures and direct-path failures both get the hint.
+                    // NOTE: the host in this message is the *user-facing* hint,
+                    // shown in a UI error toast. It is NOT logged verbatim — the
+                    // toast lives only in memory — but to be safe against any
+                    // logging downstream we keep the full host here (the user
+                    // needs to see which of their own servers failed). The
+                    // redaction happens at the log site above, not in the toast.
                     let raw = e.to_string();
                     if raw.contains("10060") || raw.contains("timed out") || raw.contains("timeout") {
                         format!(
@@ -72,7 +78,7 @@ pub async fn connect(cfg: &ConnectionConfig) -> Result<FtpSession, String> {
     // from keyring into cfg.password. If absent (anonymous FTP) we fall
     // back to empty.
     let password = cfg.password.clone().unwrap_or_default();
-    log::info!("[ftp] TCP established, logging in as {}", cfg.username);
+    log::info!("[ftp] TCP established, logging in as {}", crate::redact::user(&cfg.username));
 
     stream
         .login(&cfg.username, &password)

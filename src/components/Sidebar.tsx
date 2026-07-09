@@ -37,6 +37,8 @@ interface Props {
   updateAvailable?: boolean;
   /** Open the About / what's-new dialog. */
   onOpenAbout?: () => void;
+  /** Open the feedback dialog. */
+  onOpenFeedback?: () => void;
 }
 
 interface FolderNode {
@@ -212,6 +214,7 @@ export function Sidebar({
   version,
   updateAvailable,
   onOpenAbout,
+  onOpenFeedback,
 }: Props) {
   // Resizable sidebar width. Defaults to 240 when the parent doesn't manage it;
   // clamped to [200, 560] in onResizeStart so it can't get unusably narrow or
@@ -789,7 +792,10 @@ export function Sidebar({
       {/* Version footer — only in expanded mode (the collapsed rail is
           44px wide and already drops the header/search for density). Shows
           the running version; a small accent dot appears when a newer
-          release was detected. Click opens the About / what's-new dialog. */}
+          release was detected. Click opens the About / what's-new dialog.
+          The feedback icon (💬) sits at the far right — clicking it opens the
+          feedback dialog. It stops propagation so the version-row click
+          (About) isn't triggered. */}
       {version && (
         <div
           onClick={() => onOpenAbout?.()}
@@ -830,6 +836,32 @@ export function Sidebar({
                 marginLeft: "auto",
               }}
             />
+          )}
+          {onOpenFeedback && (
+            <span
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenFeedback();
+              }}
+              title="反馈与建议"
+              style={{
+                fontSize: 13,
+                lineHeight: 1,
+                cursor: "pointer",
+                // If no update dot claimed the right edge, push the icon right.
+                marginLeft: updateAvailable ? undefined : "auto",
+                padding: "0 2px",
+                opacity: 0.6,
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.opacity = "1";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.opacity = "0.6";
+              }}
+            >
+              💬
+            </span>
           )}
         </div>
       )}
