@@ -908,19 +908,11 @@ export async function saveFeedbackZip(
 }
 
 /**
- * Upload a single screenshot to a free image host (Telegraph — no account
- * needed) via the Rust backend, returning the hosted image URL. This lets
- * the screenshot appear in the Web3Forms email body (free tier has no
- * attachment support). On failure, throws — caller falls back to local zip.
+ * Remove all feedback zip files from the feedback directory. Called when the
+ * feedback dialog closes to prevent disk accumulation of old packages.
  */
-export async function uploadScreenshot(
-  data: Uint8Array,
-  mime: string,
-): Promise<string> {
-  return await invoke("upload_screenshot", {
-    data: Array.from(data),
-    mime,
-  });
+export async function clearFeedbackDir(): Promise<void> {
+  await invoke("clear_feedback_dir");
 }
 
 // ============ ZMODEM Event Subscriptions ============

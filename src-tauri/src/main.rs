@@ -1041,8 +1041,11 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 #[allow(deprecated)]
 fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     let lower = url.trim().to_ascii_lowercase();
-    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
-        return Err("仅支持 http(s) 链接".to_string());
+    if !(lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with("mailto:"))
+    {
+        return Err("仅支持 http(s) 链接和 mailto:".to_string());
     }
     use tauri_plugin_shell::ShellExt;
     app.shell()
@@ -1144,6 +1147,91 @@ fn get_feedback_log() -> Result<FeedbackLogInfo, String> {
     })
 }
 
+/// Windows: find an existing Explorer window showing `target` and bring it to
+/// the foreground. Returns true if a matching window was found and focused,
+/// false if no window exists (caller should spawn a new explorer).
+///
+/// Explorer exposes the current folder path via the address bar, but reading
+/// it reliably requires UI Automation (complex). Instead we compare window
+/// titles — Explorer sets the title to the folder name (e.g. "feedback"), so
+/// we match on the last path segment. This is good enough for the feedback /
+/// log folder use case where we only ever open these two specific dirs.
+#[cfg(target_os = "windows")]
+fn try_focus_existing_explorer(target: &std::path::Path) -> bool {
+    use winapi::um::winuser::{
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
+        SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOWNORMAL,
+    };
+
+    let folder_name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    if folder_name.is_empty() {
+        return false;
+    }
+
+    // Enumerate all top-level windows and look for an Explorer window whose
+    // title matches our folder name. Explorer titles are just the folder name
+    // (e.g. "feedback"), so this is a reliable match.
+    struct EnumCtx {
+        folder: String,
+        found: u32, // HWND as u32
+    }
+
+    let mut ctx = EnumCtx {
+        folder: folder_name.to_lowercase(),
+        found: 0,
+    };
+
+    extern "system" fn enum_proc(hwnd: winapi::shared::windef::HWND, lparam: winapi::shared::minwindef::LPARAM) -> winapi::shared::minwindef::BOOL {
+        unsafe {
+            // Only consider visible windows.
+            if IsWindowVisible(hwnd) == 0 {
+                return 1; // continue
+            }
+
+            let len = GetWindowTextLengthW(hwnd);
+            if len == 0 {
+                return 1;
+            }
+
+            let mut buf = vec![0u16; (len as usize) + 1];
+            GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            let title = String::from_utf16_lossy(&buf[..len as usize]);
+
+            // Explorer titles are just the folder name (e.g. "feedback").
+            // Also match "feedback" inside longer paths in the title.
+            let ctx = &mut *(lparam as *mut EnumCtx);
+            if title.to_lowercase() == ctx.folder {
+                ctx.found = hwnd as u32;
+                return 0; // stop enumerating
+            }
+            1 // continue
+        }
+    }
+
+    unsafe {
+        EnumWindows(
+            Some(enum_proc),
+            &mut ctx as *mut _ as winapi::shared::minwindef::LPARAM,
+        );
+    }
+
+    if ctx.found == 0 {
+        return false;
+    }
+
+    let hwnd = ctx.found as winapi::shared::windef::HWND;
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(hwnd);
+    }
+    true
+}
+
 /// Reveal a path in the OS file explorer. Whitelisted to the MyShell log dir
 /// ONLY — arbitrary path opening would be a footgun (could be tricked into
 /// running a malicious explorer registered for a path type). The feedback
@@ -1155,21 +1243,30 @@ fn reveal_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
     // or differing separators. A non-existent path canonicalizes to itself on
     // Windows, which still fails the contains() check for a bogus path.
     let target = std::fs::canonicalize(&path).unwrap_or_else(|_| std::path::PathBuf::from(&path));
-    let allowed_root = std::fs::canonicalize(log_dir_path())
-        .unwrap_or_else(|_| log_dir_path());
+    // Allow the entire myshell config dir (logs/, feedback/, etc.) — not just
+    // the logs subdir. The feedback dialog needs to open the feedback folder
+    // which is a sibling of logs/ under the same parent.
+    let allowed_root = log_dir_path()
+        .parent() // …/myshell/
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+        .unwrap_or_else(|| log_dir_path());
 
     if !target.starts_with(&allowed_root) {
-        return Err("仅允许打开日志目录".to_string());
+        return Err("仅允许打开 MyShell 配置目录".to_string());
     }
 
     #[cfg(target_os = "windows")]
     {
-        use tauri_plugin_shell::ShellExt;
-        app.shell()
-            .command("explorer.exe")
-            .args([target.to_string_lossy().to_string()])
-            .spawn()
-            .map_err(|e| format!("打开文件夹失败: {e}"))?;
+        // Check if an explorer window is already open at this path; if so,
+        // bring it to the foreground instead of spawning a duplicate.
+        if !try_focus_existing_explorer(&target) {
+            use tauri_plugin_shell::ShellExt;
+            app.shell()
+                .command("explorer.exe")
+                .args([target.to_string_lossy().to_string()])
+                .spawn()
+                .map_err(|e| format!("打开文件夹失败: {e}"))?;
+        }
         return Ok(());
     }
 
@@ -1244,84 +1341,34 @@ fn save_feedback_zip(filename: String, data: Vec<u8>) -> Result<String, String> 
     Ok(path.to_string_lossy().to_string())
 }
 
-/// ImgBB API key (free tier, register at imgbb.com — reachable from mainland
-/// China without a proxy, unlike Telegraph). The key is public-by-design for
-/// a client app (it only allows uploads to YOUR account; worst case on leak
-/// is someone filling your quota). TODO: replace placeholder with real key.
-const IMGBB_API_KEY: &str = "39049cc05bc225d7e0cf72236dece2c1";
-
-/// Upload a single screenshot to ImgBB so the image URL can be embedded in
-/// the Web3Forms email body (free tier has no attachment support). Uploaded
-/// via the Rust backend (reqwest) to avoid CORS / origin issues the webview
-/// would face.
-///
-/// Returns the hosted image URL on success. On any failure, returns Err so
-/// the frontend can fall back to the local-zip path (the screenshot is never
-/// lost — it's already in the local feedback zip).
-///
-/// Privacy note: ImgBB is a public image host. The screenshot should not
-/// contain secrets — the feedback dialog already warns the user that images
-/// are uploaded.
+/// Clear all files in the feedback directory. Called when the feedback dialog
+/// closes (after the user has had a chance to email the zip) to prevent
+/// accumulation of old feedback zips on disk.
 #[tauri::command]
-async fn upload_screenshot(data: Vec<u8>, _mime: String) -> Result<String, String> {
-    use base64::Engine;
+fn clear_feedback_dir() -> Result<(), String> {
+    let dir = log_dir_path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("feedback");
 
-    // ImgBB expects the raw image bytes as a base64 string (no data: prefix).
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP 客户端构造失败: {e}"))?;
-
-    let url = format!("https://api.imgbb.com/1/upload?key={IMGBB_API_KEY}");
-
-    let res = client
-        .post(&url)
-        .form(&[("image", b64.as_str())])
-        .send()
-        .await
-        .map_err(|e| format!("上传失败（网络）: {e}"))?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body = res.text().await.unwrap_or_default();
-        return Err(format!("上传失败: HTTP {status} — {body}"));
+    if !dir.exists() {
+        return Ok(());
     }
 
-    // ImgBB returns: { "data": { "url": "https://...png", ... }, "success": true }
-    #[derive(serde::Deserialize)]
-    struct ImgbbResponse {
-        data: Option<ImgbbData>,
-        success: Option<bool>,
-        #[serde(default)]
-        error: Option<ImgbbError>,
-    }
-    #[derive(serde::Deserialize)]
-    struct ImgbbData {
-        url: Option<String>,
-    }
-    #[derive(serde::Deserialize)]
-    struct ImgbbError {
-        message: Option<String>,
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| format!("读取反馈目录失败: {e}"))?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only remove files (the zip packages), leave subdirs untouched.
+        if path.is_file() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                log::warn!("[feedback] failed to remove {}: {e}", path.display());
+            }
+        }
     }
 
-    let parsed: ImgbbResponse = res
-        .json()
-        .await
-        .map_err(|e| format!("解析上传响应失败: {e}"))?;
-
-    if parsed.success == Some(true) {
-        parsed
-            .data
-            .and_then(|d| d.url)
-            .ok_or_else(|| "上传响应缺少图片地址".to_string())
-    } else {
-        Err(parsed
-            .error
-            .and_then(|e| e.message)
-            .unwrap_or_else(|| "图床返回失败但未说明原因".to_string()))
-    }
+    Ok(())
 }
 
 /// Payload for the `update_download_progress` event, scoped to the window
@@ -3517,7 +3564,7 @@ pub fn run() {
             get_feedback_log,
             reveal_path,
             save_feedback_zip,
-            upload_screenshot,
+            clear_feedback_dir,
         ])
         .setup(|app| {
             // Explicitly set the main window's icon so the title bar + taskbar

@@ -2,21 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { zipSync, strToU8 } from "fflate";
 import {
+  clearFeedbackDir,
   getFeedbackLog,
+  openExternalUrl,
   revealPath,
   saveFeedbackZip,
-  uploadScreenshot,
+  writeFrontendLog,
   type FeedbackLogInfo,
 } from "../api";
-
-// ── Web3Forms ───────────────────────────────────────────────────────────
-// The access key is PUBLIC by design (Web3Forms' own model — it's an alias to
-// a fixed recipient email, not a credential). Even if extracted from the
-// binary, the worst case is inbox spam to our address, NOT account takeover.
-// Replace with the real key from web3forms.com after registering.
-// TODO: replace this placeholder with the real Web3Forms access key.
-const WEB3FORMS_ACCESS_KEY = "d16fbbbe-6348-4c08-843b-0a556c7d904e";
-const WEB3FORMS_ENDPOINT = "https://api.web3forms.com/submit";
 
 interface Props {
   version: string;
@@ -174,6 +167,14 @@ export function FeedbackDialog({ version, onClose }: Props) {
 
   const cancelledRef = useRef(false);
 
+  // Wrap onClose to clear the feedback dir when the dialog closes. This runs
+  // on every close path (cancel, ESC, "完成" button, overlay click) and
+  // prevents old zip packages from piling up on disk.
+  const handleClose = () => {
+    void clearFeedbackDir().catch(() => {});
+    onClose();
+  };
+
   // Load the (already-scrubbed) log on open.
   useEffect(() => {
     cancelledRef.current = false;
@@ -202,11 +203,11 @@ export function FeedbackDialog({ version, onClose }: Props) {
   // ESC to close.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !submitting) onClose();
+      if (e.key === "Escape" && !submitting) handleClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, submitting]);
+  }, [handleClose, submitting]);
 
   async function addImageFromFile() {
     try {
@@ -330,120 +331,77 @@ export function FeedbackDialog({ version, onClose }: Props) {
     setSubmitting(true);
     setResult(null);
 
+    // Step 1: Always build the local zip — it's the reliable backup and the
+    // thing the user attaches to the email (mailto can't auto-attach files).
     let savedPath: string | null = null;
     try {
-      // Always build the local zip first — it's the reliable fallback and
-      // also gives the user a copy they can attach to a manual email.
       savedPath = await buildAndSaveZip();
     } catch (e) {
-      // Zip save failure is non-fatal — we still try to submit the text.
+      const msg = e instanceof Error ? e.message : String(e);
       console.warn("feedback zip save failed", e);
+      writeFrontendLog("warn", `[feedback] 本地反馈包保存失败: ${msg}`);
     }
 
-    // Upload each screenshot to a free image host (Telegraph) so the URL can
-    // be embedded in the email body — Web3Forms free tier has no attachment
-    // support. Failures are non-fatal: the screenshot is already in the local
-    // zip, and we note in the email how many images failed to upload.
-    const uploadedUrls: string[] = [];
-    let uploadFailures = 0;
-    let uploadError = "";
-    for (const att of attachments) {
-      try {
-        const base64 = att.dataUrl.split(",")[1] ?? "";
-        const bin = atob(base64);
-        const u8 = new Uint8Array(bin.length);
-        for (let j = 0; j < bin.length; j++) u8[j] = bin.charCodeAt(j);
-        const mime = att.dataUrl.slice(
-          att.dataUrl.indexOf(":") + 1,
-          att.dataUrl.indexOf(";"),
-        );
-        const url = await uploadScreenshot(u8, mime);
-        uploadedUrls.push(url);
-      } catch (e) {
-        console.warn("screenshot upload failed", e);
-        uploadFailures++;
-        uploadError = e instanceof Error ? e.message : String(e);
-      }
-    }
+    // Step 2: Prepare the feedback content for the clipboard. We DON'T put
+    // this in the mailto: body because many email clients (especially QQ Mail,
+    // Outlook) silently drop the body when the URL is too long or the encoding
+    // differs from what they expect. Instead we copy to clipboard and ask the
+    // user to Ctrl+V — 100% reliable.
+    const typeLabel = TYPE_LABELS[type];
+    const subject = `【MYSHELL】${typeLabel} v${version}`;
 
-    // Build the email message: user description + embedded screenshot URLs.
-    // Web3Forms renders the message field as the email body; markdown image
-    // syntax becomes clickable links (and inline images in many clients).
-    let message = description;
-    if (uploadedUrls.length > 0) {
-      message +=
-        "\n\n--- 截图 ---\n" +
-        uploadedUrls.map((u, i) => `截图${i + 1}: ${u}`).join("\n");
-    }
+    // Extract just the filename from savedPath for the clipboard note.
+    const zipFileName = savedPath
+      ? savedPath.replace(/[\\/]/g, "/").split("/").pop() ?? ""
+      : "";
 
-    // Submit text + log + screenshot URLs via Web3Forms.
+    const clipboardText = [
+      `类型: ${typeLabel}`,
+      `版本: v${version}`,
+      `平台: ${navigator.platform}`,
+      `联系方式: ${contact || "(未提供)"}`,
+      ``,
+      `描述:`,
+      description,
+    ].join("\n");
+
+    // mailto: with subject only — short and reliable across all email clients.
+    const mailtoUrl = `mailto:argustang@qq.com?subject=${encodeURIComponent(subject)}`;
+
     try {
-      const body = {
-        access_key: WEB3FORMS_ACCESS_KEY,
-        subject: `[MyShell反馈] ${TYPE_LABELS[type]} - v${version}`,
-        from_name: "MyShell 反馈",
-        ...(contact ? { email: contact } : {}),
-        message,
-        反馈类型: TYPE_LABELS[type],
-        应用版本: `v${version}`,
-        操作系统: navigator.platform,
-        浏览器标识: navigator.userAgent.slice(0, 200),
-        运行日志: attachLog && logInfo?.content ? logInfo.content : "(未附日志)",
-        截图数量: String(attachments.length),
-        截图链接: uploadedUrls.length
-          ? uploadedUrls.join("\n")
-          : uploadFailures > 0
-            ? `${uploadFailures} 张截图上传失败，请查看本地反馈包`
-            : "(无)",
-        备注:
-          uploadFailures > 0
-            ? `${uploadFailures} 张截图上传图床失败，已保存在本地反馈包中。`
-            : attachments.length > 0
-              ? `${uploadedUrls.length} 张截图已上传图床，链接见上方"截图链接"。`
-              : "",
-      };
+      // Copy feedback content to clipboard first, then open the mail client.
+      await navigator.clipboard.writeText(clipboardText);
+      await openExternalUrl(mailtoUrl);
+      writeFrontendLog("info", `[feedback] 已复制内容到剪贴板并唤起邮件客户端`);
 
-      const res = await fetch(WEB3FORMS_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+      const noteParts = ["反馈内容已复制到剪贴板，请在邮件正文中按 Ctrl+V 粘贴。"];
+      if (zipFileName) {
+        noteParts.push(
+          `然后点击下方按钮打开反馈包，将 "${zipFileName}" 拖入邮件作为附件后发送。`,
+        );
+      }
+      setResult({
+        kind: "success",
+        message: noteParts.join(""),
+        savedPath: savedPath ?? undefined,
       });
 
-      if (res.ok) {
-        const data = await res.json().catch(() => ({}));
-        if (data.success === false) {
-          throw new Error(data.message || "提交被拒绝");
-        }
-        setResult({
-          kind: "success",
-          message:
-            attachments.length > 0 && uploadFailures > 0
-              ? `反馈已提交成功！${uploadedUrls.length}/${attachments.length} 张截图已上传，${uploadFailures} 张上传失败（${uploadError || "网络问题"}）已保存在本地反馈包中。`
-              : attachments.length > 0
-                ? "反馈已提交成功！截图已随邮件发送，感谢你的支持！"
-                : "反馈已提交成功，感谢你的支持！",
-          savedPath: savedPath ?? undefined,
-        });
-      } else if (res.status === 403) {
-        // Web3Forms blocks non-browser / server-side origins. A Tauri webview
-        // sends Origin: http://tauri.localhost which may trip this.
-        setResult({
-          kind: "error",
-          message:
-            "提交被服务器拒绝（可能是 Tauri 桌面端 origin 不被 Web3Forms 支持）。别担心——完整反馈（含日志和截图）已保存为本地反馈包，你可以手动发送。",
-          savedPath: savedPath ?? undefined,
-        });
-      } else {
-        throw new Error(`HTTP ${res.status}`);
-      }
+      // Extra popup reminder — the result panel might be missed if the email
+      // client window covers it. This ensures the user sees the instruction.
+      const reminder = zipFileName
+        ? `反馈内容已复制到剪贴板！\n\n请在邮件中：\n1. 正文区域按 Ctrl+V 粘贴\n2. 将 "${zipFileName}" 拖入邮件作为附件`
+        : `反馈内容已复制到剪贴板！\n\n请在邮件正文区域按 Ctrl+V 粘贴。`;
+      window.alert(reminder);
+      // Intentionally NOT auto-opening the folder — explorer.exe and the
+      // mailto handler race for window focus, and either one can steal focus
+      // from the other depending on OS scheduling. The result screen has a
+      // button to open the folder after the email client has opened.
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      writeFrontendLog("error", `[feedback] 唤起邮件客户端失败: ${msg}`);
       setResult({
         kind: "error",
-        message:
-          msg.includes("Failed to fetch") || msg.includes("NetworkError")
-            ? "网络请求失败（可能是桌面端 origin 限制或网络问题）。完整反馈已保存为本地反馈包，可手动发送。"
-            : `提交失败：${msg}。完整反馈已保存为本地反馈包，可手动发送。`,
+        message: `无法打开邮件客户端：${msg}。反馈包已保存在本地，你可以手动发送到 argustang@qq.com。`,
         savedPath: savedPath ?? undefined,
       });
     } finally {
@@ -454,7 +412,7 @@ export function FeedbackDialog({ version, onClose }: Props) {
   const canSubmit = description.trim().length > 0 && !submitting;
 
   return (
-    <div style={overlay} onClick={() => !submitting && onClose()}>
+    <div style={overlay} onClick={() => !submitting && handleClose()}>
       <div
         style={panel}
         className="animate-scale-in"
@@ -489,38 +447,75 @@ export function FeedbackDialog({ version, onClose }: Props) {
                 padding: "24px 12px",
               }}
             >
-              <div style={{ fontSize: 40, marginBottom: 12 }}>
-                {result.kind === "success" ? "✅" : "📦"}
+              <div
+                style={{
+                  fontSize: 48,
+                  marginBottom: 12,
+                  filter: result.kind === "error" ? "none" : "none",
+                }}
+              >
+                {result.kind === "success" ? "✅" : "❌"}
               </div>
               <div
                 style={{
-                  fontSize: 15,
-                  fontWeight: 600,
-                  color: "var(--text-primary)",
+                  fontSize: 16,
+                  fontWeight: 700,
+                  color:
+                    result.kind === "success"
+                      ? "var(--success, #40c057)"
+                      : "var(--error, #ff3b30)",
                   marginBottom: 8,
                 }}
               >
-                {result.kind === "success" ? "提交成功" : "已保存本地反馈包"}
+                {result.kind === "success" ? "提交成功" : "提交失败"}
               </div>
-              <div
-                style={{
-                  fontSize: 13,
-                  color: "var(--text-secondary)",
-                  lineHeight: 1.6,
-                  maxWidth: 420,
-                  margin: "0 auto",
-                }}
-              >
-                {result.message}
-              </div>
+              {result.kind === "error" && (
+                <div
+                  style={{
+                    display: "inline-block",
+                    background: "var(--error-muted, rgba(255,59,48,0.1))",
+                    border: "1px solid var(--error, #ff3b30)",
+                    borderRadius: "var(--radius-md)",
+                    padding: "10px 16px",
+                    fontSize: 13,
+                    color: "var(--text-primary)",
+                    lineHeight: 1.6,
+                    maxWidth: 440,
+                    textAlign: "left",
+                    margin: "0 auto 12px",
+                  }}
+                >
+                  {result.message}
+                </div>
+              )}
+              {result.kind === "success" && (
+                <div
+                  style={{
+                    fontSize: 13,
+                    color: "var(--text-secondary)",
+                    lineHeight: 1.6,
+                    maxWidth: 420,
+                    margin: "0 auto",
+                  }}
+                >
+                  {result.message}
+                </div>
+              )}
               {result.savedPath && (
                 <div style={{ marginTop: 16 }}>
                   <button
-                    style={{ ...btnGhost, display: "inline-flex", gap: 6 }}
+                    style={{
+                      ...btnGhost,
+                      display: "inline-flex",
+                      gap: 6,
+                      ...(result.kind === "error"
+                        ? {
+                            borderColor: "var(--error, #ff3b30)",
+                            color: "var(--error, #ff3b30)",
+                          }
+                        : {}),
+                    }}
                     onClick={() => {
-                      // reveal the parent feedback dir (reveal_path whitelists
-                      // the logs dir; feedback/ is a sibling — reveal the file's
-                      // dir via its parent).
                       const dir = result.savedPath!.replace(/[\\/][^\\/]+$/, "");
                       void revealPath(dir);
                     }}
@@ -745,14 +740,32 @@ export function FeedbackDialog({ version, onClose }: Props) {
         {/* Footer */}
         <div style={footer}>
           {result ? (
-            <button style={btnPrimary} onClick={onClose}>
+            <button style={btnPrimary} onClick={handleClose}>
               完成
             </button>
           ) : (
             <>
+              <a
+                style={{
+                  fontSize: 12,
+                  color: "var(--text-tertiary)",
+                  textDecoration: "none",
+                  cursor: "pointer",
+                  marginRight: "auto",
+                }}
+                onClick={(e) => {
+                  e.preventDefault();
+                  void openExternalUrl(
+                    "https://gitee.com/argustang/myshell/issues/new",
+                  );
+                }}
+                title="在 Gitee 上提交 Issue"
+              >
+                🔗 也可通过 Gitee Issue 提交
+              </a>
               <button
                 style={btnGhost}
-                onClick={onClose}
+                onClick={handleClose}
                 disabled={submitting}
               >
                 取消
