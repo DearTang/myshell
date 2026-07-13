@@ -1240,3 +1240,26 @@
 | 目标是什么？ | 让用户能方便地报告问题/ 提建议，同时不泄露 token 精机密码/私有接场码。 |
 | 我学到了什么？ | 设计时的讨论：弄清 Gitee token 不能打包进 app，所以放弃 issue 方案；选用 Web3Forms（邮箱，access_key 公开安全）；图片用本地 zip 因路径简单，会为用户多 redux 同一组件（镜像现有 about/feedback 行）。 |
 | 我做了什么？ | redact.rs 脱敏模块（二次脱敏）；5 处日志点+ 1 处脱敏；get_feedback_log/ reveal_path/ save_feedback_zip 3 个 command；FeedbackDialog 全套；Sidebar 入口+ App.tsx 接线；fflate 依赖；tsc PASS。 |
+
+### 阶段 48：反馈提交改造为 mailto + 修复（2026-07-13）
+- **需求：** Web3Forms 在 Tauri 桌面端被 403 拦截（origin 不支持），第三方图床（ImgBB/Telegraph）涉嫌违法被封禁。需要彻底重构反馈提交渠道。
+- **方案演进：** ⑴ 先考虑自建 Cloudflare Worker + R2 + Resend（HMAC 签名、速率限制、MIME 校验），代码已写完但用户最终放弃（部署运维成本）；⑵ 改为简洁可靠的 mailto 方案——唤起本地邮件客户端，反馈内容复制到剪贴板。
+- **实现：**
+  - **Rust（main.rs）：** `open_external_url` 白名单增加 `mailto:` 支持；新增 `clear_feedback_dir` 命令（关闭反馈窗口时清空 feedback/ 目录）；`reveal_path` 白名单从 `logs/` 扩展到 `myshell/` 父目录（修复打开 feedback 文件夹无效）；新增 `try_focus_existing_explorer`（Win32 EnumWindows 查找已打开的同名资源管理器窗口，找到则激活前置，不重复打开）。
+  - **前端（FeedbackDialog.tsx）：** 删除 Web3Forms/Telegraph 全套代码；`handleSubmit` 改为：保存本地 zip → 剪贴板复制反馈内容 → `openExternalUrl(mailto:...)` 唤起邮件客户端（只带主题，URL 短不丢）→ `window.alert()` 弹窗提醒用户 Ctrl+V 粘贴 + 拖附件。
+  - **前端（api.ts）：** 删除 `uploadScreenshot`/`submitFeedback`/`FeedbackImage`；新增 `clearFeedbackDir` wrapper。
+  - **新增 Gitee Issue 入口：** 反馈窗口 footer 左侧加链接，点击打开 `gitee.com/argustang/myshell/issues/new`。
+  - **失败 UI 重设计：** 提交失败时 ❌ 红色醒目提示，与成功 ✅ 绿色明显区分。
+  - **失败日志：** `handleSubmit` 所有 catch 块增加 `writeFrontendLog`，网络错误写入应用日志。
+- **安全：** 删除了编译进二进制的 IMGBB_API_KEY（图床已封禁）；mailto 不经过任何第三方服务。
+- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS；release 打包成功。
+- **已知限制：** mailto 无法自动添加附件，需用户手动拖 zip 进邮件；邮件客户端选择器与资源管理器窗口存在焦点竞争（已通过"不自动打开文件夹"规避）。
+
+## 五问重启检查（阶段 48）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 48 complete —— 反馈提交改造为 mailto 方案，已发布 v1.10.2。 |
+| 我要去哪里？ | 下一个功能或用户反馈的新需求。 |
+| 目标是什么？ | 让用户能可靠地提交反馈，不依赖不稳定的第三方服务。 |
+| 我学到了什么？ | mailto body 在 QQ 邮箱等客户端会被模板替换/丢弃，不能依赖 body 参数传内容；剪贴板是 100% 可靠的替代；explorer 和 mailto 窗口有焦点竞争，不能同时自动弹出。 |
+| 我做了什么？ | main.rs（mailto 白名单、clear_feedback_dir、reveal_path 白名单扩展、explorer 去重）；api.ts（删旧 wrapper 加新）；FeedbackDialog.tsx（mailto 流程、剪贴板、弹窗提醒、Gitee 链接、失败红色 UI）；发布 v1.10.2 到 Gitee。 |
