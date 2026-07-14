@@ -286,6 +286,28 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
     };
     loadRenderer();
 
+    // Renderer readiness gate: after loadRenderer() swaps in the Canvas/WebGL
+    // renderer, xterm's _renderService is briefly undefined during the
+    // transition. Any operation that triggers Viewport.syncScrollArea (write,
+    // scroll, ResizeObserver) in that gap throws "Cannot read properties of
+    // undefined (reading 'dimensions')" — which crashes WebView2's render
+    // process, freezing the entire UI. We buffer SSH data until two animation
+    // frames pass (ensuring the renderer has settled) or 300ms elapses.
+    let rendererReady = false;
+    const pendingData: Uint8Array[] = [];
+    const flush = () => {
+      rendererReady = true;
+      for (const d of pendingData) {
+        try { term.write(d); } catch { /* renderer still settling */ }
+      }
+      pendingData.length = 0;
+    };
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => flush()),
+    );
+    // Safety net: if rAF never fires (background tab), force-flush after 300ms.
+    setTimeout(flush, 300);
+
     // Block OSC 52 clipboard writes from the remote side. Without this,
     // a malicious SSH server can silently replace the user's clipboard
     // (e.g., swap a wallet address) by emitting the OSC 52 escape sequence.
@@ -294,7 +316,17 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
     term.parser.registerOscHandler(52, () => true);
 
     setTimeout(() => {
-      fitAddon.fit();
+      // Guard against xterm.js race: fit() calls Viewport.syncScrollArea
+      // which accesses renderer.dimensions — if the renderer isn't ready
+      // yet (canvas init async), this throws "Cannot read properties of
+      // undefined (reading 'dimensions')". Wrap in try/catch so the error
+      // doesn't crash the WebView2 render process.
+      try {
+        fitAddon.fit();
+      } catch {
+        // Retry once after a longer delay — by then the renderer should be ready.
+        setTimeout(() => { try { fitAddon.fit(); } catch { /* give up */ } }, 300);
+      }
       resizeTo(sessionIdRef.current, term.cols, term.rows).catch(() => {});
     }, 100);
 
@@ -385,6 +417,10 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
 
     onSshOutput(sessionIdRef.current, (data) => {
       if (closed) return;
+      if (!rendererReady) {
+        pendingData.push(data);
+        return;
+      }
       term.write(data);
       if (!firstOutputHandled) {
         firstOutputHandled = true;

@@ -95,12 +95,55 @@ pub fn init_db() -> Result<Connection> {
             content       TEXT NOT NULL,
             created_at    TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_ai_conv_conn ON ai_conversations(connection_id, created_at);"
+        CREATE INDEX IF NOT EXISTS idx_ai_conv_conn ON ai_conversations(connection_id, created_at);
+
+        -- Multi-model support: stores user-created + preset model configurations.
+        CREATE TABLE IF NOT EXISTS ai_models (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL,
+            provider     TEXT NOT NULL DEFAULT 'openai',
+            model_id     TEXT NOT NULL,
+            base_url     TEXT,
+            api_key_enc  TEXT,
+            proxy_url    TEXT,
+            temperature  REAL NOT NULL DEFAULT 0.7,
+            is_preset    INTEGER NOT NULL DEFAULT 0,
+            is_enabled   INTEGER NOT NULL DEFAULT 1,
+            sort_order   INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        -- Per-supplier model list: each ai_models row (supplier) can have N models.
+        -- ai_models.model_id remains the primary/default model for backward compat;
+        -- additional models live here.
+        CREATE TABLE IF NOT EXISTS ai_supplier_models (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            supplier_id  INTEGER NOT NULL,
+            model_id     TEXT NOT NULL,
+            label        TEXT,
+            sort_order   INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (supplier_id) REFERENCES ai_models(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_supplier_models_sid ON ai_supplier_models(supplier_id, sort_order);"
     )?;
     // AI proxy_url column — idempotent ALTER for installs that already
     // created ai_settings without it (CREATE IF NOT EXISTS won't add it).
     if !column_exists(&conn, "ai_settings", "proxy_url") {
         conn.execute("ALTER TABLE ai_settings ADD COLUMN proxy_url TEXT", [])?;
+    }
+    // active_model_id — points to ai_models.id; NULL means use legacy
+    // ai_settings fields (backward compat with pre-multi-model installs).
+    if !column_exists(&conn, "ai_settings", "active_model_id") {
+        conn.execute("ALTER TABLE ai_settings ADD COLUMN active_model_id INTEGER", [])?;
+    }
+    // active_model_string — the specific model_id selected within the active
+    // supplier. NULL/empty = fall back to ai_models.model_id.
+    if !column_exists(&conn, "ai_settings", "active_model_string") {
+        conn.execute("ALTER TABLE ai_settings ADD COLUMN active_model_string TEXT", [])?;
+    }
+    // is_enabled — whether this supplier is selectable in the AI chat picker.
+    // Default 1 (enabled) so pre-existing suppliers stay usable.
+    if !column_exists(&conn, "ai_models", "is_enabled") {
+        conn.execute("ALTER TABLE ai_models ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1", [])?;
     }
     Ok(conn)
 }

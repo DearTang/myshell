@@ -23,12 +23,57 @@ import {
   type RendererBackend,
 } from "../hooks/useRendererPref";
 import { useAiConfig } from "../hooks/useAiConfig";
-import type { AiProvider } from "../api";
+import type { AiProvider, SupplierModel } from "../api";
+import {
+  addSupplierModel,
+  fetchModelsForSupplier,
+  fetchProviderModels,
+  removeSupplierModel,
+  saveAiModel,
+  setActiveAiModel,
+  toggleAiModelEnabled,
+} from "../api";
 import { RecycleDialog } from "./RecycleDialog";
 import { compressImageDataUrl } from "../utils/image";
 import { aiTestSettings } from "../api";
 import { PRESETS, type ColorPalette } from "../themes";
 import { FontField } from "./FontField";
+
+// ── System AI provider presets (mirrors init_ai_presets_cmd in ai.rs) ──
+// These are NOT shown in the sidebar — they're offered as templates when
+// creating a new supplier so the user can auto-fill provider + baseUrl.
+interface AiPreset {
+  name: string;
+  provider: Exclude<AiProvider, "claude" | "openai" | "ollama">;
+  baseUrl: string;
+}
+const AI_PRESETS: AiPreset[] = [
+  { name: "GLM (智谱)", provider: "openai_compatible", baseUrl: "https://open.bigmodel.cn/api/paas/v4" },
+  { name: "GLM Coding Plan (OpenAI)", provider: "openai_compatible", baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4" },
+  { name: "GLM Coding Plan (Anthropic)", provider: "anthropic_compatible", baseUrl: "https://open.bigmodel.cn/api/anthropic" },
+  { name: "MIMO", provider: "openai_compatible", baseUrl: "https://api.xiaomimimo.com/v1" },
+  { name: "MiniMax M3", provider: "openai_compatible", baseUrl: "https://api.minimaxi.com/v1" },
+  { name: "LongCat", provider: "openai_compatible", baseUrl: "https://api.longcat.chat/openai" },
+  { name: "DeepSeek", provider: "openai_compatible", baseUrl: "https://api.deepseek.com/v1" },
+  { name: "通义千问 (阿里云)", provider: "openai_compatible", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
+  { name: "混元 (腾讯云)", provider: "openai_compatible", baseUrl: "https://api.hunyuan.cloud.tencent.com/v1" },
+  { name: "Ollama (本地)", provider: "openai_compatible", baseUrl: "http://localhost:11434/api" },
+];
+const PROVIDER_LABELS: Record<string, string> = {
+  openai_compatible: "OpenAI 兼容",
+  anthropic_compatible: "Anthropic 兼容",
+  claude: "Claude 官方",
+  openai: "OpenAI 官方",
+  ollama: "Ollama 本地",
+};
+/** Detect if a user supplier matches a known preset by provider + baseUrl. */
+function findPresetName(provider: string, baseUrl?: string): string | null {
+  if (!baseUrl) return null;
+  const match = AI_PRESETS.find(
+    (p) => p.provider === provider && p.baseUrl === baseUrl,
+  );
+  return match ? match.name : null;
+}
 
 const categories = [
   { id: "appearance", label: "外观", icon: "🎨" },
@@ -120,79 +165,156 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   // toggle disagrees with what's persisted so we can show "重启生效" / "已生效".
   const gpuPendingRestart = gpuDisabled !== gpuDisabledInit;
 
-  // ── AI assistant config ── editable local state, initialized once from the
-  // vault-backed settings, persisted via useAiConfig.save (key re-encrypted
-  // in the backend; an empty key field means "keep existing").
-  const { settings: aiSettings, save: saveAiConfig, loading: aiLoading } = useAiConfig();
-  const [aiProvider, setAiProvider] = useState<AiProvider>("claude");
-  const [aiModel, setAiModel] = useState("");
-  const [aiBaseUrl, setAiBaseUrl] = useState("");
-  const [aiProxy, setAiProxy] = useState("");
-  const [aiKey, setAiKey] = useState("");
-  const [aiTemp, setAiTemp] = useState(0.7);
-  const [aiSaving, setAiSaving] = useState(false);
-  const [aiTesting, setAiTesting] = useState(false);
-  const [aiMsg, setAiMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
-  const aiInitRef = useRef(false);
-  useEffect(() => {
-    // Sync once the backend config finishes loading — NOT on first render,
-    // when aiSettings is still the DEFAULT placeholder. Without the loading
-    // gate the ref flips before the real values arrive (IPC is async) and the
-    // saved provider/model/baseUrl never populate the form.
-    if (!aiLoading && !aiInitRef.current) {
-      aiInitRef.current = true;
-      setAiProvider(aiSettings.provider);
-      setAiModel(aiSettings.model ?? "");
-      setAiBaseUrl(aiSettings.baseUrl ?? "");
-      setAiProxy(aiSettings.proxyUrl ?? "");
-      setAiTemp(aiSettings.temperature);
-    }
-  }, [aiSettings, aiLoading]);
+  // ── AI assistant config ── left-right layout: supplier list (left) +
+  // detail editor (right). The multi-model store is the source of truth;
+  // the right panel edits a copy of the selected supplier.
+  const {
+    models: aiModels,
+    activeId: aiActiveId,
+    reload: reloadAi,
+    setActive: setActiveAiModelHook,
+    loading: aiLoading,
+  } = useAiConfig();
+  const [selectedSupplierId, setSelectedSupplierId] = useState<number | null>(null);
+  // "create mode": when true, the right panel shows a new-supplier form.
+  const [creating, setCreating] = useState(false);
+  const [createPresetIdx, setCreatePresetIdx] = useState(-1); // -1 = custom
+  // Edit buffer for the selected supplier (right panel).
+  const [editName, setEditName] = useState("");
+  const [editProvider, setEditProvider] = useState<AiProvider>("openai_compatible");
+  const [editBaseUrl, setEditBaseUrl] = useState("");
+  const [editProxy, setEditProxy] = useState("");
+  const [editKey, setEditKey] = useState("");
+  const [editTemp, setEditTemp] = useState(0.7);
+  const [editModels, setEditModels] = useState<SupplierModel[]>([]);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editTesting, setEditTesting] = useState(false);
+  const [editMsg, setEditMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  // Inline rename state (double-click on supplier name).
+  const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [renameBuf, setRenameBuf] = useState("");
+  // Model fetching state (right panel "从接口获取模型").
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  // Manual model add buffer.
+  const [showAddModel, setShowAddModel] = useState(false);
+  const [newModelId, setNewModelId] = useState("");
+  const [newModelLabel, setNewModelLabel] = useState("");
+  // In-app toast/dialog for action feedback (replaces ugly native alert).
+  const [toast, setToast] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const showToast = (kind: "ok" | "err", text: string) => {
+    setToast({ kind, text });
+    window.setTimeout(() => setToast(null), 4000);
+  };
+  // Track whether the current edit buffer passed a test (for create-mode gate).
+  const [testedOk, setTestedOk] = useState(false);
 
-  const handleSaveAi = async () => {
-    setAiSaving(true);
-    setAiMsg(null);
+  // Sync the right-panel edit buffer whenever the selected supplier changes
+  // (or the underlying store reloads). In create mode, initialize from the
+  // chosen preset (or blank for custom).
+  const selectedSupplier = aiModels.find((m) => m.id === selectedSupplierId) ?? null;
+  // Only show non-preset suppliers in the sidebar.
+  const userSuppliers = aiModels.filter((m) => !m.isPreset);
+  useEffect(() => {
+    if (creating) {
+      // Initialize create-mode buffer from the selected preset.
+      const preset = createPresetIdx >= 0 ? AI_PRESETS[createPresetIdx] : null;
+      setEditName(preset ? preset.name : "");
+      setEditProvider((preset?.provider ?? "openai_compatible") as AiProvider);
+      setEditBaseUrl(preset?.baseUrl ?? "");
+      setEditProxy("");
+      setEditKey("");
+      setEditTemp(0.7);
+      setEditModels([]);
+      setFetchedModels([]);
+      setFetchError(null);
+      setShowAddModel(false);
+      return;
+    }
+    if (selectedSupplier) {
+      setEditName(selectedSupplier.name);
+      setEditProvider(selectedSupplier.provider);
+      setEditBaseUrl(selectedSupplier.baseUrl ?? "");
+      setEditProxy(selectedSupplier.proxyUrl ?? "");
+      setEditTemp(selectedSupplier.temperature);
+      setEditModels(selectedSupplier.models);
+      setEditKey("");
+      setFetchedModels([]);
+      setFetchError(null);
+      setShowAddModel(false);
+      setTestedOk(false);
+    }
+  }, [selectedSupplierId, aiModels, creating, createPresetIdx]);
+
+  // Auto-select the first USER supplier once data loads (skip presets).
+  useEffect(() => {
+    if (!aiLoading && !creating && selectedSupplierId === null && userSuppliers.length > 0) {
+      setSelectedSupplierId(userSuppliers[0].id);
+    }
+  }, [aiLoading, userSuppliers, selectedSupplierId, creating]);
+
+  const handleSaveSupplier = async () => {
+    // Create-mode gate: must have at least one model AND pass a test first.
+    if (creating) {
+      if (editModels.length === 0) {
+        showToast("err", "请先添加至少一个模型再创建供应商");
+        return;
+      }
+      if (!testedOk) {
+        showToast("err", "请先点击「测试」通过后再创建");
+        return;
+      }
+    }
+    setEditSaving(true);
+    setEditMsg(null);
+    const wasCreating = creating;
     try {
-      await saveAiConfig({
-        provider: aiProvider,
-        model: aiModel.trim() || undefined,
-        baseUrl: aiBaseUrl.trim() || undefined,
-        proxyUrl: aiProxy.trim() || undefined,
-        apiKey: aiKey,
-        temperature: aiTemp,
+      const id = await saveAiModel({
+        // No id = create new (create mode); has id = update existing.
+        ...(creating ? {} : { id: selectedSupplierId ?? undefined }),
+        name: editName.trim() || "未命名",
+        provider: editProvider,
+        modelId: editModels[0]?.modelId ?? "default",
+        baseUrl: editBaseUrl.trim() || undefined,
+        apiKey: editKey || undefined,
+        proxyUrl: editProxy.trim() || undefined,
+        temperature: editTemp,
+        models: editModels.map((m) => ({ modelId: m.modelId, label: m.label })),
       });
-      setAiKey("");
-      setAiMsg({ kind: "ok", text: "已保存" });
+      setEditKey("");
+      await reloadAi();
+      // Exit create mode + select the newly created supplier.
+      setCreating(false);
+      setSelectedSupplierId(id);
+      showToast("ok", wasCreating ? "供应商已创建" : "供应商已保存");
     } catch (e) {
-      setAiMsg({ kind: "err", text: `保存失败: ${e}` });
+      showToast("err", `保存失败: ${e}`);
     } finally {
-      setAiSaving(false);
-      window.setTimeout(() => setAiMsg(null), 3000);
+      setEditSaving(false);
     }
   };
 
-  // Test the AI config using the CURRENT FORM VALUES via overrides — does NOT
-  // save first, so the user can iterate on model/baseUrl/key without
-  // committing. An empty apiKey field falls through to the vault-stored key
-  // (same convention as save's "empty key = keep existing").
-  const handleTestAi = async () => {
-    setAiTesting(true);
-    setAiMsg(null);
+  // Test the current supplier's config via overrides — does NOT save first.
+  const handleTestSupplier = async () => {
+    setEditTesting(true);
     try {
       const msg = await aiTestSettings({
-        provider: aiProvider,
-        model: aiModel.trim() || undefined,
-        baseUrl: aiBaseUrl.trim() || undefined,
-        proxyUrl: aiProxy.trim() || undefined,
-        apiKey: aiKey,
-        temperature: aiTemp,
+        supplierId: creating ? undefined : selectedSupplierId ?? undefined,
+        provider: editProvider,
+        model: editModels[0]?.modelId ?? "default",
+        baseUrl: editBaseUrl.trim() || undefined,
+        proxyUrl: editProxy.trim() || undefined,
+        apiKey: editKey,
+        temperature: editTemp,
       });
-      setAiMsg({ kind: "ok", text: msg });
+      showToast("ok", msg);
+      setTestedOk(true);
     } catch (e) {
-      setAiMsg({ kind: "err", text: `测试失败: ${e}` });
+      showToast("err", `测试失败: ${e}`);
+      setTestedOk(false);
     } finally {
-      setAiTesting(false);
-      window.setTimeout(() => setAiMsg(null), 6000);
+      setEditTesting(false);
     }
   };
 
@@ -384,7 +506,7 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
           border: "1px solid var(--border-emphasis)",
           borderRadius: "var(--radius-xl)",
           width: 850,
-          maxHeight: "85vh",
+          height: "85vh",
           overflow: "hidden",
           boxShadow: "var(--shadow-xl)",
           display: "flex",
@@ -448,7 +570,7 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
           />
 
           {/* Right Content */}
-          <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
+          <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px", minHeight: 480 }}>
 
           {/* Appearance Category — 配色 / 背景图 / 字体 / 渲染后端 */}
           {activeCategory === "appearance" && (
@@ -988,132 +1110,633 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
             </>
           )}
 
-          {/* AI Category */}
+          {/* AI Category — left-right layout: supplier list + detail editor */}
           {activeCategory === "ai" && (
             <>
-          {/* AI Assistant Section */}
           <Section title="🤖 AI 助手">
             <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.6 }}>
-              配置 AI 提供商，用于命令生成、输出诊断与服务器巡检。API key 经主密码库（vault）加密存储；本地 Ollama 无需 key、数据不出本机。
+              配置 AI 供应商与模型，用于命令生成、输出诊断与服务器巡检。左侧选择供应商，右侧编辑详情。API key 经主密码库加密存储。
             </div>
-            <Field label="提供商 (Provider)">
-              <select
-                value={aiProvider}
-                onChange={(e) => setAiProvider(e.target.value as AiProvider)}
-                style={{
-                  width: "100%",
-                  padding: "10px 12px",
-                  background: "var(--bg-input)",
-                  color: "var(--text-primary)",
-                  border: "1px solid var(--border-default)",
-                  borderRadius: "var(--radius-md)",
-                  fontSize: 13,
-                  outline: "none",
-                }}
-              >
-                <option value="claude">Claude (Anthropic)</option>
-                <option value="openai">OpenAI (GPT)</option>
-                <option value="ollama">Ollama (本地)</option>
-              </select>
-            </Field>
-            <Field label="模型 (Model)">
-              <Input
-                value={aiModel}
-                onChange={setAiModel}
-                placeholder={
-                  aiProvider === "claude"
-                    ? "claude-sonnet-4-6（留空用默认）"
-                    : aiProvider === "openai"
-                    ? "gpt-4o（留空用默认）"
-                    : "llama3.1（留空用默认）"
-                }
-              />
-            </Field>
-            <Field label="API Base URL（可选：自建 / 代理 / Ollama 地址）">
-              <Input
-                value={aiBaseUrl}
-                onChange={setAiBaseUrl}
-                placeholder={
-                  aiProvider === "ollama"
-                    ? "http://localhost:11434/api（留空用默认）"
-                    : "留空用官方；自定义填到版本路径，如智谱 https://open.bigmodel.cn/api/paas/v4"
-                }
-              />
-            </Field>
-            <Field label="网络代理（可选：http:// 或 socks5://）">
-              <Input
-                value={aiProxy}
-                onChange={setAiProxy}
-                placeholder="留空直连；如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080（认证写 user:pass@host）"
-              />
-            </Field>
-            <Field
-              label={`API Key${aiSettings.hasKey ? "（已保存，留空保持不变）" : ""}`}
-            >
-              <Input
-                value={aiKey}
-                onChange={setAiKey}
-                type="password"
-                placeholder={aiSettings.hasKey ? "••••••（已保存）" : "粘贴 API key"}
-              />
-            </Field>
-            <Field label={`Temperature（创造性 ${aiTemp}）`}>
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.1}
-                value={aiTemp}
-                onChange={(e) => setAiTemp(Number(e.target.value))}
-                style={{ width: "100%" }}
-              />
-            </Field>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <button
-                onClick={handleTestAi}
-                disabled={aiTesting || aiSaving}
-                style={{
-                  background: "var(--bg-surface)",
-                  color: "var(--text-secondary)",
-                  border: "1px solid var(--border-default)",
-                  borderRadius: "var(--radius-md)",
-                  padding: "9px 16px",
-                  fontSize: 13,
-                  fontWeight: 500,
-                  cursor: aiTesting ? "default" : "pointer",
-                  opacity: aiTesting ? 0.7 : 1,
-                }}
-                title="用当前填写的配置（含未保存的 key）发起一次最小请求验证"
-              >
-                {aiTesting ? "测试中…" : "测试"}
-              </button>
-              <button
-                onClick={handleSaveAi}
-                disabled={aiSaving || aiTesting}
-                style={{
-                  background: "var(--accent-primary)",
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: "var(--radius-md)",
-                  padding: "9px 16px",
-                  fontSize: 13,
-                  fontWeight: 500,
-                  cursor: aiSaving ? "default" : "pointer",
-                  opacity: aiSaving ? 0.7 : 1,
-                }}
-              >
-                {aiSaving ? "保存中…" : "保存 AI 配置"}
-              </button>
-              {aiMsg && (
-                <span
+            <div style={{ display: "flex", gap: 16, minHeight: 420 }}>
+              {/* ── Left: supplier list ── */}
+              <div style={{ width: 240, flexShrink: 0, display: "flex", flexDirection: "column" }}>
+                <button
+                  onClick={() => {
+                    setCreating(true);
+                    setSelectedSupplierId(null);
+                    setCreatePresetIdx(-1);
+                  }}
                   style={{
+                    width: "100%",
+                    padding: "8px 12px",
+                    background: "var(--accent-primary)",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: "var(--radius-md)",
                     fontSize: 12,
-                    color: aiMsg.kind === "ok" ? "var(--success)" : "var(--error)",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                    marginBottom: 8,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: 6,
                   }}
                 >
-                  {aiMsg.text}
-                </span>
-              )}
+                  <span style={{ fontSize: 14 }}>＋</span> 新建供应商
+                </button>
+                <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
+                  {userSuppliers.map((m) => {
+                    const isSelected = selectedSupplierId === m.id;
+                    return (
+                      <div
+                        key={m.id}
+                        onClick={() => setSelectedSupplierId(m.id)}
+                        onDoubleClick={(e) => {
+                          e.stopPropagation();
+                          setRenamingId(m.id);
+                          setRenameBuf(m.name);
+                        }}
+                        style={{
+                          padding: "8px 10px",
+                          borderRadius: "var(--radius-md)",
+                          border: `1px solid ${
+                            isSelected ? "var(--accent-primary)" : "var(--border-default)"
+                          }`,
+                          background: isSelected ? "var(--accent-primary-muted)" : "var(--bg-surface)",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {/* Row 1: name + enable/disable toggle */}
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span
+                            style={{
+                              flex: 1,
+                              fontSize: 12,
+                              fontWeight: isSelected ? 600 : 400,
+                              color: isSelected ? "var(--accent-primary)" : "var(--text-primary)",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {renamingId === m.id ? (
+                              <input
+                                autoFocus
+                                value={renameBuf}
+                                onChange={(e) => setRenameBuf(e.target.value)}
+                                onBlur={async () => {
+                                  if (renameBuf.trim() && renameBuf !== m.name) {
+                                    try {
+                                      await saveAiModel({
+                                        id: m.id,
+                                        name: renameBuf.trim(),
+                                        provider: m.provider,
+                                        modelId: m.modelId,
+                                        baseUrl: m.baseUrl,
+                                        temperature: m.temperature,
+                                        models: m.models.map((x) => ({ modelId: x.modelId, label: x.label })),
+                                      });
+                                      await reloadAi();
+                                    } catch { /* ignore */ }
+                                  }
+                                  setRenamingId(null);
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                                  if (e.key === "Escape") setRenamingId(null);
+                                }}
+                                onClick={(e) => e.stopPropagation()}
+                                style={{
+                                  width: "100%",
+                                  padding: "2px 4px",
+                                  fontSize: 12,
+                                  background: "var(--bg-input)",
+                                  color: "var(--text-primary)",
+                                  border: "1px solid var(--accent-primary)",
+                                  borderRadius: "var(--radius-sm)",
+                                  outline: "none",
+                                }}
+                              />
+                            ) : (
+                              <>
+                                <span>{m.name}</span>
+                                {!m.isEnabled && (
+                                  <span style={{ fontSize: 9, marginLeft: 4, color: "var(--text-muted)" }}>已禁用</span>
+                                )}
+                              </>
+                            )}
+                          </span>
+                          {/* Enable / Disable toggle switch */}
+                          <button
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              try {
+                                await toggleAiModelEnabled(m.id, !m.isEnabled);
+                                await reloadAi();
+                              } catch (e2) {
+                                showToast("err", `操作失败: ${e2}`);
+                              }
+                            }}
+                            title={m.isEnabled ? "点击禁用" : "点击启用"}
+                            role="switch"
+                            aria-checked={m.isEnabled}
+                            style={{
+                              flexShrink: 0,
+                              width: 32,
+                              height: 18,
+                              padding: 2,
+                              background: m.isEnabled ? "var(--success)" : "var(--bg-surface-active)",
+                              border: "none",
+                              borderRadius: "var(--radius-full)",
+                              cursor: "pointer",
+                              transition: "background 0.2s",
+                              display: "flex",
+                              alignItems: "center",
+                              position: "relative",
+                            }}
+                          >
+                            <span
+                              style={{
+                                width: 14,
+                                height: 14,
+                                background: "#fff",
+                                borderRadius: "50%",
+                                transform: m.isEnabled ? "translateX(14px)" : "translateX(0)",
+                                transition: "transform 0.2s",
+                                boxShadow: "0 1px 2px rgba(0,0,0,0.15)",
+                              }}
+                            />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {userSuppliers.length === 0 && !aiLoading && (
+                    <div style={{ fontSize: 11, color: "var(--text-muted)", textAlign: "center", padding: 20 }}>
+                      暂无自定义供应商，点击上方按钮新建
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* ── Right: supplier detail editor ── */}
+              <div style={{ flex: 1, minWidth: 0, overflowY: "auto" }}>
+                {!selectedSupplier && !creating ? (
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-muted)", fontSize: 13 }}>
+                    选择左侧供应商或新建一个
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                    {/* Create-mode: preset selector */}
+                    {creating && (
+                      <Field label="选择供应商">
+                        <select
+                          value={createPresetIdx}
+                          onChange={(e) => setCreatePresetIdx(Number(e.target.value))}
+                          style={{
+                            width: "100%",
+                            padding: "10px 12px",
+                            background: "var(--bg-input)",
+                            color: "var(--text-primary)",
+                            border: "1px solid var(--border-default)",
+                            borderRadius: "var(--radius-md)",
+                            fontSize: 13,
+                            outline: "none",
+                          }}
+                        >
+                          <option value={-1}>— 自定义 —</option>
+                          {AI_PRESETS.map((p, idx) => (
+                            <option key={idx} value={idx}>
+                              {p.name}（{PROVIDER_LABELS[p.provider] ?? p.provider}）
+                            </option>
+                          ))}
+                        </select>
+                      </Field>
+                    )}
+                    {/* Basic info */}
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                      <Field label="供应商名称">
+                        <Input
+                          value={editName}
+                          onChange={setEditName}
+                          placeholder="如：GLM、腾讯云"
+                        />
+                      </Field>
+                      <Field label="协议 (Provider)">
+                        <select
+                          value={editProvider}
+                          onChange={(e) => setEditProvider(e.target.value as AiProvider)}
+                          style={{
+                            width: "100%",
+                            padding: "10px 12px",
+                            background: "var(--bg-input)",
+                            color: "var(--text-primary)",
+                            border: "1px solid var(--border-default)",
+                            borderRadius: "var(--radius-md)",
+                            fontSize: 13,
+                            outline: "none",
+                          }}
+                        >
+                          <option value="openai_compatible">OpenAI 兼容</option>
+                          <option value="anthropic_compatible">Anthropic 兼容</option>
+                          <option value="claude">Claude (Anthropic 官方)</option>
+                          <option value="openai">OpenAI (官方)</option>
+                          <option value="ollama">Ollama (本地)</option>
+                        </select>
+                      </Field>
+                    </div>
+                    <Field label="API Base URL">
+                      <Input
+                        value={editBaseUrl}
+                        onChange={setEditBaseUrl}
+                        placeholder="如 https://open.bigmodel.cn/api/paas/v4"
+                      />
+                    </Field>
+                    <Field label="网络代理（可选：http:// 或 socks5://）">
+                      <Input
+                        value={editProxy}
+                        onChange={setEditProxy}
+                        placeholder="留空直连；如 http://127.0.0.1:7890"
+                      />
+                    </Field>
+                    <Field label={`API Key${!creating && selectedSupplier?.hasKey ? "（已保存，留空保持不变）" : ""}`}>
+                      <Input
+                        value={editKey}
+                        onChange={setEditKey}
+                        type="password"
+                        placeholder={
+                          creating
+                            ? "粘贴 API key（必填，用于测试和对话）"
+                            : selectedSupplier?.hasKey
+                            ? "••••••（已保存）"
+                            : "粘贴 API key"
+                        }
+                      />
+                    </Field>
+                    <Field label={`Temperature（${editTemp}）`}>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.1}
+                        value={editTemp}
+                        onChange={(e) => setEditTemp(Number(e.target.value))}
+                        style={{ width: "100%" }}
+                      />
+                    </Field>
+
+                    {/* ── Model management ── */}
+                    <div style={{ borderTop: "1px solid var(--border-subtle)", paddingTop: 12 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: 8 }}>
+                        模型列表
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+                        {editModels.length === 0 && (
+                          <div style={{ fontSize: 11, color: "var(--text-muted)", padding: "4px 0" }}>
+                            暂无模型，请添加或从接口获取
+                          </div>
+                        )}
+                        {editModels.map((model, idx) => (
+                          <div
+                            key={model.id || idx}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 6,
+                              padding: "5px 8px",
+                              background: "var(--bg-surface)",
+                              border: "1px solid var(--border-default)",
+                              borderRadius: "var(--radius-sm)",
+                            }}
+                          >
+                            <span
+                              style={{
+                                flex: 1,
+                                fontSize: 11,
+                                color: "var(--text-primary)",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {model.label ? `${model.label} (${model.modelId})` : model.modelId}
+                            </span>
+                            {idx === 0 && (
+                              <span style={{ fontSize: 9, color: "var(--text-muted)" }}>主</span>
+                            )}
+                            <button
+                              onClick={() => {
+                                if (idx === 0) return; // can't remove primary
+                                setEditModels((prev) => prev.filter((_, i) => i !== idx));
+                              }}
+                              disabled={idx === 0}
+                              style={{
+                                background: "transparent",
+                                border: "none",
+                                color: idx === 0 ? "var(--text-muted)" : "var(--error)",
+                                fontSize: 14,
+                                cursor: idx === 0 ? "default" : "pointer",
+                                padding: "0 4px",
+                              }}
+                              title={idx === 0 ? "主模型不可删除" : "删除"}
+                            >
+                              ×
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* Fetch models from API */}
+                      {(editProvider === "openai_compatible" ||
+                        editProvider === "ollama") && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+                          <button
+                            onClick={async () => {
+                              if (!editBaseUrl) {
+                                showToast("err", "请先填写 Base URL");
+                                return;
+                              }
+                              if (!editKey && !selectedSupplier?.hasKey) {
+                                showToast("err", "请先填写 API Key");
+                                return;
+                              }
+                              setFetchingModels(true);
+                              setFetchError(null);
+                              setFetchedModels([]);
+                              try {
+                                let models: string[];
+                                if (creating || !selectedSupplierId) {
+                                  // New supplier not yet saved: use form values directly.
+                                  models = await fetchProviderModels(
+                                    editProvider,
+                                    editBaseUrl,
+                                    editKey,
+                                  );
+                                } else {
+                                  // Existing supplier: decrypt key server-side,
+                                  // but honor editKey override if user typed a new one.
+                                  models = await fetchModelsForSupplier(
+                                    selectedSupplierId,
+                                    editKey || undefined,
+                                  );
+                                }
+                                setFetchedModels(models);
+                                if (models.length === 0) {
+                                  showToast("err", "接口返回空模型列表");
+                                }
+                              } catch (e) {
+                                showToast("err", `获取模型失败: ${e}`);
+                              } finally {
+                                setFetchingModels(false);
+                              }
+                            }}
+                            disabled={fetchingModels || !editBaseUrl}
+                            style={{
+                              background: "var(--bg-surface)",
+                              color: "var(--text-secondary)",
+                              border: "1px solid var(--border-default)",
+                              borderRadius: "var(--radius-md)",
+                              padding: "6px 12px",
+                              fontSize: 11,
+                              cursor: fetchingModels || !editBaseUrl ? "default" : "pointer",
+                              opacity: fetchingModels ? 0.7 : 1,
+                            }}
+                          >
+                            {fetchingModels ? "获取中…" : "从接口获取模型"}
+                          </button>
+                          {fetchError && (
+                            <span style={{ fontSize: 11, color: "var(--error)" }}>
+                              {fetchError}
+                            </span>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Fetched models — click to add */}
+                      {fetchedModels.length > 0 && (
+                        <div style={{ marginBottom: 8 }}>
+                          <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 4 }}>
+                            点击添加到列表：
+                          </div>
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: 4, maxHeight: 100, overflowY: "auto" }}>
+                            {fetchedModels.map((mid) => {
+                              const alreadyAdded = editModels.some((m) => m.modelId === mid);
+                              return (
+                                <button
+                                  key={mid}
+                                  disabled={alreadyAdded}
+                                  onClick={() => {
+                                    if (!alreadyAdded) {
+                                      setEditModels((prev) => [
+                                        ...prev,
+                                        { id: 0, supplierId: selectedSupplierId ?? 0, modelId: mid, label: undefined, sortOrder: prev.length },
+                                      ]);
+                                    }
+                                  }}
+                                  style={{
+                                    background: alreadyAdded
+                                      ? "var(--bg-input)"
+                                      : "var(--accent-primary-muted)",
+                                    border: `1px solid ${alreadyAdded ? "var(--border-default)" : "var(--accent-primary)"}`,
+                                    borderRadius: "var(--radius-full)",
+                                    padding: "3px 10px",
+                                    fontSize: 11,
+                                    color: alreadyAdded ? "var(--text-muted)" : "var(--text-primary)",
+                                    cursor: alreadyAdded ? "default" : "pointer",
+                                    opacity: alreadyAdded ? 0.5 : 1,
+                                  }}
+                                >
+                                  {alreadyAdded ? "✓ " : "+ "}{mid}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Manual add model */}
+                      {showAddModel ? (
+                        <div style={{ display: "flex", gap: 6, alignItems: "flex-end", marginBottom: 4 }}>
+                          <div style={{ flex: 1 }}>
+                            <Field label="模型 ID">
+                              <Input
+                                value={newModelId}
+                                onChange={setNewModelId}
+                                placeholder="如 glm-4-plus"
+                              />
+                            </Field>
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <Field label="显示名（可选）">
+                              <Input
+                                value={newModelLabel}
+                                onChange={setNewModelLabel}
+                                placeholder="如 GLM-4 Plus"
+                              />
+                            </Field>
+                          </div>
+                          <button
+                            onClick={() => {
+                              if (!newModelId.trim()) return;
+                              setEditModels((prev) => [
+                                ...prev,
+                                { id: 0, supplierId: selectedSupplierId ?? 0, modelId: newModelId.trim(), label: newModelLabel.trim() || undefined, sortOrder: prev.length },
+                              ]);
+                              setNewModelId("");
+                              setNewModelLabel("");
+                              setShowAddModel(false);
+                            }}
+                            disabled={!newModelId.trim()}
+                            style={{
+                              background: "var(--accent-primary)",
+                              color: "#fff",
+                              border: "none",
+                              borderRadius: "var(--radius-md)",
+                              padding: "8px 12px",
+                              fontSize: 12,
+                              cursor: newModelId.trim() ? "pointer" : "default",
+                              opacity: newModelId.trim() ? 1 : 0.5,
+                              marginBottom: 12,
+                            }}
+                          >
+                            添加
+                          </button>
+                          <button
+                            onClick={() => setShowAddModel(false)}
+                            style={{
+                              background: "transparent",
+                              color: "var(--text-secondary)",
+                              border: "1px solid var(--border-default)",
+                              borderRadius: "var(--radius-md)",
+                              padding: "8px 12px",
+                              fontSize: 12,
+                              cursor: "pointer",
+                              marginBottom: 12,
+                            }}
+                          >
+                            取消
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => setShowAddModel(true)}
+                          style={{
+                            background: "transparent",
+                            color: "var(--accent-primary)",
+                            border: "1px dashed var(--border-default)",
+                            borderRadius: "var(--radius-md)",
+                            padding: "6px 12px",
+                            fontSize: 11,
+                            cursor: "pointer",
+                            width: "100%",
+                          }}
+                        >
+                          ＋ 手动添加模型
+                        </button>
+                      )}
+                    </div>
+
+                    {/* ── Actions ── */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, borderTop: "1px solid var(--border-subtle)", paddingTop: 12 }}>
+                      {creating && (
+                        <button
+                          onClick={() => {
+                            setCreating(false);
+                            setSelectedSupplierId(null);
+                          }}
+                          style={{
+                            background: "transparent",
+                            color: "var(--text-secondary)",
+                            border: "1px solid var(--border-default)",
+                            borderRadius: "var(--radius-md)",
+                            padding: "8px 16px",
+                            fontSize: 12,
+                            cursor: "pointer",
+                          }}
+                        >
+                          取消
+                        </button>
+                      )}
+                      <button
+                        onClick={handleTestSupplier}
+                        disabled={editTesting || editSaving}
+                        style={{
+                          background: "var(--bg-surface)",
+                          color: "var(--text-secondary)",
+                          border: "1px solid var(--border-default)",
+                          borderRadius: "var(--radius-md)",
+                          padding: "8px 16px",
+                          fontSize: 12,
+                          fontWeight: 500,
+                          cursor: editTesting ? "default" : "pointer",
+                          opacity: editTesting ? 0.7 : 1,
+                        }}
+                      >
+                        {editTesting ? "测试中…" : "测试"}
+                      </button>
+                      <button
+                        onClick={handleSaveSupplier}
+                        disabled={editSaving || editTesting}
+                        style={{
+                          background: "var(--accent-primary)",
+                          color: "#fff",
+                          border: "none",
+                          borderRadius: "var(--radius-md)",
+                          padding: "8px 16px",
+                          fontSize: 12,
+                          fontWeight: 500,
+                          cursor: editSaving ? "default" : "pointer",
+                          opacity: editSaving ? 0.7 : 1,
+                        }}
+                      >
+                        {editSaving ? "保存中…" : creating ? "创建" : "保存"}
+                      </button>
+                      {!creating && selectedSupplierId && (
+                        <button
+                          onClick={async () => {
+                            if (!selectedSupplier) return;
+                            const ok = await confirm(`删除供应商「${selectedSupplier.name}」？`, { title: "确认删除", kind: "warning" });
+                            if (ok) {
+                              try {
+                                const wasActive = aiActiveId === selectedSupplier.id;
+                                const { deleteAiModel } = await import("../api");
+                                await deleteAiModel(selectedSupplier.id);
+                                await reloadAi();
+                                // If the deleted supplier was active, auto-select
+                                // the first remaining enabled user supplier.
+                                if (wasActive) {
+                                  const remaining = aiModels.filter(
+                                    (m) => m.id !== selectedSupplier.id && m.isEnabled && !m.isPreset,
+                                  );
+                                  if (remaining.length > 0) {
+                                    await setActiveAiModelHook(remaining[0].id);
+                                  }
+                                }
+                                setSelectedSupplierId(null);
+                                showToast("ok", "供应商已删除");
+                              } catch (e) {
+                                showToast("err", `删除失败: ${e}`);
+                              }
+                            }
+                          }}
+                          style={{
+                            background: "transparent",
+                            color: "var(--error, #ff3b30)",
+                            border: "1px solid var(--error, #ff3b30)",
+                            borderRadius: "var(--radius-md)",
+                            padding: "8px 16px",
+                            fontSize: 12,
+                            cursor: "pointer",
+                          }}
+                        >
+                          删除
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           </Section>
             </>
@@ -1703,6 +2326,31 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
           onChanged={onRefresh}
           onClose={() => setShowRecycleDialog(false)}
         />
+      )}
+      {/* In-app toast for AI settings feedback */}
+      {toast && (
+        <div
+          style={{
+            position: "fixed",
+            top: 30,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 3000,
+            padding: "12px 20px",
+            borderRadius: "var(--radius-md)",
+            background: toast.kind === "ok" ? "var(--success-muted)" : "var(--error-muted)",
+            border: `1px solid ${toast.kind === "ok" ? "var(--success)" : "var(--error)"}`,
+            color: toast.kind === "ok" ? "var(--success)" : "var(--error)",
+            fontSize: 13,
+            fontWeight: 500,
+            boxShadow: "var(--shadow-lg)",
+            maxWidth: 460,
+            lineHeight: 1.5,
+            animation: "animate-slide-up 0.3s var(--ease-out-expo)",
+          }}
+        >
+          {toast.kind === "ok" ? "✓ " : "⚠ "}{toast.text}
+        </div>
       )}
     </div>
   );

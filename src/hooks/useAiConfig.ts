@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  getActiveAiModelId,
   getAiSettings,
+  listAiModels,
   saveAiSettings,
+  setActiveAiModel,
+  type AiModel,
   type AiProvider,
   type AiSettings,
 } from "../api";
@@ -15,19 +19,24 @@ const DEFAULT: AiSettings = {
   temperature: 0.7,
 };
 
-/** Loads + persists the AI provider config via IPC. Unlike the theme/font
- * hooks (localStorage), this one is backend-backed because the API key is
- * encrypted in the vault and must never touch the frontend in plaintext.
+/**
+ * Loads + persistently manages AI config and model list.
  *
- * `apiKey` on save: a non-empty value re-encrypts & overwrites; undefined /
- * empty leaves the existing key (so the user can change model without
- * re-entering the key). `proxyUrl` is stored plaintext (a proxy address
- * isn't secret; embed auth as user:pass@host if needed). */
+ * Two tiers:
+ *  - `settings` (legacy single-row): AI provider config for installs that
+ *    haven't migrated yet; used as fallback when no active model is selected.
+ *  - `models` (multi-model): full list of presets + user models; `activeId`
+ *    selects which one drives `ai_chat`.
+ *
+ * API keys are encrypted in the vault and never touch the frontend in
+ * plaintext — `hasKey` only indicates one is stored. */
 export function useAiConfig(): {
   settings: AiSettings;
+  models: AiModel[];
+  activeId: number | null;
   loading: boolean;
   reload: () => Promise<void>;
-  save: (next: {
+  saveSettings: (next: {
     provider: AiProvider;
     model?: string;
     baseUrl?: string;
@@ -35,15 +44,27 @@ export function useAiConfig(): {
     apiKey?: string;
     temperature: number;
   }) => Promise<void>;
+  setActive: (id: number) => Promise<void>;
 } {
   const [settings, setSettings] = useState<AiSettings>(DEFAULT);
+  const [models, setModels] = useState<AiModel[]>([]);
+  const [activeId, setActiveId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
 
   const reload = useCallback(async () => {
     try {
-      setSettings(await getAiSettings());
+      const [s, m, aid] = await Promise.all([
+        getAiSettings(),
+        listAiModels(),
+        getActiveAiModelId(),
+      ]);
+      setSettings(s);
+      setModels(m);
+      setActiveId(aid);
     } catch {
       setSettings(DEFAULT);
+      setModels([]);
+      setActiveId(null);
     } finally {
       setLoading(false);
     }
@@ -53,7 +74,7 @@ export function useAiConfig(): {
     reload();
   }, [reload]);
 
-  const save = useCallback(
+  const saveSettings = useCallback(
     async (next: {
       provider: AiProvider;
       model?: string;
@@ -75,5 +96,13 @@ export function useAiConfig(): {
     [reload]
   );
 
-  return { settings, loading, reload, save };
+  const setActive = useCallback(
+    async (id: number) => {
+      await setActiveAiModel(id);
+      setActiveId(id);
+    },
+    []
+  );
+
+  return { settings, models, activeId, loading, reload, saveSettings, setActive };
 }

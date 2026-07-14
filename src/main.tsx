@@ -38,6 +38,15 @@ if (typeof window !== "undefined") {
       ? `${event.error.message}${event.error.stack ? ` | ${event.error.stack.replace(/\s+/g, " ").trim()}` : ""}`
       : String(event.message || "unknown error");
     writeFrontendLog("error", `uncaught: ${msg} @ ${event.filename}:${event.lineno}`);
+
+    // Suppress the known xterm.js race condition where Viewport.syncScrollArea
+    // accesses renderer.dimensions before the Canvas/WebGL renderer has
+    // finished initializing (happens when SSH data arrives within the first
+    // ~100ms after term.open()). Without preventDefault, WebView2 treats this
+    // as a fatal error and crashes the render process, killing the app.
+    if (msg.includes("reading 'dimensions'") && event.filename.includes("xterm")) {
+      event.preventDefault();
+    }
   });
   // Unhandled promise rejections (the common case for failed async/await).
   window.addEventListener("unhandledrejection", (event) => {

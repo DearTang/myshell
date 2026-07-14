@@ -6,6 +6,9 @@
   "permissions": [
     "core:event:default",
     "dialog:allow-open",
-    "dialog:allow-save"
+    "dialog:allow-save",
+    "dialog:allow-message",
+    "dialog:allow-confirm",
+    "dialog:allow-ask"
   ]
 }

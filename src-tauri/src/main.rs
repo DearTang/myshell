@@ -2605,6 +2605,132 @@ async fn ai_test_settings(
     ai::test_settings(&state, overrides).await
 }
 
+// ── Multi-model management commands ──────────────────────────────────────
+
+#[tauri::command]
+fn list_ai_models(state: State<'_, AppState>) -> Result<Vec<ai::AiModelInfo>, String> {
+    ai::list_ai_models_cmd(&state)
+}
+
+#[tauri::command]
+fn get_active_ai_model_id(state: State<'_, AppState>) -> Result<Option<i64>, String> {
+    ai::get_active_model_id(&state)
+}
+
+#[tauri::command]
+fn save_ai_model(
+    state: State<'_, AppState>,
+    id: Option<i64>,
+    name: String,
+    provider: String,
+    model_id: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    proxy_url: Option<String>,
+    temperature: f64,
+    models: Option<Vec<SupplierModelPayload>>,
+) -> Result<i64, String> {
+    let models_arg = models.map(|list| {
+        list.into_iter()
+            .map(|m| (m.model_id, m.label))
+            .collect::<Vec<_>>()
+    });
+    ai::save_ai_model_cmd(
+        &state,
+        id,
+        name,
+        provider,
+        model_id,
+        base_url,
+        api_key,
+        proxy_url,
+        temperature,
+        models_arg,
+    )
+}
+
+#[tauri::command]
+fn delete_ai_model(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    ai::delete_ai_model_cmd(&state, id)
+}
+
+#[tauri::command]
+fn set_active_ai_model(
+    state: State<'_, AppState>,
+    id: i64,
+    model_string: Option<String>,
+) -> Result<(), String> {
+    ai::set_active_ai_model_cmd(&state, id, model_string)
+}
+
+#[tauri::command]
+fn init_ai_presets(state: State<'_, AppState>) -> Result<(), String> {
+    ai::init_ai_presets_cmd(&state)
+}
+
+/// Fetch available models from a provider's /models endpoint (OpenAI format).
+#[tauri::command]
+async fn fetch_provider_models(
+    provider: String,
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<String>, String> {
+    ai::fetch_provider_models(&provider, &base_url, &api_key).await
+}
+
+/// Fetch available models for a specific supplier by id. Decrypts the stored
+/// key server-side — used after save so the frontend doesn't handle plaintext.
+#[tauri::command]
+async fn fetch_models_for_supplier(
+    state: State<'_, AppState>,
+    supplier_id: i64,
+    override_key: Option<String>,
+) -> Result<Vec<String>, String> {
+    ai::fetch_models_for_supplier(&state, supplier_id, override_key).await
+}
+
+// ── Supplier model management ─────────────────────────────────────────────
+
+/// Payload for a single model entry when saving a supplier (model_id + label).
+#[derive(serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplierModelPayload {
+    pub model_id: String,
+    pub label: Option<String>,
+}
+
+#[tauri::command]
+fn list_supplier_models(
+    state: State<'_, AppState>,
+    supplier_id: i64,
+) -> Result<Vec<ai::SupplierModelInfo>, String> {
+    ai::list_supplier_models_cmd(&state, supplier_id)
+}
+
+#[tauri::command]
+fn add_supplier_model(
+    state: State<'_, AppState>,
+    supplier_id: i64,
+    model_id: String,
+    label: Option<String>,
+) -> Result<i64, String> {
+    ai::add_supplier_model_cmd(&state, supplier_id, model_id, label)
+}
+
+#[tauri::command]
+fn remove_supplier_model(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    ai::remove_supplier_model_cmd(&state, id)
+}
+
+#[tauri::command]
+fn toggle_ai_model_enabled(
+    state: State<'_, AppState>,
+    id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    ai::toggle_ai_model_enabled_cmd(&state, id, enabled)
+}
+
 // ============ Elevation (run as admin) ============
 
 /// Whether MyShell is running elevated (admin on Windows, root on Unix). Drives
@@ -3561,12 +3687,32 @@ pub fn run() {
             get_ai_settings,
             save_ai_settings,
             ai_test_settings,
+            list_ai_models,
+            get_active_ai_model_id,
+            save_ai_model,
+            delete_ai_model,
+            set_active_ai_model,
+            list_supplier_models,
+            add_supplier_model,
+            remove_supplier_model,
+            toggle_ai_model_enabled,
+            init_ai_presets,
+            fetch_provider_models,
+            fetch_models_for_supplier,
             get_feedback_log,
             reveal_path,
             save_feedback_zip,
             clear_feedback_dir,
         ])
         .setup(|app| {
+            // Seed built-in AI model presets on first launch (idempotent).
+            {
+                let state = app.state::<AppState>();
+                if let Err(e) = ai::init_ai_presets_cmd(&state) {
+                    log::warn!("[startup] init_ai_presets failed: {}", e);
+                }
+            }
+
             // Explicitly set the main window's icon so the title bar + taskbar
             // show the MyShell icon regardless of how tauri-build auto-embedded
             // the default window icon. Pairs with set_windows_app_user_model_id()

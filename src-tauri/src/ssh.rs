@@ -241,20 +241,47 @@ fn is_zmodem_end(buf: &[u8]) -> bool {
 /// validates the multiplexed-channel path that real SFTP relies on (catches
 /// "authenticated but server rejects channels"). The real connect path passes
 /// `false` and opens its own channel afterwards instead.
+/// Connection phase timeout (TCP dial + SSH handshake). If the server is
+/// unresponsive (dead host, firewall dropping SYN, suspended VM), the initial
+/// `client::connect()` can block indefinitely waiting for TCP retransmits.
+/// This caps the wait at 10 seconds so the user gets a clear error quickly.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wraps a connection future with `CONNECT_TIMEOUT`. On timeout, returns a
+/// localized error so the user sees "连接超时" instead of hanging forever.
+async fn with_connect_timeout<F, T, E>(
+    fut: F,
+    ctx: &str,
+    map_err: impl FnOnce(E) -> String,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    match tokio::time::timeout(CONNECT_TIMEOUT, fut).await {
+        Ok(Ok(handle)) => Ok(handle),
+        Ok(Err(e)) => Err(map_err(e)),
+        Err(_) => Err(format!(
+            "{}超时（{:?} 无响应），请检查服务器地址和网络",
+            ctx, CONNECT_TIMEOUT
+        )),
+    }
+}
+
 pub async fn dial_and_authenticate(
     state: &State<'_, AppState>,
     config: &ConnectionConfig,
     open_channel: bool,
 ) -> Result<Handle<SshClient>, String> {
     // Configure the russh client. `inactivity_timeout` ensures that a
-    // server which goes silent (NAT timeout, suspended VM, dead WiFi) is
-    // detected within ~3 minutes instead of holding the session in
+    // server which goes silent (NAT timeout, suspended VM, dead WiFi, hung
+    // process) is detected within ~30s instead of holding the session in
     // `AppState::ssh_sessions` forever — without it, the frontend's
     // `ssh_closed` event never fires and the UI shows "connected but
-    // unresponsive" indefinitely. The 3-minute window is long enough that
-    // idle interactive shells won't trip it during normal use.
+    // unresponsive" indefinitely. 30s is long enough that a healthy server
+    // won't trip it during brief network hiccups, but short enough that a
+    // genuinely hung server is detected quickly and the tab can be closed.
     let mut ssh_config = client::Config::default();
-    ssh_config.inactivity_timeout = Some(Duration::from_secs(180));
+    ssh_config.inactivity_timeout = Some(Duration::from_secs(30));
     let ssh_config = Arc::new(ssh_config);
 
     let handler = SshClient {
@@ -267,6 +294,9 @@ pub async fn dial_and_authenticate(
     // and hand the upgraded stream to russh's connect_stream variant. SFTP
     // reuses this same session (sftp.rs) so the proxy choice covers SFTP
     // automatically without a separate code path.
+    //
+    // Both paths are wrapped with `CONNECT_TIMEOUT` so a dead server fails
+    // fast instead of letting the UI spin forever.
     let mut handle = match proxy::ProxyConfig::from_config(config)? {
         Some(proxy_cfg) => {
             log::info!(
@@ -278,14 +308,20 @@ pub async fn dial_and_authenticate(
                 config.port
             );
             let stream = proxy::connect_via_proxy(&proxy_cfg, &config.host, config.port).await?;
-            client::connect_stream(ssh_config, stream, handler)
-                .await
-                .map_err(|e| format!("SSH connect via proxy failed: {}", e))?
+            with_connect_timeout(
+                client::connect_stream(ssh_config, stream, handler),
+                "通过代理连接",
+                |e| format!("SSH connect via proxy failed: {}", e),
+            )
+            .await?
         }
         None => {
-            client::connect(ssh_config, (config.host.as_str(), config.port), handler)
-                .await
-                .map_err(|e| format!("SSH connect failed: {}", e))?
+            with_connect_timeout(
+                client::connect(ssh_config, (config.host.as_str(), config.port), handler),
+                "连接",
+                |e| format!("SSH connect failed: {}", e),
+            )
+            .await?
         }
     };
 

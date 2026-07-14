@@ -15,10 +15,14 @@ import {
   aiChat,
   aiInspectHealthSsh,
   aiInspectHealthLocal,
+  getActiveAiModelId,
+  listAiModels,
   onAiToken,
   onAiDone,
   onAiError,
+  setActiveAiModel,
   type AiContext,
+  type AiModel,
   type ChatMessage,
   type ConnType,
 } from "../api";
@@ -56,6 +60,24 @@ function newId(): string {
 
 function shellHintFor(connType?: ConnType): string {
   return connType === "local" ? "powershell" : "bash";
+}
+
+/** Provider display label for the model switcher. */
+function providerLabel(provider: string): string {
+  switch (provider) {
+    case "claude":
+      return "Claude";
+    case "openai":
+      return "OpenAI";
+    case "ollama":
+      return "Ollama";
+    case "openai_compatible":
+      return "OpenAI兼容";
+    case "anthropic_compatible":
+      return "Anthropic兼容";
+    default:
+      return provider;
+  }
 }
 
 /** Read the last `n` non-empty lines from the normal buffer (skips blank
@@ -98,6 +120,17 @@ export function AiPanel({
   onWidthChange,
   onClose,
 }: Props) {
+  // Multi-model state. Only enabled suppliers are shown in the picker.
+  const [aiModels, setAiModels] = useState<AiModel[]>([]);
+  const [aiActiveId, setAiActiveId] = useState<number | null>(null);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  useEffect(() => {
+    listAiModels().then(setAiModels).catch(() => {});
+    getActiveAiModelId().then(setAiActiveId).catch(() => {});
+  }, []);
+  const enabledModels = aiModels.filter((m) => m.isEnabled && !m.isPreset);
+  const activeModel = enabledModels.find((m) => m.id === aiActiveId)
+    ?? enabledModels[0];
   const [messages, setMessages] = useState<Msg[]>([]);
   // Mirror of `messages` for reading inside async callbacks without waiting for
   // the next render (setMessages is async). The send() handler reads this to
@@ -470,6 +503,78 @@ Enter 发送 ● Shift+Enter 换行"
             {activeTerm ? "将自动附带最近输出" : "AI 命令请确认后再执行"}
           </span>
         </div>
+        {/* Two-step model picker — supplier → model. */}
+        <div
+          style={{
+            position: "relative",
+            marginTop: 6,
+            borderTop: "1px solid var(--border-subtle)",
+            paddingTop: 6,
+          }}
+        >
+          <button
+            onClick={() => setModelPickerOpen((o) => !o)}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              width: "100%",
+              background: "var(--bg-input)",
+              border: "1px solid var(--border-default)",
+              borderRadius: "var(--radius-md)",
+              padding: "5px 8px",
+              cursor: "pointer",
+              textAlign: "left",
+            }}
+            title="点击切换 AI 模型（先选供应商，再选模型）"
+          >
+            <span
+              style={{
+                flex: 1,
+                fontSize: 12,
+                fontWeight: 500,
+                color: "var(--text-primary)",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {activeModel
+                ? `${activeModel.name}${activeModel.models[0]?.modelId ? ` / ${activeModel.models[0].modelId}` : ""}`
+                : "选择模型"}
+            </span>
+            {activeModel && (
+              <span
+                style={{
+                  fontSize: 10,
+                  padding: "1px 5px",
+                  borderRadius: "var(--radius-full)",
+                  background: "var(--bg-surface)",
+                  color: "var(--text-tertiary)",
+                  border: "1px solid var(--border-default)",
+                }}
+              >
+                {providerLabel(activeModel.provider)}
+              </span>
+            )}
+            <span style={{ fontSize: 10, color: "var(--text-tertiary)" }}>
+              {modelPickerOpen ? "▲" : "▼"}
+            </span>
+          </button>
+          {modelPickerOpen && (
+            <ModelPickerDropdown
+              aiModels={enabledModels}
+              activeId={aiActiveId}
+              onClose={() => setModelPickerOpen(false)}
+              onSelect={(modelId, modelString) => {
+                setActiveAiModel(modelId, modelString)
+                  .then(() => setAiActiveId(modelId))
+                  .catch(() => {});
+                setModelPickerOpen(false);
+              }}
+            />
+          )}
+        </div>
       </div>
     </div>
   );
@@ -707,3 +812,168 @@ const codeBtnStyle: CSSProperties = {
   fontSize: 11,
   cursor: "pointer",
 };
+
+/** Two-step model picker dropdown: left = supplier list, right = model list
+ *  for the selected supplier. */
+function ModelPickerDropdown({
+  aiModels,
+  activeId,
+  onClose,
+  onSelect,
+}: {
+  aiModels: AiModel[];
+  activeId: number | null;
+  onClose: () => void;
+  onSelect: (modelId: number, modelString: string) => void;
+}) {
+  const [selectedSupplierIdx, setSelectedSupplierIdx] = useState(0);
+  // Clamp index when the list changes.
+  const safeIdx = Math.min(selectedSupplierIdx, Math.max(0, aiModels.length - 1));
+  const supplier = aiModels[safeIdx];
+  const modelList = supplier?.models?.length ? supplier.models : null;
+  return (
+    <div
+      style={{
+        position: "absolute",
+        bottom: "100%",
+        left: 0,
+        right: 0,
+        marginBottom: 4,
+        maxHeight: 280,
+        background: "var(--bg-elevated)",
+        border: "1px solid var(--border-default)",
+        borderRadius: "var(--radius-md)",
+        boxShadow: "var(--shadow-md)",
+        zIndex: 10,
+        display: "flex",
+        overflow: "hidden",
+      }}
+    >
+      {/* Left: supplier column */}
+      <div
+        style={{
+          width: 140,
+          flexShrink: 0,
+          overflowY: "auto",
+          borderRight: "1px solid var(--border-subtle)",
+          background: "var(--bg-surface)",
+        }}
+      >
+        {aiModels.map((m, idx) => {
+          const isActive = m.id === activeId;
+          const isChosen = idx === safeIdx;
+          return (
+            <div
+              key={m.id}
+              onClick={() => setSelectedSupplierIdx(idx)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 4,
+                padding: "6px 8px",
+                cursor: "pointer",
+                background: isChosen
+                  ? "var(--accent-primary-muted)"
+                  : isActive
+                  ? "var(--bg-surface-hover)"
+                  : "transparent",
+                borderBottom: "1px solid var(--border-subtle)",
+              }}
+            >
+              <span
+                style={{
+                  flex: 1,
+                  fontSize: 11,
+                  color: isChosen
+                    ? "var(--accent-primary)"
+                    : "var(--text-primary)",
+                  fontWeight: isChosen ? 600 : 400,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {m.name}
+              </span>
+              {!m.hasKey && (
+                <span style={{ fontSize: 9, color: "var(--warning, #fab005)" }}>
+                  需
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {/* Right: model column */}
+      <div style={{ flex: 1, minWidth: 0, overflowY: "auto" }}>
+        {!supplier ? (
+          <div style={{ padding: 12, fontSize: 11, color: "var(--text-muted)" }}>
+            请先选择供应商
+          </div>
+        ) : !modelList || modelList.length === 0 ? (
+          <div style={{ padding: 12, fontSize: 11, color: "var(--text-muted)" }}>
+            该供应商暂无额外模型
+          </div>
+        ) : (
+          modelList.map((m) => {
+            const isActive =
+              supplier.id === activeId && m.modelId === supplier.modelId;
+            return (
+              <div
+                key={m.id || m.modelId}
+                onClick={() => onSelect(supplier.id, m.modelId)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "6px 8px",
+                  cursor: "pointer",
+                  background: isActive
+                    ? "var(--accent-primary-muted)"
+                    : "transparent",
+                  borderBottom: "1px solid var(--border-subtle)",
+                }}
+                title={m.modelId}
+              >
+                <span
+                  style={{
+                    flex: 1,
+                    fontSize: 11,
+                    color: isActive
+                      ? "var(--accent-primary)"
+                      : "var(--text-primary)",
+                    fontWeight: isActive ? 600 : 400,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {m.label ?? m.modelId}
+                </span>
+                {m.label && (
+                  <span
+                    style={{
+                      fontSize: 9,
+                      color: "var(--text-muted)",
+                      maxWidth: 80,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {m.modelId}
+                  </span>
+                )}
+                {isActive && (
+                  <span style={{ fontSize: 10, color: "var(--accent-primary)" }}>
+                    ✓
+                  </span>
+                )}
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}

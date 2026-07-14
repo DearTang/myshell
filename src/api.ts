@@ -629,7 +629,12 @@ export function onSshClosed(
 
 // ============ AI API ============
 
-export type AiProvider = "claude" | "openai" | "ollama";
+export type AiProvider =
+  | "claude"
+  | "openai"
+  | "ollama"
+  | "openai_compatible"
+  | "anthropic_compatible";
 
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
@@ -738,6 +743,7 @@ export function saveAiSettings(
  * is the key one: pass the unsaved typed key to validate before saving; pass
  * "" / undefined to test the vault-stored key. */
 export interface AiTestOverrides {
+  supplierId?: number;
   provider?: string;
   model?: string;
   baseUrl?: string;
@@ -785,6 +791,132 @@ export function onAiError(
   return listen<AiErrorPayload>("ai_error", (event) => {
     if (event.payload.requestId === requestId) handler(event.payload.error);
   });
+}
+
+// ── Multi-model management ──────────────────────────────────────────────
+
+/** A single model belonging to a supplier (no secrets — just id + label). */
+export interface SupplierModel {
+  id: number;
+  supplierId: number;
+  modelId: string;
+  label?: string;
+  sortOrder: number;
+}
+
+/** Model info returned to the frontend (no api_key — only `hasKey`). */
+export interface AiModel {
+  id: number;
+  name: string;
+  provider: AiProvider;
+  modelId: string;
+  baseUrl?: string;
+  hasKey: boolean;
+  proxyUrl?: string;
+  temperature: number;
+  isPreset: boolean;
+  isEnabled: boolean;
+  sortOrder: number;
+  /** Full model list for this supplier (includes the primary modelId). */
+  models: SupplierModel[];
+}
+
+/** List all configured AI models (presets + user-created). */
+export function listAiModels(): Promise<AiModel[]> {
+  return invoke("list_ai_models");
+}
+
+/** Get the currently active model id. Returns null if using legacy config. */
+export function getActiveAiModelId(): Promise<number | null> {
+  return invoke("get_active_ai_model_id");
+}
+
+/** Save (create or update) an AI model. Pass `id` to update, omit to create.
+ *  `models` syncs the full model list for this supplier (replaces all). */
+export function saveAiModel(params: {
+  id?: number;
+  name: string;
+  provider: AiProvider;
+  modelId: string;
+  baseUrl?: string;
+  apiKey?: string;
+  proxyUrl?: string;
+  temperature: number;
+  models?: { modelId: string; label?: string }[];
+}): Promise<number> {
+  return invoke("save_ai_model", {
+    id: params.id ?? null,
+    name: params.name,
+    provider: params.provider,
+    modelId: params.modelId,
+    baseUrl: params.baseUrl || null,
+    apiKey: params.apiKey || null,
+    proxyUrl: params.proxyUrl || null,
+    temperature: params.temperature,
+    models: params.models ?? null,
+  });
+}
+
+/** Delete a user-created AI model. Presets cannot be deleted. */
+export function deleteAiModel(id: number): Promise<void> {
+  return invoke("delete_ai_model", { id });
+}
+
+/** Switch the active AI model. `modelString` selects the specific model_id
+ *  within the supplier (undefined = fall back to the supplier's primary). */
+export function setActiveAiModel(id: number, modelString?: string): Promise<void> {
+  return invoke("set_active_ai_model", { id, modelString });
+}
+
+// ── Supplier model management ─────────────────────────────────────────
+
+/** List all models for a given supplier. */
+export function listSupplierModels(supplierId: number): Promise<SupplierModel[]> {
+  return invoke("list_supplier_models", { supplierId });
+}
+
+/** Add a model to a supplier. Returns the new row id. */
+export function addSupplierModel(
+  supplierId: number,
+  modelId: string,
+  label?: string,
+): Promise<number> {
+  return invoke("add_supplier_model", { supplierId, modelId, label });
+}
+
+/** Remove a single supplier model row by id. */
+export function removeSupplierModel(id: number): Promise<void> {
+  return invoke("remove_supplier_model", { id });
+}
+
+/** Toggle whether a supplier is selectable in the AI chat model picker. */
+export function toggleAiModelEnabled(id: number, enabled: boolean): Promise<void> {
+  return invoke("toggle_ai_model_enabled", { id, enabled });
+}
+
+/**
+ * Fetch available models from a provider's /models endpoint (OpenAI format).
+ * Returns sorted model IDs. Only works for OpenAI-compatible / Ollama
+ * providers — Anthropic and Claude official APIs have no such endpoint.
+ */
+export function fetchProviderModels(
+  provider: AiProvider,
+  baseUrl: string,
+  apiKey: string,
+): Promise<string[]> {
+  return invoke("fetch_provider_models", { provider, baseUrl, apiKey });
+}
+
+/**
+ * Fetch available models for a specific supplier by id. Decrypts the stored
+ * key server-side — use this after save so plaintext keys never reach the
+ * frontend. Pass overrideKey only during create/edit-before-save.
+ */
+export function fetchModelsForSupplier(
+  supplierId: number,
+  overrideKey?: string,
+): Promise<string[]> {
+  return invoke("fetch_models_for_supplier", { supplierId, overrideKey: overrideKey ?? null });
 }
 
 // ============ ZMODEM API ============
