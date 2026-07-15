@@ -1263,3 +1263,20 @@
 | 目标是什么？ | 让用户能可靠地提交反馈，不依赖不稳定的第三方服务。 |
 | 我学到了什么？ | mailto body 在 QQ 邮箱等客户端会被模板替换/丢弃，不能依赖 body 参数传内容；剪贴板是 100% 可靠的替代；explorer 和 mailto 窗口有焦点竞争，不能同时自动弹出。 |
 | 我做了什么？ | main.rs（mailto 白名单、clear_feedback_dir、reveal_path 白名单扩展、explorer 去重）；api.ts（删旧 wrapper 加新）；FeedbackDialog.tsx（mailto 流程、剪贴板、弹窗提醒、Gitee 链接、失败红色 UI）；发布 v1.10.2 到 Gitee。 |
+
+### 阶段 49：发布 v1.11.0 —— AI 供应商左右布局 + 多模型管理 + 两步选择（2026-07-14）
+- **需求：** 设置→AI 助手界面改为左右布局（左侧供应商列表，右侧详情）；AI 聊天窗口模型选择改为两步（先选供应商再选模型）；仅展示用户自定义的已启用供应商，预设不再混入。
+- **数据模型变更：** 新增 ai_supplier_models 表（每供应商 N 个模型）；新增 ai_settings.active_model_string 列；新增 ai_models.is_enabled 列。
+- **后端（ai.rs）：** AiModelInfo 增加 models + is_enabled；4 个新命令（list/add/remove supplier_models + toggle_enabled）；fetch_models_for_supplier 服务端解密 key；test_settings 新增 supplier_id 参数；save_ai_model_cmd 支持 models 同步；set_active_ai_model_cmd 支持 model_string。
+- **前端：** SettingsPanel AI 标签页左右布局重写（左侧列表+开关，右侧详情+模型管理+Toast+创建校验）；AiPanel 两步级联选择器（过滤预设）；api.ts 新增 SupplierModel + 5 个函数；capabilities/main.json 新增 dialog 权限。
+- **版本号：** 含 3 项新增 → minor：v1.10.2 → v1.11.0。
+- **验证：** tsc PASS；cargo check PASS；tauri:build exit 0；发布 URL：https://gitee.com/argustang/myshell/releases/tag/v1.11.0
+
+## 五问重启检查（阶段 49）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 49 complete —— v1.11.0 已发布到 Gitee，staging 已清空、baseline→v1.11.0 |
+| 我要去哪里？ | 下一项改动完成时按 doc-after-feature 追加 staging 条目 |
+| 目标是什么？ | AI 供应商配置体验重构：左右布局清晰、多模型管理灵活、聊天窗口两步选择不混乱 |
+| 我学到了什么？ | Tauri v2 下 window.alert 映射到 dialog.message 需在 capabilities 显式授权；保存后 editKey 清空导致获取模型失败，解法是新增 fetch_models_for_supplier 服务端解密；测试需传 supplier_id 否则测全局活跃供应商 |
+| 我做了什么？ | db.rs + ai.rs + main.rs（数据模型 + 4 命令 + test 修复）；api.ts + SettingsPanel + AiPanel（前端重写）；capabilities dialog 权限；发布 v1.11.0 到 Gitee |
