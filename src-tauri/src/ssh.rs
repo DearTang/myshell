@@ -272,16 +272,31 @@ pub async fn dial_and_authenticate(
     config: &ConnectionConfig,
     open_channel: bool,
 ) -> Result<Handle<SshClient>, String> {
-    // Configure the russh client. `inactivity_timeout` ensures that a
-    // server which goes silent (NAT timeout, suspended VM, dead WiFi, hung
-    // process) is detected within ~30s instead of holding the session in
-    // `AppState::ssh_sessions` forever — without it, the frontend's
-    // `ssh_closed` event never fires and the UI shows "connected but
-    // unresponsive" indefinitely. 30s is long enough that a healthy server
-    // won't trip it during brief network hiccups, but short enough that a
-    // genuinely hung server is detected quickly and the tab can be closed.
+    // Configure the russh client. We use keepalives (not inactivity_timeout)
+    // to detect dead servers. Rationale: an interactive shell legitimately
+    // stays silent for a long time while a command runs — e.g.
+    // `find . | sort | uniq -c` blocks until find finishes (sort is a
+    // blocking consumer of its stdin), so the PTY emits nothing for
+    // minutes. inactivity_timeout is a *connection-level* idle timer in
+    // russh: if NO packets arrive from the server within the window it
+    // returns InactivityTimeout, killing the connection mid-command —
+    // which is exactly the bug we hit (channel.wait() → None → ssh_closed,
+    // terminal shows "[Connection closed]" while the command was still
+    // running). MobaXterm/OpenSSH don't have this problem because they
+    // keep the connection alive with periodic heartbeats instead of a
+    // hard idle cutoff.
+    //
+    // keepalive_interval sends a no-op request every 15s; keepalive_max=3
+    // means the connection is only dropped after ~45s of total silence
+    // (no response to 3 consecutive keepalives). A healthy server — even
+    // one busy running a long command — responds to keepalives, so the
+    // connection survives arbitrary command durations. A genuinely dead
+    // server (NAT timeout, suspended VM, dead WiFi) stops responding and
+    // is detected within ~45s, close to the old 30s intent but without
+    // the false-positive on long-running commands.
     let mut ssh_config = client::Config::default();
-    ssh_config.inactivity_timeout = Some(Duration::from_secs(30));
+    ssh_config.keepalive_interval = Some(Duration::from_secs(15));
+    ssh_config.keepalive_max = 3;
     let ssh_config = Arc::new(ssh_config);
 
     let handler = SshClient {

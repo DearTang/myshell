@@ -125,8 +125,12 @@ export function setStatsConsent(agreed: boolean): void {
  * Determine whether we need to report the current version, and whether we
  * need to ask for consent first. Call this on app startup (after vault unlock).
  *
+ * The consent dialog is shown on EVERY new version's first launch — the user
+ * explicitly asked to be re-prompted each time a version upgrade completes,
+ * rather than silently remembering a one-time "agree". So hasConsent is always
+ * false here; `setStatsConsent` is still recorded on agree in case we revert.
+ *
  * Returns:
- *   - { shouldReport: true, hasConsent: true }   → report silently
  *   - { shouldReport: true, hasConsent: false }  → ask consent, then report
  *   - { shouldReport: false }                     → already reported, do nothing
  */
@@ -137,5 +141,6 @@ export function checkReportNeeded(version: string): {
   if (isVersionReported(version)) {
     return { shouldReport: false, hasConsent: false };
   }
-  return { shouldReport: true, hasConsent: hasStatsConsent() };
+  // Always prompt — never report silently, even if the user agreed before.
+  return { shouldReport: true, hasConsent: false };
 }

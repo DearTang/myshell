@@ -138,7 +138,7 @@ export function StatsConsentDialog({ version, onAgree, onDecline }: Props) {
             lineHeight: 1.5,
           }}
         >
-          同意后将记住偏好，后续版本升级自动统计不再询问。如果选择暂不，下次版本升级时还会再问一次。
+          每次升级到新版本都会询问一次。同意将发送本次匿名统计；选择暂不则本次不发送。
         </div>
 
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>

@@ -1280,3 +1280,52 @@
 | 目标是什么？ | AI 供应商配置体验重构：左右布局清晰、多模型管理灵活、聊天窗口两步选择不混乱 |
 | 我学到了什么？ | Tauri v2 下 window.alert 映射到 dialog.message 需在 capabilities 显式授权；保存后 editKey 清空导致获取模型失败，解法是新增 fetch_models_for_supplier 服务端解密；测试需传 supplier_id 否则测全局活跃供应商 |
 | 我做了什么？ | db.rs + ai.rs + main.rs（数据模型 + 4 命令 + test 修复）；api.ts + SettingsPanel + AiPanel（前端重写）；capabilities dialog 权限；发布 v1.11.0 到 Gitee |
+
+### 阶段 50：升级安装——静默卸载旧版（NSIS 模板自定义）（2026-07-15）
+- **需求：** 用户反馈每次升级版本要"先点一次卸载、再点一次安装"很麻烦，希望合并成点一次。
+- **根因（官方源码实证）：** Tauri 默认 NSIS 模板 `installer.nsi` 的 `PageLeaveReinstall` → `reinst_uninstall` 块，调用旧版 `uninstall.exe` 时只追加 `_?=$4`（非静默），双击新安装包（普通模式）时旧版卸载器弹出完整卸载向导界面（确认页+进度页），造成"再卸载一轮"的体验。`installerHooks` 够不着这行（非宏插入点），必须用 `nsis.template` 接管整份模板。
+- **方案：** 新建 `src-tauri/nsis/installer.nsi`（=官方 tauri-v2.11.2 模板原文 + 文件头注释），唯一改动：`reinst_uninstall` 的 `StrCpy "$R1 _?=$4"` 改为 `"$R1 /S _?=$4"`（加 `/S` 静默）。`tauri.conf.json` 加 `"template": "nsis/installer.nsi"`。
+- **改动后体验：** 双击新包 → 欢迎页 → PageReinstall 页（默认选中"卸载后安装"，点一下下一步）→ 旧版**后台静默卸载（无界面）** → 装新版 → 完成。从 3 关交互降到 1 次"下一步"。
+- **边界情况（已确认安全）：** 无旧版时 `reinst_uninstall` 不执行；旧版在运行时静默卸载器自动 kill 进程；卸载失败退出码检查保留不变；`/S` 下不显示"删除应用数据"勾选框（升级期望行为，不删数据）。
+- **维护成本：** 接管模板后，今后 Tauri 升级若改了 `installer.nsi`，需 diff 新官方模板与本副本，把 `/S` 改动重新应用上去（文件头注释已写明）。
+- **验证：** `npm run tauri:build` exit 0；makensis 成功编译自定义模板，生成 `MyShell_1.11.0_x64-setup.exe`（`/S` 改动未破坏 NSIS 语法）。
+
+## 五问重启检查（阶段 50）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 50 complete —— 自定义 NSIS 模板加 `/S` 静默旧版卸载，tauri:build 通过。 |
+| 我要去哪里？ | 下次发布时（`打包`）随版本一起上线；注意这是 installMode perMachine 下的改动，若将来切 installMode 需复核。 |
+| 目标是什么？ | 升级时双击一次安装包即自动卸载旧版并装新版，旧版卸载步骤不再弹向导界面。 |
+| 我学到了什么？ | Tauri NSIS 的 `installerHooks`（宏注入）够不着 `PageLeaveReinstall` 里的 `ExecWait` 调用；要改卸载器调用参数必须用 `nsis.template` 接管整份模板；`/S` 是 NSIS 卸载器静默标志（大写），配合 `_?=dir` 才能在原位执行。 |
+| 我做了什么？ | 新建 `src-tauri/nsis/installer.nsi`（官方模板 + reinst_uninstall 加 `/S` + 文件头注释）；`tauri.conf.json` 加 nsis.template 字段；tauri:build 验证通过；progress/staging/README 文档同步。 |
+
+### 阶段 51：修复 SSH 长命令静默期被误杀（inactivity_timeout → keepalive）（2026-07-15）
+- **现象：** 用户连接服务器切 root 后执行 `find . -maxdepth 1 -type f -printf "%TY-%Tm-%Td\n" | sort | uniq -c`，命令还没跑完就 `[Connection closed]`。同一台服务器用 MobaXterm 不退出。
+- **根因（russh 0.50.4 源码实证）：** `ssh.rs:284` 设了 `inactivity_timeout = 30s`。russh 的 inactivity timer 是**连接级**静默超时（`client/mod.rs:1033-1036`），30s 内没收到任何数据包就返回 `InactivityTimeout` 错误杀连接。`find | sort | uniq -c` 这种管道命令在 sort 阶段（阻塞式消费 stdin）长时间不向 PTY 输出任何字节 → 30s 触发 → `channel.wait()` 返回 `None` → `ssh_closed`。日志印证：两台服务器都在执行长命令后 `channel.wait returned None`，相隔约 77s（含切 root + 命令静默执行累计）。
+- **为什么 MobaXterm 不受影响：** OpenSSH 系不设 inactivity 超时，靠 keepalive 心跳维持连接。
+- **修复：** 去掉 `inactivity_timeout`，改用 `keepalive_interval = 15s` + `keepalive_max = 3`（连续 3 次无响应 ~45s 才判定死亡）。长命令静默期 keepalive 心跳维持连接；真挂死的服务器仍能在 ~45s 内检测到。
+- **验证：** `cargo check` PASS；dev 启动正常。
+
+## 五问重启检查（阶段 51）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 51 complete —— keepalive 替代 inactivity_timeout，cargo check 通过，待用户实测长命令不再断开。 |
+| 我要去哪里？ | 用户实测验证；确认后随下次发布上线。 |
+| 目标是什么？ | 交互式 shell 跑长命令（find\|sort、tar、编译等）不再被误杀，同时仍能检测真挂死的服务器。 |
+| 我学到了什么？ | russh 的 inactivity_timeout 是连接级 idle timer（无数据包即杀），不适合交互式终端——长命令有合法长静默期；keepalive 才是正道（心跳维持+无响应才断），与 OpenSSH/MobaXterm 同思路。用户期望的"降级到 ias 再退出"在当前架构不存在（su 切 root 只是 PTY 内命令，SSH 会话层面是同一条连接）。 |
+| 我做了什么？ | `ssh.rs` 把 `inactivity_timeout=30s` 换成 `keepalive_interval=15s`+`keepalive_max=3`，更新注释说明根因和修复理由。 |
+
+### 阶段 52：匿名版本统计改为每次升级都弹窗询问（2026-07-15）
+- **需求：** 用户希望每次版本升级完成后都弹出匿名统计同意提示，而不是"首次同意后后续版本静默上报"。
+- **现状：** `usageStats.ts` 的 `checkReportNeeded` 对未上报版本会查 `hasStatsConsent()`——若之前同意过则静默上报不弹窗。
+- **修复：** `checkReportNeeded` 让 `hasConsent` 永远返回 false，App.tsx 永远走弹窗分支。`setStatsConsent` 仍记录偏好（以备回退）。弹窗文案从"同意后将记住偏好，后续版本升级自动统计不再询问"改为"每次升级到新版本都会询问一次"。
+- **验证：** `npx tsc --noEmit` PASS。
+
+## 五问重启检查（阶段 52）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 52 complete —— 统计弹窗改为每次版本升级都询问，tsc 通过，dev 重启中。 |
+| 我要去哪里？ | 用户实测确认弹窗行为；确认后随下次发布上线。 |
+| 目标是什么？ | 每次版本升级首次启动都征求用户同意，尊重用户对每次数据上报的知情选择权。 |
+| 我学到了什么？ | 改动最小化原则：只改 `checkReportNeeded` 返回值（hasConsent 恒 false），App.tsx 的分支逻辑完全不用动；保留 `setStatsConsent` 调用以备回退。 |
+| 我做了什么？ | `usageStats.ts` checkReportNeeded 改为恒弹窗；`StatsConsentDialog.tsx` 文案更新；tsc PASS。 |
