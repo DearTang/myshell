@@ -1329,3 +1329,18 @@
 | 目标是什么？ | 每次版本升级首次启动都征求用户同意，尊重用户对每次数据上报的知情选择权。 |
 | 我学到了什么？ | 改动最小化原则：只改 `checkReportNeeded` 返回值（hasConsent 恒 false），App.tsx 的分支逻辑完全不用动；保留 `setStatsConsent` 调用以备回退。 |
 | 我做了什么？ | `usageStats.ts` checkReportNeeded 改为恒弹窗；`StatsConsentDialog.tsx` 文案更新；tsc PASS。 |
+
+### 阶段 53：修复匿名统计弹窗同版本每次启动都重复弹出（2026-07-17）
+- **现象：** 每次启动 MyShell 都弹出匿名统计同意弹窗，而不是预期的"每次版本升级后的首次启动才弹"。
+- **根因：** 弹窗触发逻辑以 `localStorage["myshell.statsVersion"]` 判断当前版本是否已处理过。该 key 只在 `reportVersion()` 网络上报**成功后**才写入（`usageStats.ts:96`）。当用户点"暂不"（decline）时，只调用了 `setStatsConsent(false)` 移除 consent key，**没有写入 statsVersion**；当用户点"允许"但网络失败时，同样不会写入。所以下次启动 `isVersionReported(version)` 仍为 false，弹窗再次出现。
+- **修复：** 新增 `markVersionHandled(version)` 函数，在 `onAgree` 和 `onDecline` 两个回调中都调用，确保用户做出决定后立即标记当前版本已处理。`reportVersion` 内部原有的 `localStorage.setItem(KEY_VERSION, ...)` 保留（同意时冗余写入，无害且向后兼容）。更新了 `isVersionReported` 和 `checkReportNeeded` 的注释，说明 KEY_VERSION 的语义是"已处理"（已询问并已决定），而不是"已上报"。
+- **验证：** `npx tsc --noEmit` PASS。
+
+## 五问重启检查（阶段 53）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 53 complete —— 匿名统计弹窗同版本重复弹出 bug 已修复，tsc 通过。 |
+| 我要去哪里？ | 用户实测确认同版本第二次启动不再弹窗；随下次发布上线。 |
+| 目标是什么？ | 同一版本下只弹一次统计同意弹窗（无论用户同意或拒绝），版本号变化才重新弹出。 |
+| 我学到了什么？ | 区分"已上报"和"已决定"两个语义：`statsVersion` 原本只在上报成功后写，漏掉了"用户拒绝"和"网络失败"两种场景。修复思路是把"标记版本已处理"的责任移到用户做出决定的回调里（agree/decline），而不是放在网络请求成功之后。 |
+| 我做了什么？ | `usageStats.ts` 新增 `markVersionHandled(version)` 并更新相关注释；`App.tsx` 在 onAgree/onDecline 中调用；tsc PASS。 |

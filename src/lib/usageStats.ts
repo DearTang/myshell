@@ -54,12 +54,38 @@ export function hasStatsConsent(): boolean {
   }
 }
 
-/** Has the current version already been reported? */
+/**
+ * Has the current version already been handled (prompted AND decided)?
+ *
+ * `KEY_VERSION` records that the user has already been prompted for this
+ * version and made a decision — agree OR decline — so we should NOT
+ * re-prompt on subsequent launches of the same version. Only a version
+ * bump re-triggers the prompt. See {@link markVersionHandled}.
+ */
 export function isVersionReported(version: string): boolean {
   try {
     return localStorage.getItem(KEY_VERSION) === version;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Mark a version as "handled" — the user has been prompted and made a
+ * decision, so the same version must NOT re-prompt on later launches. Called
+ * from BOTH the agree and decline callbacks, which guarantees a version is
+ * stamped regardless of the user's choice (or of a network failure on the
+ * agree path). Only a version bump clears this and re-prompts.
+ *
+ * `reportVersion` also writes this key on a successful send (redundant when
+ * the agree path already called this, but harmless and keeps report-only
+ * callers consistent).
+ */
+export function markVersionHandled(version: string): void {
+  try {
+    localStorage.setItem(KEY_VERSION, version);
+  } catch {
+    // best-effort
   }
 }
 
@@ -125,14 +151,19 @@ export function setStatsConsent(agreed: boolean): void {
  * Determine whether we need to report the current version, and whether we
  * need to ask for consent first. Call this on app startup (after vault unlock).
  *
- * The consent dialog is shown on EVERY new version's first launch — the user
+ * The consent dialog is shown on every new version's first launch — the user
  * explicitly asked to be re-prompted each time a version upgrade completes,
  * rather than silently remembering a one-time "agree". So hasConsent is always
  * false here; `setStatsConsent` is still recorded on agree in case we revert.
  *
+ * "Already handled" (`isVersionReported`) means the user was already prompted
+ * for THIS version (and chose agree OR decline via `markVersionHandled`), so
+ * we do not re-prompt. Only a version bump clears the stamp and re-triggers
+ * the dialog.
+ *
  * Returns:
  *   - { shouldReport: true, hasConsent: false }  → ask consent, then report
- *   - { shouldReport: false }                     → already reported, do nothing
+ *   - { shouldReport: false }                     → already handled, do nothing
  */
 export function checkReportNeeded(version: string): {
   shouldReport: boolean;

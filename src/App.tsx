@@ -14,6 +14,7 @@ import { FeedbackDialog } from "./components/FeedbackDialog";
 import { StatsConsentDialog } from "./components/StatsConsentDialog";
 import {
   checkReportNeeded,
+  markVersionHandled,
   reportVersion,
   setStatsConsent,
 } from "./lib/usageStats";
@@ -869,11 +870,13 @@ export default function App() {
           version={statsPrompt.version}
           onAgree={() => {
             setStatsConsent(true);
+            markVersionHandled(statsPrompt.version);
             void reportVersion(statsPrompt.version, navigator.platform);
             setStatsPrompt(null);
           }}
           onDecline={() => {
             setStatsConsent(false);
+            markVersionHandled(statsPrompt.version);
             setStatsPrompt(null);
           }}
         />
