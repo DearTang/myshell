@@ -400,6 +400,16 @@ myShell/
 - Rust >= 1.70
 - pnpm/npm/yarn
 
+**Linux 额外构建依赖（用于打包 .deb）：**
+
+```bash
+sudo apt install -y \
+  build-essential pkg-config \
+  libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+  libgtk-3-dev librsvg2-dev libglib2.0-dev libsoup-3.0-dev \
+  libsecret-1-dev libayatana-appindicator3-dev libdbus-1-dev
+```
+
 ### 安装依赖
 
 ```bash
@@ -426,6 +436,18 @@ cd src-tauri && cargo tauri dev
 npm run tauri:build
 
 # 输出位置：src-tauri/target/release/bundle/
+#   - Windows: nsis/MyShell_x.y.z_x64-setup.exe
+#   - Linux:   deb/MyShell_x.y.z_amd64.deb（apt 安装时自动拉运行时依赖）
+```
+
+**Linux 安装：**
+
+```bash
+# 推荐：apt install 会自动解决运行时依赖（webkit/gtk/secret/ayatana）
+sudo apt install ./src-tauri/target/release/bundle/deb/MyShell_*_amd64.deb
+
+# 不推荐 dpkg -i：它不会自动拉依赖，缺库时会配置失败
+# 若已用了 dpkg -i，补救：sudo apt --fix-broken install
 ```
 
 ### 类型检查

@@ -865,6 +865,12 @@ struct UpdateInfo {
     /// Set when the check failed (network/parse/no release). Frontend treats
     /// any non-empty `error` as "no info / stay silent".
     error: Option<String>,
+    /// `"auto"` = built-in download + installer launch (Windows NSIS path).
+    /// `"browser"` = open the release page in the default browser and let the
+    /// user download/install manually (Linux/macOS — no auto-update pipeline
+    /// there; the `.exe`-only `install_update` would refuse a `.deb` anyway).
+    /// Empty string on the error path (field is meaningless when `error` is set).
+    update_strategy: String,
 }
 
 /// Build an UpdateInfo marked as failed. Never returns Result — the command
@@ -881,6 +887,7 @@ fn update_info_error(current_version: &str, message: impl Into<String>) -> Updat
         published_at: String::new(),
         checked_at: unix_now_secs(),
         error: Some(message.into()),
+        update_strategy: String::new(),
     }
 }
 
@@ -978,14 +985,56 @@ async fn check_for_updates() -> UpdateInfo {
         .to_string();
 
     // Prefer the first asset's download URL; otherwise the release page.
+    // Platform-aware asset selection. On Windows we look for a `.exe` asset
+    // (the NSIS installer); on Linux a `.deb`; other platforms have no
+    // installer yet. Falling back to the release page means the UI's
+    // download button always points somewhere useful rather than grabbing
+    // `assets[0]` which could be the wrong platform's installer when both
+    // are uploaded to the same release.
+    let asset_suffix = if cfg!(target_os = "windows") {
+        ".exe"
+    } else if cfg!(target_os = "linux") {
+        ".deb"
+    } else {
+        // macOS / others: no auto-installable asset; let UI fall back to
+        // the release page (browser mode).
+        ""
+    };
     let download_url = json
         .get("assets")
         .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|asset| asset.get("browser_download_url"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .and_then(|arr| {
+            arr.iter().find_map(|asset| {
+                let url = asset
+                    .get("browser_download_url")
+                    .and_then(|v| v.as_str())?;
+                if !asset_suffix.is_empty() {
+                    // Match by suffix (case-insensitive) so we pick the
+                    // right-platform installer when a release carries both
+                    // .exe and .deb.
+                    if url.to_ascii_lowercase().ends_with(asset_suffix) {
+                        Some(url.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(url.to_string())
+                }
+            })
+        })
         .unwrap_or_else(|| release_url.clone());
+
+    // Linux/macOS have no built-in installer-launch pipeline (install_update
+    // rejects non-.exe and would exec a wrong-arch binary). Route the UI to
+    // "open the release page in the default browser" instead — user
+    // downloads + runs the installer manually. Windows keeps the built-in
+    // download-and-launch flow.
+    let update_strategy = if cfg!(target_os = "windows") {
+        "auto"
+    } else {
+        "browser"
+    }
+    .to_string();
 
     let published_at = json
         .get("created_at")
@@ -1012,6 +1061,7 @@ async fn check_for_updates() -> UpdateInfo {
         published_at,
         checked_at: unix_now_secs(),
         error: None,
+        update_strategy,
     }
 }
 
@@ -3429,7 +3479,7 @@ fn sz_close(id: String, state: State<'_, AppState>) -> Result<(), String> {
 /// extern them under the "system" ABI (cdecl on x64). The OpenOptions
 /// handle is `mem::forget`'d so the OS file descriptor stays alive for
 /// the process lifetime.
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), windows))]
 fn setup_file_logging() {
     use std::mem;
     use std::os::windows::io::AsRawHandle;
@@ -3512,6 +3562,21 @@ fn setup_file_logging() {
         pruned
     );
 }
+
+/// Unix release builds: no stderr redirection. The Windows version uses
+/// MSVC CRT symbols (`_open_osfhandle` / `_dup2` / `as_raw_handle`) that
+/// don't exist on Linux, so on Unix we simply leave stderr attached to the
+/// parent process (the desktop launcher / shell). The log-directory
+/// creation and 7-day pruning logic from the Windows path are intentionally
+/// NOT duplicated here yet — Linux logging support is deferred until a
+/// later release; for now the priority is producing a working .deb.
+#[cfg(all(not(debug_assertions), unix))]
+fn setup_file_logging() {}
+
+/// Debug builds don't redirect stderr (neither Windows nor Unix) — keep
+/// `eprintln!` visible in the console for development.
+#[cfg(debug_assertions)]
+fn setup_file_logging() {}
 
 /// Set a stable Windows AppUserModelID for the process. Without it the
 /// taskbar groups the window by executable path, which — especially right

@@ -29,6 +29,11 @@ export function UpdateNotification({ updateInfo }: Props) {
   // latest_version comes from the Gitee tag which already includes "v" (e.g.
   // "v1.6.1"). Display it as-is to avoid a double "v" prefix.
   const latestDisplay = latest.startsWith("v") ? latest : `v${latest}`;
+  // Linux/macOS path: no built-in installer-launch pipeline. Skip the
+  // download+install phases and offer a single button that opens the
+  // release page in the system browser (user downloads the .deb/.dmg
+  // manually). Windows keeps the original auto-download flow.
+  const isBrowserMode = updateInfo.update_strategy === "browser";
 
   const IGNORE_KEY = "myshell.ignoredUpdateVersion";
   const [ignored, setIgnored] = useState<boolean>(() => {
@@ -129,7 +134,10 @@ export function UpdateNotification({ updateInfo }: Props) {
 
         {/* Subtitle / status */}
         <div style={styles.subtitle}>
-          {phase === "prompt" && "新版本已就绪，是否立即更新？"}
+          {phase === "prompt" &&
+            (isBrowserMode
+              ? "检测到新版本。当前系统暂不支持应用内自动更新，请前往下载页手动下载安装。"
+              : "新版本已就绪，是否立即更新？")}
           {phase === "downloading" &&
             (pct !== null ? `正在下载… ${pct}%` : "正在下载…")}
           {phase === "ready" && "下载完成，点击安装并重启应用"}
@@ -165,20 +173,39 @@ export function UpdateNotification({ updateInfo }: Props) {
               >
                 忽略
               </button>
-              <button
-                onClick={handleUpdate}
-                style={styles.btnPrimary}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.background =
-                    "var(--accent-primary-hover)";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.background =
-                    "var(--accent-primary)";
-                }}
-              >
-                更新
-              </button>
+              {isBrowserMode ? (
+                <button
+                  onClick={() =>
+                    downloadUrl && openExternalUrl(downloadUrl)
+                  }
+                  style={styles.btnPrimary}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background =
+                      "var(--accent-primary-hover)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background =
+                      "var(--accent-primary)";
+                  }}
+                >
+                  打开下载页
+                </button>
+              ) : (
+                <button
+                  onClick={handleUpdate}
+                  style={styles.btnPrimary}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background =
+                      "var(--accent-primary-hover)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background =
+                      "var(--accent-primary)";
+                  }}
+                >
+                  更新
+                </button>
+              )}
             </>
           )}
           {phase === "downloading" && (

@@ -1124,6 +1124,8 @@ export interface UpdateInfo {
   checked_at: number;
   /** Present (non-empty) when the check failed. */
   error: string | null;
+  /** "auto" = built-in download+install (Windows); "browser" = open release page in default browser (Linux/macOS). */
+  update_strategy: string;
 }
 
 /** Ask the Rust backend to fetch the latest Gitee release and compare. */

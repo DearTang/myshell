@@ -1344,3 +1344,90 @@
 | 目标是什么？ | 同一版本下只弹一次统计同意弹窗（无论用户同意或拒绝），版本号变化才重新弹出。 |
 | 我学到了什么？ | 区分"已上报"和"已决定"两个语义：`statsVersion` 原本只在上报成功后写，漏掉了"用户拒绝"和"网络失败"两种场景。修复思路是把"标记版本已处理"的责任移到用户做出决定的回调里（agree/decline），而不是放在网络请求成功之后。 |
 | 我做了什么？ | `usageStats.ts` 新增 `markVersionHandled(version)` 并更新相关注释；`App.tsx` 在 onAgree/onDecline 中调用；tsc PASS。 |
+
+### 阶段 54：Linux deb 打包支持 + setup_file_logging 跨平台守卫修复（2026-07-18）
+- **目标：** 为 MyShell 增加 Linux .deb 产物，让 Ubuntu/Debian 用户能直接 `dpkg -i` 安装。本次只验证打包流程能跑通，**不进发布流水线**（版本保持 1.11.2，不推 Gitee，不改 CHANGELOG）。
+- **`tauri.conf.json` 改动：**
+  - `bundle.targets`：`["nsis"]` → `["nsis", "deb"]`。Windows 上跑 `tauri:build` 仍只产 nsis（Tauri 按宿主 OS 自动跳过不兼容目标），Linux 上同命令直接产 deb。一次配置、跨平台通用。
+  - 新增 `bundle.linux.deb.depends`：声明 4 个运行时依赖——`libwebkit2gtk-4.1-1`（Tauri v2 Linux WebView 必需）、`libgtk-3-0`（窗口/控件）、`libsecret-1-0`（`keyring` crate 的 `sync-secret-service` feature 用）、`libayatana-appindicator3-1`（托盘图标）。apt 安装 deb 时会自动拉这些库。
+- **`src-tauri/src/main.rs` 改动（修复跨平台编译）：** `setup_file_logging` 原属性是 `#[cfg(not(debug_assertions))]`，但函数体内部用的是 MSVC CRT 专属 API（`_open_osfhandle` / `_dup2` / `std::os::windows::io::AsRawHandle`）。release build 在 Linux 上编译时炸 `error[E0433]: cannot find 'windows' in os` 和 `error[E0599]: no method named 'as_raw_handle'`。修复：
+  - 原函数属性改为 `#[cfg(all(not(debug_assertions), windows))]`——Windows release 仍走 CRT 重定向 stderr 到日志文件。
+  - 新增 `#[cfg(all(not(debug_assertions), unix))]` 版本：**空 stub**。理由：Linux 上 stderr 默认就附加到启动进程（desktop launcher / shell），日志重定向不是 deb 能跑起来的必要条件；之前尝试用 `freopen` + `__stderr_location` 实现 Unix 等价版本，但 `__stderr_location` 是 glibc 专属符号（musl 上没有），依赖 FFI 反而增加风险。Linux 日志支持延后到后续版本，本次优先保证 deb 能产出。
+  - 新增 `#[cfg(debug_assertions)]` 的 debug 空 stub——debug build 本来就不重定向 stderr（Windows/Unix 都不），但原来靠 `#[cfg(not(debug_assertions))]` 隐式跳过；现在拆成 3 个 cfg 分支后需要显式补上 debug stub，否则 debug build 下 `setup_file_logging()` 调用点会找不到函数。
+- **本机环境准备（从零搭）：** 这台 Ubuntu 26.04 开发机原本完全没有 Rust 和 Tauri Linux 构建依赖。用户授权后跑了：
+  - `sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev librsvg2-dev libglib2.0-dev libsoup-3.0-dev libsecret-1-dev libayatana-appindicator3-dev libdbus-1-dev rustup`
+  - `rustup default stable`（装 rustc 1.97.1 + cargo 1.97.1）
+  - `npm install`（装 `@tauri-apps/cli` 和前端依赖；esbuild postinstall 被 npm allow-scripts 拦截但二进制已就位，不影响 build）
+- **验证：**
+  - `npx tsc --noEmit` PASS
+  - `cargo check --release` PASS（只剩一个无关的 `is_openai_protocol` dead_code warning）
+  - `npm run tauri:build` exit 0，产出 `src-tauri/target/release/bundle/deb/MyShell_1.11.2_amd64.deb`（9.7 MB，installed-size 29 MB）
+  - `dpkg-deb -I` 验证：`Package: my-shell`、`Version: 1.11.2`、`Architecture: amd64`、`Depends:` 含我们声明的 4 个库（Tauri 还自动追加它检测到的 `libwebkit2gtk-4.1-0`、`libgtk-3-0`）
+  - `dpkg-deb -c` 验证：布局正确——`usr/bin/myshell`（主程序）、`usr/share/applications/MyShell.desktop`（桌面入口）、`usr/share/icons/hicolor/{32,128,256,512}x*/apps/myshell.png`（hicolor 图标集）
+- **已知遗留：** Linux 上 release build 没有 stderr 重定向到日志文件（Unix stub 是空的）。Windows 行为完全不变。如果将来 Linux 也需要落盘日志，再实现 Unix 版本（用 `freopen` 而非 glibc 专属符号）。
+
+## 五问重启检查（阶段 54）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 54 complete —— Linux deb 打包流程跑通，`MyShell_1.11.2_amd64.deb` 产物验证通过，待用户实测安装 + 运行。 |
+| 我要去哪里？ | 用户在 Ubuntu/Debian 上 `sudo dpkg -i MyShell_1.11.2_amd64.deb` 实测安装与运行；确认无误后随下次发布（`打包`）正式上线 Linux 产物。 |
+| 目标是什么？ | MyShell 能产出可直接 `dpkg -i` 安装的 .deb 包，apt 自动拉运行时依赖，安装后开始菜单/桌面图标齐全。 |
+| 我学到了什么？ | (1) 原仓库只针对 Windows，`setup_file_logging` 用了 MSVC CRT 专属 API 但只挂了 `cfg(not(debug_assertions))` 没 `cfg(windows)`，是典型的"只在 Windows 上测过"的坑。(2) Ubuntu 26.04 的 rustup 包把 binary 放 `/usr/bin/`、toolchain 放 `~/.rustup/`，跟官方 rustup 装到 `~/.cargo/bin/` 不一样，但功能等价。(3) `bundle.linux.deb.depends` 只是声明运行时依赖让 apt 自动拉，不影响 build-time 依赖——build 依赖仍需手动 `apt install *-dev`。(4) musl 没有 `__stderr_location` 这个 glibc 专属符号，跨发行版的 FFI 要避免依赖 glibc 内部符号。 |
+| 我做了什么？ | `tauri.conf.json`：targets 加 `deb` + 新增 `bundle.linux.deb.depends`。`src-tauri/src/main.rs`：`setup_file_logging` 拆三个 cfg 分支（windows release 实原实现 / unix release 空 stub / debug 空 stub）。apt + rustup + npm install 装好环境。tsc/cargo check/tauri:build 全 PASS，deb 产物 9.7 MB 生成并验证。progress/staging 文档同步。**版本保持 1.11.2，未进发布流水线，未推 git，未发 Gitee。** |
+
+### 阶段 55：修复 deb 安装失败 —— webkit 包名 ABI 版本错（libwebkit2gtk-4.1-1 → -0）（2026-07-18）
+- **现象：** 阶段 54 的 deb 在 `dpkg -i` 时报：`my-shell 依赖于 libwebkit2gtk-4.1-1；然而：未安装软件包 libwebkit2gtk-4.1-1`，包进入 half-installed 状态。
+- **根因：** 阶段 54 在 `tauri.conf.json` 的 `bundle.linux.deb.depends` 里把 webkit 包名写成了 `libwebkit2gtk-4.1-1`（ Debian 命名惯例里 `-1` 是 SONAME 主版本）。但 webkit2gtk 在 2.44 之后做了一次 ABI 重命名：**新版 SONAME 是 `-0`**（即 `libwebkit2gtk-4.1.so.0`），Ubuntu 24.04+/Debian 13+/Fedora 41+ 全部只提供 `libwebkit2gtk-4.1-0`，`-1` 这个包名在当前发行版**完全不存在**。`apt-cache policy libwebkit2gtk-4.1-1` 候选版本为空验证了这点；`apt-cache policy libwebkit2gtk-4.1-0` 候选 `2.52.3-0ubuntu0.26.04.2`。
+- **另一坑：`dpkg -i` 不会自动解决依赖**。就算包名对，直接 `dpkg -i xxx.deb` 遇到任何缺失库都会配置失败。正确做法是 `sudo apt install ./xxx.deb`——apt 会读取 deb 声明的依赖并自动从仓库拉取。阶段 54 README 里给的 `dpkg -i` + `apt --fix-broken install` 兜底方案能用但不优雅，本次改为推荐 `apt install`。
+- **修复：** `tauri.conf.json` 把 `libwebkit2gtk-4.1-1` 改为 `libwebkit2gtk-4.1-0`，其余三个依赖（libgtk-3-0 / libsecret-1-0 / libayatana-appindicator3-1）包名都对、无需改。
+- **顺带撤回：** 中途尝试加 `linux.appitem.categories` 配置桌面入口分类，但 Tauri v2 schema 没这个字段（官方 Debian 文档明确：deb 配置只有 `files` 和 `depends`，不暴露 .desktop 的 Categories 设置；要自定义 Categories 必须用 `desktopTemplate`，引入额外文件维护）。本次撤回，Categories 留空——不影响安装、不影响图标，只是不出现在应用菜单分类下（GNOME 搜索仍可找到）。
+- **验证：**
+  - 重新打包（22 秒，二进制没改只重 bundle）：deb `Depends:` 行现为 `libwebkit2gtk-4.1-0, libgtk-3-0, libsecret-1-0, libayatana-appindicator3-1`（Tauri 自动检测又追加了重复的 webkit/gtk，无害）。
+  - `sudo apt install ./MyShell_1.11.2_amd64.deb` 成功安装配置，`dpkg -l my-shell` 显示 `ii`（已安装并配置）。
+  - `/usr/bin/myshell` 可执行，启动日志正常：`[backup] 已备份配置文件`、`[startup] database initialized`、`schema migration ok`（GUI 因测试环境无 display 被 timeout 杀，但 Rust 后端逻辑全跑通）。
+  - 桌面入口 `/usr/share/applications/MyShell.desktop` 与 hicolor 图标集（32/128/256/512）正确部署。
+  - 测试后 `sudo apt remove my-shell` 清理机器。
+- **结论：** Linux deb 全链路打通，apt 一行装好、运行时依赖自动解决、桌面入口与图标齐全。下次发布（`打包`）即可随 v1.11.3 或 v1.12.0 正式上线 Linux 产物。
+
+## 五问重启检查（阶段 55）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 55 complete —— webkit 包名 ABI 版本错已修，`apt install ./MyShell_*.deb` 实测安装成功，二进制能启动。 |
+| 我要去哪里？ | 用户在另一台 Ubuntu/Debian 机器实测 GUI 能正常显示、SSH/SFTP/本地终端能用；确认无误随下次 `打包` 正式上线。 |
+| 目标是什么？ | `sudo apt install ./MyShell_*_amd64.deb` 一行装好，apt 自动拉依赖，应用出现在应用菜单、桌面图标齐全。 |
+| 我学到了什么？ | (1) webkit2gtk 4.1 在 2.44 后 SONAME 从 `-1` 改成 `-0`（少见的 ABI 版本倒退命名），Ubuntu 24.04+/Debian 13+ 全部用 `-0`。(2) `dpkg -i` 不解决依赖、`apt install ./xxx.deb` 才是正解——写文档时给的命令要想清楚哪种场景。(3) Tauri v2 的 deb 配置 schema 非常克制（只有 files + depends），.desktop 的 Categories 要自定义必须 desktopTemplate，权衡后留空是更好的默认。(4) 阶段 54 没实测 apt install 就报"deb 生成验证通过"是乐观了——生成不等于能装，下次类似工作要跑到实际安装那一步。 |
+| 我做了什么？ | `tauri.conf.json`：`libwebkit2gtk-4.1-1` → `-0`，撤回误加的 `linux.appitem.categories`。重新打包 22 秒。`apt install ./deb` 实测成功，`dpkg -l` 显示 `ii`，二进制启动日志正常，桌面入口与图标齐全，测试后 remove 清理。staging / README / progress 文档同步——README 把 `dpkg -i` 改成 `apt install ./`。**版本保持 1.11.2，未进发布流水线，未推 git，未发 Gitee。** |
+
+### 阶段 56：应用内更新支持平台分发 + Linux 浏览器跳转模式（2026-07-18）
+- **需求：** 阶段 54/55 让 Linux 能产出 deb，但用户问"当前更新是否会区分 Windows 版本和 Linux 版本"。调查后发现：**当前应用内更新链路完全是 Windows 专属**——
+  - `check_for_updates` 无脑取 Gitee release 的 `assets[0]` 作为 `download_url`，不区分平台（如果同一次 release 同时挂了 exe+deb，两个平台用户都被指向同一个文件）
+  - `download_update` 把文件保存为硬编码的 `myshell-update-setup.exe`
+  - `install_update` 在所有平台上 `if !lower.ends_with(".exe") { return Err("仅支持 .exe 安装包") }`，根本拒绝非 exe 文件
+  - 用户要的是"包里放平台标识让 Gitee 能判定"，这其实**不需要在包里放任何标识**——文件名后缀本身就是标识（`.exe` vs `.deb`），代码只需要按后缀过滤
+- **方案选型：** Linux 怎么"装"下载到的 deb 是复杂度的分水岭。四个方案 A/B/C/D 复杂度递增：A=跳浏览器让用户手动装（最简，几行代码）/ B=下载 deb + 弹提示 / C=pkexec apt install（要处理提权+apt输出）/ D=tauri-plugin-updater + AppImage（重构分发）。**用户选方案 A**——权衡后这是最稳的：Linux 自动安装 deb 涉及 pkexec 提权弹窗、apt 命令输出处理、替换正在运行的 `/usr/bin/myshell` 等一堆边界条件，留给后续方案做。
+- **设计洞察（关键省力点）：** 现有 UI 里**已经**有"浏览器下载"按钮——`UpdateNotification.tsx` 的 failed phase 和 `AboutDialog.tsx` 的 idle/failed phase 都有，通过 `openExternalUrl` 打开 URL；而 `open_external_url` 在 Linux 上**已经能工作**（走 Tauri shell plugin，自动 xdg-open）。所以最简做法是让 Linux **完全跳过下载/安装链路**，直接复用现有"打开浏览器"路径，只需要让前端知道"这是 browser 模式"。
+- **代码改动：**
+  - **`src-tauri/src/main.rs`**：
+    - `UpdateInfo` struct 末尾加字段 `update_strategy: String`（`"auto"` = Windows 走内置下载安装 / `"browser"` = Linux/macOS 跳浏览器 / 空串 = error path）
+    - `update_info_error` helper 给该字段填空串
+    - `check_for_updates` 重写 asset 选择：按平台挑后缀（Windows `.exe` / Linux `.deb` / 其他平台不挑），找不到匹配 asset 时退回 `release_url`。再加 `update_strategy` 赋值（Windows=auto / 其他=browser）。
+  - **`src/api.ts`**：`UpdateInfo` interface 镜像 `update_strategy: string`
+  - **`src/components/UpdateNotification.tsx`**：加 `const isBrowserMode = updateInfo.update_strategy === "browser"`；prompt phase 的副文案在 browser 模式下改为"当前系统暂不支持应用内自动更新，请前往下载页手动下载安装"；"更新"按钮在 browser 模式下替换为"打开下载页"（点击 `openExternalUrl(downloadUrl)`）。不进入 downloading/ready phase。
+  - **`src/components/AboutDialog.tsx`**：同样 `isBrowserMode` 判断；idle phase 在 browser 模式下只显示"打开下载页"按钮（替代"更新"+"网页下载"组合），副文案改为 Linux 说明。
+  - **`download_update` / `install_update` 完全不动**——Linux 路径根本不会调用它们，改了反而增加风险面。
+- **Windows 行为零变化：** Windows 下 `cfg!(target_os = "windows")` 让 `update_strategy = "auto"`、asset 后缀 = `.exe`，两个组件的 `isBrowserMode` 都为 false，完全走原 prompt→downloading→ready→install 流程。
+- **验证：**
+  - `npx tsc --noEmit` PASS
+  - `cargo check --release` PASS（只剩无关的 `is_openai_protocol` dead_code warning）
+  - `npm run tauri:build` exit 0，产出新版 `MyShell_1.11.2_amd64.deb`（含本阶段代码）
+  - Windows 编译不受影响（cfg 分支保证）
+- **遗留：** Linux deb 用户检查到新版本时只能跳浏览器手动下载安装，不是真正的"应用内自动更新"。如果将来要做方案 C（pkexec apt 自动安装），改动点已经清晰：`install_update` 加 `#[cfg(target_os = "linux")]` 分支调 pkexec，`download_update` Linux 分支改文件名后缀为 `.deb`。本次不做。
+
+## 五问重启检查（阶段 56）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 56 complete —— 应用内更新支持平台分发，Linux 走浏览器跳转模式，tsc/cargo check/tauri:build 全 PASS，新版 deb 已生成。 |
+| 我要去哪里？ | git commit + push origin main（下一步）；用户在 Linux 实测"检查更新"弹窗显示"打开下载页"按钮且能跳浏览器。 |
+| 目标是什么？ | Linux deb 用户也能感知到新版本并拿到对应平台的安装包，不会被错误地指向 Windows exe。 |
+| 我学到了什么？ | (1) "包里放平台标识"是冗余的——文件名后缀（.exe/.deb）本身就是标识，代码按后缀过滤即可。(2) 复用已有 UI 比新写 UI 省 90% 工作量：现有 failed-phase 的"浏览器下载"按钮 + `open_external_url` 在 Linux 上已经能用（Tauri shell plugin 内置 xdg-open），只需加个 `update_strategy` 字段让前端知道走哪条路。(3) Linux 自动安装 deb 的复杂度远超"打包"——pkexec/apt/替换运行中二进制都是边界条件，方案 A（跳浏览器）是务实选择。(4) `cfg!(target_os = ...)` 在 Rust 表达式里能用、`cfg!(windows)` 在属性位置用——同一概念两种语法。 |
+| 我做了什么？ | `main.rs`：UpdateInfo 加 `update_strategy`、`check_for_updates` 按平台筛 asset + 设策略、`update_info_error` 补字段。`api.ts`：镜像字段。`UpdateNotification.tsx` + `AboutDialog.tsx`：browser 模式分支（按钮+文案）。`download_update`/`install_update` 不动。预检全 PASS，新版 deb 生成。staging + progress 同步。**版本保持 1.11.2**，下一步 commit + push origin main（不发 Gitee release）。 |

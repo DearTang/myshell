@@ -73,6 +73,10 @@ export function AboutDialog({
   const downloadUrl =
     updateInfo?.download_url || updateInfo?.release_url || "";
 
+  // Linux/macOS: no built-in installer-launch pipeline; show a single
+  // "open download page" button instead of the download+install flow.
+  const isBrowserMode = updateInfo?.update_strategy === "browser";
+
   // Auto-download+install state (mirrors UpdateNotification pattern).
   type AboutUpdatePhase = "idle" | "downloading" | "ready" | "failed";
   const [aboutPhase, setAboutPhase] = useState<AboutUpdatePhase>("idle");
@@ -209,7 +213,10 @@ export function AboutDialog({
                       发现新版本 {updateInfo!.latest_version.startsWith("v") ? updateInfo!.latest_version : `v${updateInfo!.latest_version}`}
                     </div>
                     <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 2 }}>
-                      {aboutPhase === "idle" && "可自动下载安装，也可前往网页下载"}
+                      {aboutPhase === "idle" &&
+                        (isBrowserMode
+                          ? "当前系统暂不支持应用内自动更新，请前往下载页手动下载安装"
+                          : "可自动下载安装，也可前往网页下载")}
                       {aboutPhase === "downloading" && (aboutPct !== null ? `正在下载… ${aboutPct}%` : "正在下载…")}
                       {aboutPhase === "ready" && "下载完成，可安装"}
                       {aboutPhase === "failed" && (aboutError || "下载失败")}
@@ -225,10 +232,14 @@ export function AboutDialog({
                 {/* Action buttons */}
                 <div style={{ display: "flex", gap: 8 }}>
                   {aboutPhase === "idle" && (
-                    <>
-                      <button onClick={handleAboutUpdate} style={btnPrimary}>更新</button>
-                      <button onClick={() => downloadUrl && onDownload(downloadUrl)} style={btnGhost}>网页下载</button>
-                    </>
+                    isBrowserMode ? (
+                      <button onClick={() => downloadUrl && onDownload(downloadUrl)} style={{ ...btnPrimary, flex: 1 }}>打开下载页</button>
+                    ) : (
+                      <>
+                        <button onClick={handleAboutUpdate} style={btnPrimary}>更新</button>
+                        <button onClick={() => downloadUrl && onDownload(downloadUrl)} style={btnGhost}>网页下载</button>
+                      </>
+                    )
                   )}
                   {aboutPhase === "downloading" && (
                     <div style={{ flex: 1, textAlign: "center", fontSize: 12, color: "var(--text-muted)", padding: "6px 0" }}>请稍候…</div>
