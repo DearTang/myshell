@@ -8,6 +8,15 @@
   格式参考 keepachangelog.com。新增条目尽量简洁，按 ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全 分组。
 -->
 
+## v2.1.0（2026-07-22）
+
+#### ✨ 新增
+
+- **MCP `open_in_gui` 工具**：AI 可驱动 MyShell GUI 自动打开已保存连接的标签页并聚焦窗口——用户说"在 MyShell 打开 prod-db"即可，无需手动找连接双击。通过 localhost TCP IPC 桥实现（MCP server 与 GUI 是独立进程，零新依赖、只绑 `127.0.0.1`）；GUI 未运行时返回明确错误并建议改用 `ssh_exec`。
+  - **`tab_type` 参数**：`auto`（默认，按连接类型）/ `terminal`（强制终端 tab）/ `sftp`（强制 SFTP 文件浏览 tab，可对 SSH 连接开文件浏览器）。
+  - **智能聚焦**：默认聚焦已有 tab——同一连接已打开时直接切换过去，不重复开新 tab（调用两次只开一个 tab）。
+  - MCP 工具数 10 → 11。
+
 ## v2.0.0（2026-07-21）
 
 > 重大版本：从「SSH/SFTP 客户端」进化为「AI agent 可集成的 SSH/SFTP 工作台」。新增 CLI、MCP Server、终端截图三大模块，提取 `myshell_core` 共享库实现 GUI/CLI/MCP 三二进制架构。

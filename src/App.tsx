@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { TerminalPanel } from "./components/TerminalPanel";
@@ -197,6 +198,65 @@ export default function App() {
   useEffect(() => {
     if (vault === "ready") reload();
   }, [vault]);
+
+  // ── MCP ↔ GUI bridge: listen for commands from the MCP server ──────────
+  // The MCP server (separate process) can tell the GUI to open a connection
+  // via a localhost TCP IPC channel. The Rust side emits "mcp-gui-command"
+  // with { action, connection_id, tab_type, focus_existing }.
+  //
+  // Behavior:
+  //   - focus_existing (default true): if a matching tab is already open,
+  //     just switch to it (no duplicate tab).
+  //   - tab_type: "auto" opens the connection's natural tab; "terminal"
+  //     forces a shell tab; "sftp" forces a file-browser tab (by overriding
+  //     the connection's conn_type to "sftp" before handleConnect).
+  useEffect(() => {
+    const unlisten = listen<{
+      action: string;
+      connection_id: string;
+      tab_type?: string;
+      focus_existing?: boolean;
+    }>("mcp-gui-command", (event) => {
+      const { action, connection_id, tab_type = "auto", focus_existing = true } = event.payload;
+      if (action !== "open_connection" || !connection_id) return;
+
+      const config = connections.find((c) => c.id === connection_id);
+      if (!config) {
+        console.warn(`[mcp-gui] connection not found: ${connection_id}`);
+        return;
+      }
+
+      // Which tab type does this request want? "auto" → the connection's
+      // natural type; otherwise the explicit request.
+      const wantType: "terminal" | "sftp" | "auto" =
+        tab_type === "sftp" ? "sftp" : tab_type === "terminal" ? "terminal" : "auto";
+
+      // Focus an existing matching tab if requested.
+      if (focus_existing) {
+        const existing = tabs.find((t) => {
+          if (t.connectionId !== connection_id) return false;
+          if (wantType === "sftp") return t.type === "sftp";
+          if (wantType === "terminal") return t.type === "terminal";
+          return true; // auto: any open tab for this connection
+        });
+        if (existing) {
+          setActiveTabId(existing.id);
+          return;
+        }
+      }
+
+      // Open a new tab. Force SFTP type if requested (only meaningful for
+      // SSH-capable connections; ftp/local ignore the override).
+      if (wantType === "sftp" && (config.conn_type === "ssh" || config.conn_type === "sftp" || !config.conn_type)) {
+        handleConnect({ ...config, conn_type: "sftp" });
+      } else {
+        handleConnect(config);
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [connections, tabs]);
 
   // Broadcast group: a Set of tab IDs whose terminal sessions should mirror
   // each other's keystrokes. Toggled per-tab from the TabBar 📡 button.

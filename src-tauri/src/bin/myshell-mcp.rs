@@ -319,6 +319,23 @@ fn tool_definitions() -> Value {
                     },
                     "required": ["connection"]
                 }
+            },
+            {
+                "name": "open_in_gui",
+                "description": "Open a saved connection in the MyShell GUI as a tab (terminal or SFTP file browser). The GUI window is brought to the foreground and the connection is established automatically — the user sees a live, interactive tab.\n\nWHEN TO USE: The user wants to SEE and INTERACT with the connection themselves — e.g. 'open prod-db in MyShell', 'connect so I can watch', 'show me the terminal', 'let me browse files on web1'. Unlike ssh_exec/sftp_* (headless, return text), this opens a visible GUI tab the user can take over.\n\nTAB TYPES:\n- Default (omit `tab_type`): opens the connection's natural tab — a terminal for SSH connections, a file browser for SFTP connections.\n- `tab_type: \"terminal\"`: force a terminal (shell) tab.\n- `tab_type: \"sftp\"`: force an SFTP file-browser tab (useful to browse files on an SSH connection).\n\nFOCUS BEHAVIOR: If a matching tab for this connection is ALREADY open, the tool focuses (switches to) it instead of opening a duplicate. So calling this twice is safe — the second call just brings the existing tab to front.\n\nWHEN NOT TO USE:\n- For headless command execution where you just need the output — use `ssh_exec` instead.\n- When the MyShell GUI isn't running — this tool returns an error. Suggest the user open MyShell first, or use ssh_exec/sftp_* as a fallback.\n\nREQUIRES: The MyShell GUI application must be running on the same machine (communicates over a localhost IPC channel).\n\nOUTPUT: Confirmation of what happened (focused an existing tab, or opened a new terminal/SFTP tab) and that the window was focused.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
+                        "tab_type": {
+                            "type": "string",
+                            "enum": ["auto", "terminal", "sftp"],
+                            "description": "Which kind of tab to open. 'auto' (default) uses the connection's natural type (terminal for SSH, file browser for SFTP). 'terminal' forces a shell tab. 'sftp' forces a file-browser tab.",
+                            "default": "auto"
+                        }
+                    },
+                    "required": ["connection"]
+                }
             }
         ]
     })
@@ -719,6 +736,45 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             Ok(json!({ "content": [{ "type": "text", "text": instruction }] }))
         }
 
+        "open_in_gui" => {
+            // Resolve the connection first (confirms it exists + disambiguates).
+            let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
+            let config = state.find_connection(conn_name, None)?;
+
+            // tab_type: "auto" (default) | "terminal" | "sftp".
+            let tab_type = match args["tab_type"].as_str().unwrap_or("auto") {
+                "terminal" => "terminal",
+                "sftp" => "sftp",
+                _ => "auto",
+            };
+
+            // Discover the GUI's IPC port.
+            let port = read_gui_ipc_port().ok_or_else(|| {
+                "MyShell GUI 未运行（找不到 IPC 端口文件）。请先打开 MyShell 桌面应用，然后重试。如果只是想执行命令，可以改用 ssh_exec（无需 GUI）。".to_string()
+            })?;
+
+            // Send the open command over localhost TCP. The GUI focuses an
+            // existing matching tab if one is open (focus_existing=true),
+            // otherwise opens a new tab of the requested type.
+            let result = send_gui_open_command(port, &config.id, tab_type, true).map_err(|e| {
+                format!("无法与 MyShell GUI 通信（{}）。请确认 MyShell 桌面应用正在运行。如果只是想执行命令，可以改用 ssh_exec。", e)
+            })?;
+
+            if result {
+                let kind = match tab_type {
+                    "sftp" => "SFTP 文件浏览标签页",
+                    "terminal" => "终端标签页",
+                    _ => if config.conn_type == "sftp" { "SFTP 文件浏览标签页" } else { "终端标签页" },
+                };
+                Ok(json!({ "content": [{ "type": "text", "text": format!(
+                    "✅ 已在 MyShell GUI 中打开连接 [{}]（{}@{}）的{}，窗口已聚焦到前台。若该连接已有打开的标签页，则直接切换过去（不重复打开）。用户现在可以直接交互操作。",
+                    config.name, config.username, config.host, kind
+                ) }] }))
+            } else {
+                Err("GUI 收到了命令但未能打开连接（可能连接配置有误）。".to_string())
+            }
+        }
+
         _ => Err(format!("未知工具: {}", name)),
     }
 }
@@ -732,6 +788,58 @@ fn secrets_attachment_dir() -> Option<String> {
     let raw = std::fs::read_to_string(&path).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
+// ============ GUI IPC client (open_in_gui) ============
+//
+// The GUI writes its IPC listener port to `<config_dir>/myshell/gui-ipc-port`
+// on startup and deletes it on exit. We read that file to discover the port,
+// then open a localhost TCP connection and send a one-line JSON command.
+
+/// Read the GUI's IPC port from the port-discovery file. Returns None if the
+/// file is missing (GUI not running) or unparseable.
+fn read_gui_ipc_port() -> Option<u16> {
+    let mut path = dirs::config_dir()?;
+    path.push("myshell");
+    path.push("gui-ipc-port");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    raw.trim().parse::<u16>().ok()
+}
+
+/// Send an "open_connection" command to the GUI over localhost TCP and wait
+/// for the one-line JSON response. Returns true if the GUI acknowledged
+/// success (`{"ok":true}`), false otherwise.
+///
+/// `tab_type` is "auto" | "terminal" | "sftp". `focus_existing` tells the GUI
+/// to switch to an already-open matching tab instead of opening a duplicate.
+fn send_gui_open_command(port: u16, connection_id: &str, tab_type: &str, focus_existing: bool) -> Result<bool, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| format!("TCP 连接失败: {}", e))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| format!("设置超时失败: {}", e))?;
+
+    // Send the command as one NDJSON line.
+    let cmd = serde_json::json!({
+        "action": "open_connection",
+        "connection_id": connection_id,
+        "tab_type": tab_type,
+        "focus_existing": focus_existing,
+    });
+    writeln!(stream, "{}", cmd).map_err(|e| format!("发送命令失败: {}", e))?;
+    stream.flush().map_err(|e| format!("flush 失败: {}", e))?;
+
+    // Read the one-line response.
+    let mut reader = BufReader::new(stream);
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).map_err(|e| format!("读取响应失败: {}", e))?;
+
+    let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
+        .map_err(|e| format!("响应解析失败: {} (raw: {})", e, resp_line.trim()))?;
+
+    Ok(resp["ok"].as_bool().unwrap_or(false))
 }
 
 // ============ SFTP helpers (same as CLI) ============

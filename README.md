@@ -105,9 +105,17 @@ Vault 解锁：设置 `MYSHELL_PASSPHRASE` 环境变量，或使用 `--passphras
 }}}
 ```
 
-暴露 10 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`test_connection`、`screenshot_terminal`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过。
+暴露 11 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`test_connection`、`screenshot_terminal`、`open_in_gui`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。
 
 ## 更新日志
+
+### v2.1.0（2026-07-22）
+
+#### ✨ 新增
+- **MCP `open_in_gui` 工具**：AI 可驱动 MyShell GUI 自动打开已保存连接的标签页并聚焦窗口（用户说"在 MyShell 打开 prod-db"即可）。通过 localhost TCP IPC 桥实现（MCP 与 GUI 独立进程，零新依赖、只绑 `127.0.0.1`）；GUI 未运行时返回明确错误并建议改用 `ssh_exec`。
+  - **`tab_type` 参数**：`auto`/`terminal`/`sftp`（可对 SSH 连接强制开 SFTP 文件浏览 tab）。
+  - **智能聚焦**：默认聚焦已有 tab，同一连接已打开时切换过去不重复开。
+  - MCP 工具数 10 → 11。
 
 ### v2.0.0（2026-07-21）
 

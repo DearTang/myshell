@@ -3850,6 +3850,126 @@ pub fn run() {
             } else {
                 log::warn!("[startup] main window not found; cannot register dom-ready reveal");
             }
+
+            // ── MCP ↔ GUI IPC bridge ──────────────────────────────────────
+            // The MCP server (myshell-mcp.exe) is a separate process that
+            // cannot touch the GUI's DOM or window. To let AI agents open
+            // connections in the GUI ("open prod-db in MyShell"), we expose
+            // a localhost-only TCP listener. The MCP server discovers the
+            // port via a file in the config dir, connects, and sends a
+            // one-line JSON command. We emit a Tauri event that the frontend
+            // listens for, which triggers handleConnect() — the same code
+            // path as double-clicking a connection in the sidebar.
+            //
+            // Security: binds 127.0.0.1 only (no external access). The port
+            // file lives in the user's config dir (same ACL as the DB).
+            {
+                let ipc_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    use std::io::{BufRead, BufReader, Write};
+                    use std::net::TcpListener;
+
+                    let listener = match TcpListener::bind("127.0.0.1:0") {
+                        Ok(l) => l,
+                        Err(e) => {
+                            log::error!("[ipc] failed to bind TCP listener: {}", e);
+                            return;
+                        }
+                    };
+                    let port = match listener.local_addr() {
+                        Ok(addr) => addr.port(),
+                        Err(e) => {
+                            log::error!("[ipc] failed to get local addr: {}", e);
+                            return;
+                        }
+                    };
+
+                    // Write the port file so the MCP server can discover us.
+                    if let Some(dir) = dirs::config_dir() {
+                        let myshell_dir = dir.join("myshell");
+                        let _ = std::fs::create_dir_all(&myshell_dir);
+                        let port_file = myshell_dir.join("gui-ipc-port");
+                        if let Err(e) = std::fs::write(&port_file, port.to_string()) {
+                            log::error!("[ipc] failed to write port file: {}", e);
+                        } else {
+                            log::info!("[ipc] GUI IPC listener on 127.0.0.1:{}", port);
+                        }
+                    }
+
+                    // Accept loop — one command per connection (the MCP server
+                    // opens a fresh TCP connection for each tool call).
+                    for stream in listener.incoming() {
+                        let stream = match stream {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log::warn!("[ipc] accept error: {}", e);
+                                continue;
+                            }
+                        };
+                        // Set a short timeout so a misbehaving client can't
+                        // hang the listener thread forever.
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+
+                        let mut reader = BufReader::new(stream.try_clone().unwrap_or(stream));
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                            continue;
+                        }
+
+                        // Parse the command JSON.
+                        let cmd: serde_json::Value = match serde_json::from_str(line.trim()) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"invalid JSON: {}\"}}", e);
+                                continue;
+                            }
+                        };
+
+                        let action = cmd["action"].as_str().unwrap_or("");
+                        match action {
+                            "open_connection" => {
+                                let conn_id = cmd["connection_id"].as_str().unwrap_or("").to_string();
+                                if conn_id.is_empty() {
+                                    let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"missing connection_id\"}}");
+                                    continue;
+                                }
+                                // Optional fields the frontend uses to pick tab
+                                // type and decide whether to focus an existing tab.
+                                let tab_type = cmd["tab_type"].as_str().unwrap_or("auto").to_string();
+                                let focus_existing = cmd["focus_existing"].as_bool().unwrap_or(true);
+
+                                // Bring the window to the foreground.
+                                if let Some(window) = ipc_handle.get_webview_window("main") {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
+
+                                // Emit to the frontend — App.tsx listens for
+                                // "mcp-gui-command" and calls handleConnect().
+                                let payload = serde_json::json!({
+                                    "action": "open_connection",
+                                    "connection_id": conn_id,
+                                    "tab_type": tab_type,
+                                    "focus_existing": focus_existing,
+                                });
+                                match ipc_handle.emit("mcp-gui-command", payload) {
+                                    Ok(_) => {
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":true}}");
+                                    }
+                                    Err(e) => {
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"emit failed: {}\"}}", e);
+                                    }
+                                }
+                            }
+                            _ => {
+                                let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"unknown action: {}\"}}", action);
+                            }
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -3858,6 +3978,12 @@ pub fn run() {
     app.run(|app_handle, event| {
         if let tauri::RunEvent::ExitRequested { .. } = event {
             drain_all_sessions(app_handle);
+            // Clean up the IPC port file so a stale file doesn't mislead the
+            // MCP server into thinking the GUI is still running.
+            if let Some(dir) = dirs::config_dir() {
+                let port_file = dir.join("myshell").join("gui-ipc-port");
+                let _ = std::fs::remove_file(port_file);
+            }
         }
     });
 }

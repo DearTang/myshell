@@ -1621,3 +1621,51 @@
 | 什么可能导致偏离？ | (1) 用户安装后发现回归 bug → 需要 hotfix patch；(2) MCP 客户端（ZCode/Cursor 等）可能反馈新的兼容性问题。 |
 | 下一步最小可验证动作？ | 用户下载 MyShell_2.0.0_x64-setup.exe 覆盖安装，验证：①旧连接/密码能正常加载；②截图按钮工作；③MCP 在 ZCode/opencode 中连接正常。 |
 | 目标是什么？ | v2.0.0 稳定可用，AI agent 集成能力交付到用户手中。 |
+
+
+### 阶段 65：MCP open_in_gui —— AI 驱动 GUI 开新 tab（2026-07-21）
+
+- **需求：** AI agent 通过 MCP 让 MyShell GUI 自动打开某个已保存连接的终端 tab、自动连接、窗口聚焦到前台。用户说"在 MyShell 里打开 prod-db"即可，无需手动找连接双击。
+- **架构：localhost TCP IPC 桥**（MCP server 与 GUI 是两个独立进程，此前无任何 IPC 通道）：
+  ```
+  AI → MCP server → 读 <config_dir>/myshell/gui-ipc-port 拿端口
+       → TCP 连 127.0.0.1:port 发 {"action":"open_connection","connection_id":...}
+       → GUI IPC listener 线程收到 → window.show()+set_focus()
+       → emit("mcp-gui-command") → 前端 App.tsx listen → handleConnect(config)
+       → 新 tab 打开 + SSH 连接
+  ```
+  选 TCP 而非 deep-link/single-instance 插件：零新 crate 依赖（Rust std TcpListener）、不需注册 URI scheme/不需管理员权限、实时、只绑 127.0.0.1 安全。
+- **改动：**
+  - `src-tauri/src/main.rs`：setup 里 spawn IPC listener 后台线程（bind 127.0.0.1:0 随机端口 → 写 gui-ipc-port 文件 → accept 循环读 NDJSON 命令 → emit 事件 + 聚焦窗口 + 回写 {"ok":true}）；RunEvent::ExitRequested 里删除端口文件。
+  - `src/App.tsx`：新增 useEffect 监听 `mcp-gui-command` 事件，按 connection_id 在 connections 里查找并调 `handleConnect(config)`（与侧边栏双击同一代码路径）。
+  - `src-tauri/src/bin/myshell-mcp.rs`：新增 `open_in_gui` 工具（第 11 个）+ `read_gui_ipc_port()` / `send_gui_open_command()` 辅助函数。GUI 未运行时返回明确错误并建议改用 ssh_exec。
+- **验证：** `cargo check` PASS，`npx tsc --noEmit` PASS。node 端到端测试：MCP 解析连接 135.32.56.63 → TCP 连 GUI:3635 → 返回成功消息（IPC 桥 TCP 往返 + emit 全部成功）。opencode mcp list 确认 11 工具 connected。
+- **已知边界：** GUI 在主密码登录门时 connections 未加载，此时 open_in_gui 事件到达但前端查不到连接（需已登录）。进程被强杀（非正常关闭）时端口文件可能残留指向死端口——MCP 连接失败会优雅报错。
+
+## 五问重启检查（阶段 65）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 65 complete —— open_in_gui 工具 + IPC 桥实现并验证（TCP 往返成功，11 工具注册）。 |
+| 我要去哪里？ | 用户在已登录的 GUI 里实测：让 AI 调 open_in_gui，确认 GUI 真的开了 tab 并聚焦。 |
+| 什么可能导致偏离？ | (1) GUI 在登录门时连接打不开（需先登录）；(2) 进程强杀残留端口文件（已优雅处理）；(3) 前端 listener 依赖 connections，登录前为空。 |
+| 下一步最小可验证动作？ | 用户登录 GUI 后，在 AI 对话里说"在 MyShell 打开 xxx 服务器"，看 GUI 是否弹出新 tab 并聚焦。 |
+| 目标是什么？ | AI 能一键把用户已保存的连接在 GUI 里可视化打开，打通"AI 后台执行"与"用户前台交互"两种模式。 |
+
+
+### 阶段 66：open_in_gui 增强 —— tab_type + 聚焦已有 tab（2026-07-22）
+
+- **需求：** 在阶段 65 的 open_in_gui 基础上扩展：(1) 支持开 SFTP 文件浏览 tab（不只是终端）；(2) 同一连接已打开时聚焦已有 tab 而非重复开新 tab。
+- **改动：**
+  - **MCP 工具**（`myshell-mcp.rs`）：`open_in_gui` 新增 `tab_type` 参数（`auto`/`terminal`/`sftp`，默认 auto）；description 详述三种 tab 类型与聚焦行为；分发逻辑读 tab_type 并传给 GUI；成功消息按 tab 类型动态生成。
+  - **IPC 协议**：`send_gui_open_command` 签名加 `tab_type` + `focus_existing` 参数，命令 JSON 携带这两字段；GUI listener（`main.rs`）透传到 `mcp-gui-command` 事件 payload。
+  - **前端**（`App.tsx`）：listener 升级——按 `focus_existing`（默认 true）先查已有匹配 tab（按 connectionId + tab 类型过滤），命中则 `setActiveTabId` 切换不新开；未命中则 `handleConnect`，`tab_type=sftp` 时对 SSH 连接覆盖 `conn_type="sftp"` 强制开文件浏览 tab。useEffect 依赖加 `tabs`。
+- **验证：** `cargo check` + `npx tsc --noEmit` PASS。聚焦行为实测：同一连接调 open_in_gui 两次，GUI 日志 `connect requested` 仅 1 条（第二次聚焦已有 tab 未新开）——证明聚焦逻辑正确。
+
+## 五问重启检查（阶段 66）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 66 complete —— open_in_gui 增强（tab_type + 聚焦）实现并验证（聚焦实测 2 调用 1 连接）。 |
+| 我要去哪里？ | 打包 v2.1.0 发布（用户指示无需确认门）。 |
+| 什么可能导致偏离？ | (1) sftp 覆盖对 ftp/local 连接无意义（已忽略覆盖）；(2) 聚焦匹配按 connectionId+类型，同连接多 tab 时聚焦第一个匹配。 |
+| 下一步最小可验证动作？ | 打包 v2.1.0，用户安装后让 AI 调 open_in_gui tab_type=sftp 看是否开文件浏览 tab。 |
+| 目标是什么？ | AI 能灵活驱动 GUI 开终端/SFTP tab，且智能聚焦避免重复 tab。 |
