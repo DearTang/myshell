@@ -8,6 +8,33 @@
   格式参考 keepachangelog.com。新增条目尽量简洁，按 ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全 分组。
 -->
 
+## v2.0.0（2026-07-21）
+
+> 重大版本：从「SSH/SFTP 客户端」进化为「AI agent 可集成的 SSH/SFTP 工作台」。新增 CLI、MCP Server、终端截图三大模块，提取 `myshell_core` 共享库实现 GUI/CLI/MCP 三二进制架构。
+
+#### ✨ 新增
+
+- **CLI 工具（myshell-cli）**：命令行访问已保存的 SSH/SFTP 连接，让 AI agent 和高级用户可在脚本/终端直接使用。支持 `list / exec / ssh / sftp ls|get|put|mkdir|rm|rename / test / vault` 等命令，`--json` 输出对自动化友好，`vault save-passphrase` 一键将主密码加密存入 Windows 凭证管理器供 MCP 使用。
+- **MCP Server（myshell-mcp）**：通过 Model Context Protocol（stdio 传输）将 SSH/SFTP 能力暴露给 AI agent（Claude Desktop / Cursor / ZCode / opencode 等）。9 个工具：`list_connections / ssh_exec / sftp_list / sftp_download / sftp_upload / sftp_mkdir / sftp_remove / sftp_rename / test_connection`，外加 `screenshot_terminal`（详见下文）。
+- **三二进制共享架构**：提取 `myshell_core` 库，GUI（myshell）/ CLI（myshell-cli）/ MCP（myshell-mcp）三个二进制共享同一核心逻辑、同一 SQLite 数据库、同一 vault 和 keyring。新增模块 `mcp_tools.rs` 实现 AI 工具自动检测与配置写入。
+- **MCP 管理设置页**：「设置 → MCP 支持」集中管理：一键启用/禁用、vault 密码安全同步到 Windows 凭证管理器（DPAPI 加密，绝不明文落盘）、自动检测已安装 AI 工具（Claude/Opencode/Zcode）并一键写入配置、密码修改时自动同步到 keyring。
+- **MCP 连接智能查找**：调用工具时连接参数支持三种形式——name / group-path（如 `/生产/prod-db`）/ host-IP（如 `135.32.64.30`）。重名场景（同一 IP 既存 ssh 又存 sftp）自动按工具类型消歧（`ssh_exec` 选 ssh 那条，`sftp_*` 选 sftp 那条），仍歧义时返回错误列出候选项让用户明确指定。AI 说"ssh 到 135.32.64.30"即可直达。
+- **终端截图功能**：每个终端窗口 CommandBar 新增 📷 截图按钮（紧挨"快捷"按钮），一键截取当前终端 viewport（仅终端内容，不含标签栏/工具栏/输入命令栏）。直接读 xterm buffer 数据自绘，绕开 canvas/webgl renderer 的 readback 限制，完整支持 16 色 / 216 cube / 24 灰阶 / 24-bit RGB、bold / italic / underline / inverse 属性；背景色沿 DOM 树解析第一个不透明层，避免透明背景被图片查看器显示为黑白棋盘格。文件名带毫秒（`截图_<连接名>_<YYYYMMDD-HHMMSS.fff>.png`）防覆盖。
+- **附件目录设置**：「设置 → MCP 支持」新增附件目录配置，支持选择/更改/打开目录；首次进入若未配置显示警告横幅。截图自动归档到此目录；保存成功后弹"已保存 + 打开"toast，"打开"按钮调系统文件管理器并选中文件（Windows `explorer /select` / macOS `open -R` / Linux `xdg-open`）。
+- **MCP screenshot_terminal 工具**：AI 可触发截图动作。由于 MCP server 是独立进程无法访问 GUI DOM，工具返回详细中文指引（含连接信息、附件目录路径）让 AI 转告用户在 GUI 点击 📷——诚实告知架构限制，不假装能做到实际做不到的事。
+- **Linux deb 打包支持**：`tauri.conf.json` 把 `deb` 加入 `bundle.targets`，声明 libwebkit2gtk-4.1-0 / libgtk-3-0 / libsecret-1-0 / libayatana-appindicator3-1 运行时依赖（apt 安装时自动拉取）。
+- **应用内更新支持平台分发**：`UpdateInfo` 新增 `update_strategy` 字段（Windows=auto 走内置下载安装；Linux/macOS=browser 跳浏览器让用户手动下载）。`check_for_updates` 按平台筛选 asset（Windows 找 `.exe`，Linux 找 `.deb`）。Linux 用户检查到新版本时弹窗显示「打开下载页」按钮而非「更新」按钮。
+
+#### 🛠️ 优化
+
+- **MCP 工具描述全面重写**：每个工具的 description 包含 WHEN TO USE / WHEN NOT TO USE / OUTPUT / SIDE EFFECTS，让 AI 准确判断何时用 myshell 而不是自己的 shell 工具。新增 server-level `instructions` 字段（MCP 2025-06-18 规范），客户端会 prepend 到 AI 的系统提示，告知整个 myshell MCP 的定位、触发关键词、工作流、安全模型。
+- **Cargo.toml `default-run = "myshell"`**：三二进制架构下，`cargo run` / `tauri dev` 不再需要 `--bin` 参数。
+
+#### 🔒 安全
+
+- **MCP 高危操作人工确认**：AI agent 通过 MCP 执行 `ssh_exec`、`sftp_remove`、`sftp_rename`、`sftp_upload` 时，必须弹出 OS 级确认对话框（Windows `MessageBoxW` + `MB_YESNO | MB_ICONWARNING | MB_SYSTEMMODAL`），用户明确点击"确认"后才执行，AI 无法跳过。
+- **Vault 密码改用 Windows 凭证管理器（DPAPI 加密）**：替代明文环境变量方案。`MYSHELL_PASSPHRASE` env 变量仍兼容（自动化场景），但 GUI 推荐通过 keyring 同步，配置文件中绝不出现明文密码。
+
 ## v1.11.2（2026-07-17）
 
 #### 🐛 修复

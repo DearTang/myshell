@@ -726,6 +726,7 @@ export default function App() {
                       active={isActive}
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}
+                      connectionName={tab.name}
                       onOpenQuickCommandsManage={() => {
                         setQcInitialConnectionId(tab.connectionId || null);
                         setShowQuickCommands(true);

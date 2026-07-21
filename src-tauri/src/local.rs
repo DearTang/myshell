@@ -19,12 +19,11 @@
 //! in the reader via encoding_rs). v1 keeps it simple and consistent with SSH.
 
 use crate::{AppState, ConnectionConfig};
+use crate::{EventSink, EventSinkExt};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
-use tauri::{Emitter, State, WebviewWindow};
-use tauri::async_runtime;
 use tokio::sync::mpsc;
 
 /// Commands the frontend pushes into a live local session. A trimmed mirror
@@ -98,8 +97,8 @@ fn shell_utf8_prelude(shell_path: &str) -> Option<Vec<u8>> {
 }
 
 pub async fn connect(
-    state: State<'_, AppState>,
-    window: WebviewWindow,
+    state: &AppState,
+    sink: Arc<dyn EventSink>,
     config: ConnectionConfig,
     cols: u16,
     rows: u16,
@@ -161,10 +160,10 @@ pub async fn connect(
     }
 
     // ---- Reader thread (blocking) ----
-    let reader_window = window.clone();
+    let reader_sink = sink.clone();
     let reader_sid = sid.clone();
     let sessions_arc = Arc::clone(&state.local_sessions);
-    async_runtime::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let mut reader = reader;
         let mut buf = vec![0u8; READ_CHUNK];
         loop {
@@ -175,9 +174,7 @@ pub async fn connect(
                         session_id: reader_sid.clone(),
                         data: buf[..n].to_vec(),
                     };
-                    if let Err(e) = reader_window.emit("ssh_output", payload) {
-                        log::warn!("[local:{}] emit ssh_output FAILED: {}", reader_sid, e);
-                    }
+                    reader_sink.emit("ssh_output", &payload);
                 }
                 Err(e) => {
                     log::warn!("[local:{}] read error: {}", reader_sid, e);
@@ -187,7 +184,7 @@ pub async fn connect(
         }
         // Shell is gone: notify the frontend, stop the writer task, then drop
         // ourselves from the session map.
-        let _ = reader_window.emit("ssh_closed", &reader_sid);
+        reader_sink.emit("ssh_closed", &reader_sid);
         let _ = reader_tx.send(LocalCommand::Disconnect);
         if let Ok(mut map) = sessions_arc.lock() {
             map.remove(&reader_sid);
@@ -203,7 +200,7 @@ pub async fn connect(
     // pwsh / *nix shells that are already UTF-8.
     let utf8_prelude = shell_utf8_prelude(&shell_path);
     let master = pair.master;
-    async_runtime::spawn(async move {
+    tokio::spawn(async move {
         let mut writer = match master.take_writer() {
             Ok(w) => w,
             Err(e) => {
@@ -282,7 +279,7 @@ pub async fn connect(
 }
 
 pub async fn send_input(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     data: &[u8],
 ) -> Result<(), String> {
@@ -298,7 +295,7 @@ pub async fn send_input(
 }
 
 pub async fn resize_terminal(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     cols: u16,
     rows: u16,
@@ -314,7 +311,7 @@ pub async fn resize_terminal(
     Ok(())
 }
 
-pub async fn disconnect(state: &State<'_, AppState>, session_id: &str) -> Result<(), String> {
+pub async fn disconnect(state: &AppState, session_id: &str) -> Result<(), String> {
     // Signal the writer task to kill the child + exit. The reader thread
     // removes the session from the map once it observes EOF.
     let sender = {
@@ -343,7 +340,7 @@ pub async fn test_connection(config: &ConnectionConfig) -> Result<String, String
 
     let started = std::time::Instant::now();
     let cfg = config.clone();
-    let spawn = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    let spawn = tokio::task::spawn_blocking(move || -> Result<(), String> {
         let pair = native_pty_system()
             .openpty(pty_size(80, 24))
             .map_err(|e| format!("打开 PTY 失败: {}", e))?;

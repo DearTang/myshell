@@ -30,9 +30,12 @@ interface Props {
   onOpenQuickCommandsManage?: () => void;
   /** Open the docked AI assistant panel. */
   onOpenAi?: () => void;
+  /** Capture a PNG screenshot of the terminal viewport (excludes this
+   * CommandBar). Saves to the configured attachment directory. */
+  onScreenshot?: () => void;
 }
 
-export function CommandBar({ sessionId, connectionId, connType, broadcastTargets = [], onRegisterRefresh, status, onReconnect, onOpenQuickCommandsManage, onOpenAi }: Props) {
+export function CommandBar({ sessionId, connectionId, connType, broadcastTargets = [], onRegisterRefresh, status, onReconnect, onOpenQuickCommandsManage, onOpenAi, onScreenshot }: Props) {
   // Pick the send backend by connection type — local tabs must route to
   // local_send, not ssh_send.
   const sendFn = connType === "local" ? localSend : sshSend;
@@ -217,6 +220,34 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
       >
         <span>⌨</span>
         <span>快捷</span>
+      </button>
+
+      {/* Screenshot button — captures the terminal viewport only (this
+          CommandBar is excluded by the capture util). Saves to the
+          attachment dir configured in Settings → MCP 支持. */}
+      <button
+        onClick={() => {
+          setPanelOpen(false);
+          setQuickPanelOpen(false);
+          onScreenshot?.();
+        }}
+        title="截取当前终端（不含输入栏/工具栏）"
+        style={{
+          background: "var(--bg-input)",
+          color: "var(--text-secondary)",
+          border: "1px solid var(--border-default)",
+          borderRadius: "var(--radius-md)",
+          padding: "6px 12px",
+          fontSize: 12,
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          gap: 4,
+          transition: "all var(--duration-fast) var(--ease-in-out)",
+        }}
+      >
+        <span>📷</span>
+        <span>截图</span>
       </button>
 
       {/* History button */}

@@ -38,6 +38,7 @@
 - **本地终端**：直连本地 PowerShell / CMD / WSL / 自定义 shell，作为可保存的连接，体验等同 SSH 终端
 - **终端字体**：从系统已安装字体下拉选择（也可手输），默认字体栈 Nerd Font 优先，正确渲染 Powerline / 图标字形（Oh My Posh / Starship / powerlevel10k 等）；支持**按连接单独覆盖字体**
 - **本地终端编码自适应**：cmd / Windows PowerShell 5.1 启动自动切 UTF-8，中文系统不再 GBK 乱码；并向 shell 声明 `TERM=xterm-256color` / `COLORTERM=truecolor`，提示符引擎完整渲染
+- **终端截图**：每个终端窗口工具栏的 📷 按钮一键截取当前终端画面（仅终端 viewport，不含标签栏/工具栏/输入命令栏），自动保存到「设置 → MCP 支持 → 附件目录」配置的目录，文件名带毫秒防覆盖；直接读 xterm buffer 自绘，完整还原颜色（16 色/216 cube/24 灰阶/24-bit RGB）和文字属性（bold/italic/underline/inverse）
 
 ### 文件传输
 - SFTP/FTP 文件浏览器
@@ -78,8 +79,57 @@
 - **自动下载安装**：点「立即更新」后台下载安装包（带进度条）→「安装并重启」自动启动安装器并退出 App 接管安装；下载失败可回退浏览器手动下载
 - **关于对话框**：手动「检查更新」+「去下载」+ 查看更新日志（内置 CHANGELOG，版本升级后首启自动展示）
 
+### CLI 与 MCP 服务器
+
+MyShell 提供命令行工具和 MCP 协议服务器，让 AI agent（Claude Desktop、Cursor、ZCode 等）能直接使用已保存的 SSH/SFTP 连接。
+
+**myshell-cli** — 命令行工具：
+```bash
+myshell-cli list --json                              # 列出所有连接
+myshell-cli exec myserver "uname -a" --json          # 远程执行命令
+myshell-cli sftp ls myserver /var/log --json         # 列出远程目录
+myshell-cli sftp get myserver /etc/hosts ./hosts     # 下载文件
+myshell-cli sftp put myserver ./file.txt /tmp/       # 上传文件
+myshell-cli test myserver                            # 测试连接
+myshell-cli ssh myserver                             # 交互式终端
+```
+
+Vault 解锁：设置 `MYSHELL_PASSPHRASE` 环境变量，或使用 `--passphrase` 参数，或交互式提示。
+
+**myshell-mcp** — MCP 协议服务器（stdio 传输）：
+```json
+// Claude Desktop / Cursor / ZCode 配置
+{ "mcpServers": { "myshell": {
+    "command": "myshell-mcp",
+    "env": { "MYSHELL_PASSPHRASE": "your-master-password" }
+}}}
+```
+
+暴露 10 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`test_connection`、`screenshot_terminal`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过。
 
 ## 更新日志
+
+### v2.0.0（2026-07-21）
+
+> 重大版本：从「SSH/SFTP 客户端」进化为「AI agent 可集成的 SSH/SFTP 工作台」。新增 CLI、MCP Server、终端截图三大模块，提取 `myshell_core` 共享库实现 GUI/CLI/MCP 三二进制架构。
+
+#### ✨ 新增
+- **CLI 工具（myshell-cli）**：命令行访问已保存的 SSH/SFTP 连接，让 AI agent 和高级用户可在脚本/终端直接使用。支持 `list / exec / ssh / sftp / test / vault` 等命令，`--json` 输出对自动化友好。
+- **MCP Server（myshell-mcp）**：通过 Model Context Protocol（stdio 传输）将 SSH/SFTP 能力暴露给 AI agent（Claude Desktop / Cursor / ZCode / opencode 等）。10 个工具：连接管理 + 远程命令执行 + SFTP 文件操作 + 连接测试 + 终端截图。
+- **三二进制共享架构**：提取 `myshell_core` 库，GUI / CLI / MCP 三个二进制共享同一核心逻辑、同一 SQLite、同一 vault 和 keyring。
+- **MCP 管理设置页**：「设置 → MCP 支持」集中管理：启用/禁用、vault 密码 DPAPI 加密同步、自动检测已安装 AI 工具并一键写入配置。
+- **MCP 连接智能查找**：连接参数支持 name / group-path / host-IP 三种形式；重名场景（同 IP 多类型）自动按工具类型消歧。
+- **终端截图功能**：CommandBar 新增 📷 按钮，截取纯终端 viewport（不含标签栏/工具栏/输入栏）。读 xterm buffer 自绘，支持完整颜色和文字属性。文件名带毫秒防覆盖。
+- **附件目录设置**：截图自动归档；保存后弹"已保存 + 打开"toast，跨平台调系统文件管理器并选中文件。
+- **Linux deb 打包支持** + **应用内更新平台分发**（Windows=auto，Linux/macOS=browser）。
+
+#### 🛠️ 优化
+- **MCP 工具描述全面重写**：每个工具含 WHEN TO USE / WHEN NOT TO USE / OUTPUT / SIDE EFFECTS；新增 server-level `instructions` 字段（MCP 2025-06-18 规范）。
+- **Cargo.toml `default-run = "myshell"`**：三二进制架构下 `cargo run` / `tauri dev` 不再需要 `--bin`。
+
+#### 🔒 安全
+- **MCP 高危操作人工确认**：`ssh_exec / sftp_remove / sftp_rename / sftp_upload` 必须弹 OS 级对话框，AI 无法跳过。
+- **Vault 密码改用 Windows 凭证管理器（DPAPI 加密）**：替代明文环境变量方案，配置文件绝不出现明文密码。
 
 ### v1.11.2（2026-07-17）
 

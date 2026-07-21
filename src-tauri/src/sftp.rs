@@ -1,17 +1,17 @@
 use crate::{AppState, FileEntry};
+use crate::{EventSink, EventSinkExt};
 use russh_sftp::client::SftpSession;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{Emitter, State, WebviewWindow};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn get_sftp_session(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
 ) -> Result<SftpSession, String> {
     // Scope the MutexGuard so it's dropped before any await — std::sync::MutexGuard
-    // is not Send, and tauri commands require the returned future to be Send.
+    // is not Send, and the returned future must be Send.
     let handle = {
         let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
         let session = sessions
@@ -79,7 +79,7 @@ async fn resolve_path(sftp: &SftpSession, path: &str) -> Result<String, String> 
 }
 
 pub async fn list_dir(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     path: &str,
 ) -> Result<Vec<FileEntry>, String> {
@@ -128,7 +128,7 @@ pub async fn list_dir(
 }
 
 pub async fn create_dir(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     path: &str,
 ) -> Result<(), String> {
@@ -141,7 +141,7 @@ pub async fn create_dir(
 }
 
 pub async fn remove(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     path: &str,
 ) -> Result<(), String> {
@@ -158,7 +158,7 @@ pub async fn remove(
 }
 
 pub async fn rename(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     old_path: &str,
     new_path: &str,
@@ -176,7 +176,7 @@ pub async fn rename(
 //
 // Batch, files-only, overwrite. Each file opens its own SFTP file handle on
 // the shared `SftpSession` (one subsystem channel per batch). Progress streams
-// to the originating window via `sftp_transfer_*` events, keyed by `request_id`
+// to the originating event sink via `sftp_transfer_*` events, keyed by `request_id`
 // so concurrent transfers in different panels don't cross.
 //
 // Per-file errors are collected, not fatal: one unreadable file must not abort
@@ -211,7 +211,7 @@ struct TransferDonePayload {
 }
 
 fn emit_transfer_progress(
-    window: &WebviewWindow,
+    sink: &dyn EventSink,
     request_id: &str,
     phase: &'static str,
     current_file: &str,
@@ -220,9 +220,9 @@ fn emit_transfer_progress(
     bytes_done: u64,
     bytes_total: u64,
 ) {
-    let _ = window.emit(
+    sink.emit(
         "sftp_transfer_progress",
-        TransferProgressPayload {
+        &TransferProgressPayload {
             request_id: request_id.to_string(),
             phase,
             current_file: current_file.to_string(),
@@ -250,12 +250,12 @@ fn basename(path: &str) -> String {
 /// `Err` only on fatal failures (no SFTP session); per-file failures land in
 /// the `sftp_transfer_done` errors list.
 pub async fn upload(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     local_paths: Vec<String>,
     remote_dest_dir: &str,
     request_id: &str,
-    window: &WebviewWindow,
+    sink: &dyn EventSink,
 ) -> Result<(), String> {
     let sftp = get_sftp_session(state, session_id).await?;
     let dest = resolve_path(&sftp, remote_dest_dir).await?;
@@ -288,10 +288,10 @@ pub async fn upload(
 
         let mut last_emit = Instant::now();
         emit_transfer_progress(
-            window, request_id, "upload", &name, i, file_count, bytes_done, bytes_total,
+            sink, request_id, "upload", &name, i, file_count, bytes_done, bytes_total,
         );
         if let Err(e) = upload_one(
-            &sftp, window, request_id, lp, &remote_path, i, file_count, bytes_total,
+            &sftp, sink, request_id, lp, &remote_path, i, file_count, bytes_total,
             &mut bytes_done, &mut last_emit,
         )
         .await
@@ -302,11 +302,11 @@ pub async fn upload(
 
     // Final tick so the overlay completes cleanly at 100%.
     emit_transfer_progress(
-        window, request_id, "upload", "", file_count, file_count, bytes_done, bytes_total,
+        sink, request_id, "upload", "", file_count, file_count, bytes_done, bytes_total,
     );
-    let _ = window.emit(
+    sink.emit(
         "sftp_transfer_done",
-        TransferDonePayload {
+        &TransferDonePayload {
             request_id: request_id.to_string(),
             errors,
         },
@@ -316,7 +316,7 @@ pub async fn upload(
 
 async fn upload_one(
     sftp: &SftpSession,
-    window: &WebviewWindow,
+    sink: &dyn EventSink,
     request_id: &str,
     local_path: &str,
     remote_path: &str,
@@ -364,7 +364,7 @@ async fn upload_one(
         *bytes_done = bytes_done.saturating_add(n as u64);
         if last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
             emit_transfer_progress(
-                window, request_id, "upload", &name, file_index, file_count, *bytes_done,
+                sink, request_id, "upload", &name, file_index, file_count, *bytes_done,
                 bytes_total,
             );
             *last_emit = Instant::now();
@@ -381,12 +381,12 @@ async fn upload_one(
 /// Download a batch of remote files into `local_dest_dir`. `remote_paths` are
 /// taken absolute (they come from the listing). Overwrites local files.
 pub async fn download(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     remote_paths: Vec<String>,
     local_dest_dir: &str,
     request_id: &str,
-    window: &WebviewWindow,
+    sink: &dyn EventSink,
 ) -> Result<(), String> {
     let sftp = get_sftp_session(state, session_id).await?;
     // Local destination — created if missing (covers a freshly-typed path).
@@ -416,11 +416,11 @@ pub async fn download(
 
         let mut last_emit = Instant::now();
         emit_transfer_progress(
-            window, request_id, "download", &name, i, file_count, bytes_done, bytes_total,
+            sink, request_id, "download", &name, i, file_count, bytes_done, bytes_total,
         );
         if let Err(e) = download_one(
             &sftp,
-            window,
+            sink,
             request_id,
             rp,
             &local_path.to_string_lossy(),
@@ -437,11 +437,11 @@ pub async fn download(
     }
 
     emit_transfer_progress(
-        window, request_id, "download", "", file_count, file_count, bytes_done, bytes_total,
+        sink, request_id, "download", "", file_count, file_count, bytes_done, bytes_total,
     );
-    let _ = window.emit(
+    sink.emit(
         "sftp_transfer_done",
-        TransferDonePayload {
+        &TransferDonePayload {
             request_id: request_id.to_string(),
             errors,
         },
@@ -451,7 +451,7 @@ pub async fn download(
 
 async fn download_one(
     sftp: &SftpSession,
-    window: &WebviewWindow,
+    sink: &dyn EventSink,
     request_id: &str,
     remote_path: &str,
     local_path: &str,
@@ -500,7 +500,7 @@ async fn download_one(
         *bytes_done = bytes_done.saturating_add(n as u64);
         if last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
             emit_transfer_progress(
-                window, request_id, "download", &name, file_index, file_count, *bytes_done,
+                sink, request_id, "download", &name, file_index, file_count, *bytes_done,
                 bytes_total,
             );
             *last_emit = Instant::now();

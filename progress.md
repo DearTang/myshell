@@ -1,1433 +1,1589 @@
-# 进度日志
+﻿# 杩涘害鏃ュ織
 
-## 会话：2026-06-12 ~ 2026-06-13
+## 浼氳瘽锛?026-06-12 ~ 2026-06-13
 
-### 阶段 1：需求分析与技术选型
-- **状态：** complete
+### 闃舵 1锛氶渶姹傚垎鏋愪笌鎶€鏈€夊瀷
+- **鐘舵€侊細** complete
 
-### 阶段 2：环境搭建与项目初始化
-- **状态：** in_progress
-- Rust 工具链安装中（rustup stable 1.96.0, 下载7个组件中）
-- npm 依赖已安装完成
-- TypeScript 编译检查通过（无错误）
+### 闃舵 2锛氱幆澧冩惌寤轰笌椤圭洰鍒濆鍖?
+- **鐘舵€侊細** in_progress
+- Rust 宸ュ叿閾惧畨瑁呬腑锛坮ustup stable 1.96.0, 涓嬭浇7涓粍浠朵腑锛?
+- npm 渚濊禆宸插畨瑁呭畬鎴?
+- TypeScript 缂栬瘧妫€鏌ラ€氳繃锛堟棤閿欒锛?
 
-### 阶段 3：核心后端实现 (Rust/Tauri)
-- **状态：** complete（代码已编写）
-- 已创建/修改的文件：
-  - `src-tauri/Cargo.toml` — Rust 依赖配置
-  - `src-tauri/build.rs` — Tauri 构建脚本
-  - `src-tauri/tauri.conf.json` — Tauri 应用配置
-  - `src-tauri/src/main.rs` — 主入口 + Tauri commands
-  - `src-tauri/src/db.rs` — SQLite 连接配置存储
-  - `src-tauri/src/ssh.rs` — SSH 连接管理 (russh)
-  - `src-tauri/src/sftp.rs` — SFTP 文件操作 (russh-sftp)
+### 闃舵 3锛氭牳蹇冨悗绔疄鐜?(Rust/Tauri)
+- **鐘舵€侊細** complete锛堜唬鐮佸凡缂栧啓锛?
+- 宸插垱寤?淇敼鐨勬枃浠讹細
+  - `src-tauri/Cargo.toml` 鈥?Rust 渚濊禆閰嶇疆
+  - `src-tauri/build.rs` 鈥?Tauri 鏋勫缓鑴氭湰
+  - `src-tauri/tauri.conf.json` 鈥?Tauri 搴旂敤閰嶇疆
+  - `src-tauri/src/main.rs` 鈥?涓诲叆鍙?+ Tauri commands
+  - `src-tauri/src/db.rs` 鈥?SQLite 杩炴帴閰嶇疆瀛樺偍
+  - `src-tauri/src/ssh.rs` 鈥?SSH 杩炴帴绠＄悊 (russh)
+  - `src-tauri/src/sftp.rs` 鈥?SFTP 鏂囦欢鎿嶄綔 (russh-sftp)
 
-### 阶段 3.1：修复 SSH 输出回显（2026-06-13）
-- **状态：** complete（前端代码已验证，后端代码已编写但未编译）
-- **问题：** 原 ssh.rs 创建了 output_tx 通道但从未启动读取任务，导致服务器输出无法回到 xterm.js（只能看到 PTY echo 的本地输入）
-- **修复方案：** 重构 SshSession 结构 — 将 Channel 所有权移交给独立的 tokio reader 任务
-  - 新增 `SessionCommand` 枚举（Input/Resize/Disconnect）通过 mpsc 通道传递给 reader
-  - `channel_reader` 任务用 `tokio::select! { biased; ... }` 多路复用：
-    - `command_rx.recv()` — 前端命令（优先级最高，输入延迟低）
-    - `channel.wait()` — 服务器数据，缓冲到 Vec<u8>
-    - `flush_interval.tick()` — 16ms 定时刷新，合并突发输出缓解 tauri#13234
-  - 16KB 阈值在线刷新（避免高输出时定时器分支饥饿）
-  - 通过 `app.emit("ssh_output"|"ssh_closed"|"ssh_exit", payload)` 推送到前端
-- **修改的文件：**
-  - `src-tauri/src/ssh.rs` — 大改：新增 SessionCommand、channel_reader 任务、flush_buffer 辅助函数；send_input/resize_terminal/disconnect 改为发命令
-  - `src-tauri/src/main.rs` — `ssh_sessions` 改为 `Arc<Mutex<...>>`；ssh_connect 注入 `AppHandle` 参数（修复了原 `state.app_handle()` 不存在的 bug）；新增 `SshOutputPayload` 序列化结构
-  - `src/api.ts` — 新增 `onSshOutput`/`onSshClosed`/`onSshExit` 监听器（按 sessionId 过滤）
-  - `src/components/TerminalPanel.tsx` — useEffect 内订阅 ssh_output（写入 xterm）和 ssh_closed（红色 [Connection closed] 提示）；卸载时反订阅
-- **验证：** `npx tsc --noEmit` PASS（exit code 0）
-- **遗留风险：**
-  - `channel.wait()` 在 select! 中的取消安全性 — 若实测丢字节，改用 `make_reader()` + `tokio::io::split()`
-  - `Vec<u8>` JSON 序列化为数字数组（~4× 膨胀）— v0.1 可接受，如 profiling 显示瓶颈再切 base64
-  - tauri#13234 在大量输出时仍可能卡顿 — 16ms 合并已缓解，必要时增大间隔
+### 闃舵 3.1锛氫慨澶?SSH 杈撳嚭鍥炴樉锛?026-06-13锛?
+- **鐘舵€侊細** complete锛堝墠绔唬鐮佸凡楠岃瘉锛屽悗绔唬鐮佸凡缂栧啓浣嗘湭缂栬瘧锛?
+- **闂锛?* 鍘?ssh.rs 鍒涘缓浜?output_tx 閫氶亾浣嗕粠鏈惎鍔ㄨ鍙栦换鍔★紝瀵艰嚧鏈嶅姟鍣ㄨ緭鍑烘棤娉曞洖鍒?xterm.js锛堝彧鑳界湅鍒?PTY echo 鐨勬湰鍦拌緭鍏ワ級
+- **淇鏂规锛?* 閲嶆瀯 SshSession 缁撴瀯 鈥?灏?Channel 鎵€鏈夋潈绉讳氦缁欑嫭绔嬬殑 tokio reader 浠诲姟
+  - 鏂板 `SessionCommand` 鏋氫妇锛圛nput/Resize/Disconnect锛夐€氳繃 mpsc 閫氶亾浼犻€掔粰 reader
+  - `channel_reader` 浠诲姟鐢?`tokio::select! { biased; ... }` 澶氳矾澶嶇敤锛?
+    - `command_rx.recv()` 鈥?鍓嶇鍛戒护锛堜紭鍏堢骇鏈€楂橈紝杈撳叆寤惰繜浣庯級
+    - `channel.wait()` 鈥?鏈嶅姟鍣ㄦ暟鎹紝缂撳啿鍒?Vec<u8>
+    - `flush_interval.tick()` 鈥?16ms 瀹氭椂鍒锋柊锛屽悎骞剁獊鍙戣緭鍑虹紦瑙?tauri#13234
+  - 16KB 闃堝€煎湪绾垮埛鏂帮紙閬垮厤楂樿緭鍑烘椂瀹氭椂鍣ㄥ垎鏀ゥ楗匡級
+  - 閫氳繃 `app.emit("ssh_output"|"ssh_closed"|"ssh_exit", payload)` 鎺ㄩ€佸埌鍓嶇
+- **淇敼鐨勬枃浠讹細**
+  - `src-tauri/src/ssh.rs` 鈥?澶ф敼锛氭柊澧?SessionCommand銆乧hannel_reader 浠诲姟銆乫lush_buffer 杈呭姪鍑芥暟锛泂end_input/resize_terminal/disconnect 鏀逛负鍙戝懡浠?
+  - `src-tauri/src/main.rs` 鈥?`ssh_sessions` 鏀逛负 `Arc<Mutex<...>>`锛泂sh_connect 娉ㄥ叆 `AppHandle` 鍙傛暟锛堜慨澶嶄簡鍘?`state.app_handle()` 涓嶅瓨鍦ㄧ殑 bug锛夛紱鏂板 `SshOutputPayload` 搴忓垪鍖栫粨鏋?
+  - `src/api.ts` 鈥?鏂板 `onSshOutput`/`onSshClosed`/`onSshExit` 鐩戝惉鍣紙鎸?sessionId 杩囨护锛?
+  - `src/components/TerminalPanel.tsx` 鈥?useEffect 鍐呰闃?ssh_output锛堝啓鍏?xterm锛夊拰 ssh_closed锛堢孩鑹?[Connection closed] 鎻愮ず锛夛紱鍗歌浇鏃跺弽璁㈤槄
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛坋xit code 0锛?
+- **閬楃暀椋庨櫓锛?*
+  - `channel.wait()` 鍦?select! 涓殑鍙栨秷瀹夊叏鎬?鈥?鑻ュ疄娴嬩涪瀛楄妭锛屾敼鐢?`make_reader()` + `tokio::io::split()`
+  - `Vec<u8>` JSON 搴忓垪鍖栦负鏁板瓧鏁扮粍锛垀4脳 鑶ㄨ儉锛夆€?v0.1 鍙帴鍙楋紝濡?profiling 鏄剧ず鐡堕鍐嶅垏 base64
+  - tauri#13234 鍦ㄥぇ閲忚緭鍑烘椂浠嶅彲鑳藉崱椤?鈥?16ms 鍚堝苟宸茬紦瑙ｏ紝蹇呰鏃跺澶ч棿闅?
 
-### 阶段 3.2：安全审查与高危修复（2026-06-13）
-- **状态：** complete（前端 tsc 通过，后端代码已写待 cargo 编译）
-- **审查发现：** 并行执行安全审查 + 设计审查两个 agent
-  - 设计审查确认：Mutex 选择正确、select! 取消安全、reader 自移除无 TOCTOU、SFTP 不与 bash 通道冲突
-  - 安全审查发现 2 个 HIGH + 3 个 MEDIUM + 5 个 LOW
-- **已修复（HIGH/MEDIUM 立即修）：**
-  - **HIGH #1：跨窗口终端泄漏** — `app.emit` 广播到所有 webview。改为 `window.emit` 通过 `WebviewWindow` 仅发给源窗口。修改 `ssh.rs::connect/channel_reader/flush_buffer` 签名 `AppHandle → WebviewWindow`；`main.rs::ssh_connect` 同步
-  - **HIGH #2：缓冲区无上限导致前端 OOM** — 新增 `MAX_BUFFER_SIZE = 256KB` 常量与 `append_capped` 辅助函数。超限时刷新已有数据 + 写入 `[output truncated]` 标记 + 丢弃剩余
-  - **MEDIUM #4：端口验证** — `ConnectionDialog.tsx` 用 `parseInt(port, 10)` 显式校验 `1-65535`，替代静默 `|| 22` 回退
-- **遗留未修：**
-  - MEDIUM #3：app 退出不清理 active sessions（资源泄漏）— 需加 `RunEvent::Exit` handler
-  - MEDIUM #5：`load_secret_key` 路径未规范化（文件存在性 oracle）
-  - LOW：SFTP 每次开新子通道（延迟，缓存 `SftpSession` 可优化）、listener 微任务间隙泄漏、SQLite 文件权限、SFTP rename 允许 `../`、reader 任务 JoinHandle 未跟踪
+### 闃舵 3.2锛氬畨鍏ㄥ鏌ヤ笌楂樺嵄淇锛?026-06-13锛?
+- **鐘舵€侊細** complete锛堝墠绔?tsc 閫氳繃锛屽悗绔唬鐮佸凡鍐欏緟 cargo 缂栬瘧锛?
+- **瀹℃煡鍙戠幇锛?* 骞惰鎵ц瀹夊叏瀹℃煡 + 璁捐瀹℃煡涓や釜 agent
+  - 璁捐瀹℃煡纭锛歁utex 閫夋嫨姝ｇ‘銆乻elect! 鍙栨秷瀹夊叏銆乺eader 鑷Щ闄ゆ棤 TOCTOU銆丼FTP 涓嶄笌 bash 閫氶亾鍐茬獊
+  - 瀹夊叏瀹℃煡鍙戠幇 2 涓?HIGH + 3 涓?MEDIUM + 5 涓?LOW
+- **宸蹭慨澶嶏紙HIGH/MEDIUM 绔嬪嵆淇級锛?*
+  - **HIGH #1锛氳法绐楀彛缁堢娉勬紡** 鈥?`app.emit` 骞挎挱鍒版墍鏈?webview銆傛敼涓?`window.emit` 閫氳繃 `WebviewWindow` 浠呭彂缁欐簮绐楀彛銆備慨鏀?`ssh.rs::connect/channel_reader/flush_buffer` 绛惧悕 `AppHandle 鈫?WebviewWindow`锛沗main.rs::ssh_connect` 鍚屾
+  - **HIGH #2锛氱紦鍐插尯鏃犱笂闄愬鑷村墠绔?OOM** 鈥?鏂板 `MAX_BUFFER_SIZE = 256KB` 甯搁噺涓?`append_capped` 杈呭姪鍑芥暟銆傝秴闄愭椂鍒锋柊宸叉湁鏁版嵁 + 鍐欏叆 `[output truncated]` 鏍囪 + 涓㈠純鍓╀綑
+  - **MEDIUM #4锛氱鍙ｉ獙璇?* 鈥?`ConnectionDialog.tsx` 鐢?`parseInt(port, 10)` 鏄惧紡鏍￠獙 `1-65535`锛屾浛浠ｉ潤榛?`|| 22` 鍥為€€
+- **閬楃暀鏈慨锛?*
+  - MEDIUM #3锛歛pp 閫€鍑轰笉娓呯悊 active sessions锛堣祫婧愭硠婕忥級鈥?闇€鍔?`RunEvent::Exit` handler
+  - MEDIUM #5锛歚load_secret_key` 璺緞鏈鑼冨寲锛堟枃浠跺瓨鍦ㄦ€?oracle锛?
+  - LOW锛歋FTP 姣忔寮€鏂板瓙閫氶亾锛堝欢杩燂紝缂撳瓨 `SftpSession` 鍙紭鍖栵級銆乴istener 寰换鍔￠棿闅欐硠婕忋€丼QLite 鏂囦欢鏉冮檺銆丼FTP rename 鍏佽 `../`銆乺eader 浠诲姟 JoinHandle 鏈窡韪?
 
-### 阶段 4：前端 UI 实现
-- **状态：** complete（代码已编写）
-- 已创建/修改的文件：
-  - `package.json` — 前端依赖
-  - `vite.config.ts` — Vite 构建配置
-  - `tsconfig.json` — TypeScript 配置
-  - `index.html` — HTML 入口
-  - `src/main.tsx` — React 入口
-  - `src/vite-env.d.ts` — Vite 类型声明
-  - `src/styles/global.css` — 全局样式（Catppuccin Mocha 主题）
-  - `src/api.ts` — Tauri IPC 接口封装
-  - `src/App.tsx` — 主应用（布局 + 多标签）
-  - `src/components/Sidebar.tsx` — 连接管理侧边栏
-  - `src/components/TabBar.tsx` — 标签栏 + SFTP 切换
-  - `src/components/TerminalPanel.tsx` — xterm.js 终端面板
-  - `src/components/SftpPanel.tsx` — SFTP 文件浏览器
-  - `src/components/ConnectionDialog.tsx` — 连接配置对话框
+### 闃舵 4锛氬墠绔?UI 瀹炵幇
+- **鐘舵€侊細** complete锛堜唬鐮佸凡缂栧啓锛?
+- 宸插垱寤?淇敼鐨勬枃浠讹細
+  - `package.json` 鈥?鍓嶇渚濊禆
+  - `vite.config.ts` 鈥?Vite 鏋勫缓閰嶇疆
+  - `tsconfig.json` 鈥?TypeScript 閰嶇疆
+  - `index.html` 鈥?HTML 鍏ュ彛
+  - `src/main.tsx` 鈥?React 鍏ュ彛
+  - `src/vite-env.d.ts` 鈥?Vite 绫诲瀷澹版槑
+  - `src/styles/global.css` 鈥?鍏ㄥ眬鏍峰紡锛圕atppuccin Mocha 涓婚锛?
+  - `src/api.ts` 鈥?Tauri IPC 鎺ュ彛灏佽
+  - `src/App.tsx` 鈥?涓诲簲鐢紙甯冨眬 + 澶氭爣绛撅級
+  - `src/components/Sidebar.tsx` 鈥?杩炴帴绠＄悊渚ц竟鏍?
+  - `src/components/TabBar.tsx` 鈥?鏍囩鏍?+ SFTP 鍒囨崲
+  - `src/components/TerminalPanel.tsx` 鈥?xterm.js 缁堢闈㈡澘
+  - `src/components/SftpPanel.tsx` 鈥?SFTP 鏂囦欢娴忚鍣?
+  - `src/components/ConnectionDialog.tsx` 鈥?杩炴帴閰嶇疆瀵硅瘽妗?
 
-### 阶段 5：集成测试与交付
-- **状态：** in_progress
-- **里程碑（2026-06-13）：cargo build 首次成功**
-- **验证步骤（按序执行）：**
-  1. `cargo build`（在 `src-tauri/`）— **PASS**（11.10s，零警告零错误）
-  2. `cargo tauri dev`（在 `src-tauri/`）— 待执行
-  3. 连接真实 SSH 服务器（如 docker `linuxserver/openssh-server` 端口 2222）验证：
-     - 服务器提示符出现在终端（输出回路已通）
-     - 输入 `ls`、`echo hello`、`pwd` — 输出可见
-     - 输入 `ls /nonexistent` — stderr 可见
-     - 调整窗口尺寸 — `stty size` 显示正确行列数
-     - 关闭标签 — `ssh_disconnect` 触发，无泄漏
-     - 服务器侧 kill 用户 shell — 标签显示红色 [Connection closed]
+### 闃舵 5锛氶泦鎴愭祴璇曚笌浜や粯
+- **鐘舵€侊細** in_progress
+- **閲岀▼纰戯紙2026-06-13锛夛細cargo build 棣栨鎴愬姛**
+- **楠岃瘉姝ラ锛堟寜搴忔墽琛岋級锛?*
+  1. `cargo build`锛堝湪 `src-tauri/`锛夆€?**PASS**锛?1.10s锛岄浂璀﹀憡闆堕敊璇級
+  2. `cargo tauri dev`锛堝湪 `src-tauri/`锛夆€?寰呮墽琛?
+  3. 杩炴帴鐪熷疄 SSH 鏈嶅姟鍣紙濡?docker `linuxserver/openssh-server` 绔彛 2222锛夐獙璇侊細
+     - 鏈嶅姟鍣ㄦ彁绀虹鍑虹幇鍦ㄧ粓绔紙杈撳嚭鍥炶矾宸查€氾級
+     - 杈撳叆 `ls`銆乣echo hello`銆乣pwd` 鈥?杈撳嚭鍙
+     - 杈撳叆 `ls /nonexistent` 鈥?stderr 鍙
+     - 璋冩暣绐楀彛灏哄 鈥?`stty size` 鏄剧ず姝ｇ‘琛屽垪鏁?
+     - 鍏抽棴鏍囩 鈥?`ssh_disconnect` 瑙﹀彂锛屾棤娉勬紡
+     - 鏈嶅姟鍣ㄤ晶 kill 鐢ㄦ埛 shell 鈥?鏍囩鏄剧ず绾㈣壊 [Connection closed]
 
-### 阶段 6：v0.1 占位项清理（2026-06-14）
-- **状态：** complete（Rust 编译 PASS，TS 类型检查 PASS；端到端验证待跑）
-- **CLAUDE.md 列出的三处占位：**
-  1. `check_server_key` 全盘接受 → DB 比对
-  2. 密码明文存 SQLite → OS keyring
-  3. app 关闭不 disconnect 会话 → 退出时 drain
-- **修改明细：**
-  - `src-tauri/Cargo.toml` — 加 `keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }`
-  - `src-tauri/src/main.rs` — `AppState.db` 改 `Arc<Mutex<rusqlite::Connection>>`（handler 持久引用需要 Arc）；`save_connection` 把密码从 config 取出写入 keyring 后 DB 存 NULL；`delete_connection` 先 best-effort 删 keyring；启动调 `migrate_plaintext_passwords`；`.run()` 改 `.build()` + `ExitRequested` 监听 → `drain_ssh_sessions` 发 Disconnect + sleep 500ms
-  - `src-tauri/src/db.rs` — `CREATE TABLE known_hosts`；`get_known_host`/`set_known_host`；`migrate_plaintext_passwords`（一次性把 NOT NULL 的明文搬到 keyring 并 NULL 化）
-  - `src-tauri/src/secrets.rs` — 新模块，keyring::Entry 包装（set/get/delete）
-  - `src-tauri/src/ssh.rs` — `SshClient { db: Arc<Mutex<Connection>>, host }`；`check_server_key` 走 DB 比对：匹配接受、不匹配拒绝、首次写入；`connect()` 构造 handler 时注入 db Arc clone + host；password 认证如 config.password 空就从 keyring 读；删除死代码 `windows_match`
-  - `src/components/ConnectionDialog.tsx` — 编辑时空密码字段传 `undefined`（保留 keyring 旧值，不再误删）；新建 + password 认证 + 密码空 → 报错"请填写密码"
-- **遗留风险：**
-  - Linux keyring 走 Secret Service（需要 D-Bus + gnome-keyring/kwallet 运行）；Windows/macOS 用原生（Credential Manager / Keychain），无依赖
-  - known_hosts 是 host 维度（不分端口/算法）— 同 host 不同端口的恶意服务端会触发"mismatch"误拒；v0.1 接受
-  - keyring 写失败时 save_connection 整体失败，但 DB 已经写了（INSERT OR REPLACE 是一个事务内的，未调 set_password 不会先动 DB）— 实际顺序是 set_password → db::save_connection，keyring 失败时 DB 未动，OK
+### 闃舵 6锛歷0.1 鍗犱綅椤规竻鐞嗭紙2026-06-14锛?
+- **鐘舵€侊細** complete锛圧ust 缂栬瘧 PASS锛孴S 绫诲瀷妫€鏌?PASS锛涚鍒扮楠岃瘉寰呰窇锛?
+- **CLAUDE.md 鍒楀嚭鐨勪笁澶勫崰浣嶏細**
+  1. `check_server_key` 鍏ㄧ洏鎺ュ彈 鈫?DB 姣斿
+  2. 瀵嗙爜鏄庢枃瀛?SQLite 鈫?OS keyring
+  3. app 鍏抽棴涓?disconnect 浼氳瘽 鈫?閫€鍑烘椂 drain
+- **淇敼鏄庣粏锛?*
+  - `src-tauri/Cargo.toml` 鈥?鍔?`keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }`
+  - `src-tauri/src/main.rs` 鈥?`AppState.db` 鏀?`Arc<Mutex<rusqlite::Connection>>`锛坔andler 鎸佷箙寮曠敤闇€瑕?Arc锛夛紱`save_connection` 鎶婂瘑鐮佷粠 config 鍙栧嚭鍐欏叆 keyring 鍚?DB 瀛?NULL锛沗delete_connection` 鍏?best-effort 鍒?keyring锛涘惎鍔ㄨ皟 `migrate_plaintext_passwords`锛沗.run()` 鏀?`.build()` + `ExitRequested` 鐩戝惉 鈫?`drain_ssh_sessions` 鍙?Disconnect + sleep 500ms
+  - `src-tauri/src/db.rs` 鈥?`CREATE TABLE known_hosts`锛沗get_known_host`/`set_known_host`锛沗migrate_plaintext_passwords`锛堜竴娆℃€ф妸 NOT NULL 鐨勬槑鏂囨惉鍒?keyring 骞?NULL 鍖栵級
+  - `src-tauri/src/secrets.rs` 鈥?鏂版ā鍧楋紝keyring::Entry 鍖呰锛坰et/get/delete锛?
+  - `src-tauri/src/ssh.rs` 鈥?`SshClient { db: Arc<Mutex<Connection>>, host }`锛沗check_server_key` 璧?DB 姣斿锛氬尮閰嶆帴鍙椼€佷笉鍖归厤鎷掔粷銆侀娆″啓鍏ワ紱`connect()` 鏋勯€?handler 鏃舵敞鍏?db Arc clone + host锛沺assword 璁よ瘉濡?config.password 绌哄氨浠?keyring 璇伙紱鍒犻櫎姝讳唬鐮?`windows_match`
+  - `src/components/ConnectionDialog.tsx` 鈥?缂栬緫鏃剁┖瀵嗙爜瀛楁浼?`undefined`锛堜繚鐣?keyring 鏃у€硷紝涓嶅啀璇垹锛夛紱鏂板缓 + password 璁よ瘉 + 瀵嗙爜绌?鈫?鎶ラ敊"璇峰～鍐欏瘑鐮?
+- **閬楃暀椋庨櫓锛?*
+  - Linux keyring 璧?Secret Service锛堥渶瑕?D-Bus + gnome-keyring/kwallet 杩愯锛夛紱Windows/macOS 鐢ㄥ師鐢燂紙Credential Manager / Keychain锛夛紝鏃犱緷璧?
+  - known_hosts 鏄?host 缁村害锛堜笉鍒嗙鍙?绠楁硶锛夆€?鍚?host 涓嶅悓绔彛鐨勬伓鎰忔湇鍔＄浼氳Е鍙?mismatch"璇嫆锛泇0.1 鎺ュ彈
+  - keyring 鍐欏け璐ユ椂 save_connection 鏁翠綋澶辫触锛屼絾 DB 宸茬粡鍐欎簡锛圛NSERT OR REPLACE 鏄竴涓簨鍔″唴鐨勶紝鏈皟 set_password 涓嶄細鍏堝姩 DB锛夆€?瀹為檯椤哄簭鏄?set_password 鈫?db::save_connection锛宬eyring 澶辫触鏃?DB 鏈姩锛孫K
 
 
-- **状态：** complete
-- **起因：** rustup 装好后首次 `cargo build`，连续命中 7 类阻塞问题
-- **修复明细：**
-  1. **`russh-keys = "0.50"` 无 stable 版本**：0.50 只有 beta（0.50.0-beta.7）。从 `Cargo.toml` 移除直接依赖，改用 `russh::keys` 的 re-export（`PublicKey`、`load_secret_key`、`PrivateKeyWithHashAlg`）
-  2. **Windows schannel CRYPT_E_REVOCATION_OFFLINE (0x80092013)**：吊销服务器无法访问。在 `.cargo/config.toml` 加 `[http] check-revoke = false`
-  3. **`russh-sftp 1.2.1` 与 `bytes 1.10` 冲突**：bytes 1.10 在 `Buf` trait 上加了 `try_get_*` 方法，与 russh-sftp 自己的 `TryBuf::try_get_u32` 冲突（tokio-rs/bytes#767）。升级到 `russh-sftp = "2"`
-  4. **`tauri.conf.json` 顶层 `title` 字段废弃**：新版 tauri-build 2.6.2 要求 `title` 在 `windows[]` 内。删除顶层 `app.title`，顺手把错误的 `$schema` 从 nicegui 改成 Tauri 官方 `https://schema.tauri.app/config/2`
-  5. **缺 `icons/icon.ico`**：用 PowerShell System.Drawing 生成 32×32 占位 ICO（蓝圆 + Catppuccin 深色背景）
-  6. **russh 0.50.4 API 变更**：
-     - `authenticate_publickey` 第二参数从 `Arc<PrivateKey>` → `PrivateKeyWithHashAlg::new(Arc<PrivateKey>, None)`
-     - `AuthResult` 改为 enum，提供 `.success()` 方法替代 `!` 操作
-     - `Handle<H>` 不再实现 `Clone` → 把 `SshSession.handle` 改成 `Arc<Handle<SshClient>>`
-     - `CryptoVec` 无 `as_slice()` → 用 `&data[..]`（Deref 到 `[u8]`）
-     - `SshClient` 必须是 `pub`（否则 `pub handle: Arc<Handle<SshClient>>` 暴露私有类型）
-  7. **russh-sftp 2.x API 变更**：
-     - `mkdir` → `create_dir`
-     - `rm_dir` → `remove_dir`
-     - `FilePermissions` 不再实现 `Debug`，但有 `Display` → `format!("{}", ...)` 替代 `{:?}`
-  8. **`MutexGuard` 跨 await 导致 Future 不 Send**：tauri command 的返回 Future 必须 Send。`get_sftp_session` 用块作用域包住锁，确保 guard 在 await 前释放
-  9. **`src/main.rs` 缺 `fn main()`**：原代码只定义了 `pub fn run()`。补 `fn main() { run() }`，保留 `#[cfg_attr(mobile, tauri::mobile_entry_point)]` 兼容移动端
-- **修改的文件：**
-  - `src-tauri/Cargo.toml` — 移除 `russh-keys`，`russh-sftp` 升 2
-  - `src-tauri/.cargo/config.toml` — 加 `check-revoke = false`
-  - `src-tauri/tauri.conf.json` — 删 `app.title`，修 `$schema`
-  - `src-tauri/icons/icon.ico` — 新建占位图标
-  - `src-tauri/src/ssh.rs` — handle 改 Arc 包装；认证 API 升级；CryptoVec 切片语法；SshClient 加 pub
-  - `src-tauri/src/sftp.rs` — Handle clone 改 Arc::clone；mkdir/rm_dir 改名；permissions Display；MutexGuard 块作用域
-  - `src-tauri/src/main.rs` — 补 `fn main()`
+- **鐘舵€侊細** complete
+- **璧峰洜锛?* rustup 瑁呭ソ鍚庨娆?`cargo build`锛岃繛缁懡涓?7 绫婚樆濉為棶棰?
+- **淇鏄庣粏锛?*
+  1. **`russh-keys = "0.50"` 鏃?stable 鐗堟湰**锛?.50 鍙湁 beta锛?.50.0-beta.7锛夈€備粠 `Cargo.toml` 绉婚櫎鐩存帴渚濊禆锛屾敼鐢?`russh::keys` 鐨?re-export锛坄PublicKey`銆乣load_secret_key`銆乣PrivateKeyWithHashAlg`锛?
+  2. **Windows schannel CRYPT_E_REVOCATION_OFFLINE (0x80092013)**锛氬悐閿€鏈嶅姟鍣ㄦ棤娉曡闂€傚湪 `.cargo/config.toml` 鍔?`[http] check-revoke = false`
+  3. **`russh-sftp 1.2.1` 涓?`bytes 1.10` 鍐茬獊**锛歜ytes 1.10 鍦?`Buf` trait 涓婂姞浜?`try_get_*` 鏂规硶锛屼笌 russh-sftp 鑷繁鐨?`TryBuf::try_get_u32` 鍐茬獊锛坱okio-rs/bytes#767锛夈€傚崌绾у埌 `russh-sftp = "2"`
+  4. **`tauri.conf.json` 椤跺眰 `title` 瀛楁搴熷純**锛氭柊鐗?tauri-build 2.6.2 瑕佹眰 `title` 鍦?`windows[]` 鍐呫€傚垹闄ら《灞?`app.title`锛岄『鎵嬫妸閿欒鐨?`$schema` 浠?nicegui 鏀规垚 Tauri 瀹樻柟 `https://schema.tauri.app/config/2`
+  5. **缂?`icons/icon.ico`**锛氱敤 PowerShell System.Drawing 鐢熸垚 32脳32 鍗犱綅 ICO锛堣摑鍦?+ Catppuccin 娣辫壊鑳屾櫙锛?
+  6. **russh 0.50.4 API 鍙樻洿**锛?
+     - `authenticate_publickey` 绗簩鍙傛暟浠?`Arc<PrivateKey>` 鈫?`PrivateKeyWithHashAlg::new(Arc<PrivateKey>, None)`
+     - `AuthResult` 鏀逛负 enum锛屾彁渚?`.success()` 鏂规硶鏇夸唬 `!` 鎿嶄綔
+     - `Handle<H>` 涓嶅啀瀹炵幇 `Clone` 鈫?鎶?`SshSession.handle` 鏀规垚 `Arc<Handle<SshClient>>`
+     - `CryptoVec` 鏃?`as_slice()` 鈫?鐢?`&data[..]`锛圖eref 鍒?`[u8]`锛?
+     - `SshClient` 蹇呴』鏄?`pub`锛堝惁鍒?`pub handle: Arc<Handle<SshClient>>` 鏆撮湶绉佹湁绫诲瀷锛?
+  7. **russh-sftp 2.x API 鍙樻洿**锛?
+     - `mkdir` 鈫?`create_dir`
+     - `rm_dir` 鈫?`remove_dir`
+     - `FilePermissions` 涓嶅啀瀹炵幇 `Debug`锛屼絾鏈?`Display` 鈫?`format!("{}", ...)` 鏇夸唬 `{:?}`
+  8. **`MutexGuard` 璺?await 瀵艰嚧 Future 涓?Send**锛歵auri command 鐨勮繑鍥?Future 蹇呴』 Send銆俙get_sftp_session` 鐢ㄥ潡浣滅敤鍩熷寘浣忛攣锛岀‘淇?guard 鍦?await 鍓嶉噴鏀?
+  9. **`src/main.rs` 缂?`fn main()`**锛氬師浠ｇ爜鍙畾涔変簡 `pub fn run()`銆傝ˉ `fn main() { run() }`锛屼繚鐣?`#[cfg_attr(mobile, tauri::mobile_entry_point)]` 鍏煎绉诲姩绔?
+- **淇敼鐨勬枃浠讹細**
+  - `src-tauri/Cargo.toml` 鈥?绉婚櫎 `russh-keys`锛宍russh-sftp` 鍗?2
+  - `src-tauri/.cargo/config.toml` 鈥?鍔?`check-revoke = false`
+  - `src-tauri/tauri.conf.json` 鈥?鍒?`app.title`锛屼慨 `$schema`
+  - `src-tauri/icons/icon.ico` 鈥?鏂板缓鍗犱綅鍥炬爣
+  - `src-tauri/src/ssh.rs` 鈥?handle 鏀?Arc 鍖呰锛涜璇?API 鍗囩骇锛汣ryptoVec 鍒囩墖璇硶锛汼shClient 鍔?pub
+  - `src-tauri/src/sftp.rs` 鈥?Handle clone 鏀?Arc::clone锛沵kdir/rm_dir 鏀瑰悕锛沺ermissions Display锛汳utexGuard 鍧椾綔鐢ㄥ煙
+  - `src-tauri/src/main.rs` 鈥?琛?`fn main()`
 
-## 测试结果
-| 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
+## 娴嬭瘯缁撴灉
+| 娴嬭瘯 | 杈撳叆 | 棰勬湡缁撴灉 | 瀹為檯缁撴灉 | 鐘舵€?|
 |------|------|---------|---------|------|
-| TypeScript 编译 | npx tsc --noEmit | 无错误 | 无错误 | PASS |
-| npm install | package.json | 安装成功 | 成功 | PASS |
-| Rust 安装 | rustup default stable | 安装成功 | 成功 | PASS |
-| Rust 编译 | cargo build | 无错误 | 11.10s 完成 | PASS |
+| TypeScript 缂栬瘧 | npx tsc --noEmit | 鏃犻敊璇?| 鏃犻敊璇?| PASS |
+| npm install | package.json | 瀹夎鎴愬姛 | 鎴愬姛 | PASS |
+| Rust 瀹夎 | rustup default stable | 瀹夎鎴愬姛 | 鎴愬姛 | PASS |
+| Rust 缂栬瘧 | cargo build | 鏃犻敊璇?| 11.10s 瀹屾垚 | PASS |
 
-## 错误日志
-| 时间戳 | 错误 | 尝试次数 | 解决方案 |
+## 閿欒鏃ュ織
+| 鏃堕棿鎴?| 閿欒 | 灏濊瘯娆℃暟 | 瑙ｅ喅鏂规 |
 |--------|------|---------|---------|
-| 2026-06-12 | rustup default 未设置 | 1 | 执行 rustup default stable |
-| 2026-06-12 | rustup 下载耗时过长 | 1 | 后台继续，等待完成 |
+| 2026-06-12 | rustup default 鏈缃?| 1 | 鎵ц rustup default stable |
+| 2026-06-12 | rustup 涓嬭浇鑰楁椂杩囬暱 | 1 | 鍚庡彴缁х画锛岀瓑寰呭畬鎴?|
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 3.3（编译修复）完成，`cargo build` PASS（11.10s 零警告）；进入阶段 5 端到端验证 |
-| 我要去哪里？ | 启动 `cargo tauri dev`，连真实 SSH 服务器跑完 6 项验证清单 |
-| 目标是什么？ | 构建可运行的 MyShell SSH/SFTP 客户端 |
-| 我学到了什么？ | russh 0.50 与 0.49 API 差异巨大（Handle 不 Clone、AuthResult enum、PrivateKeyWithHashAlg）；russh-sftp 1.x 与 bytes 1.10 不兼容；async fn 中 std::sync::MutexGuard 即便 drop 也会让 Future 不 Send，必须块作用域；tauri-build 2.6 删除了 `app.title` 字段 |
-| 我做了什么？ | 3.3：连续修 9 类编译阻塞（russh-keys 缺失、SSL 吊销、russh-sftp 升级、tauri.conf 字段、icon 缺失、5 处 API 升级、MutexGuard Send、main 函数缺失） |
+| 鎴戝湪鍝噷锛?| 闃舵 3.3锛堢紪璇戜慨澶嶏級瀹屾垚锛宍cargo build` PASS锛?1.10s 闆惰鍛婏級锛涜繘鍏ラ樁娈?5 绔埌绔獙璇?|
+| 鎴戣鍘诲摢閲岋紵 | 鍚姩 `cargo tauri dev`锛岃繛鐪熷疄 SSH 鏈嶅姟鍣ㄨ窇瀹?6 椤归獙璇佹竻鍗?|
+| 鐩爣鏄粈涔堬紵 | 鏋勫缓鍙繍琛岀殑 MyShell SSH/SFTP 瀹㈡埛绔?|
+| 鎴戝鍒颁簡浠€涔堬紵 | russh 0.50 涓?0.49 API 宸紓宸ㄥぇ锛圚andle 涓?Clone銆丄uthResult enum銆丳rivateKeyWithHashAlg锛夛紱russh-sftp 1.x 涓?bytes 1.10 涓嶅吋瀹癸紱async fn 涓?std::sync::MutexGuard 鍗充究 drop 涔熶細璁?Future 涓?Send锛屽繀椤诲潡浣滅敤鍩燂紱tauri-build 2.6 鍒犻櫎浜?`app.title` 瀛楁 |
+| 鎴戝仛浜嗕粈涔堬紵 | 3.3锛氳繛缁慨 9 绫荤紪璇戦樆濉烇紙russh-keys 缂哄け銆丼SL 鍚婇攢銆乺ussh-sftp 鍗囩骇銆乼auri.conf 瀛楁銆乮con 缂哄け銆? 澶?API 鍗囩骇銆丮utexGuard Send銆乵ain 鍑芥暟缂哄け锛?|
 
 ---
-*每个阶段完成后或遇到错误时更新此文件*
+*姣忎釜闃舵瀹屾垚鍚庢垨閬囧埌閿欒鏃舵洿鏂版鏂囦欢*
 
-## 会话：2026-06-14 — 5 大需求增强
+## 浼氳瘽锛?026-06-14 鈥?5 澶ч渶姹傚寮?
 
-### 阶段 7：需求扩展（A-F 全套）
-- **状态：** Phase A-E complete / Phase F 待运行时验证
-- **需求清单：**
-  1. Stage 4 性能与健壮性（5GB 大文件、abort 5s 兜底、10 连发）
-  2. 多级文件夹（树形/默认收起）
-  3. SSH/SFTP/FTP 统一管理
-  4. SSH 服务器信息侧栏（OS/CPU/内存/磁盘 5s 刷新）
-  5. UI 美化（终端着色 + 对话框分组）
+### 闃舵 7锛氶渶姹傛墿灞曪紙A-F 鍏ㄥ锛?
+- **鐘舵€侊細** Phase A-E complete / Phase F 寰呰繍琛屾椂楠岃瘉
+- **闇€姹傛竻鍗曪細**
+  1. Stage 4 鎬ц兘涓庡仴澹€э紙5GB 澶ф枃浠躲€乤bort 5s 鍏滃簳銆?0 杩炲彂锛?
+  2. 澶氱骇鏂囦欢澶癸紙鏍戝舰/榛樿鏀惰捣锛?
+  3. SSH/SFTP/FTP 缁熶竴绠＄悊
+  4. SSH 鏈嶅姟鍣ㄤ俊鎭晶鏍忥紙OS/CPU/鍐呭瓨/纾佺洏 5s 鍒锋柊锛?
+  5. UI 缇庡寲锛堢粓绔潃鑹?+ 瀵硅瘽妗嗗垎缁勶級
 
-### 阶段 7.A：DB schema + 类型扩展
-- **状态：** complete
-- `db.rs` — `init_db` 加 `conn_type/group_path/ftp_tls/ftp_passive` 列 + `folders` 表；`column_exists` PRAGMA 探测；`migrate_legacy_schema` 按顺序：`group_name` → `group_path` 迁移 → drop column → drop legacy `password` 列；`list/save/delete/rename_folder` + `folder_has_children`；`rename_folder` 用 `LIKE 'old/%'` 模式批量更新子项路径
-- `main.rs` — `ConnectionConfig` 加 4 个字段（带 `#[serde(default)]` 兼容旧 JSON）；`AppState.ftp_sessions: Arc<Mutex<HashMap<UUID, FtpSession>>>`
+### 闃舵 7.A锛欴B schema + 绫诲瀷鎵╁睍
+- **鐘舵€侊細** complete
+- `db.rs` 鈥?`init_db` 鍔?`conn_type/group_path/ftp_tls/ftp_passive` 鍒?+ `folders` 琛紱`column_exists` PRAGMA 鎺㈡祴锛沗migrate_legacy_schema` 鎸夐『搴忥細`group_name` 鈫?`group_path` 杩佺Щ 鈫?drop column 鈫?drop legacy `password` 鍒楋紱`list/save/delete/rename_folder` + `folder_has_children`锛沗rename_folder` 鐢?`LIKE 'old/%'` 妯″紡鎵归噺鏇存柊瀛愰」璺緞
+- `main.rs` 鈥?`ConnectionConfig` 鍔?4 涓瓧娈碉紙甯?`#[serde(default)]` 鍏煎鏃?JSON锛夛紱`AppState.ftp_sessions: Arc<Mutex<HashMap<UUID, FtpSession>>>`
 
-### 阶段 7.B：UI 美化
-- **状态：** complete
-- `TerminalPanel.tsx` — PTY 建立后注入 `SHELL_INIT_SEQ`（`FORCE_COLOR=1` + `alias ls='ls --color=auto'` + `source ~/.bashrc 2>/dev/null` + `clear`），sh/dash/fish 兼容（`2>/dev/null` 静默）；`abortTimeoutRef` 5s setTimeout 调 `bridgeRef.reset()` 兜底
-- `ConnectionDialog.tsx` — `TypeSelector`（SSH/SFTP/FTP 按钮 + accent 高亮）；`FieldGroup` 卡片分组（基本/认证/FTP/分组）；`nameTouchedRef` 自动同步 host → name 直到用户改 name；focus 态 `boxShadow: 0 0 0 2px rgba(137,180,250,0.18)`；密码字段 warning 色边框、密钥路径 accent 色
+### 闃舵 7.B锛歎I 缇庡寲
+- **鐘舵€侊細** complete
+- `TerminalPanel.tsx` 鈥?PTY 寤虹珛鍚庢敞鍏?`SHELL_INIT_SEQ`锛坄FORCE_COLOR=1` + `alias ls='ls --color=auto'` + `source ~/.bashrc 2>/dev/null` + `clear`锛夛紝sh/dash/fish 鍏煎锛坄2>/dev/null` 闈欓粯锛夛紱`abortTimeoutRef` 5s setTimeout 璋?`bridgeRef.reset()` 鍏滃簳
+- `ConnectionDialog.tsx` 鈥?`TypeSelector`锛圫SH/SFTP/FTP 鎸夐挳 + accent 楂樹寒锛夛紱`FieldGroup` 鍗＄墖鍒嗙粍锛堝熀鏈?璁よ瘉/FTP/鍒嗙粍锛夛紱`nameTouchedRef` 鑷姩鍚屾 host 鈫?name 鐩村埌鐢ㄦ埛鏀?name锛沠ocus 鎬?`boxShadow: 0 0 0 2px rgba(137,180,250,0.18)`锛涘瘑鐮佸瓧娈?warning 鑹茶竟妗嗐€佸瘑閽ヨ矾寰?accent 鑹?
 
-### 阶段 7.C：多级文件夹
-- **状态：** complete
-- `Sidebar.tsx` 重写为树形 — `buildTree(conns, folders)` 递归构造 `FolderNode { depth, children, conns }`；`paddingLeft: 14 + depth * 12`；`Set<string>` 展开态初始空（默认全收起）；右键菜单：空白处新建连接/文件夹、文件夹项子建/重命名/删除；`CONN_ICONS: { ssh: "🖥", sftp: "📁", ftp: "📤" }`
-- `normalize_folder_path` 在 Rust 端规范化（去重 `/`、补前导 `/`）；`rename_folder` 拒绝循环（`new.starts_with(old + "/")`）；`delete_folder` 校验 `folder_has_children`
+### 闃舵 7.C锛氬绾ф枃浠跺す
+- **鐘舵€侊細** complete
+- `Sidebar.tsx` 閲嶅啓涓烘爲褰?鈥?`buildTree(conns, folders)` 閫掑綊鏋勯€?`FolderNode { depth, children, conns }`锛沗paddingLeft: 14 + depth * 12`锛沗Set<string>` 灞曞紑鎬佸垵濮嬬┖锛堥粯璁ゅ叏鏀惰捣锛夛紱鍙抽敭鑿滃崟锛氱┖鐧藉鏂板缓杩炴帴/鏂囦欢澶广€佹枃浠跺す椤瑰瓙寤?閲嶅懡鍚?鍒犻櫎锛沗CONN_ICONS: { ssh: "馃枼", sftp: "馃搧", ftp: "馃摛" }`
+- `normalize_folder_path` 鍦?Rust 绔鑼冨寲锛堝幓閲?`/`銆佽ˉ鍓嶅 `/`锛夛紱`rename_folder` 鎷掔粷寰幆锛坄new.starts_with(old + "/")`锛夛紱`delete_folder` 鏍￠獙 `folder_has_children`
 
-### 阶段 7.D：SSH 服务器信息
-- **状态：** complete
-- `ssh.rs::exec_once` — 短命令执行助手（clone `Arc<Handle>`、开 channel、`channel.exec(true, cmd)`、循环 `channel.wait()` 累积 `Data`/`ExtendedData`）
-- `main.rs` — `SERVER_INFO_SCRIPT` 单次 exec 拿全（OS/K/C/M/D/S1/sleep/S2），`tokio::time::timeout(8s)` 超时返回 `stale: true`；`parse_server_info` 按 `=TAG=` 切片；`cpu_busy_pct` 从两次 /proc/stat 算差值
-- `ServerInfoPanel.tsx`（240px 侧栏）— `MetricCard` + `UsageBar`（>85% error / >60% warning / else success）；5s setInterval；`active=false` 时跳过刷新（切 tab 暂停）
+### 闃舵 7.D锛歋SH 鏈嶅姟鍣ㄤ俊鎭?
+- **鐘舵€侊細** complete
+- `ssh.rs::exec_once` 鈥?鐭懡浠ゆ墽琛屽姪鎵嬶紙clone `Arc<Handle>`銆佸紑 channel銆乣channel.exec(true, cmd)`銆佸惊鐜?`channel.wait()` 绱Н `Data`/`ExtendedData`锛?
+- `main.rs` 鈥?`SERVER_INFO_SCRIPT` 鍗曟 exec 鎷垮叏锛圤S/K/C/M/D/S1/sleep/S2锛夛紝`tokio::time::timeout(8s)` 瓒呮椂杩斿洖 `stale: true`锛沗parse_server_info` 鎸?`=TAG=` 鍒囩墖锛沗cpu_busy_pct` 浠庝袱娆?/proc/stat 绠楀樊鍊?
+- `ServerInfoPanel.tsx`锛?40px 渚ф爮锛夆€?`MetricCard` + `UsageBar`锛?85% error / >60% warning / else success锛夛紱5s setInterval锛沗active=false` 鏃惰烦杩囧埛鏂帮紙鍒?tab 鏆傚仠锛?
 
-### 阶段 7.E：FTP 支持（最大改动）
-- **状态：** complete
-- **suppaftp v8 API 探索踩坑：**
-  - `types::File` 不存在 → `list::File`
-  - `AsyncRustlsConnector` 需要外部 rustls/webpki-roots 直接依赖 → 暂缓 TLS（返回错误引导选 `ftp_tls=none`）
-  - `passive()` 方法不存在 → v8 默认就是 PASV；切 active 用 `stream.active_mode(timeout)`
-  - `mlsd/list` 返回 `Vec<String>` 不是 `Vec<File>` → 必须用 `ListParser::parse_mlsd().or_else(parse_posix)` 逐行解析
-- `ftp.rs` — `FtpSession { stream: AsyncFtpStream }`；connect/list/mkdir/remove/rename/disconnect；`format_pex` POSIX 权限串；`format_time`+`days_to_ymd` 无 chrono 转秒为日期
-- `main.rs` — 6 个新命令；FTP 借还术 `take_ftp_session`/`return_ftp_session`（`AsyncFtpStream` 不 Clone，必须 take → 用 → return）；`drain_all_sessions` 同步 clear FTP map（drop 即关 socket）
-- `api.ts` — `ftpConnect/ListDir/Mkdir/Remove/Rename/Disconnect` 包装
-- `App.tsx::handleConnect` — 按 `conn_type` 分流：ftp → 独立 FTP tab；sftp → ssh tab+sftp type；ssh → terminal；`handleCloseTab` 按 connType 调对应 disconnect
-- `SftpPanel.tsx` — `source: "ssh" | "ftp"` props + `fullHeight`；按 source 分发；FTP 初始路径用 `/`（不支持 `~`）
-- `TabBar.tsx` — tab 图标按 connType 切换
+### 闃舵 7.E锛欶TP 鏀寔锛堟渶澶ф敼鍔級
+- **鐘舵€侊細** complete
+- **suppaftp v8 API 鎺㈢储韪╁潙锛?*
+  - `types::File` 涓嶅瓨鍦?鈫?`list::File`
+  - `AsyncRustlsConnector` 闇€瑕佸閮?rustls/webpki-roots 鐩存帴渚濊禆 鈫?鏆傜紦 TLS锛堣繑鍥為敊璇紩瀵奸€?`ftp_tls=none`锛?
+  - `passive()` 鏂规硶涓嶅瓨鍦?鈫?v8 榛樿灏辨槸 PASV锛涘垏 active 鐢?`stream.active_mode(timeout)`
+  - `mlsd/list` 杩斿洖 `Vec<String>` 涓嶆槸 `Vec<File>` 鈫?蹇呴』鐢?`ListParser::parse_mlsd().or_else(parse_posix)` 閫愯瑙ｆ瀽
+- `ftp.rs` 鈥?`FtpSession { stream: AsyncFtpStream }`锛沜onnect/list/mkdir/remove/rename/disconnect锛沗format_pex` POSIX 鏉冮檺涓诧紱`format_time`+`days_to_ymd` 鏃?chrono 杞涓烘棩鏈?
+- `main.rs` 鈥?6 涓柊鍛戒护锛汧TP 鍊熻繕鏈?`take_ftp_session`/`return_ftp_session`锛坄AsyncFtpStream` 涓?Clone锛屽繀椤?take 鈫?鐢?鈫?return锛夛紱`drain_all_sessions` 鍚屾 clear FTP map锛坉rop 鍗冲叧 socket锛?
+- `api.ts` 鈥?`ftpConnect/ListDir/Mkdir/Remove/Rename/Disconnect` 鍖呰
+- `App.tsx::handleConnect` 鈥?鎸?`conn_type` 鍒嗘祦锛歠tp 鈫?鐙珛 FTP tab锛泂ftp 鈫?ssh tab+sftp type锛泂sh 鈫?terminal锛沗handleCloseTab` 鎸?connType 璋冨搴?disconnect
+- `SftpPanel.tsx` 鈥?`source: "ssh" | "ftp"` props + `fullHeight`锛涙寜 source 鍒嗗彂锛汧TP 鍒濆璺緞鐢?`/`锛堜笉鏀寔 `~`锛?
+- `TabBar.tsx` 鈥?tab 鍥炬爣鎸?connType 鍒囨崲
 
-### 阶段 7.F：Stage 4 验证（运行时）
-- **状态：** pending（待用户参与）
-- **已就绪代码侧：** `MAX_BUFFER_SIZE=256KB` 防前端 OOM；ZMODEM chunk 8KB；5s abort setTimeout 兜底已加
-- **待跑测试：**
-  1. `dd if=/dev/urandom of=big.bin bs=1M count=5120` → rz + sz → 任务管理器观察 myshell.exe 峰值 <100MB
-  2. 单 tab 连续 10 次 `sz fileN` → 监控 zmodem_files Mutex 不阻塞
-  3. ZMODEM abort → 5s 后强制 reset 验证
+### 闃舵 7.F锛歋tage 4 楠岃瘉锛堣繍琛屾椂锛?
+- **鐘舵€侊細** pending锛堝緟鐢ㄦ埛鍙備笌锛?
+- **宸插氨缁唬鐮佷晶锛?* `MAX_BUFFER_SIZE=256KB` 闃插墠绔?OOM锛沍MODEM chunk 8KB锛?s abort setTimeout 鍏滃簳宸插姞
+- **寰呰窇娴嬭瘯锛?*
+  1. `dd if=/dev/urandom of=big.bin bs=1M count=5120` 鈫?rz + sz 鈫?浠诲姟绠＄悊鍣ㄨ瀵?myshell.exe 宄板€?<100MB
+  2. 鍗?tab 杩炵画 10 娆?`sz fileN` 鈫?鐩戞帶 zmodem_files Mutex 涓嶉樆濉?
+  3. ZMODEM abort 鈫?5s 鍚庡己鍒?reset 楠岃瘉
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | Phase A-E 全部完成；cargo build + tsc --noEmit 双绿 |
-| 我要去哪里？ | Phase F 运行时验证；之后启动 `cargo tauri dev` 让用户连真实服务器端到端测试 |
-| 目标是什么？ | 5 大需求完整可用 |
-| 我学到了什么？ | suppaftp v8 API 大改（无 `passive()`/`types::File`，mlsd 返回 String）；FTP session 因 `AsyncFtpStream` 不 Clone 必须用 take/return 借还术；russh 0.50 Handle 是 Arc 可多开 channel — exec channel 与 PTY channel 共存（ServerInfo panel 与终端同时工作） |
-| 我做了什么？ | Phase A：DB schema；Phase B：UI 美化；Phase C：树形文件夹；Phase D：服务器信息侧栏；Phase E：FTP 全栈 |
+| 鎴戝湪鍝噷锛?| Phase A-E 鍏ㄩ儴瀹屾垚锛沜argo build + tsc --noEmit 鍙岀豢 |
+| 鎴戣鍘诲摢閲岋紵 | Phase F 杩愯鏃堕獙璇侊紱涔嬪悗鍚姩 `cargo tauri dev` 璁╃敤鎴疯繛鐪熷疄鏈嶅姟鍣ㄧ鍒扮娴嬭瘯 |
+| 鐩爣鏄粈涔堬紵 | 5 澶ч渶姹傚畬鏁村彲鐢?|
+| 鎴戝鍒颁簡浠€涔堬紵 | suppaftp v8 API 澶ф敼锛堟棤 `passive()`/`types::File`锛宮lsd 杩斿洖 String锛夛紱FTP session 鍥?`AsyncFtpStream` 涓?Clone 蹇呴』鐢?take/return 鍊熻繕鏈紱russh 0.50 Handle 鏄?Arc 鍙寮€ channel 鈥?exec channel 涓?PTY channel 鍏卞瓨锛圫erverInfo panel 涓庣粓绔悓鏃跺伐浣滐級 |
+| 鎴戝仛浜嗕粈涔堬紵 | Phase A锛欴B schema锛汸hase B锛歎I 缇庡寲锛汸hase C锛氭爲褰㈡枃浠跺す锛汸hase D锛氭湇鍔″櫒淇℃伅渚ф爮锛汸hase E锛欶TP 鍏ㄦ爤 |
 
-## 会话：2026-06-15 — 全局 + 服务器专属快捷命令
+## 浼氳瘽锛?026-06-15 鈥?鍏ㄥ眬 + 鏈嶅姟鍣ㄤ笓灞炲揩鎹峰懡浠?
 
-### 阶段 8：快捷命令功能（全局 + 服务器专属 + 多行顺序执行）
-- **状态：** complete（cargo check + tsc + clippy 新代码三绿；端到端待用户手动验证）
-- **需求：** 设置中添加全局快捷命令；针对当前服务器的专属快捷命令；多行命令按行顺序执行；终端一键点击直接执行
-- **设计决策（与用户确认）：**
-  - 数据模型：单表 `quick_commands`，`connection_id` 为 NULL=全局、非 NULL=服务器专属；执行面板一条 SQL（`WHERE connection_id IS NULL OR connection_id = ?`）联合取全局+专属
-  - NULL 安全：db.rs 按 scope 分支构造 SQL（None→`IS NULL`，Some→`= ?1`），规避 `connection_id IS ?1` 跨 SQLite 版本语义风险
-  - 多行执行：前端按 `\r?\n` 拆行→trim→跳过空行和行首 `#` 注释→用 `\r` 拼接一次性 `sshSend`（PTY 必须用 `\r` 触发执行，`\n` 不触发）；复用 `sshSend` + 广播扇出
-  - 管理界面：独立 `QuickCommandsPanel`（作用域下拉切换 全局/任意服务器），入口三处（侧边栏 🧩 / 终端执行面板"管理"链接 / 设置面板内 Section）
-  - 点击行为：直接执行（不填输入框，符合"快捷"定位）
-  - 不写入 command_history（多行语义与单行历史模型不匹配）
-  - `delete_connection` 改造为事务 + 级联清理该服务器的专属命令（command_history 保持现状不级联，向后兼容）
-- **修改明细：**
-  - `src-tauri/src/db.rs` — `init_db` 加 `quick_commands` 表 + 2 索引；`QuickCommandTuple` type alias（消 clippy complex_type warning）；6 个 CRUD（`add_quick_command`/`list_quick_commands`/`list_quick_commands_for_connection` 联合查询/`update_quick_command`/`update_quick_command_order`/`delete_quick_command`）；`delete_connection` 改事务级联
-  - `src-tauri/src/main.rs` — `QuickCommandItem`/`QuickCommandExecItem` struct；6 个 `#[tauri::command]`（同步，明文不调 `require_dek`）；`generate_handler!` 注册
-  - `src/api.ts` — `QuickCommandItem`/`QuickCommandExecItem` interface + 6 个 invoke 包装（按 connectionId 键控，与 command_history 同约定）
-  - `src/components/QuickCommandsPanel.tsx`（新建）— 统一管理面板：作用域下拉切换 + CRUD 列表 + 内联编辑表单 + ↑↓排序（交换相邻 sortOrder）
-  - `src/components/CommandBar.tsx` — `⌨ 快捷` 按钮 + 浮层面板（🌐 全局 / 📌 本服务器专属 分组）+ `handleExecuteQuickCommand`（多行 `\r` 拼接 + 跳过空行/注释 + 广播扇出）+ `QuickCommandGroup` 子组件
-  - `src/components/TerminalPanel.tsx` — 透传 `onOpenQuickCommandsManage` prop
-  - `src/App.tsx` — `showQuickCommands`/`qcInitialConnectionId` state + 面板渲染 + 三入口接线（Sidebar/CommandBar 管理/SettingsPanel）
-  - `src/components/Sidebar.tsx` — 🧩 按钮（同款 IconBtn）
-  - `src/components/SettingsPanel.tsx` — "快捷命令" Section 入口
-- **验证：**
-  - `cargo check` PASS（8m52s，首次编译 tauri 全套依赖；零错误零警告）
-  - `cargo clippy` 新代码 0 warning（修复 `list_quick_commands` 的 "very complex type" → `QuickCommandTuple` type alias）；剩余 5 个 warning 均为项目预存（ssh.rs:249 / db.rs:243 / backup.rs:187 / main.rs:303 / backup create）
+### 闃舵 8锛氬揩鎹峰懡浠ゅ姛鑳斤紙鍏ㄥ眬 + 鏈嶅姟鍣ㄤ笓灞?+ 澶氳椤哄簭鎵ц锛?
+- **鐘舵€侊細** complete锛坈argo check + tsc + clippy 鏂颁唬鐮佷笁缁匡紱绔埌绔緟鐢ㄦ埛鎵嬪姩楠岃瘉锛?
+- **闇€姹傦細** 璁剧疆涓坊鍔犲叏灞€蹇嵎鍛戒护锛涢拡瀵瑰綋鍓嶆湇鍔″櫒鐨勪笓灞炲揩鎹峰懡浠わ紱澶氳鍛戒护鎸夎椤哄簭鎵ц锛涚粓绔竴閿偣鍑荤洿鎺ユ墽琛?
+- **璁捐鍐崇瓥锛堜笌鐢ㄦ埛纭锛夛細**
+  - 鏁版嵁妯″瀷锛氬崟琛?`quick_commands`锛宍connection_id` 涓?NULL=鍏ㄥ眬銆侀潪 NULL=鏈嶅姟鍣ㄤ笓灞烇紱鎵ц闈㈡澘涓€鏉?SQL锛坄WHERE connection_id IS NULL OR connection_id = ?`锛夎仈鍚堝彇鍏ㄥ眬+涓撳睘
+  - NULL 瀹夊叏锛歞b.rs 鎸?scope 鍒嗘敮鏋勯€?SQL锛圢one鈫抈IS NULL`锛孲ome鈫抈= ?1`锛夛紝瑙勯伩 `connection_id IS ?1` 璺?SQLite 鐗堟湰璇箟椋庨櫓
+  - 澶氳鎵ц锛氬墠绔寜 `\r?\n` 鎷嗚鈫抰rim鈫掕烦杩囩┖琛屽拰琛岄 `#` 娉ㄩ噴鈫掔敤 `\r` 鎷兼帴涓€娆℃€?`sshSend`锛圥TY 蹇呴』鐢?`\r` 瑙﹀彂鎵ц锛宍\n` 涓嶈Е鍙戯級锛涘鐢?`sshSend` + 骞挎挱鎵囧嚭
+  - 绠＄悊鐣岄潰锛氱嫭绔?`QuickCommandsPanel`锛堜綔鐢ㄥ煙涓嬫媺鍒囨崲 鍏ㄥ眬/浠绘剰鏈嶅姟鍣級锛屽叆鍙ｄ笁澶勶紙渚ц竟鏍?馃З / 缁堢鎵ц闈㈡澘"绠＄悊"閾炬帴 / 璁剧疆闈㈡澘鍐?Section锛?
+  - 鐐瑰嚮琛屼负锛氱洿鎺ユ墽琛岋紙涓嶅～杈撳叆妗嗭紝绗﹀悎"蹇嵎"瀹氫綅锛?
+  - 涓嶅啓鍏?command_history锛堝琛岃涔変笌鍗曡鍘嗗彶妯″瀷涓嶅尮閰嶏級
+  - `delete_connection` 鏀归€犱负浜嬪姟 + 绾ц仈娓呯悊璇ユ湇鍔″櫒鐨勪笓灞炲懡浠わ紙command_history 淇濇寔鐜扮姸涓嶇骇鑱旓紝鍚戝悗鍏煎锛?
+- **淇敼鏄庣粏锛?*
+  - `src-tauri/src/db.rs` 鈥?`init_db` 鍔?`quick_commands` 琛?+ 2 绱㈠紩锛沗QuickCommandTuple` type alias锛堟秷 clippy complex_type warning锛夛紱6 涓?CRUD锛坄add_quick_command`/`list_quick_commands`/`list_quick_commands_for_connection` 鑱斿悎鏌ヨ/`update_quick_command`/`update_quick_command_order`/`delete_quick_command`锛夛紱`delete_connection` 鏀逛簨鍔＄骇鑱?
+  - `src-tauri/src/main.rs` 鈥?`QuickCommandItem`/`QuickCommandExecItem` struct锛? 涓?`#[tauri::command]`锛堝悓姝ワ紝鏄庢枃涓嶈皟 `require_dek`锛夛紱`generate_handler!` 娉ㄥ唽
+  - `src/api.ts` 鈥?`QuickCommandItem`/`QuickCommandExecItem` interface + 6 涓?invoke 鍖呰锛堟寜 connectionId 閿帶锛屼笌 command_history 鍚岀害瀹氾級
+  - `src/components/QuickCommandsPanel.tsx`锛堟柊寤猴級鈥?缁熶竴绠＄悊闈㈡澘锛氫綔鐢ㄥ煙涓嬫媺鍒囨崲 + CRUD 鍒楄〃 + 鍐呰仈缂栬緫琛ㄥ崟 + 鈫戔啌鎺掑簭锛堜氦鎹㈢浉閭?sortOrder锛?
+  - `src/components/CommandBar.tsx` 鈥?`鈱?蹇嵎` 鎸夐挳 + 娴眰闈㈡澘锛堭煂?鍏ㄥ眬 / 馃搶 鏈湇鍔″櫒涓撳睘 鍒嗙粍锛? `handleExecuteQuickCommand`锛堝琛?`\r` 鎷兼帴 + 璺宠繃绌鸿/娉ㄩ噴 + 骞挎挱鎵囧嚭锛? `QuickCommandGroup` 瀛愮粍浠?
+  - `src/components/TerminalPanel.tsx` 鈥?閫忎紶 `onOpenQuickCommandsManage` prop
+  - `src/App.tsx` 鈥?`showQuickCommands`/`qcInitialConnectionId` state + 闈㈡澘娓叉煋 + 涓夊叆鍙ｆ帴绾匡紙Sidebar/CommandBar 绠＄悊/SettingsPanel锛?
+  - `src/components/Sidebar.tsx` 鈥?馃З 鎸夐挳锛堝悓娆?IconBtn锛?
+  - `src/components/SettingsPanel.tsx` 鈥?"蹇嵎鍛戒护" Section 鍏ュ彛
+- **楠岃瘉锛?*
+  - `cargo check` PASS锛?m52s锛岄娆＄紪璇?tauri 鍏ㄥ渚濊禆锛涢浂閿欒闆惰鍛婏級
+  - `cargo clippy` 鏂颁唬鐮?0 warning锛堜慨澶?`list_quick_commands` 鐨?"very complex type" 鈫?`QuickCommandTuple` type alias锛夛紱鍓╀綑 5 涓?warning 鍧囦负椤圭洰棰勫瓨锛坰sh.rs:249 / db.rs:243 / backup.rs:187 / main.rs:303 / backup create锛?
   - `npx tsc --noEmit` PASS
-- **待手动 E2E（需真实 SSH 服务器）：**
-  1. 管理面板：全局新增 `echo global`；当前服务器新增多行 `cd /tmp`+`# 注释`+`echo $PWD`
-  2. 终端 `⌨ 快捷`：两组命令分组显示，点击直接执行；多行按顺序、空行/注释跳过
-  3. 广播：两 tab 广播，点快捷命令同步执行
-  4. 级联：删除服务器，专属命令被清、全局保留；重连后面板仍能列出并执行
-- **遗留风险/限制：**
-  - heredoc（`<<EOF`）体内 `#` 开头行/空行会被过滤误删 — 面板文案已提示，未来可加 per-command raw 开关
-  - 多行执行依赖 PTY 行缓冲保证顺序；`cd` 等状态依赖命令需用户在同一快捷命令内写好
-  - 图标避开 `⚡`（重连按钮已占用，CommandBar.tsx:186）：执行按钮用 `⌨`，管理入口用 `🧩`
-- **首次编译踩坑：** `cargo check` 首次因网络中断下载 `web-sys`（reqwest→tauri 依赖）失败（`schannel: server closed abruptly`），重试一次后成功
+- **寰呮墜鍔?E2E锛堥渶鐪熷疄 SSH 鏈嶅姟鍣級锛?*
+  1. 绠＄悊闈㈡澘锛氬叏灞€鏂板 `echo global`锛涘綋鍓嶆湇鍔″櫒鏂板澶氳 `cd /tmp`+`# 娉ㄩ噴`+`echo $PWD`
+  2. 缁堢 `鈱?蹇嵎`锛氫袱缁勫懡浠ゅ垎缁勬樉绀猴紝鐐瑰嚮鐩存帴鎵ц锛涘琛屾寜椤哄簭銆佺┖琛?娉ㄩ噴璺宠繃
+  3. 骞挎挱锛氫袱 tab 骞挎挱锛岀偣蹇嵎鍛戒护鍚屾鎵ц
+  4. 绾ц仈锛氬垹闄ゆ湇鍔″櫒锛屼笓灞炲懡浠よ娓呫€佸叏灞€淇濈暀锛涢噸杩炲悗闈㈡澘浠嶈兘鍒楀嚭骞舵墽琛?
+- **閬楃暀椋庨櫓/闄愬埗锛?*
+  - heredoc锛坄<<EOF`锛変綋鍐?`#` 寮€澶磋/绌鸿浼氳杩囨护璇垹 鈥?闈㈡澘鏂囨宸叉彁绀猴紝鏈潵鍙姞 per-command raw 寮€鍏?
+  - 澶氳鎵ц渚濊禆 PTY 琛岀紦鍐蹭繚璇侀『搴忥紱`cd` 绛夌姸鎬佷緷璧栧懡浠ら渶鐢ㄦ埛鍦ㄥ悓涓€蹇嵎鍛戒护鍐呭啓濂?
+  - 鍥炬爣閬垮紑 `鈿锛堥噸杩炴寜閽凡鍗犵敤锛孋ommandBar.tsx:186锛夛細鎵ц鎸夐挳鐢?`鈱╜锛岀鐞嗗叆鍙ｇ敤 `馃З`
+- **棣栨缂栬瘧韪╁潙锛?* `cargo check` 棣栨鍥犵綉缁滀腑鏂笅杞?`web-sys`锛坮eqwest鈫抰auri 渚濊禆锛夊け璐ワ紙`schannel: server closed abruptly`锛夛紝閲嶈瘯涓€娆″悗鎴愬姛
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 8 快捷命令功能完成；cargo check + tsc + clippy（新代码）三绿 |
-| 我要去哪里？ | 用户运行 `cargo tauri dev` 连真实服务器跑 E2E（多行 `\r` 执行顺序是验证重点） |
-| 目标是什么？ | 全局+服务器专属快捷命令，多行按行顺序执行，终端一键点击直接运行 |
-| 我学到了什么？ | command_history 是快捷命令的天然模板（同款建表/CRUD/IPC/执行通道）；PTY 多行必须用 `\r` 拼接而非 `\n`；`connection_id IS ?1` 的 NULL 语义跨版本有风险，应按 scope 分支构造 SQL；rusqlite `query_map` 两分支若用不同闭包字面量会类型不一致，需提取成函数指针（fn 类型）复用 |
-| 我做了什么？ | 阶段 8：db 建表+CRUD+级联；main struct+commands+注册；api.ts 封装；CommandBar 执行面板；QuickCommandsPanel 管理面板；App/Sidebar/SettingsPanel/TerminalPanel 接线 |
+| 鎴戝湪鍝噷锛?| 闃舵 8 蹇嵎鍛戒护鍔熻兘瀹屾垚锛沜argo check + tsc + clippy锛堟柊浠ｇ爜锛変笁缁?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛杩愯 `cargo tauri dev` 杩炵湡瀹炴湇鍔″櫒璺?E2E锛堝琛?`\r` 鎵ц椤哄簭鏄獙璇侀噸鐐癸級 |
+| 鐩爣鏄粈涔堬紵 | 鍏ㄥ眬+鏈嶅姟鍣ㄤ笓灞炲揩鎹峰懡浠わ紝澶氳鎸夎椤哄簭鎵ц锛岀粓绔竴閿偣鍑荤洿鎺ヨ繍琛?|
+| 鎴戝鍒颁簡浠€涔堬紵 | command_history 鏄揩鎹峰懡浠ょ殑澶╃劧妯℃澘锛堝悓娆惧缓琛?CRUD/IPC/鎵ц閫氶亾锛夛紱PTY 澶氳蹇呴』鐢?`\r` 鎷兼帴鑰岄潪 `\n`锛沗connection_id IS ?1` 鐨?NULL 璇箟璺ㄧ増鏈湁椋庨櫓锛屽簲鎸?scope 鍒嗘敮鏋勯€?SQL锛況usqlite `query_map` 涓ゅ垎鏀嫢鐢ㄤ笉鍚岄棴鍖呭瓧闈㈤噺浼氱被鍨嬩笉涓€鑷达紝闇€鎻愬彇鎴愬嚱鏁版寚閽堬紙fn 绫诲瀷锛夊鐢?|
+| 鎴戝仛浜嗕粈涔堬紵 | 闃舵 8锛歞b 寤鸿〃+CRUD+绾ц仈锛沵ain struct+commands+娉ㄥ唽锛沘pi.ts 灏佽锛汣ommandBar 鎵ц闈㈡澘锛決uickCommandsPanel 绠＄悊闈㈡澘锛汚pp/Sidebar/SettingsPanel/TerminalPanel 鎺ョ嚎 |
 
-## 会话：2026-06-15 — 日志增强（7 天保留 + 结构化诊断日志）
+## 浼氳瘽锛?026-06-15 鈥?鏃ュ織澧炲己锛? 澶╀繚鐣?+ 缁撴瀯鍖栬瘖鏂棩蹇楋級
 
-### 阶段 9：日志系统加固
-- **状态：** complete（cargo clippy 通过，新代码 0 warning）
-- **需求：** 多增加日志方便后续定位问题；默认删除 7 天前的日志
-- **现有机制发现：** release 模式已有 `setup_file_logging`（Windows CRT `_open_osfhandle` + `_dup2` 把 stderr fd 2 重定向到按天命名的文件 `<config_dir>/myshell/logs/myshell-{day}.log`），所有 `eprintln!` 已落盘；但保留期是 14 天，且 `env_logger::init()` 默认 error 级别导致 `log::info!/warn!` 被过滤掉
-- **改动明细：**
+### 闃舵 9锛氭棩蹇楃郴缁熷姞鍥?
+- **鐘舵€侊細** complete锛坈argo clippy 閫氳繃锛屾柊浠ｇ爜 0 warning锛?
+- **闇€姹傦細** 澶氬鍔犳棩蹇楁柟渚垮悗缁畾浣嶉棶棰橈紱榛樿鍒犻櫎 7 澶╁墠鐨勬棩蹇?
+- **鐜版湁鏈哄埗鍙戠幇锛?* release 妯″紡宸叉湁 `setup_file_logging`锛圵indows CRT `_open_osfhandle` + `_dup2` 鎶?stderr fd 2 閲嶅畾鍚戝埌鎸夊ぉ鍛藉悕鐨勬枃浠?`<config_dir>/myshell/logs/myshell-{day}.log`锛夛紝鎵€鏈?`eprintln!` 宸茶惤鐩橈紱浣嗕繚鐣欐湡鏄?14 澶╋紝涓?`env_logger::init()` 榛樿 error 绾у埆瀵艰嚧 `log::info!/warn!` 琚繃婊ゆ帀
+- **鏀瑰姩鏄庣粏锛?*
   - `src-tauri/src/main.rs` `setup_file_logging`
-    - 清理阈值 14 天 → **7 天**（`60*60*24*14` → `*7`，含 doc 注释）
-    - 清理逻辑统计删除数量（`pruned: u32` 计数），在 dup2 完成后的 startup banner 输出（dup2 之前的日志写原始 stderr，release 会丢失）
-    - startup banner 从 `eprintln!`（无格式 epoch 秒）→ `log::info!`（带级别/时间戳/保留期/清理数）
+    - 娓呯悊闃堝€?14 澶?鈫?**7 澶?*锛坄60*60*24*14` 鈫?`*7`锛屽惈 doc 娉ㄩ噴锛?
+    - 娓呯悊閫昏緫缁熻鍒犻櫎鏁伴噺锛坄pruned: u32` 璁℃暟锛夛紝鍦?dup2 瀹屾垚鍚庣殑 startup banner 杈撳嚭锛坉up2 涔嬪墠鐨勬棩蹇楀啓鍘熷 stderr锛宺elease 浼氫涪澶憋級
+    - startup banner 浠?`eprintln!`锛堟棤鏍煎紡 epoch 绉掞級鈫?`log::info!`锛堝甫绾у埆/鏃堕棿鎴?淇濈暀鏈?娓呯悊鏁帮級
   - `src-tauri/src/main.rs` `run()`
-    - `env_logger::init()` → `Builder::from_env(Env::default().default_filter_or("info")).format_timestamp_millis()` —— 让 log 宏在默认级别生效；RUST_LOG 仍可覆盖（如 `RUST_LOG=myshell=debug` 排查）
-    - 启动阶段日志：db 初始化 info、schema 迁移结果（失败 warn / 成功 info）、backup 检查失败 warn
-  - `src-tauri/src/main.rs` 关键诊断路径
-    - `ssh_connect`：请求（user@host:port + auth + proxy）、成功（sid + target）、失败（error + 原因）
-    - `ssh_disconnect`：disconnect requested
-    - `delete_connection`：keyring 删除失败 warn、完成 info（级联清理提示）
-    - 快捷命令 `add_quick_command` / `update_quick_command` / `delete_quick_command`：info（id / label / scope）
-  - `src-tauri/src/ssh.rs` `channel_reader`：启动 started + 退出 exited（info）—— 定位 SSH 输出中断/会话结束的关键
-- **保留未改：** 现有 `eprintln!`（debug 数据流 `Data N bytes`、PTY 步骤等）保留 —— release 已通过 stderr 重定向写入文件，工作正常，避免全量替换引入风险
-- **验证：** `cargo clippy` PASS（7.93s 增量编译，0 错误）；新代码 0 warning（5 个 warning 均为项目预存：backup sort_by / main.rs manual_strip / main.rs open_options / ssh.rs field assignment / db.rs complex type）
-- **日志查看：** release 用户看 `%APPDATA%/myshell/logs/myshell-{day}.log`；开发 debug 看控制台；排查连接问题搜 `[ssh]` 前缀（connect requested → connected/failed → channel_reader started/exited 完整链路）
+    - `env_logger::init()` 鈫?`Builder::from_env(Env::default().default_filter_or("info")).format_timestamp_millis()` 鈥斺€?璁?log 瀹忓湪榛樿绾у埆鐢熸晥锛汻UST_LOG 浠嶅彲瑕嗙洊锛堝 `RUST_LOG=myshell=debug` 鎺掓煡锛?
+    - 鍚姩闃舵鏃ュ織锛歞b 鍒濆鍖?info銆乻chema 杩佺Щ缁撴灉锛堝け璐?warn / 鎴愬姛 info锛夈€乥ackup 妫€鏌ュけ璐?warn
+  - `src-tauri/src/main.rs` 鍏抽敭璇婃柇璺緞
+    - `ssh_connect`锛氳姹傦紙user@host:port + auth + proxy锛夈€佹垚鍔燂紙sid + target锛夈€佸け璐ワ紙error + 鍘熷洜锛?
+    - `ssh_disconnect`锛歞isconnect requested
+    - `delete_connection`锛歬eyring 鍒犻櫎澶辫触 warn銆佸畬鎴?info锛堢骇鑱旀竻鐞嗘彁绀猴級
+    - 蹇嵎鍛戒护 `add_quick_command` / `update_quick_command` / `delete_quick_command`锛歩nfo锛坕d / label / scope锛?
+  - `src-tauri/src/ssh.rs` `channel_reader`锛氬惎鍔?started + 閫€鍑?exited锛坕nfo锛夆€斺€?瀹氫綅 SSH 杈撳嚭涓柇/浼氳瘽缁撴潫鐨勫叧閿?
+- **淇濈暀鏈敼锛?* 鐜版湁 `eprintln!`锛坉ebug 鏁版嵁娴?`Data N bytes`銆丳TY 姝ラ绛夛級淇濈暀 鈥斺€?release 宸查€氳繃 stderr 閲嶅畾鍚戝啓鍏ユ枃浠讹紝宸ヤ綔姝ｅ父锛岄伩鍏嶅叏閲忔浛鎹㈠紩鍏ラ闄?
+- **楠岃瘉锛?* `cargo clippy` PASS锛?.93s 澧為噺缂栬瘧锛? 閿欒锛夛紱鏂颁唬鐮?0 warning锛? 涓?warning 鍧囦负椤圭洰棰勫瓨锛歜ackup sort_by / main.rs manual_strip / main.rs open_options / ssh.rs field assignment / db.rs complex type锛?
+- **鏃ュ織鏌ョ湅锛?* release 鐢ㄦ埛鐪?`%APPDATA%/myshell/logs/myshell-{day}.log`锛涘紑鍙?debug 鐪嬫帶鍒跺彴锛涙帓鏌ヨ繛鎺ラ棶棰樻悳 `[ssh]` 鍓嶇紑锛坈onnect requested 鈫?connected/failed 鈫?channel_reader started/exited 瀹屾暣閾捐矾锛?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 9 日志增强完成；cargo clippy 通过 |
-| 我要去哪里？ | release 运行验证日志文件实际写入 + 7 天清理生效（需积累日志或手动测试清理逻辑） |
-| 目标是什么？ | 通过日志文件能定位问题，自动清理 7 天前日志 |
-| 我学到了什么？ | 现有已有 setup_file_logging（dup2 stderr → 按天文件），只需调阈值 + 配置 env_logger 级别即可让 log 宏生效，无需重写日志框架；env_logger 默认 error 级别会吞掉 info/warn，必须显式 `default_filter_or("info")`；dup2 之前的日志写原始 stderr（release 丢失），所以清理计数要在 dup2 后的 banner 输出 |
-| 我做了什么？ | 阶段 9：清理 14→7 天；env_logger 配 info + 毫秒时间戳；startup / SSH 生命周期 / 快捷命令 / delete_connection / channel_reader 补充结构化日志 |
+| 鎴戝湪鍝噷锛?| 闃舵 9 鏃ュ織澧炲己瀹屾垚锛沜argo clippy 閫氳繃 |
+| 鎴戣鍘诲摢閲岋紵 | release 杩愯楠岃瘉鏃ュ織鏂囦欢瀹為檯鍐欏叆 + 7 澶╂竻鐞嗙敓鏁堬紙闇€绉疮鏃ュ織鎴栨墜鍔ㄦ祴璇曟竻鐞嗛€昏緫锛?|
+| 鐩爣鏄粈涔堬紵 | 閫氳繃鏃ュ織鏂囦欢鑳藉畾浣嶉棶棰橈紝鑷姩娓呯悊 7 澶╁墠鏃ュ織 |
+| 鎴戝鍒颁簡浠€涔堬紵 | 鐜版湁宸叉湁 setup_file_logging锛坉up2 stderr 鈫?鎸夊ぉ鏂囦欢锛夛紝鍙渶璋冮槇鍊?+ 閰嶇疆 env_logger 绾у埆鍗冲彲璁?log 瀹忕敓鏁堬紝鏃犻渶閲嶅啓鏃ュ織妗嗘灦锛沞nv_logger 榛樿 error 绾у埆浼氬悶鎺?info/warn锛屽繀椤绘樉寮?`default_filter_or("info")`锛沝up2 涔嬪墠鐨勬棩蹇楀啓鍘熷 stderr锛坮elease 涓㈠け锛夛紝鎵€浠ユ竻鐞嗚鏁拌鍦?dup2 鍚庣殑 banner 杈撳嚭 |
+| 鎴戝仛浜嗕粈涔堬紵 | 闃舵 9锛氭竻鐞?14鈫? 澶╋紱env_logger 閰?info + 姣鏃堕棿鎴筹紱startup / SSH 鐢熷懡鍛ㄦ湡 / 蹇嵎鍛戒护 / delete_connection / channel_reader 琛ュ厖缁撴瀯鍖栨棩蹇?|
 
-## 会话：2026-06-17 — 本地终端（连接本地 PowerShell / CMD / WSL / 自定义 shell）
+## 浼氳瘽锛?026-06-17 鈥?鏈湴缁堢锛堣繛鎺ユ湰鍦?PowerShell / CMD / WSL / 鑷畾涔?shell锛?
 
-### 阶段 10：本地终端全栈（conn_type='local'）
-- **状态：** 前端 complete（tsc 通过）；后端代码 complete 但 **未编译验证**（环境无 rustup）；端到端待用户 `cargo build` + 运行
-- **需求：** 在 MyShell 里直连本地的 PowerShell / CMD / WSL / 自定义 shell，作为可保存的连接（进文件夹、带 shell 配置），与 SSH 终端体验一致
-- **设计决策（与用户确认）：**
-  - 入口形态：本地终端作为 `conn_type='local'` 的一种 `ConnectionConfig`，复用现有连接管理 / 文件夹 / 命令历史 / 快捷命令全套 —— 不新建表、不新写管理 UI
-  - 复用 SSH 事件通道：本地后端 emit 现有的 `ssh_output` / `ssh_closed`，`TerminalPanel` 事件订阅零改动，只按 `connType` 选 connect/send/resize/disconnect 命令
-  - vault 解锁保持现状：本地连接行随 connections 表加密存储，列出需解锁（`get_connections` 的 DEK 门禁自动覆盖）；`local_connect` 本身不需要密码/DEK
-  - shell 配置双字段：`shell_path`（可执行路径，明文列）+ `shell_args`（可选参数）—— 不用单字段命令串，避免 `C:\Program Files\...` 空格被 split 破坏
-  - 技术选型：`portable-pty`（Windows ConPTY / Unix openpty，wezterm 出品）。`std::process` + pipe 因无 PTY 被否决（交互式 TUI / 颜色 / resize 全废）
-- **修改明细：**
-  - `src-tauri/Cargo.toml` — 加 `portable-pty = "0.8"`
-  - `src-tauri/src/local.rs`（新建）— `LocalCommand` 枚举（Input/Resize/Disconnect，本地无 ZMODEM）+ `LocalSession { command_tx }` + `connect`：openpty → spawn shell → **reader 阻塞线程**（`spawn_blocking`，因 portable-pty reader 是阻塞 `Read`）emit `ssh_output`，EOF emit `ssh_closed` + 从 map 移除；**writer 任务**（async，持 master）处理 Input/Resize/Disconnect（Disconnect 时 `child.kill()`）。`send_input`/`resize_terminal`/`disconnect` 镜像 ssh.rs
-  - `src-tauri/src/db.rs` — `init_db` 加 `shell_path`/`shell_args` 明文列；`migrate_legacy_schema` 加幂等迁移（`column_exists` 探测 + `ALTER TABLE ADD COLUMN`）；`get_all_connections`/`get_connection`/`save_connection` 三处 SELECT+元组+INSERT 同步加列
-  - `src-tauri/src/main.rs` — `mod local`；`ConnectionConfig` 加 `shell_path`/`shell_args`（`#[serde(default)]`）；`AppState.local_sessions` map + 初始化；`drain_all_sessions` 加 local 清理（发 `LocalCommand::Disconnect`）；4 命令 `local_connect`/`local_send`/`local_resize`/`local_disconnect`（`local_send` 复用 256KB 输入上限）+ `generate_handler!` 注册
-  - `src/api.ts` — `ConnType` 加 `"local"`；`ConnectionConfig` 加 `shell_path`/`shell_args`（snake_case，匹配后端 serde 默认）；4 个 wrapper
-  - `src/App.tsx` — `handleConnect`/`handleReconnect`/`handleCloseTab` 加 `connType==='local'` 分支（`localConnect`/`localDisconnect`，display name 用 `config.name`）；TerminalPanel 透传 `connType`
-  - `src/components/TerminalPanel.tsx` — `connType` prop + `connTypeRef` + `sendTo`/`resizeTo` 分发（按 connType 选 ssh_*/local_*）；事件订阅 `onSshOutput`/`onSshClosed` 原样复用
-  - `src/components/CommandBar.tsx` — `connType` prop + `sendFn` 分发（**修复**：原本直接 `sshSend`，本地 tab 命令会发错后端；现按 connType 选 sshSend/localSend）
-  - `src/components/ConnectionDialog.tsx` — `TYPE_OPTIONS` 加 local + `SHELL_PRESETS`（pwsh/powershell/cmd/wsl/git-bash）；`connType==='local'` 时表单只显示 名称/分组/shell 选择+路径+参数，隐藏 host/port/auth/proxy；`handleSave` local 分支（host="" port=0 username=""，shell_path 必填校验）
-  - `src/components/Sidebar.tsx` — `CONN_ICONS` 加 `local: 💻`
-- **验证：**
-  - `npx tsc --noEmit` PASS（首次 3 个错误：ConnectionDialog 误用 `shell_path`/`shell_args` 而 api.ts 我先写成了 camelCase `shellPath`/`shellArgs`；统一为 snake_case 与其他字段一致后通过）
-  - Rust `cargo build` **未执行**（环境无 rustup）—— 最可能的调整点是 portable-pty 0.8 的 `take_writer`/`spawn_command` 返回的 trait bound
-- **遗留风险 / 待验证：**
-  - **ConPTY 编码**：Windows 上 portable-pty 输出按 shell 的 console codepage 走（pwsh=UTF-8 正常；Windows PowerShell 5.1 在中文系统可能 GBK → xterm 中文乱码）。v1 emit 原始字节（与 SSH 一致，不做转换）；如实测乱码，改 pwsh 或在 `local.rs` reader 加 `encoding_rs` 转换 / 注入 `chcp 65001`
-  - **Rust 未编译**：portable-pty API 细节、`CommandBuilder` 默认环境/cwd 继承行为需 `cargo build` + 运行确认
-  - `shell_args` 空白分割：含空格的单个参数需用户自加引号（v1 限制，`local.rs` 注释已标注）
-  - 本地终端不参与广播（`getBroadcastTargets` 已按 `connType==='ssh'` 过滤）也不显示 ServerInfoPanel（同样 ssh-only 判断）—— 无需额外排除
-- **首次类型检查踩坑：** `ConnectionConfig` 在 TS 侧一直用 snake_case（匹配后端 serde 默认，无 `rename_all`），新加字段时误用 camelCase 导致不一致；统一 snake_case 后 tsc 绿
+### 闃舵 10锛氭湰鍦扮粓绔叏鏍堬紙conn_type='local'锛?
+- **鐘舵€侊細** 鍓嶇 complete锛坱sc 閫氳繃锛夛紱鍚庣浠ｇ爜 complete 浣?**鏈紪璇戦獙璇?*锛堢幆澧冩棤 rustup锛夛紱绔埌绔緟鐢ㄦ埛 `cargo build` + 杩愯
+- **闇€姹傦細** 鍦?MyShell 閲岀洿杩炴湰鍦扮殑 PowerShell / CMD / WSL / 鑷畾涔?shell锛屼綔涓哄彲淇濆瓨鐨勮繛鎺ワ紙杩涙枃浠跺す銆佸甫 shell 閰嶇疆锛夛紝涓?SSH 缁堢浣撻獙涓€鑷?
+- **璁捐鍐崇瓥锛堜笌鐢ㄦ埛纭锛夛細**
+  - 鍏ュ彛褰㈡€侊細鏈湴缁堢浣滀负 `conn_type='local'` 鐨勪竴绉?`ConnectionConfig`锛屽鐢ㄧ幇鏈夎繛鎺ョ鐞?/ 鏂囦欢澶?/ 鍛戒护鍘嗗彶 / 蹇嵎鍛戒护鍏ㄥ 鈥斺€?涓嶆柊寤鸿〃銆佷笉鏂板啓绠＄悊 UI
+  - 澶嶇敤 SSH 浜嬩欢閫氶亾锛氭湰鍦板悗绔?emit 鐜版湁鐨?`ssh_output` / `ssh_closed`锛宍TerminalPanel` 浜嬩欢璁㈤槄闆舵敼鍔紝鍙寜 `connType` 閫?connect/send/resize/disconnect 鍛戒护
+  - vault 瑙ｉ攣淇濇寔鐜扮姸锛氭湰鍦拌繛鎺ヨ闅?connections 琛ㄥ姞瀵嗗瓨鍌紝鍒楀嚭闇€瑙ｉ攣锛坄get_connections` 鐨?DEK 闂ㄧ鑷姩瑕嗙洊锛夛紱`local_connect` 鏈韩涓嶉渶瑕佸瘑鐮?DEK
+  - shell 閰嶇疆鍙屽瓧娈碉細`shell_path`锛堝彲鎵ц璺緞锛屾槑鏂囧垪锛? `shell_args`锛堝彲閫夊弬鏁帮級鈥斺€?涓嶇敤鍗曞瓧娈靛懡浠や覆锛岄伩鍏?`C:\Program Files\...` 绌烘牸琚?split 鐮村潖
+  - 鎶€鏈€夊瀷锛歚portable-pty`锛圵indows ConPTY / Unix openpty锛寃ezterm 鍑哄搧锛夈€俙std::process` + pipe 鍥犳棤 PTY 琚惁鍐筹紙浜や簰寮?TUI / 棰滆壊 / resize 鍏ㄥ簾锛?
+- **淇敼鏄庣粏锛?*
+  - `src-tauri/Cargo.toml` 鈥?鍔?`portable-pty = "0.8"`
+  - `src-tauri/src/local.rs`锛堟柊寤猴級鈥?`LocalCommand` 鏋氫妇锛圛nput/Resize/Disconnect锛屾湰鍦版棤 ZMODEM锛? `LocalSession { command_tx }` + `connect`锛歰penpty 鈫?spawn shell 鈫?**reader 闃诲绾跨▼**锛坄spawn_blocking`锛屽洜 portable-pty reader 鏄樆濉?`Read`锛塭mit `ssh_output`锛孍OF emit `ssh_closed` + 浠?map 绉婚櫎锛?*writer 浠诲姟**锛坅sync锛屾寔 master锛夊鐞?Input/Resize/Disconnect锛圖isconnect 鏃?`child.kill()`锛夈€俙send_input`/`resize_terminal`/`disconnect` 闀滃儚 ssh.rs
+  - `src-tauri/src/db.rs` 鈥?`init_db` 鍔?`shell_path`/`shell_args` 鏄庢枃鍒楋紱`migrate_legacy_schema` 鍔犲箓绛夎縼绉伙紙`column_exists` 鎺㈡祴 + `ALTER TABLE ADD COLUMN`锛夛紱`get_all_connections`/`get_connection`/`save_connection` 涓夊 SELECT+鍏冪粍+INSERT 鍚屾鍔犲垪
+  - `src-tauri/src/main.rs` 鈥?`mod local`锛沗ConnectionConfig` 鍔?`shell_path`/`shell_args`锛坄#[serde(default)]`锛夛紱`AppState.local_sessions` map + 鍒濆鍖栵紱`drain_all_sessions` 鍔?local 娓呯悊锛堝彂 `LocalCommand::Disconnect`锛夛紱4 鍛戒护 `local_connect`/`local_send`/`local_resize`/`local_disconnect`锛坄local_send` 澶嶇敤 256KB 杈撳叆涓婇檺锛? `generate_handler!` 娉ㄥ唽
+  - `src/api.ts` 鈥?`ConnType` 鍔?`"local"`锛沗ConnectionConfig` 鍔?`shell_path`/`shell_args`锛坰nake_case锛屽尮閰嶅悗绔?serde 榛樿锛夛紱4 涓?wrapper
+  - `src/App.tsx` 鈥?`handleConnect`/`handleReconnect`/`handleCloseTab` 鍔?`connType==='local'` 鍒嗘敮锛坄localConnect`/`localDisconnect`锛宒isplay name 鐢?`config.name`锛夛紱TerminalPanel 閫忎紶 `connType`
+  - `src/components/TerminalPanel.tsx` 鈥?`connType` prop + `connTypeRef` + `sendTo`/`resizeTo` 鍒嗗彂锛堟寜 connType 閫?ssh_*/local_*锛夛紱浜嬩欢璁㈤槄 `onSshOutput`/`onSshClosed` 鍘熸牱澶嶇敤
+  - `src/components/CommandBar.tsx` 鈥?`connType` prop + `sendFn` 鍒嗗彂锛?*淇**锛氬師鏈洿鎺?`sshSend`锛屾湰鍦?tab 鍛戒护浼氬彂閿欏悗绔紱鐜版寜 connType 閫?sshSend/localSend锛?
+  - `src/components/ConnectionDialog.tsx` 鈥?`TYPE_OPTIONS` 鍔?local + `SHELL_PRESETS`锛坧wsh/powershell/cmd/wsl/git-bash锛夛紱`connType==='local'` 鏃惰〃鍗曞彧鏄剧ず 鍚嶇О/鍒嗙粍/shell 閫夋嫨+璺緞+鍙傛暟锛岄殣钘?host/port/auth/proxy锛沗handleSave` local 鍒嗘敮锛坔ost="" port=0 username=""锛宻hell_path 蹇呭～鏍￠獙锛?
+  - `src/components/Sidebar.tsx` 鈥?`CONN_ICONS` 鍔?`local: 馃捇`
+- **楠岃瘉锛?*
+  - `npx tsc --noEmit` PASS锛堥娆?3 涓敊璇細ConnectionDialog 璇敤 `shell_path`/`shell_args` 鑰?api.ts 鎴戝厛鍐欐垚浜?camelCase `shellPath`/`shellArgs`锛涚粺涓€涓?snake_case 涓庡叾浠栧瓧娈典竴鑷村悗閫氳繃锛?
+  - Rust `cargo build` **鏈墽琛?*锛堢幆澧冩棤 rustup锛夆€斺€?鏈€鍙兘鐨勮皟鏁寸偣鏄?portable-pty 0.8 鐨?`take_writer`/`spawn_command` 杩斿洖鐨?trait bound
+- **閬楃暀椋庨櫓 / 寰呴獙璇侊細**
+  - **ConPTY 缂栫爜**锛歐indows 涓?portable-pty 杈撳嚭鎸?shell 鐨?console codepage 璧帮紙pwsh=UTF-8 姝ｅ父锛沇indows PowerShell 5.1 鍦ㄤ腑鏂囩郴缁熷彲鑳?GBK 鈫?xterm 涓枃涔辩爜锛夈€倂1 emit 鍘熷瀛楄妭锛堜笌 SSH 涓€鑷达紝涓嶅仛杞崲锛夛紱濡傚疄娴嬩贡鐮侊紝鏀?pwsh 鎴栧湪 `local.rs` reader 鍔?`encoding_rs` 杞崲 / 娉ㄥ叆 `chcp 65001`
+  - **Rust 鏈紪璇?*锛歱ortable-pty API 缁嗚妭銆乣CommandBuilder` 榛樿鐜/cwd 缁ф壙琛屼负闇€ `cargo build` + 杩愯纭
+  - `shell_args` 绌虹櫧鍒嗗壊锛氬惈绌烘牸鐨勫崟涓弬鏁伴渶鐢ㄦ埛鑷姞寮曞彿锛坴1 闄愬埗锛宍local.rs` 娉ㄩ噴宸叉爣娉級
+  - 鏈湴缁堢涓嶅弬涓庡箍鎾紙`getBroadcastTargets` 宸叉寜 `connType==='ssh'` 杩囨护锛変篃涓嶆樉绀?ServerInfoPanel锛堝悓鏍?ssh-only 鍒ゆ柇锛夆€斺€?鏃犻渶棰濆鎺掗櫎
+- **棣栨绫诲瀷妫€鏌ヨ俯鍧戯細** `ConnectionConfig` 鍦?TS 渚т竴鐩寸敤 snake_case锛堝尮閰嶅悗绔?serde 榛樿锛屾棤 `rename_all`锛夛紝鏂板姞瀛楁鏃惰鐢?camelCase 瀵艰嚧涓嶄竴鑷达紱缁熶竴 snake_case 鍚?tsc 缁?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 10 本地终端前端 complete（tsc 绿）；后端代码 complete 但未编译（无 rustup） |
-| 我要去哪里？ | 用户 `cargo build`（可能需调 portable-pty API）→ `cargo tauri dev` → 新建本地连接（pwsh.exe）双击开 tab 验证打字/输出/resize/关闭/编码 |
-| 目标是什么？ | MyShell 直连本地 PowerShell/CMD/WSL/自定义 shell，作为可保存的连接，体验等同 SSH 终端 |
-| 我学到了什么？ | 本地终端与 SSH 终端在渲染层完全同构（都是 xterm + 字节流），差异只在上游数据源 —— 抽象出按 connType 分发即可零成本复用；portable-pty 的 reader 是阻塞 `Read`，必须 `spawn_blocking` 独立线程 + writer 任务双线（不同于 SSH 的 select! 单循环）；CommandBar 直接调 sshSend 是隐藏的分发遗漏点，新增后端必须全局 grep 确认所有 ssh_* 调用点 |
-| 我做了什么？ | 阶段 10：Cargo + local.rs PTY 模块；db schema + 字段；main AppState + 4 命令 + drain；api.ts 类型 + wrapper；App/TerminalPanel/CommandBar 按 connType 分发；ConnectionDialog local 表单 + shell 预设；Sidebar 图标 |
+| 鎴戝湪鍝噷锛?| 闃舵 10 鏈湴缁堢鍓嶇 complete锛坱sc 缁匡級锛涘悗绔唬鐮?complete 浣嗘湭缂栬瘧锛堟棤 rustup锛?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo build`锛堝彲鑳介渶璋?portable-pty API锛夆啋 `cargo tauri dev` 鈫?鏂板缓鏈湴杩炴帴锛坧wsh.exe锛夊弻鍑诲紑 tab 楠岃瘉鎵撳瓧/杈撳嚭/resize/鍏抽棴/缂栫爜 |
+| 鐩爣鏄粈涔堬紵 | MyShell 鐩磋繛鏈湴 PowerShell/CMD/WSL/鑷畾涔?shell锛屼綔涓哄彲淇濆瓨鐨勮繛鎺ワ紝浣撻獙绛夊悓 SSH 缁堢 |
+| 鎴戝鍒颁簡浠€涔堬紵 | 鏈湴缁堢涓?SSH 缁堢鍦ㄦ覆鏌撳眰瀹屽叏鍚屾瀯锛堥兘鏄?xterm + 瀛楄妭娴侊級锛屽樊寮傚彧鍦ㄤ笂娓告暟鎹簮 鈥斺€?鎶借薄鍑烘寜 connType 鍒嗗彂鍗冲彲闆舵垚鏈鐢紱portable-pty 鐨?reader 鏄樆濉?`Read`锛屽繀椤?`spawn_blocking` 鐙珛绾跨▼ + writer 浠诲姟鍙岀嚎锛堜笉鍚屼簬 SSH 鐨?select! 鍗曞惊鐜級锛汣ommandBar 鐩存帴璋?sshSend 鏄殣钘忕殑鍒嗗彂閬楁紡鐐癸紝鏂板鍚庣蹇呴』鍏ㄥ眬 grep 纭鎵€鏈?ssh_* 璋冪敤鐐?|
+| 鎴戝仛浜嗕粈涔堬紵 | 闃舵 10锛欳argo + local.rs PTY 妯″潡锛沝b schema + 瀛楁锛沵ain AppState + 4 鍛戒护 + drain锛沘pi.ts 绫诲瀷 + wrapper锛汚pp/TerminalPanel/CommandBar 鎸?connType 鍒嗗彂锛汣onnectionDialog local 琛ㄥ崟 + shell 棰勮锛汼idebar 鍥炬爣 |
 
-### 阶段 10.1：类型图标修复 + 启动命令 init_command（2026-06-17）
-- **状态：** 前端 complete（tsc 通过）；后端代码 complete 未编译；**版本号 1.1.0 → 1.2.2**
-- **问题1：新建连接类型选择图标显示方框**
-  - 根因：`ConnectionDialog` 的 `TYPE_OPTIONS` 里 ssh/sftp/ftp 用 Nerd Font 私有区字符（`󰖟`/`󰉋`/`󰈙`），系统未装 Nerd Font 就渲染成方框；local 用 emoji（`💻`）所以正常
-  - 修复：`TYPE_OPTIONS` 图标改 emoji，与 Sidebar `CONN_ICONS` 一致 —— `🖥️`/`📁`/`📤`/`💻`，免字体跨平台
-- **问题2：本地终端打开后默认执行命令（init_command）**
-  - 需求：连接里配 `claude`，开 tab 自动执行
-  - 设计：`ConnectionConfig` 加 `init_command`（明文列，通用字段先本地用）→ `local.rs` writer 任务 `take_writer` 后立即注入 `init_command + \r`（PTY stdin 缓冲，shell 就绪后 echo + 执行；`\r` 触发执行，与 onData 转发 Enter 一致）；`ConnectionDialog` 本地表单加「启动命令（可选）」输入
-  - 数据层：`db.rs` 加 `init_command TEXT` 列 + 幂等迁移 + `get_all`/`get`/`save` 三处 SQL 同步；`main.rs`/`api.ts` `ConnectionConfig` 双端加字段
-  - 限制：当前把整条 `init_command` 当**单行**命令注入（trim + `\r`）；多行命令暂不支持，后续可按 `\n` 拆分依次注入
-- **版本号：** `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `Cargo.lock`(myshell 条目) 四处 1.1.0 → 1.2.2；`backup.rs::APP_VERSION` 经 `env!("CARGO_PKG_VERSION")` 自动跟随 Cargo.toml，无需手改
-- **验证：** `npx tsc --noEmit` PASS；Rust 待 `cargo build`（含 portable-pty 编译验证）
+### 闃舵 10.1锛氱被鍨嬪浘鏍囦慨澶?+ 鍚姩鍛戒护 init_command锛?026-06-17锛?
+- **鐘舵€侊細** 鍓嶇 complete锛坱sc 閫氳繃锛夛紱鍚庣浠ｇ爜 complete 鏈紪璇戯紱**鐗堟湰鍙?1.1.0 鈫?1.2.2**
+- **闂1锛氭柊寤鸿繛鎺ョ被鍨嬮€夋嫨鍥炬爣鏄剧ず鏂规**
+  - 鏍瑰洜锛歚ConnectionDialog` 鐨?`TYPE_OPTIONS` 閲?ssh/sftp/ftp 鐢?Nerd Font 绉佹湁鍖哄瓧绗︼紙`蟀枱`/`蟀墜`/`蟀垯`锛夛紝绯荤粺鏈 Nerd Font 灏辨覆鏌撴垚鏂规锛沴ocal 鐢?emoji锛坄馃捇`锛夋墍浠ユ甯?
+  - 淇锛歚TYPE_OPTIONS` 鍥炬爣鏀?emoji锛屼笌 Sidebar `CONN_ICONS` 涓€鑷?鈥斺€?`馃枼锔廯/`馃搧`/`馃摛`/`馃捇`锛屽厤瀛椾綋璺ㄥ钩鍙?
+- **闂2锛氭湰鍦扮粓绔墦寮€鍚庨粯璁ゆ墽琛屽懡浠わ紙init_command锛?*
+  - 闇€姹傦細杩炴帴閲岄厤 `claude`锛屽紑 tab 鑷姩鎵ц
+  - 璁捐锛歚ConnectionConfig` 鍔?`init_command`锛堟槑鏂囧垪锛岄€氱敤瀛楁鍏堟湰鍦扮敤锛夆啋 `local.rs` writer 浠诲姟 `take_writer` 鍚庣珛鍗虫敞鍏?`init_command + \r`锛圥TY stdin 缂撳啿锛宻hell 灏辩华鍚?echo + 鎵ц锛沗\r` 瑙﹀彂鎵ц锛屼笌 onData 杞彂 Enter 涓€鑷达級锛沗ConnectionDialog` 鏈湴琛ㄥ崟鍔犮€屽惎鍔ㄥ懡浠わ紙鍙€夛級銆嶈緭鍏?
+  - 鏁版嵁灞傦細`db.rs` 鍔?`init_command TEXT` 鍒?+ 骞傜瓑杩佺Щ + `get_all`/`get`/`save` 涓夊 SQL 鍚屾锛沗main.rs`/`api.ts` `ConnectionConfig` 鍙岀鍔犲瓧娈?
+  - 闄愬埗锛氬綋鍓嶆妸鏁存潯 `init_command` 褰?*鍗曡**鍛戒护娉ㄥ叆锛坱rim + `\r`锛夛紱澶氳鍛戒护鏆備笉鏀寔锛屽悗缁彲鎸?`\n` 鎷嗗垎渚濇娉ㄥ叆
+- **鐗堟湰鍙凤細** `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` / `Cargo.lock`(myshell 鏉＄洰) 鍥涘 1.1.0 鈫?1.2.2锛沗backup.rs::APP_VERSION` 缁?`env!("CARGO_PKG_VERSION")` 鑷姩璺熼殢 Cargo.toml锛屾棤闇€鎵嬫敼
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛汻ust 寰?`cargo build`锛堝惈 portable-pty 缂栬瘧楠岃瘉锛?
 
-## 会话：2026-06-18 — 安装器数据删除安全 / 本地终端渲染与编码修复
+## 浼氳瘽锛?026-06-18 鈥?瀹夎鍣ㄦ暟鎹垹闄ゅ畨鍏?/ 鏈湴缁堢娓叉煋涓庣紪鐮佷慨澶?
 
-### 阶段 11：安装器「删除应用数据」二次确认 + 危险提示 + 直白文案
-- **状态：** complete（配置与脚本就位；本机无 rustup，未跑 `cargo tauri build` 实际打包验证）
-- **问题：** NSIS 卸载/更新流程勾选「删除应用程序数据」（`deleteAppData`）会递归删 `$APPDATA\<bundle>` + `$LOCALAPPDATA\<bundle>` = 整个 `connections.db`（全部连接 / 明文密码 / 命令历史 / 快捷命令 / 密钥库，不可恢复），但只是一个无警告的复选框 + 模糊文案，极易误删
-- **方案（不 fork 900 行模板，用官方机制）：**
-  - **二次确认**：`installerHooks` 注入 `NSIS_HOOK_PREUNINSTALL` 宏 —— 在 `Section Uninstall` 开头（删数据之前、`$UpdateMode`/`$DeleteAppDataCheckboxState` 已就绪时）拦截：仅当勾选且非自动更新模式弹 `MessageBox MB_YESNO|MB_ICONEXCLAMATION|MB_DEFBUTTON2`（默认「否」、`/SD IDNO`），点「否」则置 `$DeleteAppDataCheckboxState=0` 取消删除
-  - **文案直白**：`customLanguageFiles`（合并语义，仅覆盖 `deleteAppData` 一条）把「删除应用程序数据」→「删除全部应用数据（连接/密码/历史/密钥库，不可恢复）」
-- **修改明细：**
-  - `src-tauri/nsis/uninstall-confirm-hook.nsh`（新建，UTF-8 BOM）— `NSIS_HOOK_PREUNINSTALL` 宏 + 双语危险提示
-  - `src-tauri/nsis/lang/SimpChinese.nsh`（新建，BOM）/ `English.nsh`（新建）— `deleteAppData` 覆盖
-  - `src-tauri/tauri.conf.json` — `bundle.windows.nsis` 加 `installerHooks` + `customLanguageFiles`
-- **验证：** JSON 解析通过；NSIS 钩子语法/BOM/反斜杠续行逐项核对；实机验证待 `cargo tauri build` 后覆盖安装→卸载页勾选→应见警告框默认「否」
-- **机制确认：** `NSIS_HOOK_PREUNINSTALL` 由模板 `Section Uninstall` 顶部 `!insertmacro`（本地生成 installer.nsi L747-748 实证）；`customLanguageFiles` 为 Rust 层按键名合并（NSIS 不允许同名 LangString 重复，故必为合并而非 include 叠加，仅需写覆盖项）—— 依据 Tauri v2 官方文档 + 配置参考
+### 闃舵 11锛氬畨瑁呭櫒銆屽垹闄ゅ簲鐢ㄦ暟鎹€嶄簩娆＄‘璁?+ 鍗遍櫓鎻愮ず + 鐩寸櫧鏂囨
+- **鐘舵€侊細** complete锛堥厤缃笌鑴氭湰灏变綅锛涙湰鏈烘棤 rustup锛屾湭璺?`cargo tauri build` 瀹為檯鎵撳寘楠岃瘉锛?
+- **闂锛?* NSIS 鍗歌浇/鏇存柊娴佺▼鍕鹃€夈€屽垹闄ゅ簲鐢ㄧ▼搴忔暟鎹€嶏紙`deleteAppData`锛変細閫掑綊鍒?`$APPDATA\<bundle>` + `$LOCALAPPDATA\<bundle>` = 鏁翠釜 `connections.db`锛堝叏閮ㄨ繛鎺?/ 鏄庢枃瀵嗙爜 / 鍛戒护鍘嗗彶 / 蹇嵎鍛戒护 / 瀵嗛挜搴擄紝涓嶅彲鎭㈠锛夛紝浣嗗彧鏄竴涓棤璀﹀憡鐨勫閫夋 + 妯＄硦鏂囨锛屾瀬鏄撹鍒?
+- **鏂规锛堜笉 fork 900 琛屾ā鏉匡紝鐢ㄥ畼鏂规満鍒讹級锛?*
+  - **浜屾纭**锛歚installerHooks` 娉ㄥ叆 `NSIS_HOOK_PREUNINSTALL` 瀹?鈥斺€?鍦?`Section Uninstall` 寮€澶达紙鍒犳暟鎹箣鍓嶃€乣$UpdateMode`/`$DeleteAppDataCheckboxState` 宸插氨缁椂锛夋嫤鎴細浠呭綋鍕鹃€変笖闈炶嚜鍔ㄦ洿鏂版ā寮忓脊 `MessageBox MB_YESNO|MB_ICONEXCLAMATION|MB_DEFBUTTON2`锛堥粯璁ゃ€屽惁銆嶃€乣/SD IDNO`锛夛紝鐐广€屽惁銆嶅垯缃?`$DeleteAppDataCheckboxState=0` 鍙栨秷鍒犻櫎
+  - **鏂囨鐩寸櫧**锛歚customLanguageFiles`锛堝悎骞惰涔夛紝浠呰鐩?`deleteAppData` 涓€鏉★級鎶娿€屽垹闄ゅ簲鐢ㄧ▼搴忔暟鎹€嶁啋銆屽垹闄ゅ叏閮ㄥ簲鐢ㄦ暟鎹紙杩炴帴/瀵嗙爜/鍘嗗彶/瀵嗛挜搴擄紝涓嶅彲鎭㈠锛夈€?
+- **淇敼鏄庣粏锛?*
+  - `src-tauri/nsis/uninstall-confirm-hook.nsh`锛堟柊寤猴紝UTF-8 BOM锛夆€?`NSIS_HOOK_PREUNINSTALL` 瀹?+ 鍙岃鍗遍櫓鎻愮ず
+  - `src-tauri/nsis/lang/SimpChinese.nsh`锛堟柊寤猴紝BOM锛? `English.nsh`锛堟柊寤猴級鈥?`deleteAppData` 瑕嗙洊
+  - `src-tauri/tauri.conf.json` 鈥?`bundle.windows.nsis` 鍔?`installerHooks` + `customLanguageFiles`
+- **楠岃瘉锛?* JSON 瑙ｆ瀽閫氳繃锛汵SIS 閽╁瓙璇硶/BOM/鍙嶆枩鏉犵画琛岄€愰」鏍稿锛涘疄鏈洪獙璇佸緟 `cargo tauri build` 鍚庤鐩栧畨瑁呪啋鍗歌浇椤靛嬀閫夆啋搴旇璀﹀憡妗嗛粯璁ゃ€屽惁銆?
+- **鏈哄埗纭锛?* `NSIS_HOOK_PREUNINSTALL` 鐢辨ā鏉?`Section Uninstall` 椤堕儴 `!insertmacro`锛堟湰鍦扮敓鎴?installer.nsi L747-748 瀹炶瘉锛夛紱`customLanguageFiles` 涓?Rust 灞傛寜閿悕鍚堝苟锛圢SIS 涓嶅厑璁稿悓鍚?LangString 閲嶅锛屾晠蹇呬负鍚堝苟鑰岄潪 include 鍙犲姞锛屼粎闇€鍐欒鐩栭」锛夆€斺€?渚濇嵁 Tauri v2 瀹樻柟鏂囨。 + 閰嶇疆鍙傝€?
 
-### 阶段 12：本地终端渲染与编码修复（字体 / TERM 环境 / 字体可配置 / UTF-8 硬化）
-- **状态：** 前端 complete（`npx tsc --noEmit` PASS）；后端代码 complete 未编译（无 rustup）
-- **问题：** 本地终端（`conn_type='local'`）从 MyShell 打开时「字体样式乱码」——① xterm `fontFamily` 只列基础字体（Cascadia Code/Fira Code…），无 Nerd Font，提示符 powerline/图标字形（Oh My Posh 等）渲染成豆腐块；② `local.rs` spawn 继承父进程环境无 `TERM`/`COLORTERM`，提示符引擎可能降级；③ cmd / Windows PowerShell 5.1 在 zh-CN 吐 GBK → 中文乱码（阶段10 遗留）
-- **方案：**
-  - **字体**：xterm 字体栈改为 Nerd Font 优先（CaskaydiaCove/Cascadia Code NF/MesloLGM/JetBrainsMono/FiraCode/Hack Nerd Font）+ 基础字体回退
-  - **环境**：`CommandBuilder::env` 声明 `TERM=xterm-256color` / `COLORTERM=truecolor` / `TERM_PROGRAM=MyShell`（portable-pty `env()` 为加性覆盖，PATH/profile 照常继承 —— 已查文档确认）
-  - **字体可配置**：新增 localStorage 设置（沿用主题/配色同一套持久化模式）—— 用户填入本机已装字体名即生效（无需内置字体，要用 Nerd Font 的用户必然已自装）
-  - **UTF-8 硬化**：`local.rs` 启动时按 shell 名注入 UTF-8 前导（写在 init_command 之前）—— cmd：`@chcp 65001>nul`；PowerShell 5.1：`[Console]::{Output,Input}Encoding=[Text.Encoding]::UTF8; chcp 65001 > $null`；pwsh / bash / zsh / wsl 不处理（本就 UTF-8）
-- **修改明细：**
-  - `src/components/TerminalPanel.tsx` — 字体栈移至共享常量；`useTerminalFont` 取字体；新增 `useEffect` 热更新 `term.options.fontFamily`（已开终端免重开）
-  - `src/themes.ts` — 加 `STORAGE_KEY_TERMINAL_FONT` + `TERMINAL_FONT_DEFAULT_STACK`
-  - `src/hooks/useTerminalFont.ts`（新建）— localStorage 读/写 + 解析 `fontFamily`（选中字体 + 默认回退栈）
-  - `src/components/SettingsPanel.tsx` — 新增「终端字体」Section（Input + 常见 Nerd Font 提示）
-  - `src-tauri/src/local.rs` — `use std::path::Path`；新增 `shell_utf8_prelude()`（按 file_stem 匹配，裸名/全路径皆认）；`connect` 计算 prelude 并 move 进 writer 任务，`take_writer` 后先于 init_command 写入
-- **验证：** `npx tsc --noEmit` PASS；Rust 待 `cargo tauri dev`（设置面板改字体→已开/新开终端字形即出；本地连 cmd/powershell.exe 中文不再乱码）
-- **遗留 / 提醒：** PowerShell 5.1 启动会回显一行编码命令（交互式 PS 无法干净抑制，可接受）；首帧提示符（profile 用旧编码绘制）可能略瑕疵，注入后全部 UTF-8
+### 闃舵 12锛氭湰鍦扮粓绔覆鏌撲笌缂栫爜淇锛堝瓧浣?/ TERM 鐜 / 瀛椾綋鍙厤缃?/ UTF-8 纭寲锛?
+- **鐘舵€侊細** 鍓嶇 complete锛坄npx tsc --noEmit` PASS锛夛紱鍚庣浠ｇ爜 complete 鏈紪璇戯紙鏃?rustup锛?
+- **闂锛?* 鏈湴缁堢锛坄conn_type='local'`锛変粠 MyShell 鎵撳紑鏃躲€屽瓧浣撴牱寮忎贡鐮併€嶁€斺€斺憼 xterm `fontFamily` 鍙垪鍩虹瀛椾綋锛圕ascadia Code/Fira Code鈥︼級锛屾棤 Nerd Font锛屾彁绀虹 powerline/鍥炬爣瀛楀舰锛圤h My Posh 绛夛級娓叉煋鎴愯眴鑵愬潡锛涒憽 `local.rs` spawn 缁ф壙鐖惰繘绋嬬幆澧冩棤 `TERM`/`COLORTERM`锛屾彁绀虹寮曟搸鍙兘闄嶇骇锛涒憿 cmd / Windows PowerShell 5.1 鍦?zh-CN 鍚?GBK 鈫?涓枃涔辩爜锛堥樁娈?0 閬楃暀锛?
+- **鏂规锛?*
+  - **瀛椾綋**锛歺term 瀛椾綋鏍堟敼涓?Nerd Font 浼樺厛锛圕askaydiaCove/Cascadia Code NF/MesloLGM/JetBrainsMono/FiraCode/Hack Nerd Font锛? 鍩虹瀛椾綋鍥為€€
+  - **鐜**锛歚CommandBuilder::env` 澹版槑 `TERM=xterm-256color` / `COLORTERM=truecolor` / `TERM_PROGRAM=MyShell`锛坧ortable-pty `env()` 涓哄姞鎬ц鐩栵紝PATH/profile 鐓у父缁ф壙 鈥斺€?宸叉煡鏂囨。纭锛?
+  - **瀛椾綋鍙厤缃?*锛氭柊澧?localStorage 璁剧疆锛堟部鐢ㄤ富棰?閰嶈壊鍚屼竴濂楁寔涔呭寲妯″紡锛夆€斺€?鐢ㄦ埛濉叆鏈満宸茶瀛椾綋鍚嶅嵆鐢熸晥锛堟棤闇€鍐呯疆瀛椾綋锛岃鐢?Nerd Font 鐨勭敤鎴峰繀鐒跺凡鑷锛?
+  - **UTF-8 纭寲**锛歚local.rs` 鍚姩鏃舵寜 shell 鍚嶆敞鍏?UTF-8 鍓嶅锛堝啓鍦?init_command 涔嬪墠锛夆€斺€?cmd锛歚@chcp 65001>nul`锛汸owerShell 5.1锛歚[Console]::{Output,Input}Encoding=[Text.Encoding]::UTF8; chcp 65001 > $null`锛沺wsh / bash / zsh / wsl 涓嶅鐞嗭紙鏈氨 UTF-8锛?
+- **淇敼鏄庣粏锛?*
+  - `src/components/TerminalPanel.tsx` 鈥?瀛椾綋鏍堢Щ鑷冲叡浜父閲忥紱`useTerminalFont` 鍙栧瓧浣擄紱鏂板 `useEffect` 鐑洿鏂?`term.options.fontFamily`锛堝凡寮€缁堢鍏嶉噸寮€锛?
+  - `src/themes.ts` 鈥?鍔?`STORAGE_KEY_TERMINAL_FONT` + `TERMINAL_FONT_DEFAULT_STACK`
+  - `src/hooks/useTerminalFont.ts`锛堟柊寤猴級鈥?localStorage 璇?鍐?+ 瑙ｆ瀽 `fontFamily`锛堥€変腑瀛椾綋 + 榛樿鍥為€€鏍堬級
+  - `src/components/SettingsPanel.tsx` 鈥?鏂板銆岀粓绔瓧浣撱€峉ection锛圛nput + 甯歌 Nerd Font 鎻愮ず锛?
+  - `src-tauri/src/local.rs` 鈥?`use std::path::Path`锛涙柊澧?`shell_utf8_prelude()`锛堟寜 file_stem 鍖归厤锛岃８鍚?鍏ㄨ矾寰勭殕璁わ級锛沗connect` 璁＄畻 prelude 骞?move 杩?writer 浠诲姟锛宍take_writer` 鍚庡厛浜?init_command 鍐欏叆
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛汻ust 寰?`cargo tauri dev`锛堣缃潰鏉挎敼瀛椾綋鈫掑凡寮€/鏂板紑缁堢瀛楀舰鍗冲嚭锛涙湰鍦拌繛 cmd/powershell.exe 涓枃涓嶅啀涔辩爜锛?
+- **閬楃暀 / 鎻愰啋锛?* PowerShell 5.1 鍚姩浼氬洖鏄句竴琛岀紪鐮佸懡浠わ紙浜や簰寮?PS 鏃犳硶骞插噣鎶戝埗锛屽彲鎺ュ彈锛夛紱棣栧抚鎻愮ず绗︼紙profile 鐢ㄦ棫缂栫爜缁樺埗锛夊彲鑳界暐鐟曠柕锛屾敞鍏ュ悗鍏ㄩ儴 UTF-8
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 11/12 complete（前端 tsc 绿，Rust 未编译）；已按新规同步更新 progress.md + README.md |
-| 我要去哪里？ | 用户 `cargo tauri build` 验证安装器二次确认 + `cargo tauri dev` 验证字体/编码 |
-| 目标是什么？ | 卸载数据删除防误删；本地终端字体/编码与真终端一致 |
-| 我学到了什么？ | Tauri NSIS 钩子（`NSIS_HOOK_PREUNINSTALL`）+ `customLanguageFiles`（合并语义）能在不 fork 模板的前提下改卸载行为与文案；portable-pty `CommandBuilder::env` 加性覆盖（镜像 std `Command`）；本地终端乱码是「字体缺 Nerd Font 私有区字形 + 缺 TERM 环境 + 非 UTF-8 shell」三因叠加 |
-| 我做了什么？ | 阶段 11：卸载钩子 + 语言串覆盖 + tauri.conf 接线；阶段 12：Nerd Font 默认栈 + TERM/COLORTERM + 字体可配置（hook/设置面板/热更新）+ cmd/PS5.1 UTF-8 前导 |
+| 鎴戝湪鍝噷锛?| 闃舵 11/12 complete锛堝墠绔?tsc 缁匡紝Rust 鏈紪璇戯級锛涘凡鎸夋柊瑙勫悓姝ユ洿鏂?progress.md + README.md |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri build` 楠岃瘉瀹夎鍣ㄤ簩娆＄‘璁?+ `cargo tauri dev` 楠岃瘉瀛椾綋/缂栫爜 |
+| 鐩爣鏄粈涔堬紵 | 鍗歌浇鏁版嵁鍒犻櫎闃茶鍒狅紱鏈湴缁堢瀛椾綋/缂栫爜涓庣湡缁堢涓€鑷?|
+| 鎴戝鍒颁簡浠€涔堬紵 | Tauri NSIS 閽╁瓙锛坄NSIS_HOOK_PREUNINSTALL`锛? `customLanguageFiles`锛堝悎骞惰涔夛級鑳藉湪涓?fork 妯℃澘鐨勫墠鎻愪笅鏀瑰嵏杞借涓轰笌鏂囨锛沺ortable-pty `CommandBuilder::env` 鍔犳€ц鐩栵紙闀滃儚 std `Command`锛夛紱鏈湴缁堢涔辩爜鏄€屽瓧浣撶己 Nerd Font 绉佹湁鍖哄瓧褰?+ 缂?TERM 鐜 + 闈?UTF-8 shell銆嶄笁鍥犲彔鍔?|
+| 鎴戝仛浜嗕粈涔堬紵 | 闃舵 11锛氬嵏杞介挬瀛?+ 璇█涓茶鐩?+ tauri.conf 鎺ョ嚎锛涢樁娈?12锛歂erd Font 榛樿鏍?+ TERM/COLORTERM + 瀛椾綋鍙厤缃紙hook/璁剧疆闈㈡澘/鐑洿鏂帮級+ cmd/PS5.1 UTF-8 鍓嶅 |
 
-### 阶段 13：终端字体——系统字体下拉选择 + 按连接单独覆盖（2026-06-18）
-- **状态：** 前端 complete（`npx tsc --noEmit` PASS）；后端代码 complete 未编译（无 rustup，font-kit 首次拉取 + DB 迁移待 `cargo build` 验证）
-- **需求（用户反馈）：** ① 字体设置不该手输，应查询系统可用字体做下拉选择；② 不同连接可能需要不同字体（可访问性/常盯的生产机更大字号/仅某些连接用 Nerd Font），希望按终端单独设字体
-- **决策（与用户确认两个分叉）：** 字体枚举用 **font-kit 后端真实枚举**（最贴合"查询系统字体"，跨平台；代价是新增 1 个依赖）；按连接覆盖存 **数据库列**（随连接走，导出/导入备份一起带走，沿用 shell_path/init_command 同款幂等迁移）
-- **设计：** 复用 `FontField` 组件（input + 原生 `<datalist>`，模块级缓存共享一次 fetch，失败降级为纯手输）；全局设置 + 按连接覆盖都用它；TerminalPanel 解析 `override ?? global` 热更新
-- **修改明细：**
-  - `src-tauri/Cargo.toml` — 加 `font-kit = "0.14"`
-  - `src-tauri/src/fonts.rs`（新建）— `list_system_fonts` 命令：`SystemSource::new().all_families()` → 排序去重，失败返空
-  - `src-tauri/src/db.rs` — `connections` 加 `terminal_font TEXT` 列 + 幂等迁移 + `get_all`/`get`/`save` 三处 SQL（SELECT 末尾追加 index 20、tuple、struct、INSERT 列/VALUES/params）
-  - `src-tauri/src/main.rs` — `ConnectionConfig` 加 `terminal_font: Option<String>`（`#[serde(default)]`）；`mod fonts`；`generate_handler!` 注册 `list_system_fonts`
-  - `src/api.ts` — `ConnectionConfig.terminal_font?` + `listSystemFonts()` wrapper
-  - `src/hooks/useTerminalFont.ts` — 抽出导出 `resolveFontStack(primary?)`（选中字体优先 + 默认回退栈），hook 与按连接覆盖共用
-  - `src/components/FontField.tsx`（新建）— input + datalist，`useId` 防多实例 id 冲突，模块级 fetch 缓存
-  - `src/components/SettingsPanel.tsx` — 全局字体 `Input` → `FontField`
-  - `src/components/ConnectionDialog.tsx` — `terminalFont` state；ssh+local 显示「终端」FieldGroup（FontField，留空=全局）；`handleSave` 两分支（local / ssh·sftp·ftp）都写 `terminal_font`
-  - `src/components/TerminalPanel.tsx` — `fontOverride?` prop；`fontFamily = fontOverride ? resolveFontStack(fontOverride) : globalFontFamily`；既有 live-update effect 自动覆盖
-  - `src/App.tsx` — 两处 `<TerminalPanel>` 传 `fontOverride={connections.find(...)?.terminal_font}`
-- **验证：** `npx tsc --noEmit` PASS；Rust 待 `cargo tauri dev`（font-kit 首次编译 + 验证枚举返回 + DB 迁移 + 字体覆盖生效）
-- **遗留 / 风险：** font-kit 为新依赖（Windows 用 DirectWrite 枚举，构建应可靠，但本机无法预编译验证；若 build 报错最可能在此依赖）；DB get_all/get/save 的列索引改动需 `cargo build` 确认无 off-by-one
+### 闃舵 13锛氱粓绔瓧浣撯€斺€旂郴缁熷瓧浣撲笅鎷夐€夋嫨 + 鎸夎繛鎺ュ崟鐙鐩栵紙2026-06-18锛?
+- **鐘舵€侊細** 鍓嶇 complete锛坄npx tsc --noEmit` PASS锛夛紱鍚庣浠ｇ爜 complete 鏈紪璇戯紙鏃?rustup锛宖ont-kit 棣栨鎷夊彇 + DB 杩佺Щ寰?`cargo build` 楠岃瘉锛?
+- **闇€姹傦紙鐢ㄦ埛鍙嶉锛夛細** 鈶?瀛椾綋璁剧疆涓嶈鎵嬭緭锛屽簲鏌ヨ绯荤粺鍙敤瀛椾綋鍋氫笅鎷夐€夋嫨锛涒憽 涓嶅悓杩炴帴鍙兘闇€瑕佷笉鍚屽瓧浣擄紙鍙闂€?甯哥洴鐨勭敓浜ф満鏇村ぇ瀛楀彿/浠呮煇浜涜繛鎺ョ敤 Nerd Font锛夛紝甯屾湜鎸夌粓绔崟鐙瀛椾綋
+- **鍐崇瓥锛堜笌鐢ㄦ埛纭涓や釜鍒嗗弶锛夛細** 瀛椾綋鏋氫妇鐢?**font-kit 鍚庣鐪熷疄鏋氫妇**锛堟渶璐村悎"鏌ヨ绯荤粺瀛椾綋"锛岃法骞冲彴锛涗唬浠锋槸鏂板 1 涓緷璧栵級锛涙寜杩炴帴瑕嗙洊瀛?**鏁版嵁搴撳垪**锛堥殢杩炴帴璧帮紝瀵煎嚭/瀵煎叆澶囦唤涓€璧峰甫璧帮紝娌跨敤 shell_path/init_command 鍚屾骞傜瓑杩佺Щ锛?
+- **璁捐锛?* 澶嶇敤 `FontField` 缁勪欢锛坕nput + 鍘熺敓 `<datalist>`锛屾ā鍧楃骇缂撳瓨鍏变韩涓€娆?fetch锛屽け璐ラ檷绾т负绾墜杈擄級锛涘叏灞€璁剧疆 + 鎸夎繛鎺ヨ鐩栭兘鐢ㄥ畠锛汿erminalPanel 瑙ｆ瀽 `override ?? global` 鐑洿鏂?
+- **淇敼鏄庣粏锛?*
+  - `src-tauri/Cargo.toml` 鈥?鍔?`font-kit = "0.14"`
+  - `src-tauri/src/fonts.rs`锛堟柊寤猴級鈥?`list_system_fonts` 鍛戒护锛歚SystemSource::new().all_families()` 鈫?鎺掑簭鍘婚噸锛屽け璐ヨ繑绌?
+  - `src-tauri/src/db.rs` 鈥?`connections` 鍔?`terminal_font TEXT` 鍒?+ 骞傜瓑杩佺Щ + `get_all`/`get`/`save` 涓夊 SQL锛圫ELECT 鏈熬杩藉姞 index 20銆乼uple銆乻truct銆両NSERT 鍒?VALUES/params锛?
+  - `src-tauri/src/main.rs` 鈥?`ConnectionConfig` 鍔?`terminal_font: Option<String>`锛坄#[serde(default)]`锛夛紱`mod fonts`锛沗generate_handler!` 娉ㄥ唽 `list_system_fonts`
+  - `src/api.ts` 鈥?`ConnectionConfig.terminal_font?` + `listSystemFonts()` wrapper
+  - `src/hooks/useTerminalFont.ts` 鈥?鎶藉嚭瀵煎嚭 `resolveFontStack(primary?)`锛堥€変腑瀛椾綋浼樺厛 + 榛樿鍥為€€鏍堬級锛宧ook 涓庢寜杩炴帴瑕嗙洊鍏辩敤
+  - `src/components/FontField.tsx`锛堟柊寤猴級鈥?input + datalist锛宍useId` 闃插瀹炰緥 id 鍐茬獊锛屾ā鍧楃骇 fetch 缂撳瓨
+  - `src/components/SettingsPanel.tsx` 鈥?鍏ㄥ眬瀛椾綋 `Input` 鈫?`FontField`
+  - `src/components/ConnectionDialog.tsx` 鈥?`terminalFont` state锛泂sh+local 鏄剧ず銆岀粓绔€岶ieldGroup锛團ontField锛岀暀绌?鍏ㄥ眬锛夛紱`handleSave` 涓ゅ垎鏀紙local / ssh路sftp路ftp锛夐兘鍐?`terminal_font`
+  - `src/components/TerminalPanel.tsx` 鈥?`fontOverride?` prop锛沗fontFamily = fontOverride ? resolveFontStack(fontOverride) : globalFontFamily`锛涙棦鏈?live-update effect 鑷姩瑕嗙洊
+  - `src/App.tsx` 鈥?涓ゅ `<TerminalPanel>` 浼?`fontOverride={connections.find(...)?.terminal_font}`
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛汻ust 寰?`cargo tauri dev`锛坒ont-kit 棣栨缂栬瘧 + 楠岃瘉鏋氫妇杩斿洖 + DB 杩佺Щ + 瀛椾綋瑕嗙洊鐢熸晥锛?
+- **閬楃暀 / 椋庨櫓锛?* font-kit 涓烘柊渚濊禆锛圵indows 鐢?DirectWrite 鏋氫妇锛屾瀯寤哄簲鍙潬锛屼絾鏈満鏃犳硶棰勭紪璇戦獙璇侊紱鑻?build 鎶ラ敊鏈€鍙兘鍦ㄦ渚濊禆锛夛紱DB get_all/get/save 鐨勫垪绱㈠紩鏀瑰姩闇€ `cargo build` 纭鏃?off-by-one
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 13 前端 complete（tsc 绿）；后端 font-kit + DB 迁移未编译 |
-| 我要去哪里？ | 用户 `cargo tauri dev` 验证：设置/连接对话框字体下拉列出系统字体；按连接设字体后该 tab 生效 |
-| 目标是什么？ | 字体从系统字体选择（非手输）；支持按连接单独覆盖字体 |
-| 我学到了什么？ | Tauri NSIS 之外又一个"前端要的能力在后端枚举再走 IPC"模式（字体枚举用 font-kit，前端零权限弹窗）；DB 加列要同步改 SELECT/row.get index/tuple 解构/struct/INSERT 五处，SELECT 末尾追加新列可保持既有 index 不动（created_at 仍 19，新列 20）降低 off-by-one 风险；xterm fontFamily 可 live mutation，按连接覆盖复用同一 effect |
-| 我做了什么？ | 阶段 13：font-kit 枚举命令 + DB terminal_font 列/迁移 + 类型双端 + FontField 组件 + 设置/连接对话框接入 + TerminalPanel override 解析 + App 透传 |
+| 鎴戝湪鍝噷锛?| 闃舵 13 鍓嶇 complete锛坱sc 缁匡級锛涘悗绔?font-kit + DB 杩佺Щ鏈紪璇?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri dev` 楠岃瘉锛氳缃?杩炴帴瀵硅瘽妗嗗瓧浣撲笅鎷夊垪鍑虹郴缁熷瓧浣擄紱鎸夎繛鎺ヨ瀛椾綋鍚庤 tab 鐢熸晥 |
+| 鐩爣鏄粈涔堬紵 | 瀛椾綋浠庣郴缁熷瓧浣撻€夋嫨锛堥潪鎵嬭緭锛夛紱鏀寔鎸夎繛鎺ュ崟鐙鐩栧瓧浣?|
+| 鎴戝鍒颁簡浠€涔堬紵 | Tauri NSIS 涔嬪鍙堜竴涓?鍓嶇瑕佺殑鑳藉姏鍦ㄥ悗绔灇涓惧啀璧?IPC"妯″紡锛堝瓧浣撴灇涓剧敤 font-kit锛屽墠绔浂鏉冮檺寮圭獥锛夛紱DB 鍔犲垪瑕佸悓姝ユ敼 SELECT/row.get index/tuple 瑙ｆ瀯/struct/INSERT 浜斿锛孲ELECT 鏈熬杩藉姞鏂板垪鍙繚鎸佹棦鏈?index 涓嶅姩锛坈reated_at 浠?19锛屾柊鍒?20锛夐檷浣?off-by-one 椋庨櫓锛泋term fontFamily 鍙?live mutation锛屾寜杩炴帴瑕嗙洊澶嶇敤鍚屼竴 effect |
+| 鎴戝仛浜嗕粈涔堬紵 | 闃舵 13锛歠ont-kit 鏋氫妇鍛戒护 + DB terminal_font 鍒?杩佺Щ + 绫诲瀷鍙岀 + FontField 缁勪欢 + 璁剧疆/杩炴帴瀵硅瘽妗嗘帴鍏?+ TerminalPanel override 瑙ｆ瀽 + App 閫忎紶 |
 
-### 阶段 14：对话框「点击遮罩即关闭」误触修复（2026-06-18）
-- **状态：** 前端 complete（`npx tsc --noEmit` PASS）
-- **问题（用户反馈）：** 设置 / 快捷命令界面与新建连接界面存在同一个毛病——点到操作框（对话框内容）外的遮罩区域，界面直接退出。设置/快捷命令这类长表单误触代价高（已填内容全丢）。新建连接（`ConnectionDialog`）其实已无此问题（overlay 未挂 `onClick`），其余弹窗未对齐。
-- **根因：** 这些弹窗的遮罩层 `<div>` 上挂了 `onClick={onClose}`，内容容器再 `stopPropagation` 阻断——这是「点遮罩关闭」标准模式。长表单不适合，需统一为「只有关闭按钮 / 取消按钮关闭」。
-- **方案：** 移除所有遮罩层的 `onClick={onClose}`；点击遮罩不再关闭，必须走关闭按钮。内部 `stopPropagation` 一律保留（无副作用、防御性）；所有按钮的 `onClick` 不动。
-- **修改明细（5 处遮罩）：**
-  - `src/components/SettingsPanel.tsx` — 主面板 overlay（zIndex 2000）+ `Dialog` 子组件 overlay（zIndex 2100，自定义主题弹窗用）两处 `onClick={onClose}` 移除
-  - `src/components/QuickCommandsPanel.tsx` — 面板 overlay `onClick={onClose}` 移除
-  - `src/components/PassphraseDialog.tsx` — overlay `onClick={onClose}` 移除
-  - `src/components/PasswordVerifyDialog.tsx` — overlay `onClick={onClose}` 移除
-- **已核查不变更（无此问题或不适用）：**
-  - `ConnectionDialog.tsx` — overlay 本就无 `onClick`（正确参照样本）
-  - `MasterPasswordGate.tsx` — 启动主密码门，无 overlay `onClick`（不应轻易关闭）
-  - `App.tsx:653` — 仅是连接失败提示框的「关闭」按钮（非遮罩），保留
-  - `Sidebar.tsx:801` — 右键菜单遮罩，点空白关闭菜单是期望行为，不动
-- **验证：** `npx tsc --noEmit` PASS
-- **附：阶段 13 build 收尾** — `src-tauri/src/main.rs` `generate_handler!` 里 `list_system_fonts` 改为限定路径 `fonts::list_system_fonts`（命令定义在 `fonts.rs` 而非 main.rs，需模块限定）；`cargo check` 已绿，阶段 13 后端可编译
+### 闃舵 14锛氬璇濇銆岀偣鍑婚伄缃╁嵆鍏抽棴銆嶈瑙︿慨澶嶏紙2026-06-18锛?
+- **鐘舵€侊細** 鍓嶇 complete锛坄npx tsc --noEmit` PASS锛?
+- **闂锛堢敤鎴峰弽棣堬級锛?* 璁剧疆 / 蹇嵎鍛戒护鐣岄潰涓庢柊寤鸿繛鎺ョ晫闈㈠瓨鍦ㄥ悓涓€涓瘺鐥呪€斺€旂偣鍒版搷浣滄锛堝璇濇鍐呭锛夊鐨勯伄缃╁尯鍩燂紝鐣岄潰鐩存帴閫€鍑恒€傝缃?蹇嵎鍛戒护杩欑被闀胯〃鍗曡瑙︿唬浠烽珮锛堝凡濉唴瀹瑰叏涓級銆傛柊寤鸿繛鎺ワ紙`ConnectionDialog`锛夊叾瀹炲凡鏃犳闂锛坥verlay 鏈寕 `onClick`锛夛紝鍏朵綑寮圭獥鏈榻愩€?
+- **鏍瑰洜锛?* 杩欎簺寮圭獥鐨勯伄缃╁眰 `<div>` 涓婃寕浜?`onClick={onClose}`锛屽唴瀹瑰鍣ㄥ啀 `stopPropagation` 闃绘柇鈥斺€旇繖鏄€岀偣閬僵鍏抽棴銆嶆爣鍑嗘ā寮忋€傞暱琛ㄥ崟涓嶉€傚悎锛岄渶缁熶竴涓恒€屽彧鏈夊叧闂寜閽?/ 鍙栨秷鎸夐挳鍏抽棴銆嶃€?
+- **鏂规锛?* 绉婚櫎鎵€鏈夐伄缃╁眰鐨?`onClick={onClose}`锛涚偣鍑婚伄缃╀笉鍐嶅叧闂紝蹇呴』璧板叧闂寜閽€傚唴閮?`stopPropagation` 涓€寰嬩繚鐣欙紙鏃犲壇浣滅敤銆侀槻寰℃€э級锛涙墍鏈夋寜閽殑 `onClick` 涓嶅姩銆?
+- **淇敼鏄庣粏锛? 澶勯伄缃╋級锛?*
+  - `src/components/SettingsPanel.tsx` 鈥?涓婚潰鏉?overlay锛坺Index 2000锛? `Dialog` 瀛愮粍浠?overlay锛坺Index 2100锛岃嚜瀹氫箟涓婚寮圭獥鐢級涓ゅ `onClick={onClose}` 绉婚櫎
+  - `src/components/QuickCommandsPanel.tsx` 鈥?闈㈡澘 overlay `onClick={onClose}` 绉婚櫎
+  - `src/components/PassphraseDialog.tsx` 鈥?overlay `onClick={onClose}` 绉婚櫎
+  - `src/components/PasswordVerifyDialog.tsx` 鈥?overlay `onClick={onClose}` 绉婚櫎
+- **宸叉牳鏌ヤ笉鍙樻洿锛堟棤姝ら棶棰樻垨涓嶉€傜敤锛夛細**
+  - `ConnectionDialog.tsx` 鈥?overlay 鏈氨鏃?`onClick`锛堟纭弬鐓ф牱鏈級
+  - `MasterPasswordGate.tsx` 鈥?鍚姩涓诲瘑鐮侀棬锛屾棤 overlay `onClick`锛堜笉搴旇交鏄撳叧闂級
+  - `App.tsx:653` 鈥?浠呮槸杩炴帴澶辫触鎻愮ず妗嗙殑銆屽叧闂€嶆寜閽紙闈為伄缃╋級锛屼繚鐣?
+  - `Sidebar.tsx:801` 鈥?鍙抽敭鑿滃崟閬僵锛岀偣绌虹櫧鍏抽棴鑿滃崟鏄湡鏈涜涓猴紝涓嶅姩
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS
+- **闄勶細闃舵 13 build 鏀跺熬** 鈥?`src-tauri/src/main.rs` `generate_handler!` 閲?`list_system_fonts` 鏀逛负闄愬畾璺緞 `fonts::list_system_fonts`锛堝懡浠ゅ畾涔夊湪 `fonts.rs` 鑰岄潪 main.rs锛岄渶妯″潡闄愬畾锛夛紱`cargo check` 宸茬豢锛岄樁娈?13 鍚庣鍙紪璇?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 14 complete（对话框误触关闭修复，tsc 绿）；阶段 13 build 已收尾（cargo check 绿） |
-| 我要去哪里？ | 用户 `cargo tauri dev` 验证：打开设置 / 快捷命令 / 主密码 / 密码验证弹窗，点遮罩不再关闭，只能用关闭/取消按钮 |
-| 目标是什么？ | 所有对话框点操作框外不意外退出，行为与新建连接一致 |
-| 我学到了什么？ | 「overlay `onClick={onClose}` + content `stopPropagation`」是点遮罩关闭的标准模式，但长表单误触代价高应禁用；批量改时靠 `position:fixed;inset:0` 的遮罩区分「overlay 的 onClick」与「按钮的 onClick」，逐个用 zIndex 上下文唯一定位避免误删按钮 |
-| 我做了什么？ | 4 个组件共 5 处遮罩移除 `onClick={onClose}`；顺带修阶段 13 build 错误（`fonts::` 限定路径） |
+| 鎴戝湪鍝噷锛?| 闃舵 14 complete锛堝璇濇璇Е鍏抽棴淇锛宼sc 缁匡級锛涢樁娈?13 build 宸叉敹灏撅紙cargo check 缁匡級 |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri dev` 楠岃瘉锛氭墦寮€璁剧疆 / 蹇嵎鍛戒护 / 涓诲瘑鐮?/ 瀵嗙爜楠岃瘉寮圭獥锛岀偣閬僵涓嶅啀鍏抽棴锛屽彧鑳界敤鍏抽棴/鍙栨秷鎸夐挳 |
+| 鐩爣鏄粈涔堬紵 | 鎵€鏈夊璇濇鐐规搷浣滄澶栦笉鎰忓閫€鍑猴紝琛屼负涓庢柊寤鸿繛鎺ヤ竴鑷?|
+| 鎴戝鍒颁簡浠€涔堬紵 | 銆宱verlay `onClick={onClose}` + content `stopPropagation`銆嶆槸鐐归伄缃╁叧闂殑鏍囧噯妯″紡锛屼絾闀胯〃鍗曡瑙︿唬浠烽珮搴旂鐢紱鎵归噺鏀规椂闈?`position:fixed;inset:0` 鐨勯伄缃╁尯鍒嗐€宱verlay 鐨?onClick銆嶄笌銆屾寜閽殑 onClick銆嶏紝閫愪釜鐢?zIndex 涓婁笅鏂囧敮涓€瀹氫綅閬垮厤璇垹鎸夐挳 |
+| 鎴戝仛浜嗕粈涔堬紵 | 4 涓粍浠跺叡 5 澶勯伄缃╃Щ闄?`onClick={onClose}`锛涢『甯︿慨闃舵 13 build 閿欒锛坄fonts::` 闄愬畾璺緞锛?|
 
-### 阶段 15：字体选择——模糊搜索下拉 + 样式统一（2026-06-18）
-- **状态：** 前端 complete（`npx tsc --noEmit` PASS）
-- **需求（用户反馈）：** ① 字体选择支持模糊搜索，通过下拉框选择；② 现在字体下拉框很丑，统一样式
-- **问题（原实现）：** `FontField` 用原生 `<datalist>`——① 浏览器默认下拉样式无法定制，与应用 Catppuccin 主题完全不搭（丑）；② 只做前缀/子串匹配，输入中间词无法过滤，谈不上「模糊搜索」
-- **方案：** 重写为自定义 combobox（props 签名 `value/onChange/placeholder` 不变，`SettingsPanel` / `ConnectionDialog` 调用处零改动）
-  - **模糊匹配**：查询按空格分词，每个 token（大小写不敏感）都需出现在字体名中、顺序无关 → `nerd mono` 命中 `JetBrainsMono Nerd Font Mono`
-  - **`value` / `query` 分离**：过滤用独立 `query`，已选字体重新聚焦仍显示完整列表，不会被自身值过滤掉；选中 / 外部清空时重置 `query`
-  - **匹配片段高亮**：结果中把命中 token 加粗 + 加深色，模糊命中一目了然
-  - **统一样式**：输入框复用项目输入框样式 + focus 蓝环（`--accent-primary` + `0 0 0 3px --accent-primary-muted`）；下拉面板用 `--bg-elevated` / `--border-emphasis` / `--shadow-xl` / `--radius-md`，选项高亮用 `--accent-primary-muted` + `--accent-primary`，与 TypeSelector / 按钮选中态一致；右侧加 `▾` 提示可下拉
-  - **交互**：键盘 `↑↓` 移动高亮、`Enter` 选中、`Esc` 关闭；hover 同步高亮；点击选中。选项 `onMouseDown preventDefault` 防止 input blur 先关掉下拉
-  - **性能**：`MAX_RESULTS = 200` + 超量截断提示；字体列表模块级缓存（沿用）
-  - 加载中 / 无匹配 空状态提示，自由文本输入仍可用（系统字体枚举可能不全）
-- **修改明细：**
-  - `src/components/FontField.tsx` — 整体重写（datalist → combobox + `renderHighlighted` 片段高亮工具）
-- **验证：** `npx tsc --noEmit` PASS；待 `cargo tauri dev` 实测：设置 / 连接对话框字体输入触发模糊过滤、下拉主题一致、键盘可导航、匹配字加粗
-- **遗留 / 限制：** 下拉用 `relative + absolute`，位于设置面板 / 连接对话框的 `overflowY: auto` 内容区内；字体字段贴近可视区底部时下拉可能被裁剪（内容区可滚动看到）。两处实际使用位置（设置中段、连接对话框表单上部）空间充足，暂不引入 portal/fixed 定位；若反馈裁剪再升级
+### 闃舵 15锛氬瓧浣撻€夋嫨鈥斺€旀ā绯婃悳绱笅鎷?+ 鏍峰紡缁熶竴锛?026-06-18锛?
+- **鐘舵€侊細** 鍓嶇 complete锛坄npx tsc --noEmit` PASS锛?
+- **闇€姹傦紙鐢ㄦ埛鍙嶉锛夛細** 鈶?瀛椾綋閫夋嫨鏀寔妯＄硦鎼滅储锛岄€氳繃涓嬫媺妗嗛€夋嫨锛涒憽 鐜板湪瀛椾綋涓嬫媺妗嗗緢涓戯紝缁熶竴鏍峰紡
+- **闂锛堝師瀹炵幇锛夛細** `FontField` 鐢ㄥ師鐢?`<datalist>`鈥斺€斺憼 娴忚鍣ㄩ粯璁や笅鎷夋牱寮忔棤娉曞畾鍒讹紝涓庡簲鐢?Catppuccin 涓婚瀹屽叏涓嶆惌锛堜笐锛夛紱鈶?鍙仛鍓嶇紑/瀛愪覆鍖归厤锛岃緭鍏ヤ腑闂磋瘝鏃犳硶杩囨护锛岃皥涓嶄笂銆屾ā绯婃悳绱€?
+- **鏂规锛?* 閲嶅啓涓鸿嚜瀹氫箟 combobox锛坧rops 绛惧悕 `value/onChange/placeholder` 涓嶅彉锛宍SettingsPanel` / `ConnectionDialog` 璋冪敤澶勯浂鏀瑰姩锛?
+  - **妯＄硦鍖归厤**锛氭煡璇㈡寜绌烘牸鍒嗚瘝锛屾瘡涓?token锛堝ぇ灏忓啓涓嶆晱鎰燂級閮介渶鍑虹幇鍦ㄥ瓧浣撳悕涓€侀『搴忔棤鍏?鈫?`nerd mono` 鍛戒腑 `JetBrainsMono Nerd Font Mono`
+  - **`value` / `query` 鍒嗙**锛氳繃婊ょ敤鐙珛 `query`锛屽凡閫夊瓧浣撻噸鏂拌仛鐒︿粛鏄剧ず瀹屾暣鍒楄〃锛屼笉浼氳鑷韩鍊艰繃婊ゆ帀锛涢€変腑 / 澶栭儴娓呯┖鏃堕噸缃?`query`
+  - **鍖归厤鐗囨楂樹寒**锛氱粨鏋滀腑鎶婂懡涓?token 鍔犵矖 + 鍔犳繁鑹诧紝妯＄硦鍛戒腑涓€鐩簡鐒?
+  - **缁熶竴鏍峰紡**锛氳緭鍏ユ澶嶇敤椤圭洰杈撳叆妗嗘牱寮?+ focus 钃濈幆锛坄--accent-primary` + `0 0 0 3px --accent-primary-muted`锛夛紱涓嬫媺闈㈡澘鐢?`--bg-elevated` / `--border-emphasis` / `--shadow-xl` / `--radius-md`锛岄€夐」楂樹寒鐢?`--accent-primary-muted` + `--accent-primary`锛屼笌 TypeSelector / 鎸夐挳閫変腑鎬佷竴鑷达紱鍙充晶鍔?`鈻綻 鎻愮ず鍙笅鎷?
+  - **浜や簰**锛氶敭鐩?`鈫戔啌` 绉诲姩楂樹寒銆乣Enter` 閫変腑銆乣Esc` 鍏抽棴锛沨over 鍚屾楂樹寒锛涚偣鍑婚€変腑銆傞€夐」 `onMouseDown preventDefault` 闃叉 input blur 鍏堝叧鎺変笅鎷?
+  - **鎬ц兘**锛歚MAX_RESULTS = 200` + 瓒呴噺鎴柇鎻愮ず锛涘瓧浣撳垪琛ㄦā鍧楃骇缂撳瓨锛堟部鐢級
+  - 鍔犺浇涓?/ 鏃犲尮閰?绌虹姸鎬佹彁绀猴紝鑷敱鏂囨湰杈撳叆浠嶅彲鐢紙绯荤粺瀛椾綋鏋氫妇鍙兘涓嶅叏锛?
+- **淇敼鏄庣粏锛?*
+  - `src/components/FontField.tsx` 鈥?鏁翠綋閲嶅啓锛坉atalist 鈫?combobox + `renderHighlighted` 鐗囨楂樹寒宸ュ叿锛?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛涘緟 `cargo tauri dev` 瀹炴祴锛氳缃?/ 杩炴帴瀵硅瘽妗嗗瓧浣撹緭鍏ヨЕ鍙戞ā绯婅繃婊ゃ€佷笅鎷変富棰樹竴鑷淬€侀敭鐩樺彲瀵艰埅銆佸尮閰嶅瓧鍔犵矖
+- **閬楃暀 / 闄愬埗锛?* 涓嬫媺鐢?`relative + absolute`锛屼綅浜庤缃潰鏉?/ 杩炴帴瀵硅瘽妗嗙殑 `overflowY: auto` 鍐呭鍖哄唴锛涘瓧浣撳瓧娈佃创杩戝彲瑙嗗尯搴曢儴鏃朵笅鎷夊彲鑳借瑁佸壀锛堝唴瀹瑰尯鍙粴鍔ㄧ湅鍒帮級銆備袱澶勫疄闄呬娇鐢ㄤ綅缃紙璁剧疆涓銆佽繛鎺ュ璇濇琛ㄥ崟涓婇儴锛夌┖闂村厖瓒筹紝鏆備笉寮曞叆 portal/fixed 瀹氫綅锛涜嫢鍙嶉瑁佸壀鍐嶅崌绾?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 15 complete（字体 combobox，tsc 绿） |
-| 我要去哪里？ | 用户 `cargo tauri dev` 验证：设置 / 连接对话框字体框输入即模糊过滤、下拉样式统一、键盘 ↑↓/Enter/Esc 可用 |
-| 目标是什么？ | 字体模糊搜索 + 下拉选择 + 与应用统一的下拉样式 |
-| 我学到了什么？ | 原生 `<datalist>` 不可定制样式且只前缀匹配；combobox 必须 `value`/`query` 分离，否则已选字体聚焦时会被自身值过滤成只剩自己；选项点击用 `onMouseDown preventDefault` 阻止 input 先 blur 关下拉，是 combobox 经典坑 |
-| 我做了什么？ | `FontField` 重写：模糊匹配（多 token 任意顺序）+ value/query 分离 + 匹配片段高亮 + 主题化下拉 + 键盘/hover/点击交互 + 截断与空状态 |
+| 鎴戝湪鍝噷锛?| 闃舵 15 complete锛堝瓧浣?combobox锛宼sc 缁匡級 |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri dev` 楠岃瘉锛氳缃?/ 杩炴帴瀵硅瘽妗嗗瓧浣撴杈撳叆鍗虫ā绯婅繃婊ゃ€佷笅鎷夋牱寮忕粺涓€銆侀敭鐩?鈫戔啌/Enter/Esc 鍙敤 |
+| 鐩爣鏄粈涔堬紵 | 瀛椾綋妯＄硦鎼滅储 + 涓嬫媺閫夋嫨 + 涓庡簲鐢ㄧ粺涓€鐨勪笅鎷夋牱寮?|
+| 鎴戝鍒颁簡浠€涔堬紵 | 鍘熺敓 `<datalist>` 涓嶅彲瀹氬埗鏍峰紡涓斿彧鍓嶇紑鍖归厤锛沜ombobox 蹇呴』 `value`/`query` 鍒嗙锛屽惁鍒欏凡閫夊瓧浣撹仛鐒︽椂浼氳鑷韩鍊艰繃婊ゆ垚鍙墿鑷繁锛涢€夐」鐐瑰嚮鐢?`onMouseDown preventDefault` 闃绘 input 鍏?blur 鍏充笅鎷夛紝鏄?combobox 缁忓吀鍧?|
+| 鎴戝仛浜嗕粈涔堬紵 | `FontField` 閲嶅啓锛氭ā绯婂尮閰嶏紙澶?token 浠绘剰椤哄簭锛? value/query 鍒嗙 + 鍖归厤鐗囨楂樹寒 + 涓婚鍖栦笅鎷?+ 閿洏/hover/鐐瑰嚮浜や簰 + 鎴柇涓庣┖鐘舵€?|
 
-### 阶段 16：本地连接「以管理员运行」（整体提权方案）（2026-06-18）
-- **状态：** 前端 complete（`npx tsc --noEmit` PASS）；后端 complete（`cargo check` PASS，winapi 新增 features 编译通过）
-- **需求（用户）：** 本地的连接是否可以支持管理员运行？
-- **技术调研（为何不单连接提权）：** 本地 shell 经 `portable-pty` 的 `openpty()` + `spawn_command()` 启动，继承 MyShell 完整性级别（IL）。单连接提权的硬约束：① `portable-pty`/`CommandBuilder` 走 `CreateProcessW`，无提权选项；② 标准提权 `ShellExecute("runas")` 无法挂 ConPTY（ConPTY 要先 `CreatePseudoConsole` 再用带 `hPC` 的 `STARTUPINFOEX`）；③ medium-IL 进程无法把 ConPTY attach 到 high-IL shell（完整性级别隔离）。结论：要让 elevated shell 跑进我们的 ConPTY，**ConPTY 必须在已提权进程内创建**——即单连接提权需另起 elevated helper 进程 + 跨完整性级别命名管道 IPC 转发，工程量大、每次弹 UAC、维护重；连 Windows Terminal 都只开独立 elevated 窗口而非单进程混跑 IL。
-- **决策（用户选定方案 A · 整体提权）：** 以管理员身份重启 MyShell，提权后所有本地连接自动获得管理员权限。最小代价覆盖"偶尔要管理员跑命令"的真实需求。
-- **方案：**
-  - 新增 `elevation.rs`：
-    - `is_elevated()` — Windows：`OpenProcessToken` + `GetTokenInformation(TokenElevation)`；非 Windows：`geteuid()==0`（extern C 声明，免 libc 依赖）
-    - `restart_as_admin()` — Windows：`ShellExecuteW(verb="runas")` 触发 UAC，返回 HINSTANCE ≤ 32 为错误（1223=ERROR_CANCELLED 用户取消）；非 Windows：stub 返回"暂不支持"
-  - `main.rs`：`is_elevated` / `restart_as_admin` 两个 `#[tauri::command]`；后者成功后 `app.exit(0)` 触发 `ExitRequested` → `drain_all_sessions` 优雅排空再退出，elevated 新实例由系统在 UAC 后独立启动
-  - 前端：`api.ts` 加 `isElevated()` / `restartAsAdmin()`；`SettingsPanel` 新增「🛡️ 管理员权限」Section（状态 chip：检测中 / ✓ 已是管理员 / 当前普通用户 + 未提权时「以管理员重启」按钮 + 警告条）；`ConnectionDialog` 本地 shell 提示加引导语
-  - 依赖：winapi 升为 Windows-only 直接依赖（features：`processthreadsapi`/`securitybaseapi`/`winnt`/`handleapi`/`shellapi`/`winuser`）——原为 portable-pty 间接依赖，声明直接依赖以便手写 elevation FFI
-- **修改明细：**
-  - `src-tauri/src/elevation.rs`（新建）
-  - `src-tauri/Cargo.toml` — `[target.'cfg(windows)'.dependencies] winapi = { ..., features=[...] }`
-  - `src-tauri/src/main.rs` — `mod elevation` + 2 命令 + `generate_handler!` 注册
-  - `src/api.ts` — `isElevated` / `restartAsAdmin`
-  - `src/components/SettingsPanel.tsx` — import `confirm`/`isElevated`/`restartAsAdmin`；`elevated`/`restartBusy` state + 加载 effect；`handleRestartAdmin`（`confirm` 二次确认 → `restartAsAdmin`，取消 UAC 静默、其他错误 alert）；管理员权限 Section
-  - `src/components/ConnectionDialog.tsx` — 本地 shell 说明追加管理员引导
-- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS（winapi features 齐全，`myshell` 编译通过）
-- **遗留 / 限制：**
-  - 粒度为全局：重启后所有连接提权，非单连接；重启丢失当前 tab（已在警告条 + 二次确认说明）
-  - 每次重启弹一次 UAC
-  - 非 Windows：`restart_as_admin` 为 stub，前端按钮在非 root 时仍可见但点击报"当前平台暂不支持"（项目 Windows 优先，未做平台级隐藏）；如需可在前端按 `navigator.platform` 隐藏
+### 闃舵 16锛氭湰鍦拌繛鎺ャ€屼互绠＄悊鍛樿繍琛屻€嶏紙鏁翠綋鎻愭潈鏂规锛夛紙2026-06-18锛?
+- **鐘舵€侊細** 鍓嶇 complete锛坄npx tsc --noEmit` PASS锛夛紱鍚庣 complete锛坄cargo check` PASS锛寃inapi 鏂板 features 缂栬瘧閫氳繃锛?
+- **闇€姹傦紙鐢ㄦ埛锛夛細** 鏈湴鐨勮繛鎺ユ槸鍚﹀彲浠ユ敮鎸佺鐞嗗憳杩愯锛?
+- **鎶€鏈皟鐮旓紙涓轰綍涓嶅崟杩炴帴鎻愭潈锛夛細** 鏈湴 shell 缁?`portable-pty` 鐨?`openpty()` + `spawn_command()` 鍚姩锛岀户鎵?MyShell 瀹屾暣鎬х骇鍒紙IL锛夈€傚崟杩炴帴鎻愭潈鐨勭‖绾︽潫锛氣憼 `portable-pty`/`CommandBuilder` 璧?`CreateProcessW`锛屾棤鎻愭潈閫夐」锛涒憽 鏍囧噯鎻愭潈 `ShellExecute("runas")` 鏃犳硶鎸?ConPTY锛圕onPTY 瑕佸厛 `CreatePseudoConsole` 鍐嶇敤甯?`hPC` 鐨?`STARTUPINFOEX`锛夛紱鈶?medium-IL 杩涚▼鏃犳硶鎶?ConPTY attach 鍒?high-IL shell锛堝畬鏁存€х骇鍒殧绂伙級銆傜粨璁猴細瑕佽 elevated shell 璺戣繘鎴戜滑鐨?ConPTY锛?*ConPTY 蹇呴』鍦ㄥ凡鎻愭潈杩涚▼鍐呭垱寤?*鈥斺€斿嵆鍗曡繛鎺ユ彁鏉冮渶鍙﹁捣 elevated helper 杩涚▼ + 璺ㄥ畬鏁存€х骇鍒懡鍚嶇閬?IPC 杞彂锛屽伐绋嬮噺澶с€佹瘡娆″脊 UAC銆佺淮鎶ら噸锛涜繛 Windows Terminal 閮藉彧寮€鐙珛 elevated 绐楀彛鑰岄潪鍗曡繘绋嬫贩璺?IL銆?
+- **鍐崇瓥锛堢敤鎴烽€夊畾鏂规 A 路 鏁翠綋鎻愭潈锛夛細** 浠ョ鐞嗗憳韬唤閲嶅惎 MyShell锛屾彁鏉冨悗鎵€鏈夋湰鍦拌繛鎺ヨ嚜鍔ㄨ幏寰楃鐞嗗憳鏉冮檺銆傛渶灏忎唬浠疯鐩?鍋跺皵瑕佺鐞嗗憳璺戝懡浠?鐨勭湡瀹為渶姹傘€?
+- **鏂规锛?*
+  - 鏂板 `elevation.rs`锛?
+    - `is_elevated()` 鈥?Windows锛歚OpenProcessToken` + `GetTokenInformation(TokenElevation)`锛涢潪 Windows锛歚geteuid()==0`锛坋xtern C 澹版槑锛屽厤 libc 渚濊禆锛?
+    - `restart_as_admin()` 鈥?Windows锛歚ShellExecuteW(verb="runas")` 瑙﹀彂 UAC锛岃繑鍥?HINSTANCE 鈮?32 涓洪敊璇紙1223=ERROR_CANCELLED 鐢ㄦ埛鍙栨秷锛夛紱闈?Windows锛歴tub 杩斿洖"鏆備笉鏀寔"
+  - `main.rs`锛歚is_elevated` / `restart_as_admin` 涓や釜 `#[tauri::command]`锛涘悗鑰呮垚鍔熷悗 `app.exit(0)` 瑙﹀彂 `ExitRequested` 鈫?`drain_all_sessions` 浼橀泤鎺掔┖鍐嶉€€鍑猴紝elevated 鏂板疄渚嬬敱绯荤粺鍦?UAC 鍚庣嫭绔嬪惎鍔?
+  - 鍓嶇锛歚api.ts` 鍔?`isElevated()` / `restartAsAdmin()`锛沗SettingsPanel` 鏂板銆岎煕★笍 绠＄悊鍛樻潈闄愩€峉ection锛堢姸鎬?chip锛氭娴嬩腑 / 鉁?宸叉槸绠＄悊鍛?/ 褰撳墠鏅€氱敤鎴?+ 鏈彁鏉冩椂銆屼互绠＄悊鍛橀噸鍚€嶆寜閽?+ 璀﹀憡鏉★級锛沗ConnectionDialog` 鏈湴 shell 鎻愮ず鍔犲紩瀵艰
+  - 渚濊禆锛歸inapi 鍗囦负 Windows-only 鐩存帴渚濊禆锛坒eatures锛歚processthreadsapi`/`securitybaseapi`/`winnt`/`handleapi`/`shellapi`/`winuser`锛夆€斺€斿師涓?portable-pty 闂存帴渚濊禆锛屽０鏄庣洿鎺ヤ緷璧栦互渚挎墜鍐?elevation FFI
+- **淇敼鏄庣粏锛?*
+  - `src-tauri/src/elevation.rs`锛堟柊寤猴級
+  - `src-tauri/Cargo.toml` 鈥?`[target.'cfg(windows)'.dependencies] winapi = { ..., features=[...] }`
+  - `src-tauri/src/main.rs` 鈥?`mod elevation` + 2 鍛戒护 + `generate_handler!` 娉ㄥ唽
+  - `src/api.ts` 鈥?`isElevated` / `restartAsAdmin`
+  - `src/components/SettingsPanel.tsx` 鈥?import `confirm`/`isElevated`/`restartAsAdmin`锛沗elevated`/`restartBusy` state + 鍔犺浇 effect锛沗handleRestartAdmin`锛坄confirm` 浜屾纭 鈫?`restartAsAdmin`锛屽彇娑?UAC 闈欓粯銆佸叾浠栭敊璇?alert锛夛紱绠＄悊鍛樻潈闄?Section
+  - `src/components/ConnectionDialog.tsx` 鈥?鏈湴 shell 璇存槑杩藉姞绠＄悊鍛樺紩瀵?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛沗cargo check` PASS锛坵inapi features 榻愬叏锛宍myshell` 缂栬瘧閫氳繃锛?
+- **閬楃暀 / 闄愬埗锛?*
+  - 绮掑害涓哄叏灞€锛氶噸鍚悗鎵€鏈夎繛鎺ユ彁鏉冿紝闈炲崟杩炴帴锛涢噸鍚涪澶卞綋鍓?tab锛堝凡鍦ㄨ鍛婃潯 + 浜屾纭璇存槑锛?
+  - 姣忔閲嶅惎寮逛竴娆?UAC
+  - 闈?Windows锛歚restart_as_admin` 涓?stub锛屽墠绔寜閽湪闈?root 鏃朵粛鍙浣嗙偣鍑绘姤"褰撳墠骞冲彴鏆備笉鏀寔"锛堥」鐩?Windows 浼樺厛锛屾湭鍋氬钩鍙扮骇闅愯棌锛夛紱濡傞渶鍙湪鍓嶇鎸?`navigator.platform` 闅愯棌
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 16 complete（管理员重启；前端 tsc 绿 + 后端 cargo check 绿） |
-| 我要去哪里？ | 用户 `cargo tauri dev` → 设置面板看「管理员权限」状态 → 未提权点「以管理员重启」→ UAC「是」→ 新实例管理员运行 → 开本地连接执行需管理员命令 |
-| 目标是什么？ | 本地连接支持以管理员身份运行 shell（整体提权方案） |
-| 我学到了什么？ | ConPTY + UAC 完整性级别隔离使单连接提权必须 elevated helper + 跨 IL IPC（Windows Terminal 也只开独立 elevated 窗口）→ 整体提权性价比最高；`ShellExecuteW("runas")` 返回 HINSTANCE≤32 为错（1223=用户取消）；winapi 直接依赖需按用到的 API 精确列 features |
-| 我做了什么？ | `elevation.rs`（is_elevated + restart_as_admin）+ winapi Windows-only 依赖 + main.rs 两命令（重启后 app.exit 触发 drain）+ api.ts + SettingsPanel 管理员 Section + ConnectionDialog 引导 |
+| 鎴戝湪鍝噷锛?| 闃舵 16 complete锛堢鐞嗗憳閲嶅惎锛涘墠绔?tsc 缁?+ 鍚庣 cargo check 缁匡級 |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri dev` 鈫?璁剧疆闈㈡澘鐪嬨€岀鐞嗗憳鏉冮檺銆嶇姸鎬?鈫?鏈彁鏉冪偣銆屼互绠＄悊鍛橀噸鍚€嶁啋 UAC銆屾槸銆嶁啋 鏂板疄渚嬬鐞嗗憳杩愯 鈫?寮€鏈湴杩炴帴鎵ц闇€绠＄悊鍛樺懡浠?|
+| 鐩爣鏄粈涔堬紵 | 鏈湴杩炴帴鏀寔浠ョ鐞嗗憳韬唤杩愯 shell锛堟暣浣撴彁鏉冩柟妗堬級 |
+| 鎴戝鍒颁簡浠€涔堬紵 | ConPTY + UAC 瀹屾暣鎬х骇鍒殧绂讳娇鍗曡繛鎺ユ彁鏉冨繀椤?elevated helper + 璺?IL IPC锛圵indows Terminal 涔熷彧寮€鐙珛 elevated 绐楀彛锛夆啋 鏁翠綋鎻愭潈鎬т环姣旀渶楂橈紱`ShellExecuteW("runas")` 杩斿洖 HINSTANCE鈮?2 涓洪敊锛?223=鐢ㄦ埛鍙栨秷锛夛紱winapi 鐩存帴渚濊禆闇€鎸夌敤鍒扮殑 API 绮剧‘鍒?features |
+| 鎴戝仛浜嗕粈涔堬紵 | `elevation.rs`锛坕s_elevated + restart_as_admin锛? winapi Windows-only 渚濊禆 + main.rs 涓ゅ懡浠わ紙閲嶅惎鍚?app.exit 瑙﹀彂 drain锛? api.ts + SettingsPanel 绠＄悊鍛?Section + ConnectionDialog 寮曞 |
 
-### 阶段 17：v1.3.3 综合优化（历史过滤 / 保存按钮悬浮 / 版本号单一源 / 图标重生成）（2026-06-18）
-- **状态：** 前端 complete（tsc PASS）；后端 complete（cargo check PASS，`myshell v1.3.3`）；图标全套重生成（tauri icon from source-a.svg）
-- **四项改动：**
-  1. **历史命令废命令过滤**：用户反馈历史里有 "A"、"AD" 这类误触单/双字母无效命令。在 `add_command_history` 边界（main.rs，覆盖 TerminalPanel + CommandBar 两个调用入口）加 `is_junk_command`：trim 后仅由 a/d 字符组成（大小写不敏感）→ 返回 Ok(0) 不入库。⚠️ 此规则也匹配 `dd`（Linux 常用），已向用户提示，如需可加白名单
-  2. **新建连接保存按钮悬浮**：ConnectionDialog 底部「取消/保存」footer 加 `position: sticky; bottom: 0`（卡片是 overflowY auto 滚动容器），长表单不用滚到底也能点保存
-  3. **版本号单一源**：`Cargo.toml [package] version` 为唯一手动源；`tauri.conf.json` 删除 version 字段（Tauri v2 自动读 Cargo.toml）；新增 `scripts/sync-version.mjs` 在 `npm run build`（tauri build 的 beforeBuildCommand）前自动把 version 同步到 package.json + package-lock.json，亦可 `npm run version:sync` 手动。以后升版只改 Cargo.toml 一处
-  4. **打包图标重生成**：用户上传的图标即当前 Aurora Prompt（source-a.svg 渲染）。用矢量源 `source-a.svg`（1024 viewBox）跑 `npx tauri icon` 重新生成全套——icon.ico（exe）、icon.icns（mac）、各尺寸 PNG、Square*Logo/StoreLogo（NSIS 安装器）、iOS/Android，确保全套高清一致
-- **版本号：** 1.2.2 → 1.3.3（Cargo.toml / package.json / package-lock；tauri.conf.json 无 version，由 Cargo.toml 驱动）
-- **修改明细：**
-  - `src-tauri/src/main.rs` — `add_command_history` 改用 trimmed + `is_junk_command` 过滤；新增 `is_junk_command` 函数
-  - `src/components/ConnectionDialog.tsx` — footer 加 sticky bottom / flexShrink / zIndex
-  - `src-tauri/Cargo.toml` / `package.json` / `package-lock.json` — version → 1.3.3
-  - `src-tauri/tauri.conf.json` — 删除 version 字段
-  - `scripts/sync-version.mjs`（新建）— Cargo.toml → package.json/lock 同步脚本
-  - `package.json` scripts — build 前置 sync-version，新增 version:sync
-  - `src-tauri/icons/*` — tauri icon 从 source-a.svg 重新生成全套
-- **验证：** tsc PASS；cargo check PASS（v1.3.3）；sync-version.mjs 运行 OK（"already at 1.3.3"）；tauri icon 全套生成 OK（icon.ico/icns/png/Square*Logo/iOS/Android 均 11:21 更新）
-- **遗留 / 提醒：** ① 历史过滤 dd 风险（见上，待用户确认是否加白名单）；② tauri.conf.json 删 version 依赖 Tauri v2 自动读 Cargo.toml（官方行为，待 `tauri build` 实测 version 显示）；③ 看新 exe 图标需重新 `cargo tauri build`，Windows 可能要清图标缓存
+### 闃舵 17锛歷1.3.3 缁煎悎浼樺寲锛堝巻鍙茶繃婊?/ 淇濆瓨鎸夐挳鎮诞 / 鐗堟湰鍙峰崟涓€婧?/ 鍥炬爣閲嶇敓鎴愶級锛?026-06-18锛?
+- **鐘舵€侊細** 鍓嶇 complete锛坱sc PASS锛夛紱鍚庣 complete锛坈argo check PASS锛宍myshell v1.3.3`锛夛紱鍥炬爣鍏ㄥ閲嶇敓鎴愶紙tauri icon from source-a.svg锛?
+- **鍥涢」鏀瑰姩锛?*
+  1. **鍘嗗彶鍛戒护搴熷懡浠よ繃婊?*锛氱敤鎴峰弽棣堝巻鍙查噷鏈?"A"銆?AD" 杩欑被璇Е鍗?鍙屽瓧姣嶆棤鏁堝懡浠ゃ€傚湪 `add_command_history` 杈圭晫锛坢ain.rs锛岃鐩?TerminalPanel + CommandBar 涓や釜璋冪敤鍏ュ彛锛夊姞 `is_junk_command`锛歵rim 鍚庝粎鐢?a/d 瀛楃缁勬垚锛堝ぇ灏忓啓涓嶆晱鎰燂級鈫?杩斿洖 Ok(0) 涓嶅叆搴撱€傗殸锔?姝よ鍒欎篃鍖归厤 `dd`锛圠inux 甯哥敤锛夛紝宸插悜鐢ㄦ埛鎻愮ず锛屽闇€鍙姞鐧藉悕鍗?
+  2. **鏂板缓杩炴帴淇濆瓨鎸夐挳鎮诞**锛欳onnectionDialog 搴曢儴銆屽彇娑?淇濆瓨銆峟ooter 鍔?`position: sticky; bottom: 0`锛堝崱鐗囨槸 overflowY auto 婊氬姩瀹瑰櫒锛夛紝闀胯〃鍗曚笉鐢ㄦ粴鍒板簳涔熻兘鐐逛繚瀛?
+  3. **鐗堟湰鍙峰崟涓€婧?*锛歚Cargo.toml [package] version` 涓哄敮涓€鎵嬪姩婧愶紱`tauri.conf.json` 鍒犻櫎 version 瀛楁锛圱auri v2 鑷姩璇?Cargo.toml锛夛紱鏂板 `scripts/sync-version.mjs` 鍦?`npm run build`锛坱auri build 鐨?beforeBuildCommand锛夊墠鑷姩鎶?version 鍚屾鍒?package.json + package-lock.json锛屼害鍙?`npm run version:sync` 鎵嬪姩銆備互鍚庡崌鐗堝彧鏀?Cargo.toml 涓€澶?
+  4. **鎵撳寘鍥炬爣閲嶇敓鎴?*锛氱敤鎴蜂笂浼犵殑鍥炬爣鍗冲綋鍓?Aurora Prompt锛坰ource-a.svg 娓叉煋锛夈€傜敤鐭㈤噺婧?`source-a.svg`锛?024 viewBox锛夎窇 `npx tauri icon` 閲嶆柊鐢熸垚鍏ㄥ鈥斺€攊con.ico锛坋xe锛夈€乮con.icns锛坢ac锛夈€佸悇灏哄 PNG銆丼quare*Logo/StoreLogo锛圢SIS 瀹夎鍣級銆乮OS/Android锛岀‘淇濆叏濂楅珮娓呬竴鑷?
+- **鐗堟湰鍙凤細** 1.2.2 鈫?1.3.3锛圕argo.toml / package.json / package-lock锛泃auri.conf.json 鏃?version锛岀敱 Cargo.toml 椹卞姩锛?
+- **淇敼鏄庣粏锛?*
+  - `src-tauri/src/main.rs` 鈥?`add_command_history` 鏀圭敤 trimmed + `is_junk_command` 杩囨护锛涙柊澧?`is_junk_command` 鍑芥暟
+  - `src/components/ConnectionDialog.tsx` 鈥?footer 鍔?sticky bottom / flexShrink / zIndex
+  - `src-tauri/Cargo.toml` / `package.json` / `package-lock.json` 鈥?version 鈫?1.3.3
+  - `src-tauri/tauri.conf.json` 鈥?鍒犻櫎 version 瀛楁
+  - `scripts/sync-version.mjs`锛堟柊寤猴級鈥?Cargo.toml 鈫?package.json/lock 鍚屾鑴氭湰
+  - `package.json` scripts 鈥?build 鍓嶇疆 sync-version锛屾柊澧?version:sync
+  - `src-tauri/icons/*` 鈥?tauri icon 浠?source-a.svg 閲嶆柊鐢熸垚鍏ㄥ
+- **楠岃瘉锛?* tsc PASS锛沜argo check PASS锛坴1.3.3锛夛紱sync-version.mjs 杩愯 OK锛?already at 1.3.3"锛夛紱tauri icon 鍏ㄥ鐢熸垚 OK锛坕con.ico/icns/png/Square*Logo/iOS/Android 鍧?11:21 鏇存柊锛?
+- **閬楃暀 / 鎻愰啋锛?* 鈶?鍘嗗彶杩囨护 dd 椋庨櫓锛堣涓婏紝寰呯敤鎴风‘璁ゆ槸鍚﹀姞鐧藉悕鍗曪級锛涒憽 tauri.conf.json 鍒?version 渚濊禆 Tauri v2 鑷姩璇?Cargo.toml锛堝畼鏂硅涓猴紝寰?`tauri build` 瀹炴祴 version 鏄剧ず锛夛紱鈶?鐪嬫柊 exe 鍥炬爣闇€閲嶆柊 `cargo tauri build`锛學indows 鍙兘瑕佹竻鍥炬爣缂撳瓨
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 17 complete（v1.3.3 四项优化，tsc + cargo check 绿，图标重生成） |
-| 我要去哪里？ | 用户 `cargo tauri build` 验证：版本 1.3.3、exe 图标、安装器；`cargo tauri dev` 验证历史命令过滤 + 保存按钮悬浮 |
-| 目标是什么？ | 过滤历史废命令；保存按钮常驻；版本号只改一处；打包图标统一高清 |
-| 我学到了什么？ | Tauri v2 `tauri.conf.json` 的 version 可省略、自动读 Cargo.toml（单一源关键）；`npx tauri icon` 接受 SVG 矢量源生成全平台图标（输出默认在 tauri.conf.json 旁的 icons/）；`position: sticky; bottom: 0` 在 overflowY auto 容器内让 footer 常驻且不脱离流（无遮挡）；历史过滤放在系统边界（命令层）可覆盖所有调用入口 |
-| 我做了什么？ | main.rs 历史过滤 + ConnectionDialog footer sticky + 版本号单一源（Cargo.toml 唯一 / tauri.conf.json 删 / sync 脚本）+ tauri icon 全套重生成 + 版本号 1.3.3 |
+| 鎴戝湪鍝噷锛?| 闃舵 17 complete锛坴1.3.3 鍥涢」浼樺寲锛宼sc + cargo check 缁匡紝鍥炬爣閲嶇敓鎴愶級 |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri build` 楠岃瘉锛氱増鏈?1.3.3銆乪xe 鍥炬爣銆佸畨瑁呭櫒锛沗cargo tauri dev` 楠岃瘉鍘嗗彶鍛戒护杩囨护 + 淇濆瓨鎸夐挳鎮诞 |
+| 鐩爣鏄粈涔堬紵 | 杩囨护鍘嗗彶搴熷懡浠わ紱淇濆瓨鎸夐挳甯搁┗锛涚増鏈彿鍙敼涓€澶勶紱鎵撳寘鍥炬爣缁熶竴楂樻竻 |
+| 鎴戝鍒颁簡浠€涔堬紵 | Tauri v2 `tauri.conf.json` 鐨?version 鍙渷鐣ャ€佽嚜鍔ㄨ Cargo.toml锛堝崟涓€婧愬叧閿級锛沗npx tauri icon` 鎺ュ彈 SVG 鐭㈤噺婧愮敓鎴愬叏骞冲彴鍥炬爣锛堣緭鍑洪粯璁ゅ湪 tauri.conf.json 鏃佺殑 icons/锛夛紱`position: sticky; bottom: 0` 鍦?overflowY auto 瀹瑰櫒鍐呰 footer 甯搁┗涓斾笉鑴辩娴侊紙鏃犻伄鎸★級锛涘巻鍙茶繃婊ゆ斁鍦ㄧ郴缁熻竟鐣岋紙鍛戒护灞傦級鍙鐩栨墍鏈夎皟鐢ㄥ叆鍙?|
+| 鎴戝仛浜嗕粈涔堬紵 | main.rs 鍘嗗彶杩囨护 + ConnectionDialog footer sticky + 鐗堟湰鍙峰崟涓€婧愶紙Cargo.toml 鍞竴 / tauri.conf.json 鍒?/ sync 鑴氭湰锛? tauri icon 鍏ㄥ閲嶇敓鎴?+ 鐗堟湰鍙?1.3.3 |
 
-### 阶段 17 补：NSIS 打包 BOM 修复（2026-06-18）
-- **现象：** `cargo tauri build` 在 NSIS 阶段失败：`Invalid command: "﻿;"` → `!include: error in script: SimpChinese.nsh on line 1` → `aborting creation process`。
-- **根因：** `src-tauri/nsis/lang/SimpChinese.nsh` 与 `src-tauri/nsis/uninstall-confirm-hook.nsh` 文件头带 **UTF-8 BOM（U+FEFF）**，NSIS 不认 BOM，把 BOM 当命令解析。`English.nsh` 无 BOM 故正常。潜伏问题——之前各阶段只跑 cargo check / dev，未跑完整 NSIS 打包，未暴露。
-- **修复：** 去掉这两个 `.nsh` 的 BOM（保留 UTF-8 内容；NSIS Unicode 模式按 UTF-8 读中文）。
-- **验证：** 重新 `npm run tauri:build` 成功，生成 `MyShell_1.3.3_x64-setup.exe`；文件名 1.3.3 证明 tauri.conf.json 删 version 后 Tauri 正确取自 Cargo.toml（单一源方案生效）。
-- **教训：** NSIS 的 `.nsh`（customLanguageFiles / installerHooks）必须 **无 BOM**；以后新增/编辑 .nsh 注意编辑器别存 BOM。
+### 闃舵 17 琛ワ細NSIS 鎵撳寘 BOM 淇锛?026-06-18锛?
+- **鐜拌薄锛?* `cargo tauri build` 鍦?NSIS 闃舵澶辫触锛歚Invalid command: "锘?"` 鈫?`!include: error in script: SimpChinese.nsh on line 1` 鈫?`aborting creation process`銆?
+- **鏍瑰洜锛?* `src-tauri/nsis/lang/SimpChinese.nsh` 涓?`src-tauri/nsis/uninstall-confirm-hook.nsh` 鏂囦欢澶村甫 **UTF-8 BOM锛圲+FEFF锛?*锛孨SIS 涓嶈 BOM锛屾妸 BOM 褰撳懡浠よВ鏋愩€俙English.nsh` 鏃?BOM 鏁呮甯搞€傛綔浼忛棶棰樷€斺€斾箣鍓嶅悇闃舵鍙窇 cargo check / dev锛屾湭璺戝畬鏁?NSIS 鎵撳寘锛屾湭鏆撮湶銆?
+- **淇锛?* 鍘绘帀杩欎袱涓?`.nsh` 鐨?BOM锛堜繚鐣?UTF-8 鍐呭锛汵SIS Unicode 妯″紡鎸?UTF-8 璇讳腑鏂囷級銆?
+- **楠岃瘉锛?* 閲嶆柊 `npm run tauri:build` 鎴愬姛锛岀敓鎴?`MyShell_1.3.3_x64-setup.exe`锛涙枃浠跺悕 1.3.3 璇佹槑 tauri.conf.json 鍒?version 鍚?Tauri 姝ｇ‘鍙栬嚜 Cargo.toml锛堝崟涓€婧愭柟妗堢敓鏁堬級銆?
+- **鏁欒锛?* NSIS 鐨?`.nsh`锛坈ustomLanguageFiles / installerHooks锛夊繀椤?**鏃?BOM**锛涗互鍚庢柊澧?缂栬緫 .nsh 娉ㄦ剰缂栬緫鍣ㄥ埆瀛?BOM銆?
 
-### 阶段 18：打包警告清理 + 本地 PowerShell 透明背景渲染修复（2026-06-18）
-- **状态：** 前端 complete（tsc PASS）；打包验证通过（MyShell_1.3.3_x64-setup.exe，两 warning 消失）
-- **三项改动：**
-  1. **bundle identifier**：`com.myshell.app` → `com.myshell.client`（消除 Tauri "ends with `.app`" macOS 冲突警告）。副作用：新 identifier = 新 app 标识；DB/连接/密码/历史不变（存 `dirs/myshell`，不依赖 identifier）；WebView2 localStorage（主题/字体）可能重置；旧版（com.myshell.app）需手动卸载
-  2. **api.ts 动态导入**：App.tsx `await import("./api")` 改为静态 `import { deleteConnection }`（消除 vite "dynamically imported but also statically imported" 警告，bundle 635→632KB）
-  3. **本地 PowerShell 输入字母乱跳 + 影响背景**：根因——终端设背景图时 `allowTransparency: true`，xterm 默认 **canvas renderer 在透明模式下重绘不清除旧像素** → 输入字符残影叠加（"乱跳"）+ 残影糊在背景图上（"影响背景"），本地 ConPTY 输出更易触发。修复：加 `@xterm/addon-webgl`，启用 **WebGL renderer**（每帧完整重绘，透明合成干净无残影），失败 fallback canvas
-- **修改明细：**
-  - `src-tauri/tauri.conf.json` — identifier → `com.myshell.client`
-  - `src/App.tsx` — deleteConnection 改静态 import；onDelete 去掉 `await import`
-  - `package.json` — 加 `@xterm/addon-webgl@^0.18`
-  - `src/components/TerminalPanel.tsx` — import WebglAddon；`term.open` 后 `loadAddon(new WebglAddon())`（try/catch fallback）
-- **验证：** tsc PASS；`npm run tauri:build` 成功，两 warning 消失；WebGL 待 dev/build 实测乱跳是否消除
-- **遗留：** ① 图标问题待澄清——用户反馈 setup.exe 图标"仍是旧的"，但 `source-a.svg` 本就是当前 chevron，重新生成同款无变化，需用户确认期望的图标设计或排查 Windows 图标缓存；② PowerShell 乱跳修复待用户实测确认（若 WebGL 不解决再排查 cols/ConPTY 时序）
+### 闃舵 18锛氭墦鍖呰鍛婃竻鐞?+ 鏈湴 PowerShell 閫忔槑鑳屾櫙娓叉煋淇锛?026-06-18锛?
+- **鐘舵€侊細** 鍓嶇 complete锛坱sc PASS锛夛紱鎵撳寘楠岃瘉閫氳繃锛圡yShell_1.3.3_x64-setup.exe锛屼袱 warning 娑堝け锛?
+- **涓夐」鏀瑰姩锛?*
+  1. **bundle identifier**锛歚com.myshell.app` 鈫?`com.myshell.client`锛堟秷闄?Tauri "ends with `.app`" macOS 鍐茬獊璀﹀憡锛夈€傚壇浣滅敤锛氭柊 identifier = 鏂?app 鏍囪瘑锛汥B/杩炴帴/瀵嗙爜/鍘嗗彶涓嶅彉锛堝瓨 `dirs/myshell`锛屼笉渚濊禆 identifier锛夛紱WebView2 localStorage锛堜富棰?瀛椾綋锛夊彲鑳介噸缃紱鏃х増锛坈om.myshell.app锛夐渶鎵嬪姩鍗歌浇
+  2. **api.ts 鍔ㄦ€佸鍏?*锛欰pp.tsx `await import("./api")` 鏀逛负闈欐€?`import { deleteConnection }`锛堟秷闄?vite "dynamically imported but also statically imported" 璀﹀憡锛宐undle 635鈫?32KB锛?
+  3. **鏈湴 PowerShell 杈撳叆瀛楁瘝涔辫烦 + 褰卞搷鑳屾櫙**锛氭牴鍥犫€斺€旂粓绔鑳屾櫙鍥炬椂 `allowTransparency: true`锛寈term 榛樿 **canvas renderer 鍦ㄩ€忔槑妯″紡涓嬮噸缁樹笉娓呴櫎鏃у儚绱?* 鈫?杈撳叆瀛楃娈嬪奖鍙犲姞锛?涔辫烦"锛? 娈嬪奖绯婂湪鑳屾櫙鍥句笂锛?褰卞搷鑳屾櫙"锛夛紝鏈湴 ConPTY 杈撳嚭鏇存槗瑙﹀彂銆備慨澶嶏細鍔?`@xterm/addon-webgl`锛屽惎鐢?**WebGL renderer**锛堟瘡甯у畬鏁撮噸缁橈紝閫忔槑鍚堟垚骞插噣鏃犳畫褰憋級锛屽け璐?fallback canvas
+- **淇敼鏄庣粏锛?*
+  - `src-tauri/tauri.conf.json` 鈥?identifier 鈫?`com.myshell.client`
+  - `src/App.tsx` 鈥?deleteConnection 鏀归潤鎬?import锛沷nDelete 鍘绘帀 `await import`
+  - `package.json` 鈥?鍔?`@xterm/addon-webgl@^0.18`
+  - `src/components/TerminalPanel.tsx` 鈥?import WebglAddon锛沗term.open` 鍚?`loadAddon(new WebglAddon())`锛坱ry/catch fallback锛?
+- **楠岃瘉锛?* tsc PASS锛沗npm run tauri:build` 鎴愬姛锛屼袱 warning 娑堝け锛沇ebGL 寰?dev/build 瀹炴祴涔辫烦鏄惁娑堥櫎
+- **閬楃暀锛?* 鈶?鍥炬爣闂寰呮緞娓呪€斺€旂敤鎴峰弽棣?setup.exe 鍥炬爣"浠嶆槸鏃х殑"锛屼絾 `source-a.svg` 鏈氨鏄綋鍓?chevron锛岄噸鏂扮敓鎴愬悓娆炬棤鍙樺寲锛岄渶鐢ㄦ埛纭鏈熸湜鐨勫浘鏍囪璁℃垨鎺掓煡 Windows 鍥炬爣缂撳瓨锛涒憽 PowerShell 涔辫烦淇寰呯敤鎴峰疄娴嬬‘璁わ紙鑻?WebGL 涓嶈В鍐冲啀鎺掓煡 cols/ConPTY 鏃跺簭锛?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 18 complete（identifier + vite 警告清理已验证；PowerShell WebGL 修复待实测） |
-| 我要去哪里？ | 用户 `cargo tauri dev` 实测本地 PowerShell 输入不再乱跳/糊背景；确认 setup.exe 图标问题（缓存 or 需换源） |
-| 目标是什么？ | 消除两个打包 warning；修复本地 PowerShell 透明背景渲染；澄清图标 |
-| 我学到了什么？ | xterm `allowTransparency` + 默认 canvas renderer 透明模式重绘不清像素（残影），透明背景应用 WebGL renderer；Tauri identifier 不应以 `.app` 结尾（macOS 冲突）；改 identifier 不影响 dirs/myshell 下的 DB，但 WebView2 localStorage 会重置；vite 静态+动态混用导入失去分块意义 |
-| 我做了什么？ | identifier 改 com.myshell.client + App.tsx 动态改静态 + TerminalPanel 加 WebGL renderer + @xterm/addon-webgl 依赖 |
+| 鎴戝湪鍝噷锛?| 闃舵 18 complete锛坕dentifier + vite 璀﹀憡娓呯悊宸查獙璇侊紱PowerShell WebGL 淇寰呭疄娴嬶級 |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri dev` 瀹炴祴鏈湴 PowerShell 杈撳叆涓嶅啀涔辫烦/绯婅儗鏅紱纭 setup.exe 鍥炬爣闂锛堢紦瀛?or 闇€鎹㈡簮锛?|
+| 鐩爣鏄粈涔堬紵 | 娑堥櫎涓や釜鎵撳寘 warning锛涗慨澶嶆湰鍦?PowerShell 閫忔槑鑳屾櫙娓叉煋锛涙緞娓呭浘鏍?|
+| 鎴戝鍒颁簡浠€涔堬紵 | xterm `allowTransparency` + 榛樿 canvas renderer 閫忔槑妯″紡閲嶇粯涓嶆竻鍍忕礌锛堟畫褰憋級锛岄€忔槑鑳屾櫙搴旂敤 WebGL renderer锛汿auri identifier 涓嶅簲浠?`.app` 缁撳熬锛坢acOS 鍐茬獊锛夛紱鏀?identifier 涓嶅奖鍝?dirs/myshell 涓嬬殑 DB锛屼絾 WebView2 localStorage 浼氶噸缃紱vite 闈欐€?鍔ㄦ€佹贩鐢ㄥ鍏ュけ鍘诲垎鍧楁剰涔?|
+| 鎴戝仛浜嗕粈涔堬紵 | identifier 鏀?com.myshell.client + App.tsx 鍔ㄦ€佹敼闈欐€?+ TerminalPanel 鍔?WebGL renderer + @xterm/addon-webgl 渚濊禆 |
 
-### 阶段 18 补：NSIS 安装包（setup.exe）图标修复（2026-06-18）
-- **现象：** 用户反馈 setup.exe（安装包）图标不是 chevron，但应用图标（myshell.exe）正常。
-- **根因：** 应用图标走 `bundle.icon`（icon.ico，正常）；但 **NSIS 安装器图标是独立的 `bundle.windows.nsis.installerIcon` 字段**，之前未配置 → Tauri 用内置默认安装器图标。installer.nsi 里 `MUI_ICON "${INSTALLERICON}"`，而 INSTALLERICON 未指向用户图标。
-- **修复：** `tauri.conf.json` 的 nsis 块加 `"installerIcon": "icons/icon.ico"`（source-a.svg 渲染的 chevron）。
-- **验证：** rebuild 后 installer.nsi:39 `!define INSTALLERICON "F:\...\src-tauri\icons\icon.ico"`，setup.exe（MyShell_1.3.3_x64-setup.exe）嵌入 chevron 图标。
-- **遗留：** 资源管理器若仍显示旧图标，是 Windows 图标缓存（setup.exe 同名缓存）——右键属性看真实图标，或清 `%localappdata%\IconCache.db` + 重启资源管理器。
+### 闃舵 18 琛ワ細NSIS 瀹夎鍖咃紙setup.exe锛夊浘鏍囦慨澶嶏紙2026-06-18锛?
+- **鐜拌薄锛?* 鐢ㄦ埛鍙嶉 setup.exe锛堝畨瑁呭寘锛夊浘鏍囦笉鏄?chevron锛屼絾搴旂敤鍥炬爣锛坢yshell.exe锛夋甯搞€?
+- **鏍瑰洜锛?* 搴旂敤鍥炬爣璧?`bundle.icon`锛坕con.ico锛屾甯革級锛涗絾 **NSIS 瀹夎鍣ㄥ浘鏍囨槸鐙珛鐨?`bundle.windows.nsis.installerIcon` 瀛楁**锛屼箣鍓嶆湭閰嶇疆 鈫?Tauri 鐢ㄥ唴缃粯璁ゅ畨瑁呭櫒鍥炬爣銆俰nstaller.nsi 閲?`MUI_ICON "${INSTALLERICON}"`锛岃€?INSTALLERICON 鏈寚鍚戠敤鎴峰浘鏍囥€?
+- **淇锛?* `tauri.conf.json` 鐨?nsis 鍧楀姞 `"installerIcon": "icons/icon.ico"`锛坰ource-a.svg 娓叉煋鐨?chevron锛夈€?
+- **楠岃瘉锛?* rebuild 鍚?installer.nsi:39 `!define INSTALLERICON "F:\...\src-tauri\icons\icon.ico"`锛宻etup.exe锛圡yShell_1.3.3_x64-setup.exe锛夊祵鍏?chevron 鍥炬爣銆?
+- **閬楃暀锛?* 璧勬簮绠＄悊鍣ㄨ嫢浠嶆樉绀烘棫鍥炬爣锛屾槸 Windows 鍥炬爣缂撳瓨锛坰etup.exe 鍚屽悕缂撳瓨锛夆€斺€斿彸閿睘鎬х湅鐪熷疄鍥炬爣锛屾垨娓?`%localappdata%\IconCache.db` + 閲嶅惎璧勬簮绠＄悊鍣ㄣ€?
 
-### 阶段 18 补 2：NSIS 定制整体回退到初始（2026-06-18）
-- **现象：** 用户反馈卸载页面空白、安装最终页有问题（阶段 11 的 NSIS 定制 + 阶段 18 补的 installerIcon 引起）。
-- **决策：** 用户要求把安装/卸载变更回退到初始状态。
-- **回退：**
-  - `tauri.conf.json` nsis 块恢复到 HEAD 初始 —— 移除 `installerIcon` / `installerHooks` / `customLanguageFiles`，仅保留 `installMode` / `languages` / `displayLanguageSelector`
-  - 删除 `src-tauri/nsis/` 目录（uninstall-confirm-hook.nsh + lang/SimpChinese.nsh + lang/English.nsh，均为阶段 11 新增的 untracked 文件）
-- **保留（非安装/卸载页面变更）：** 版本号单一源（Cargo.toml 驱动，tauri.conf.json 无 version 字段）、identifier `com.myshell.client`
-- **验证：** rebuild 成功，MyShell_1.3.3_x64-setup.exe 生成；installer.nsi 无 `customLanguageFile` / `uninstall-confirm` 引用（`NSIS_HOOK_*` 是 Tauri 默认模板的钩子检查点，宏未定义故跳过）→ 卸载页 / 安装最终页恢复 Tauri 默认（不再空白/错误）
-- **影响：** ① setup.exe 图标回到 Tauri 默认（installerIcon 已移除）；② 卸载不再有"删除应用数据"二次确认钩子；③ 语言串用 Tauri 默认（不再覆盖 deleteAppData 文案）
-- **后续（同日，installerIcon 单独加回）：** 应用户要求只恢复安装器图标 —— nsis 块加回 `"installerIcon": "icons/icon.ico"`（钩子 / 语言覆盖保持回退）。验证：rebuild 成功，installer.nsi `INSTALLERICON → icons/icon.ico`，`customLanguageFile | uninstall-confirm` 计数 = 0 → 安装器图标 = chevron，卸载页 / 安装页仍 Tauri 默认（不空白）
+### 闃舵 18 琛?2锛歂SIS 瀹氬埗鏁翠綋鍥為€€鍒板垵濮嬶紙2026-06-18锛?
+- **鐜拌薄锛?* 鐢ㄦ埛鍙嶉鍗歌浇椤甸潰绌虹櫧銆佸畨瑁呮渶缁堥〉鏈夐棶棰橈紙闃舵 11 鐨?NSIS 瀹氬埗 + 闃舵 18 琛ョ殑 installerIcon 寮曡捣锛夈€?
+- **鍐崇瓥锛?* 鐢ㄦ埛瑕佹眰鎶婂畨瑁?鍗歌浇鍙樻洿鍥為€€鍒板垵濮嬬姸鎬併€?
+- **鍥為€€锛?*
+  - `tauri.conf.json` nsis 鍧楁仮澶嶅埌 HEAD 鍒濆 鈥斺€?绉婚櫎 `installerIcon` / `installerHooks` / `customLanguageFiles`锛屼粎淇濈暀 `installMode` / `languages` / `displayLanguageSelector`
+  - 鍒犻櫎 `src-tauri/nsis/` 鐩綍锛坲ninstall-confirm-hook.nsh + lang/SimpChinese.nsh + lang/English.nsh锛屽潎涓洪樁娈?11 鏂板鐨?untracked 鏂囦欢锛?
+- **淇濈暀锛堥潪瀹夎/鍗歌浇椤甸潰鍙樻洿锛夛細** 鐗堟湰鍙峰崟涓€婧愶紙Cargo.toml 椹卞姩锛宼auri.conf.json 鏃?version 瀛楁锛夈€乮dentifier `com.myshell.client`
+- **楠岃瘉锛?* rebuild 鎴愬姛锛孧yShell_1.3.3_x64-setup.exe 鐢熸垚锛沬nstaller.nsi 鏃?`customLanguageFile` / `uninstall-confirm` 寮曠敤锛坄NSIS_HOOK_*` 鏄?Tauri 榛樿妯℃澘鐨勯挬瀛愭鏌ョ偣锛屽畯鏈畾涔夋晠璺宠繃锛夆啋 鍗歌浇椤?/ 瀹夎鏈€缁堥〉鎭㈠ Tauri 榛樿锛堜笉鍐嶇┖鐧?閿欒锛?
+- **褰卞搷锛?* 鈶?setup.exe 鍥炬爣鍥炲埌 Tauri 榛樿锛坕nstallerIcon 宸茬Щ闄わ級锛涒憽 鍗歌浇涓嶅啀鏈?鍒犻櫎搴旂敤鏁版嵁"浜屾纭閽╁瓙锛涒憿 璇█涓茬敤 Tauri 榛樿锛堜笉鍐嶈鐩?deleteAppData 鏂囨锛?
+- **鍚庣画锛堝悓鏃ワ紝installerIcon 鍗曠嫭鍔犲洖锛夛細** 搴旂敤鎴疯姹傚彧鎭㈠瀹夎鍣ㄥ浘鏍?鈥斺€?nsis 鍧楀姞鍥?`"installerIcon": "icons/icon.ico"`锛堥挬瀛?/ 璇█瑕嗙洊淇濇寔鍥為€€锛夈€傞獙璇侊細rebuild 鎴愬姛锛宨nstaller.nsi `INSTALLERICON 鈫?icons/icon.ico`锛宍customLanguageFile | uninstall-confirm` 璁℃暟 = 0 鈫?瀹夎鍣ㄥ浘鏍?= chevron锛屽嵏杞介〉 / 瀹夎椤典粛 Tauri 榛樿锛堜笉绌虹櫧锛?
 
-### 阶段 18 补 3：WebGL 透明背景修复（背景图变黑）（2026-06-18）
-- **现象：** 阶段 18 加 WebGL renderer 后，用户反馈背景图变黑（看不到实际背景图）。
-- **根因：** 终端透明背景之前用 `theme.background = "transparent"` 字符串。canvas renderer 认这个 CSS 关键字（透明），但 **WebGL renderer 解析颜色失败**，clearColor 回退到不透明黑，盖住背景图层。
-- **修复：** 透明色改 `rgba(0, 0, 0, 0)`（alpha=0，WebGL 能正确解析）。两处：初始 Terminal 的 `theme` + live theme effect 的 `currentBg`。
-- **验证：** tsc PASS；待 build/dev 实测：WebGL 透明（背景图透出）+ 每帧重绘（无残影 / 乱跳）。
-- **教训：** xterm theme 色要用 WebGL / canvas 都能解析的格式（rgba / hex），别用 `"transparent"` 关键字——canvas 容忍、webgl 不认。
+### 闃舵 18 琛?3锛歐ebGL 閫忔槑鑳屾櫙淇锛堣儗鏅浘鍙橀粦锛夛紙2026-06-18锛?
+- **鐜拌薄锛?* 闃舵 18 鍔?WebGL renderer 鍚庯紝鐢ㄦ埛鍙嶉鑳屾櫙鍥惧彉榛戯紙鐪嬩笉鍒板疄闄呰儗鏅浘锛夈€?
+- **鏍瑰洜锛?* 缁堢閫忔槑鑳屾櫙涔嬪墠鐢?`theme.background = "transparent"` 瀛楃涓层€俢anvas renderer 璁よ繖涓?CSS 鍏抽敭瀛楋紙閫忔槑锛夛紝浣?**WebGL renderer 瑙ｆ瀽棰滆壊澶辫触**锛宑learColor 鍥為€€鍒颁笉閫忔槑榛戯紝鐩栦綇鑳屾櫙鍥惧眰銆?
+- **淇锛?* 閫忔槑鑹叉敼 `rgba(0, 0, 0, 0)`锛坅lpha=0锛學ebGL 鑳芥纭В鏋愶級銆備袱澶勶細鍒濆 Terminal 鐨?`theme` + live theme effect 鐨?`currentBg`銆?
+- **楠岃瘉锛?* tsc PASS锛涘緟 build/dev 瀹炴祴锛歐ebGL 閫忔槑锛堣儗鏅浘閫忓嚭锛? 姣忓抚閲嶇粯锛堟棤娈嬪奖 / 涔辫烦锛夈€?
+- **鏁欒锛?* xterm theme 鑹茶鐢?WebGL / canvas 閮借兘瑙ｆ瀽鐨勬牸寮忥紙rgba / hex锛夛紝鍒敤 `"transparent"` 鍏抽敭瀛椻€斺€攃anvas 瀹瑰繊銆亀ebgl 涓嶈銆?
 
-### 阶段 19：本地终端输入字符跳出 + 背景左移（cols 被 padding 污染）（2026-06-19）
-- **现象：** 用户反馈本地终端（PowerShell / ConPTY）输入命令时字符会跳出界面，并出现背景左移。这正是阶段 18 WebGL 修复（透明背景残影）之后**仍残留**的症状——阶段 18 遗留项②「若 WebGL 不解决再排查 cols / ConPTY 时序」预判的 cols 方向。
-- **根因：** FitAddon（@xterm/addon-fit 0.10.x）`proposeDimensions` 读 `getComputedStyle(容器).width`（border-box 宽度）当可用宽度，再除以 cellWidth 得 cols。而 `global.css` 全局 `* { box-sizing: border-box }` + `TerminalPanel.tsx` 的 **xterm 容器自身带 `padding: 4`** → 容器 `.width`（border-box，含 padding）≠ `.xterm` 实际填充的 content box（减 8px）。FitAddon 因此多算约 8px ≈ **多 1 列**。xterm 把这个偏大的 cols 经 `localResize`/`sshResize` 发给 PTY，PSReadLine 每次按键按偏大 cols 全行重绘 + 绝对光标定位 `\x1b[<n>G` → 最后一列画到 canvas 外（字符跳出）、重绘清除范围与可视区错位（背景左移）。本地 PowerShell/ConPTY 上 PSReadLine 对 cols 最敏感故最明显（SSH bash readline 同样受影响，只是表现不同）。
-- **修复：** 把 `padding: 4` 从 xterm 容器移到外层 wrapper div；外层同时设 `background: terminalTheme.background`（非背景图模式）保证 4px 内缩无缝（不露 App 底色）；容器自身去 padding，`.xterm` 干净填满 content box（此时 content box == border box），FitAddon 读到的宽度 == `.xterm` 真实渲染宽度 → cols 精确。背景图模式下 wrapper 透明 + 背景图层 `inset:0` 仍铺满 padding box（背景铺到边缘、文字内缩）。
-- **修改明细：** `src/components/TerminalPanel.tsx` —— 外层 wrapper div（`.terminal-bg-transparent` 那层）加 `padding: 4` + `background`；`containerRef` div 移除 `padding: 4` 并加详细注释解释为何不能在此层加 padding。
-- **验证：** `npx tsc --noEmit` PASS。待 `cargo tauri dev` 实测：本地终端输入长命令不再跳出、不再背景左移；SSH 终端行尾对齐亦应更准。
-- **遗留：** 本地终端以 80×24 启动（main.rs `local_connect` 写死），靠 mount 后 100ms fit + 首帧输出后再 fit 两次 resize 同步真实 cols；本次只修 cols 计算（让其准确），时序逻辑本身未改。若极个别场景仍偶发抖动，再考虑改 initial cols 或加 debounce。
-- **关联：** 阶段 18 WebGL renderer（解决透明残影）+ 本次 cols 修复，两者叠加才彻底解决"输入乱跳 / 糊背景"——前者管透明重绘，后者管列宽。
+### 闃舵 19锛氭湰鍦扮粓绔緭鍏ュ瓧绗﹁烦鍑?+ 鑳屾櫙宸︾Щ锛坈ols 琚?padding 姹℃煋锛夛紙2026-06-19锛?
+- **鐜拌薄锛?* 鐢ㄦ埛鍙嶉鏈湴缁堢锛圥owerShell / ConPTY锛夎緭鍏ュ懡浠ゆ椂瀛楃浼氳烦鍑虹晫闈紝骞跺嚭鐜拌儗鏅乏绉汇€傝繖姝ｆ槸闃舵 18 WebGL 淇锛堥€忔槑鑳屾櫙娈嬪奖锛変箣鍚?*浠嶆畫鐣?*鐨勭棁鐘垛€斺€旈樁娈?18 閬楃暀椤光憽銆岃嫢 WebGL 涓嶈В鍐冲啀鎺掓煡 cols / ConPTY 鏃跺簭銆嶉鍒ょ殑 cols 鏂瑰悜銆?
+- **鏍瑰洜锛?* FitAddon锛園xterm/addon-fit 0.10.x锛塦proposeDimensions` 璇?`getComputedStyle(瀹瑰櫒).width`锛坆order-box 瀹藉害锛夊綋鍙敤瀹藉害锛屽啀闄や互 cellWidth 寰?cols銆傝€?`global.css` 鍏ㄥ眬 `* { box-sizing: border-box }` + `TerminalPanel.tsx` 鐨?**xterm 瀹瑰櫒鑷韩甯?`padding: 4`** 鈫?瀹瑰櫒 `.width`锛坆order-box锛屽惈 padding锛夆墵 `.xterm` 瀹為檯濉厖鐨?content box锛堝噺 8px锛夈€侳itAddon 鍥犳澶氱畻绾?8px 鈮?**澶?1 鍒?*銆倄term 鎶婅繖涓亸澶х殑 cols 缁?`localResize`/`sshResize` 鍙戠粰 PTY锛孭SReadLine 姣忔鎸夐敭鎸夊亸澶?cols 鍏ㄨ閲嶇粯 + 缁濆鍏夋爣瀹氫綅 `\x1b[<n>G` 鈫?鏈€鍚庝竴鍒楃敾鍒?canvas 澶栵紙瀛楃璺冲嚭锛夈€侀噸缁樻竻闄よ寖鍥翠笌鍙鍖洪敊浣嶏紙鑳屾櫙宸︾Щ锛夈€傛湰鍦?PowerShell/ConPTY 涓?PSReadLine 瀵?cols 鏈€鏁忔劅鏁呮渶鏄庢樉锛圫SH bash readline 鍚屾牱鍙楀奖鍝嶏紝鍙槸琛ㄧ幇涓嶅悓锛夈€?
+- **淇锛?* 鎶?`padding: 4` 浠?xterm 瀹瑰櫒绉诲埌澶栧眰 wrapper div锛涘灞傚悓鏃惰 `background: terminalTheme.background`锛堥潪鑳屾櫙鍥炬ā寮忥級淇濊瘉 4px 鍐呯缉鏃犵紳锛堜笉闇?App 搴曡壊锛夛紱瀹瑰櫒鑷韩鍘?padding锛宍.xterm` 骞插噣濉弧 content box锛堟鏃?content box == border box锛夛紝FitAddon 璇诲埌鐨勫搴?== `.xterm` 鐪熷疄娓叉煋瀹藉害 鈫?cols 绮剧‘銆傝儗鏅浘妯″紡涓?wrapper 閫忔槑 + 鑳屾櫙鍥惧眰 `inset:0` 浠嶉摵婊?padding box锛堣儗鏅摵鍒拌竟缂樸€佹枃瀛楀唴缂╋級銆?
+- **淇敼鏄庣粏锛?* `src/components/TerminalPanel.tsx` 鈥斺€?澶栧眰 wrapper div锛坄.terminal-bg-transparent` 閭ｅ眰锛夊姞 `padding: 4` + `background`锛沗containerRef` div 绉婚櫎 `padding: 4` 骞跺姞璇︾粏娉ㄩ噴瑙ｉ噴涓轰綍涓嶈兘鍦ㄦ灞傚姞 padding銆?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS銆傚緟 `cargo tauri dev` 瀹炴祴锛氭湰鍦扮粓绔緭鍏ラ暱鍛戒护涓嶅啀璺冲嚭銆佷笉鍐嶈儗鏅乏绉伙紱SSH 缁堢琛屽熬瀵归綈浜﹀簲鏇村噯銆?
+- **閬楃暀锛?* 鏈湴缁堢浠?80脳24 鍚姩锛坢ain.rs `local_connect` 鍐欐锛夛紝闈?mount 鍚?100ms fit + 棣栧抚杈撳嚭鍚庡啀 fit 涓ゆ resize 鍚屾鐪熷疄 cols锛涙湰娆″彧淇?cols 璁＄畻锛堣鍏跺噯纭級锛屾椂搴忛€昏緫鏈韩鏈敼銆傝嫢鏋佷釜鍒満鏅粛鍋跺彂鎶栧姩锛屽啀鑰冭檻鏀?initial cols 鎴栧姞 debounce銆?
+- **鍏宠仈锛?* 闃舵 18 WebGL renderer锛堣В鍐抽€忔槑娈嬪奖锛? 鏈 cols 淇锛屼袱鑰呭彔鍔犳墠褰诲簳瑙ｅ喅"杈撳叆涔辫烦 / 绯婅儗鏅?鈥斺€斿墠鑰呯閫忔槑閲嶇粯锛屽悗鑰呯鍒楀銆?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 19 complete（本地终端 cols 污染修复，tsc 绿，待 dev 实测） |
-| 我要去哪里？ | 用户 `cargo tauri dev` 实测本地 PowerShell：输入长命令不跳出、不背景左移；顺带验证 SSH 行尾对齐 |
-| 目标是什么？ | 彻底解决阶段 18 WebGL 之后仍残留的"字符跳出 + 背景左移"——这次的根因是 cols 被容器 padding 污染 |
-| 我学到了什么？ | FitAddon 读的是 `getComputedStyle(容器).width`（border-box，含 padding）；全局 `box-sizing:border-box` 下，承载 `.xterm` 的容器**绝不能带 padding**（会被算进列宽），视觉内缩应放外层 wrapper；"输入乱跳"可有多层根因（阶段 18 透明残影 / 阶段 19 cols 偏差），需逐层排查 |
-| 我做了什么？ | TerminalPanel.tsx padding 从 xterm 容器移到外层 wrapper（+ 外层补背景色保无缝）+ 注释 + tsc 验证 |
+| 鎴戝湪鍝噷锛?| 闃舵 19 complete锛堟湰鍦扮粓绔?cols 姹℃煋淇锛宼sc 缁匡紝寰?dev 瀹炴祴锛?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri dev` 瀹炴祴鏈湴 PowerShell锛氳緭鍏ラ暱鍛戒护涓嶈烦鍑恒€佷笉鑳屾櫙宸︾Щ锛涢『甯﹂獙璇?SSH 琛屽熬瀵归綈 |
+| 鐩爣鏄粈涔堬紵 | 褰诲簳瑙ｅ喅闃舵 18 WebGL 涔嬪悗浠嶆畫鐣欑殑"瀛楃璺冲嚭 + 鑳屾櫙宸︾Щ"鈥斺€旇繖娆＄殑鏍瑰洜鏄?cols 琚鍣?padding 姹℃煋 |
+| 鎴戝鍒颁簡浠€涔堬紵 | FitAddon 璇荤殑鏄?`getComputedStyle(瀹瑰櫒).width`锛坆order-box锛屽惈 padding锛夛紱鍏ㄥ眬 `box-sizing:border-box` 涓嬶紝鎵胯浇 `.xterm` 鐨勫鍣?*缁濅笉鑳藉甫 padding**锛堜細琚畻杩涘垪瀹斤級锛岃瑙夊唴缂╁簲鏀惧灞?wrapper锛?杈撳叆涔辫烦"鍙湁澶氬眰鏍瑰洜锛堥樁娈?18 閫忔槑娈嬪奖 / 闃舵 19 cols 鍋忓樊锛夛紝闇€閫愬眰鎺掓煡 |
+| 鎴戝仛浜嗕粈涔堬紵 | TerminalPanel.tsx padding 浠?xterm 瀹瑰櫒绉诲埌澶栧眰 wrapper锛? 澶栧眰琛ヨ儗鏅壊淇濇棤缂濓級+ 娉ㄩ噴 + tsc 楠岃瘉 |
 
-### 阶段 20：本地终端输入字符错位（二）—— 字体加载竞态致 cols 漂移（2026-06-19）
-- **现象：** 阶段 19 padding 修复后用户仍反馈：本地终端输入时"在背景旁边输入字符，把背景挤到左边"，**随机出现**。
-- **定位（AskUserQuestion 锁环境）：** ① 设置了自定义背景图（→ 走 allowTransparency + WebGL 透明路径）② PowerShell 7 (pwsh) ③ 随机 / 不确定。
-- **根因：** pwsh 的 PSReadLine **每次按键都用绝对光标定位（`\x1b[<col>G`）重绘整个输入行**。一旦 xterm 的 cols 与 PTY 认为的列数不一致（哪怕差 1），光标和重绘内容就画进错误单元格；透明 canvas + 背景图下，画错位的字符浮在背景的错误位置 → 视觉"字符跑到背景旁、把背景挤偏"。随机是因为只有输入触碰列边界（近行尾 / 回卷）才显现。cols 不一致的剩余根因 = **字体异步加载竞态**：Nerd Font 文件没加载完时 `fit()` 用 fallback 字体量 cellWidth → cols 偏；字体就绪后 cellWidth 变但 cols 没重算。且代码里 `fontFamily` 变化时只改 `term.options.fontFamily`、**没有重新 fit**——xterm 改字体重新量 cellWidth 却不重算 cols，`cols × cellWidth` 静默漂离容器宽度。
-- **修复：** `TerminalPanel.tsx` 的 fontFamily effect：改字体后（含 mount 初始触发）等 `document.fonts.ready` 再 `fit()` + `resizeTo()`，把字体就绪后的正确 cols 推给 PTY。覆盖初始字体竞态 + 后续字体切换两个场景。沿用 ResizeObserver 的 `clientWidth<80` 小尺寸保护。
-- **研究依据：** xterm.js 社区同类问题经验——[Issue #2252](https://github.com/xtermjs/xterm.js/issues/2252)（WebGL 透明）、[#1901](https://github.com/xtermjs/xterm.js/issues/1901)（buffer line 光标跳）、[#3287](https://github.com/xtermjs/xterm.js/issues/3287)（glyph 定位）+ 通用建议「fit() 前等 `document.fonts.ready`、改 fontFamily 后必须重新 fit」。
-- **修改明细：** `src/components/TerminalPanel.tsx` —— fontFamily effect 扩展：`document.fonts.ready.then(refit)`（catch 兜底），refit 内含小尺寸保护 + fit + resizeTo。
-- **验证：** `npx tsc --noEmit` PASS。待 `cargo tauri dev` 实测：本地 pwsh + 背景图，输入长命令不再随机错位 / 挤背景。
-- **遗留 / 二分诊断：** 若字体 fit 修复后**仍有**问题，请临时在设置里**关掉背景图**测试——① 关背景图后正常 → 确认是 WebGL 透明合成路径独立问题（Issue #2252 类），下一步考虑 canvas 回退（但会带回残影）或升级 xterm / 调透明策略；② 关背景图仍有 → 纯 cols 问题，继续排查 initial 80×24 跳变 / ResizeObserver 瞬时尺寸。
-- **关联：** 阶段 18（WebGL 透明重绘）+ 阶段 19（padding 修 cols 几何）+ 阶段 20（字体 fit 修 cols 时序）三层叠加治理"输入乱跳 / 挤背景"——同一症状的多层根因。
+### 闃舵 20锛氭湰鍦扮粓绔緭鍏ュ瓧绗﹂敊浣嶏紙浜岋級鈥斺€?瀛椾綋鍔犺浇绔炴€佽嚧 cols 婕傜Щ锛?026-06-19锛?
+- **鐜拌薄锛?* 闃舵 19 padding 淇鍚庣敤鎴蜂粛鍙嶉锛氭湰鍦扮粓绔緭鍏ユ椂"鍦ㄨ儗鏅梺杈硅緭鍏ュ瓧绗︼紝鎶婅儗鏅尋鍒板乏杈?锛?*闅忔満鍑虹幇**銆?
+- **瀹氫綅锛圓skUserQuestion 閿佺幆澧冿級锛?* 鈶?璁剧疆浜嗚嚜瀹氫箟鑳屾櫙鍥撅紙鈫?璧?allowTransparency + WebGL 閫忔槑璺緞锛夆憽 PowerShell 7 (pwsh) 鈶?闅忔満 / 涓嶇‘瀹氥€?
+- **鏍瑰洜锛?* pwsh 鐨?PSReadLine **姣忔鎸夐敭閮界敤缁濆鍏夋爣瀹氫綅锛坄\x1b[<col>G`锛夐噸缁樻暣涓緭鍏ヨ**銆備竴鏃?xterm 鐨?cols 涓?PTY 璁や负鐨勫垪鏁颁笉涓€鑷达紙鍝€曞樊 1锛夛紝鍏夋爣鍜岄噸缁樺唴瀹瑰氨鐢昏繘閿欒鍗曞厓鏍硷紱閫忔槑 canvas + 鑳屾櫙鍥句笅锛岀敾閿欎綅鐨勫瓧绗︽诞鍦ㄨ儗鏅殑閿欒浣嶇疆 鈫?瑙嗚"瀛楃璺戝埌鑳屾櫙鏃併€佹妸鑳屾櫙鎸ゅ亸"銆傞殢鏈烘槸鍥犱负鍙湁杈撳叆瑙︾鍒楄竟鐣岋紙杩戣灏?/ 鍥炲嵎锛夋墠鏄剧幇銆俢ols 涓嶄竴鑷寸殑鍓╀綑鏍瑰洜 = **瀛椾綋寮傛鍔犺浇绔炴€?*锛歂erd Font 鏂囦欢娌″姞杞藉畬鏃?`fit()` 鐢?fallback 瀛椾綋閲?cellWidth 鈫?cols 鍋忥紱瀛椾綋灏辩华鍚?cellWidth 鍙樹絾 cols 娌￠噸绠椼€備笖浠ｇ爜閲?`fontFamily` 鍙樺寲鏃跺彧鏀?`term.options.fontFamily`銆?*娌℃湁閲嶆柊 fit**鈥斺€攛term 鏀瑰瓧浣撻噸鏂伴噺 cellWidth 鍗翠笉閲嶇畻 cols锛宍cols 脳 cellWidth` 闈欓粯婕傜瀹瑰櫒瀹藉害銆?
+- **淇锛?* `TerminalPanel.tsx` 鐨?fontFamily effect锛氭敼瀛椾綋鍚庯紙鍚?mount 鍒濆瑙﹀彂锛夌瓑 `document.fonts.ready` 鍐?`fit()` + `resizeTo()`锛屾妸瀛椾綋灏辩华鍚庣殑姝ｇ‘ cols 鎺ㄧ粰 PTY銆傝鐩栧垵濮嬪瓧浣撶珵鎬?+ 鍚庣画瀛椾綋鍒囨崲涓や釜鍦烘櫙銆傛部鐢?ResizeObserver 鐨?`clientWidth<80` 灏忓昂瀵镐繚鎶ゃ€?
+- **鐮旂┒渚濇嵁锛?* xterm.js 绀惧尯鍚岀被闂缁忛獙鈥斺€擺Issue #2252](https://github.com/xtermjs/xterm.js/issues/2252)锛圵ebGL 閫忔槑锛夈€乕#1901](https://github.com/xtermjs/xterm.js/issues/1901)锛坆uffer line 鍏夋爣璺筹級銆乕#3287](https://github.com/xtermjs/xterm.js/issues/3287)锛坓lyph 瀹氫綅锛? 閫氱敤寤鸿銆宖it() 鍓嶇瓑 `document.fonts.ready`銆佹敼 fontFamily 鍚庡繀椤婚噸鏂?fit銆嶃€?
+- **淇敼鏄庣粏锛?* `src/components/TerminalPanel.tsx` 鈥斺€?fontFamily effect 鎵╁睍锛歚document.fonts.ready.then(refit)`锛坈atch 鍏滃簳锛夛紝refit 鍐呭惈灏忓昂瀵镐繚鎶?+ fit + resizeTo銆?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS銆傚緟 `cargo tauri dev` 瀹炴祴锛氭湰鍦?pwsh + 鑳屾櫙鍥撅紝杈撳叆闀垮懡浠や笉鍐嶉殢鏈洪敊浣?/ 鎸よ儗鏅€?
+- **閬楃暀 / 浜屽垎璇婃柇锛?* 鑻ュ瓧浣?fit 淇鍚?*浠嶆湁**闂锛岃涓存椂鍦ㄨ缃噷**鍏虫帀鑳屾櫙鍥?*娴嬭瘯鈥斺€斺憼 鍏宠儗鏅浘鍚庢甯?鈫?纭鏄?WebGL 閫忔槑鍚堟垚璺緞鐙珛闂锛圛ssue #2252 绫伙級锛屼笅涓€姝ヨ€冭檻 canvas 鍥為€€锛堜絾浼氬甫鍥炴畫褰憋級鎴栧崌绾?xterm / 璋冮€忔槑绛栫暐锛涒憽 鍏宠儗鏅浘浠嶆湁 鈫?绾?cols 闂锛岀户缁帓鏌?initial 80脳24 璺冲彉 / ResizeObserver 鐬椂灏哄銆?
+- **鍏宠仈锛?* 闃舵 18锛圵ebGL 閫忔槑閲嶇粯锛? 闃舵 19锛坧adding 淇?cols 鍑犱綍锛? 闃舵 20锛堝瓧浣?fit 淇?cols 鏃跺簭锛変笁灞傚彔鍔犳不鐞?杈撳叆涔辫烦 / 鎸よ儗鏅?鈥斺€斿悓涓€鐥囩姸鐨勫灞傛牴鍥犮€?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 20 complete（字体加载竞态致 cols 漂移修复，tsc 绿，待 dev 实测） |
-| 我要去哪里？ | 用户 dev 实测本地 pwsh + 背景图输入不再随机错位；若仍有，按"关背景图二分"判断是否 WebGL 路径独立问题 |
-| 目标是什么？ | 修掉阶段 19 padding 之后仍残留的"字符挤背景"——这次根因是字体异步加载让 cols 漂移、PSReadLine 按错误 cols 重绘 |
-| 我学到了什么？ | xterm 改 fontFamily 重新量 cellWidth 但**不重算 cols**，必须手动 fit；fit() 前应等 `document.fonts.ready`；PSReadLine 每键绝对定位重绘、对 cols 偏差零容忍；"输入乱跳"是多层根因（透明残影 / padding / 字体时序），需逐层剥 + 用 AskUserQuestion 锁环境再改，避免盲目修偏 |
-| 我做了什么？ | AskUserQuestion 锁定（背景图 + pwsh + 随机）+ 研究 xterm 社区经验 + TerminalPanel fontFamily effect 加 document.fonts.ready → fit + resize + tsc 验证 |
+| 鎴戝湪鍝噷锛?| 闃舵 20 complete锛堝瓧浣撳姞杞界珵鎬佽嚧 cols 婕傜Щ淇锛宼sc 缁匡紝寰?dev 瀹炴祴锛?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 dev 瀹炴祴鏈湴 pwsh + 鑳屾櫙鍥捐緭鍏ヤ笉鍐嶉殢鏈洪敊浣嶏紱鑻ヤ粛鏈夛紝鎸?鍏宠儗鏅浘浜屽垎"鍒ゆ柇鏄惁 WebGL 璺緞鐙珛闂 |
+| 鐩爣鏄粈涔堬紵 | 淇帀闃舵 19 padding 涔嬪悗浠嶆畫鐣欑殑"瀛楃鎸よ儗鏅?鈥斺€旇繖娆℃牴鍥犳槸瀛椾綋寮傛鍔犺浇璁?cols 婕傜Щ銆丳SReadLine 鎸夐敊璇?cols 閲嶇粯 |
+| 鎴戝鍒颁簡浠€涔堬紵 | xterm 鏀?fontFamily 閲嶆柊閲?cellWidth 浣?*涓嶉噸绠?cols**锛屽繀椤绘墜鍔?fit锛沠it() 鍓嶅簲绛?`document.fonts.ready`锛汸SReadLine 姣忛敭缁濆瀹氫綅閲嶇粯銆佸 cols 鍋忓樊闆跺蹇嶏紱"杈撳叆涔辫烦"鏄灞傛牴鍥狅紙閫忔槑娈嬪奖 / padding / 瀛椾綋鏃跺簭锛夛紝闇€閫愬眰鍓?+ 鐢?AskUserQuestion 閿佺幆澧冨啀鏀癸紝閬垮厤鐩茬洰淇亸 |
+| 鎴戝仛浜嗕粈涔堬紵 | AskUserQuestion 閿佸畾锛堣儗鏅浘 + pwsh + 闅忔満锛? 鐮旂┒ xterm 绀惧尯缁忛獙 + TerminalPanel fontFamily effect 鍔?document.fonts.ready 鈫?fit + resize + tsc 楠岃瘉 |
 
-### 阶段 21：本地终端输入回卷错位（三）—— PTY 初始 cols 同步时机（决定性根因）（2026-06-19）
-- **现象（用户给出完美复现点）：** 阶段 20 字体 fit 修复后，用户锁定**百分百复现**条件——输入内容超过本行（触发回卷）必现"背景左移"；**无背景图也复现**（排除 WebGL 透明路径）；输入完成换行后**恢复正常**。
-- **根因（掘金 juejin/7476761846411870258 100% 匹配验证）：** 经典 xterm↔PTY cols 不同步。本地 PTY 以 **80×24 启动**（main.rs `local_connect` 写死 cols=80），pwsh 的 PSReadLine 缓存了 80；前端 xterm 经 fit 得到真实 cols（如 120）。同步链两处时机都太赶：① mount 100ms resize 撞在 PSReadLine 初始化**之前** → 被丢弃；② firstOutput 的 resize 是 `setTimeout(..., 0)`，PSReadLine 刚画完 prompt、resize listener 还没接管 → 再次丢弃。结果后端 cols 卡在 80、前端 120，输入过第 80 列后端换行前端不换行 → PSReadLine 重绘编辑行进错单元格 = "背景左移"；Enter 后新 prompt 单行故恢复。回卷边界 100% 复现完全吻合。
-- **修复：** `TerminalPanel.tsx` firstOutput 把单次 `setTimeout(0)` resize 改为**立即 + 250ms + 600ms 多次延迟同步**（fit + resizeTo），覆盖不同 shell 冷启动速度下 PSReadLine/ConPTY 就绪窗口（掘金验证 200ms 有效，多次更稳）。新增 `firstSyncTimersRef` + [sessionId] cleanup 清理 timers。
-- **研究依据：** [掘金：xterm.js 输入字符换行覆盖排查](https://juejin.cn/post/7476761846411870258)（$COLUMNS=80 + resize 后正常 + onResize/200ms 防抖 + 首帧 output 触发 resize）；[Issue #3342](https://github.com/xtermjs/xterm.js/issues/3342) nerd font 宽字符裁剪（相关但非本次主因）。
-- **修改明细：** `src/components/TerminalPanel.tsx` —— firstOutput 同步改为多次延迟（0/250/600ms）；新增 firstSyncTimersRef ref；cleanup 清理。
-- **验证：** `npx tsc --noEmit` PASS。待 `cargo tauri dev` 实测：本地 pwsh 输入超过 80 列不再回卷错位 / 背景左移。
-- **遗留 / 诊断命令：** 若仍有问题，在出问题的本地终端跑 `$Host.UI.RawUI.WindowSize.Width`——① 仍是 80 → resize 没送达 ConPTY（升级 portable-pty 0.8 或查 ConPTY resize 时序）；② 已是真实值但仍错位 → 转向 xterm 渲染层（WebGL/canvas 对比、nerd font 宽字符 #3342、clearTextureAtlas）。
-- **关联：** 阶段 18（WebGL 透明残影）+ 19（padding 修 cols 几何）+ 20（字体 fit 修 cols 时序）+ 21（PTY 初始同步送达）四层叠加。**前三次修的是"前端 cols 算得对不对"，本次修的是"前端算对了之后有没有把正确 cols 送达后端 PTY"**——这是 SSH/PTY 终端经验里最经典、最易漏的一环。
+### 闃舵 21锛氭湰鍦扮粓绔緭鍏ュ洖鍗烽敊浣嶏紙涓夛級鈥斺€?PTY 鍒濆 cols 鍚屾鏃舵満锛堝喅瀹氭€ф牴鍥狅級锛?026-06-19锛?
+- **鐜拌薄锛堢敤鎴风粰鍑哄畬缇庡鐜扮偣锛夛細** 闃舵 20 瀛椾綋 fit 淇鍚庯紝鐢ㄦ埛閿佸畾**鐧惧垎鐧惧鐜?*鏉′欢鈥斺€旇緭鍏ュ唴瀹硅秴杩囨湰琛岋紙瑙﹀彂鍥炲嵎锛夊繀鐜?鑳屾櫙宸︾Щ"锛?*鏃犺儗鏅浘涔熷鐜?*锛堟帓闄?WebGL 閫忔槑璺緞锛夛紱杈撳叆瀹屾垚鎹㈣鍚?*鎭㈠姝ｅ父**銆?
+- **鏍瑰洜锛堟帢閲?juejin/7476761846411870258 100% 鍖归厤楠岃瘉锛夛細** 缁忓吀 xterm鈫擯TY cols 涓嶅悓姝ャ€傛湰鍦?PTY 浠?**80脳24 鍚姩**锛坢ain.rs `local_connect` 鍐欐 cols=80锛夛紝pwsh 鐨?PSReadLine 缂撳瓨浜?80锛涘墠绔?xterm 缁?fit 寰楀埌鐪熷疄 cols锛堝 120锛夈€傚悓姝ラ摼涓ゅ鏃舵満閮藉お璧讹細鈶?mount 100ms resize 鎾炲湪 PSReadLine 鍒濆鍖?*涔嬪墠** 鈫?琚涪寮冿紱鈶?firstOutput 鐨?resize 鏄?`setTimeout(..., 0)`锛孭SReadLine 鍒氱敾瀹?prompt銆乺esize listener 杩樻病鎺ョ 鈫?鍐嶆涓㈠純銆傜粨鏋滃悗绔?cols 鍗″湪 80銆佸墠绔?120锛岃緭鍏ヨ繃绗?80 鍒楀悗绔崲琛屽墠绔笉鎹㈣ 鈫?PSReadLine 閲嶇粯缂栬緫琛岃繘閿欏崟鍏冩牸 = "鑳屾櫙宸︾Щ"锛汦nter 鍚庢柊 prompt 鍗曡鏁呮仮澶嶃€傚洖鍗疯竟鐣?100% 澶嶇幇瀹屽叏鍚诲悎銆?
+- **淇锛?* `TerminalPanel.tsx` firstOutput 鎶婂崟娆?`setTimeout(0)` resize 鏀逛负**绔嬪嵆 + 250ms + 600ms 澶氭寤惰繜鍚屾**锛坒it + resizeTo锛夛紝瑕嗙洊涓嶅悓 shell 鍐峰惎鍔ㄩ€熷害涓?PSReadLine/ConPTY 灏辩华绐楀彛锛堟帢閲戦獙璇?200ms 鏈夋晥锛屽娆℃洿绋筹級銆傛柊澧?`firstSyncTimersRef` + [sessionId] cleanup 娓呯悊 timers銆?
+- **鐮旂┒渚濇嵁锛?* [鎺橀噾锛歺term.js 杈撳叆瀛楃鎹㈣瑕嗙洊鎺掓煡](https://juejin.cn/post/7476761846411870258)锛?COLUMNS=80 + resize 鍚庢甯?+ onResize/200ms 闃叉姈 + 棣栧抚 output 瑙﹀彂 resize锛夛紱[Issue #3342](https://github.com/xtermjs/xterm.js/issues/3342) nerd font 瀹藉瓧绗﹁鍓紙鐩稿叧浣嗛潪鏈涓诲洜锛夈€?
+- **淇敼鏄庣粏锛?* `src/components/TerminalPanel.tsx` 鈥斺€?firstOutput 鍚屾鏀逛负澶氭寤惰繜锛?/250/600ms锛夛紱鏂板 firstSyncTimersRef ref锛沜leanup 娓呯悊銆?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS銆傚緟 `cargo tauri dev` 瀹炴祴锛氭湰鍦?pwsh 杈撳叆瓒呰繃 80 鍒椾笉鍐嶅洖鍗烽敊浣?/ 鑳屾櫙宸︾Щ銆?
+- **閬楃暀 / 璇婃柇鍛戒护锛?* 鑻ヤ粛鏈夐棶棰橈紝鍦ㄥ嚭闂鐨勬湰鍦扮粓绔窇 `$Host.UI.RawUI.WindowSize.Width`鈥斺€斺憼 浠嶆槸 80 鈫?resize 娌￠€佽揪 ConPTY锛堝崌绾?portable-pty 0.8 鎴栨煡 ConPTY resize 鏃跺簭锛夛紱鈶?宸叉槸鐪熷疄鍊间絾浠嶉敊浣?鈫?杞悜 xterm 娓叉煋灞傦紙WebGL/canvas 瀵规瘮銆乶erd font 瀹藉瓧绗?#3342銆乧learTextureAtlas锛夈€?
+- **鍏宠仈锛?* 闃舵 18锛圵ebGL 閫忔槑娈嬪奖锛? 19锛坧adding 淇?cols 鍑犱綍锛? 20锛堝瓧浣?fit 淇?cols 鏃跺簭锛? 21锛圥TY 鍒濆鍚屾閫佽揪锛夊洓灞傚彔鍔犮€?*鍓嶄笁娆′慨鐨勬槸"鍓嶇 cols 绠楀緱瀵逛笉瀵?锛屾湰娆′慨鐨勬槸"鍓嶇绠楀浜嗕箣鍚庢湁娌℃湁鎶婃纭?cols 閫佽揪鍚庣 PTY"**鈥斺€旇繖鏄?SSH/PTY 缁堢缁忛獙閲屾渶缁忓吀銆佹渶鏄撴紡鐨勪竴鐜€?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 21 complete（PTY 初始 cols 同步时机修复，tsc 绿，待 dev 实测） |
-| 我要去哪里？ | 用户 dev 实测本地 pwsh：输入超过 80 列不再回卷错位；若仍有跑 `$Host.UI.RawUI.WindowSize.Width` 诊断 cols 是否送达 |
-| 目标是什么？ | 彻底解决"输入回卷必现背景左移、换行恢复"——根因是 PTY 以 80 启动、初始 resize 时机太早被丢弃，后端卡 80 |
-| 我学到了什么？ | xterm↔PTY cols 同步是终端最经典 bug：PTY 启动 cols（80）≠ 前端真实 cols，必须在 shell 就绪后（首帧 output + 充分延迟）把真实 cols resize 给后端，时机要给足（PSReadLine 初始化慢，0ms 不够，需 200ms+，多次更稳）；掘金实战文章比泛搜更精准；"换行后恢复 + 回卷边界 100% 复现"是 cols 不同步的指纹 |
-| 我做了什么？ | 掘金文章锁定 cols 不同步根因 + firstOutput 单次 0ms → 多次延迟（0/250/600ms）同步 + firstSyncTimersRef cleanup + tsc 验证 |
+| 鎴戝湪鍝噷锛?| 闃舵 21 complete锛圥TY 鍒濆 cols 鍚屾鏃舵満淇锛宼sc 缁匡紝寰?dev 瀹炴祴锛?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 dev 瀹炴祴鏈湴 pwsh锛氳緭鍏ヨ秴杩?80 鍒椾笉鍐嶅洖鍗烽敊浣嶏紱鑻ヤ粛鏈夎窇 `$Host.UI.RawUI.WindowSize.Width` 璇婃柇 cols 鏄惁閫佽揪 |
+| 鐩爣鏄粈涔堬紵 | 褰诲簳瑙ｅ喅"杈撳叆鍥炲嵎蹇呯幇鑳屾櫙宸︾Щ銆佹崲琛屾仮澶?鈥斺€旀牴鍥犳槸 PTY 浠?80 鍚姩銆佸垵濮?resize 鏃舵満澶棭琚涪寮冿紝鍚庣鍗?80 |
+| 鎴戝鍒颁簡浠€涔堬紵 | xterm鈫擯TY cols 鍚屾鏄粓绔渶缁忓吀 bug锛歅TY 鍚姩 cols锛?0锛夆墵 鍓嶇鐪熷疄 cols锛屽繀椤诲湪 shell 灏辩华鍚庯紙棣栧抚 output + 鍏呭垎寤惰繜锛夋妸鐪熷疄 cols resize 缁欏悗绔紝鏃舵満瑕佺粰瓒筹紙PSReadLine 鍒濆鍖栨參锛?ms 涓嶅锛岄渶 200ms+锛屽娆℃洿绋筹級锛涙帢閲戝疄鎴樻枃绔犳瘮娉涙悳鏇寸簿鍑嗭紱"鎹㈣鍚庢仮澶?+ 鍥炲嵎杈圭晫 100% 澶嶇幇"鏄?cols 涓嶅悓姝ョ殑鎸囩汗 |
+| 鎴戝仛浜嗕粈涔堬紵 | 鎺橀噾鏂囩珷閿佸畾 cols 涓嶅悓姝ユ牴鍥?+ firstOutput 鍗曟 0ms 鈫?澶氭寤惰繜锛?/250/600ms锛夊悓姝?+ firstSyncTimersRef cleanup + tsc 楠岃瘉 |
 
-### 阶段 22：claude TUI 输入左移（决定性根因）—— init_command 启动时机（2026-06-19）
-- **现象：** 阶段 21 cols 同步修复后，用户给出**决定性线索**——左移**只有 claude（Claude Code CLI）里才有**，普通命令（ls/dir）完全正常；且 claude 是配置**「启动命令」自动启动**的。
-- **推理：** "只有 claude" 排除了 cols 同步对 PSReadLine 的问题——普通命令正常 = PowerShell 行编辑拿到的列数是对的，即阶段 19-21 的 cols 同步**确实生效**了。问题聚焦到 claude 这个 TUI 应用本身。
-- **根因：** claude 是交互式 TUI，启动时读取终端列数布局界面（输入框宽度），且**启动后不跟随 resize**。它通过「启动命令」（init_command）自动启动，而 init_command 在 PTY **刚以 80×24 启动时就被立即写入 stdin**（local.rs writer task 启动即发）→ claude 启动读到 **80 列** → TUI 按 80 布局 → 之后前端 resize 到真实宽度（如 120）但 claude 已缓存 80 不更新 → 输入过第 80 字符时 claude 按其认知的 80 列重绘输入框，在实际上 120 宽的终端里错位、左移；Enter 后新 prompt 单行故恢复。普通命令不缓存列数（每次按当前宽度输出）故完全正常。**完美解释"只有 claude + 回卷边界 100% 复现 + 换行恢复"**。
-- **修复：** `src-tauri/src/local.rs` writer task：把 init_command 从「启动时立即发」改为「**第一次 resize 到达后再发**」。第一次 resize = 前端已 fit 出真实尺寸并同步给 PTY 的信号，此时再发 init_command，claude 启动读到的就是真实列数（而非 80）。utf8_prelude 仍立即发（shell 编码设置需在启动早期）；`pending_init` 用 `take()` 保证只发一次。
-- **副作用（预期）：** pwsh 提示符会**先短暂出现**（init_command 延迟到第一次 resize ~100ms 后才发），随后 claude 启动。可接受。非 TUI 的 init_command（如 cd）延迟执行亦无害。
-- **修改明细：** `src-tauri/src/local.rs` —— 移除 init_command 启动即发块，改为 `pending_init: Option<String>`；Resize 分支 `master.resize` 后 `if let Some(init) = pending_init.take() { write + \r + flush }`。
-- **验证：** `cargo check` PASS（**首次**——Rust 工具链现已在编辑环境可用，之前各阶段 Rust 侧未编译过）。待 `cargo tauri dev` 实测：claude 输入超过本行不再左移。
-- **关联：** 阶段 18-21 修的是 cols 的**正确性 + 同步**（前端算对、同步给 PTY），但 claude TUI 在 cols 同步**之前**就启动并缓存了 80。本次（22）修的是「**让 claude 在 cols 同步之后再启动**」——同一条"左移"症状，五层根因（透明残影 / padding / 字体时序 / PTY 同步 / **TUI 启动时机**）逐层剥开。
-- **教训：** "只有某个 TUI 应用才有"是关键信号——TUI 缓存终端尺寸且不跟随 resize，与普通 shell 行为不同；init_command 类的自动启动命令应在终端尺寸确定后再发，否则 TUI 拿到的是 PTY 启动默认值（80）；连续盲改无效时要回到"什么场景才有 / 没有该现象"的对比来缩小范围。
+### 闃舵 22锛歝laude TUI 杈撳叆宸︾Щ锛堝喅瀹氭€ф牴鍥狅級鈥斺€?init_command 鍚姩鏃舵満锛?026-06-19锛?
+- **鐜拌薄锛?* 闃舵 21 cols 鍚屾淇鍚庯紝鐢ㄦ埛缁欏嚭**鍐冲畾鎬х嚎绱?*鈥斺€斿乏绉?*鍙湁 claude锛圕laude Code CLI锛夐噷鎵嶆湁**锛屾櫘閫氬懡浠わ紙ls/dir锛夊畬鍏ㄦ甯革紱涓?claude 鏄厤缃?*銆屽惎鍔ㄥ懡浠ゃ€嶈嚜鍔ㄥ惎鍔?*鐨勩€?
+- **鎺ㄧ悊锛?* "鍙湁 claude" 鎺掗櫎浜?cols 鍚屾瀵?PSReadLine 鐨勯棶棰樷€斺€旀櫘閫氬懡浠ゆ甯?= PowerShell 琛岀紪杈戞嬁鍒扮殑鍒楁暟鏄鐨勶紝鍗抽樁娈?19-21 鐨?cols 鍚屾**纭疄鐢熸晥**浜嗐€傞棶棰樿仛鐒﹀埌 claude 杩欎釜 TUI 搴旂敤鏈韩銆?
+- **鏍瑰洜锛?* claude 鏄氦浜掑紡 TUI锛屽惎鍔ㄦ椂璇诲彇缁堢鍒楁暟甯冨眬鐣岄潰锛堣緭鍏ユ瀹藉害锛夛紝涓?*鍚姩鍚庝笉璺熼殢 resize**銆傚畠閫氳繃銆屽惎鍔ㄥ懡浠ゃ€嶏紙init_command锛夎嚜鍔ㄥ惎鍔紝鑰?init_command 鍦?PTY **鍒氫互 80脳24 鍚姩鏃跺氨琚珛鍗冲啓鍏?stdin**锛坙ocal.rs writer task 鍚姩鍗冲彂锛夆啋 claude 鍚姩璇诲埌 **80 鍒?* 鈫?TUI 鎸?80 甯冨眬 鈫?涔嬪悗鍓嶇 resize 鍒扮湡瀹炲搴︼紙濡?120锛変絾 claude 宸茬紦瀛?80 涓嶆洿鏂?鈫?杈撳叆杩囩 80 瀛楃鏃?claude 鎸夊叾璁ょ煡鐨?80 鍒楅噸缁樿緭鍏ユ锛屽湪瀹為檯涓?120 瀹界殑缁堢閲岄敊浣嶃€佸乏绉伙紱Enter 鍚庢柊 prompt 鍗曡鏁呮仮澶嶃€傛櫘閫氬懡浠や笉缂撳瓨鍒楁暟锛堟瘡娆℃寜褰撳墠瀹藉害杈撳嚭锛夋晠瀹屽叏姝ｅ父銆?*瀹岀編瑙ｉ噴"鍙湁 claude + 鍥炲嵎杈圭晫 100% 澶嶇幇 + 鎹㈣鎭㈠"**銆?
+- **淇锛?* `src-tauri/src/local.rs` writer task锛氭妸 init_command 浠庛€屽惎鍔ㄦ椂绔嬪嵆鍙戙€嶆敼涓恒€?*绗竴娆?resize 鍒拌揪鍚庡啀鍙?*銆嶃€傜涓€娆?resize = 鍓嶇宸?fit 鍑虹湡瀹炲昂瀵稿苟鍚屾缁?PTY 鐨勪俊鍙凤紝姝ゆ椂鍐嶅彂 init_command锛宑laude 鍚姩璇诲埌鐨勫氨鏄湡瀹炲垪鏁帮紙鑰岄潪 80锛夈€倁tf8_prelude 浠嶇珛鍗冲彂锛坰hell 缂栫爜璁剧疆闇€鍦ㄥ惎鍔ㄦ棭鏈燂級锛沗pending_init` 鐢?`take()` 淇濊瘉鍙彂涓€娆°€?
+- **鍓綔鐢紙棰勬湡锛夛細** pwsh 鎻愮ず绗︿細**鍏堢煭鏆傚嚭鐜?*锛坕nit_command 寤惰繜鍒扮涓€娆?resize ~100ms 鍚庢墠鍙戯級锛岄殢鍚?claude 鍚姩銆傚彲鎺ュ彈銆傞潪 TUI 鐨?init_command锛堝 cd锛夊欢杩熸墽琛屼害鏃犲銆?
+- **淇敼鏄庣粏锛?* `src-tauri/src/local.rs` 鈥斺€?绉婚櫎 init_command 鍚姩鍗冲彂鍧楋紝鏀逛负 `pending_init: Option<String>`锛汻esize 鍒嗘敮 `master.resize` 鍚?`if let Some(init) = pending_init.take() { write + \r + flush }`銆?
+- **楠岃瘉锛?* `cargo check` PASS锛?*棣栨**鈥斺€擱ust 宸ュ叿閾剧幇宸插湪缂栬緫鐜鍙敤锛屼箣鍓嶅悇闃舵 Rust 渚ф湭缂栬瘧杩囷級銆傚緟 `cargo tauri dev` 瀹炴祴锛歝laude 杈撳叆瓒呰繃鏈涓嶅啀宸︾Щ銆?
+- **鍏宠仈锛?* 闃舵 18-21 淇殑鏄?cols 鐨?*姝ｇ‘鎬?+ 鍚屾**锛堝墠绔畻瀵广€佸悓姝ョ粰 PTY锛夛紝浣?claude TUI 鍦?cols 鍚屾**涔嬪墠**灏卞惎鍔ㄥ苟缂撳瓨浜?80銆傛湰娆★紙22锛変慨鐨勬槸銆?*璁?claude 鍦?cols 鍚屾涔嬪悗鍐嶅惎鍔?*銆嶁€斺€斿悓涓€鏉?宸︾Щ"鐥囩姸锛屼簲灞傛牴鍥狅紙閫忔槑娈嬪奖 / padding / 瀛椾綋鏃跺簭 / PTY 鍚屾 / **TUI 鍚姩鏃舵満**锛夐€愬眰鍓ュ紑銆?
+- **鏁欒锛?* "鍙湁鏌愪釜 TUI 搴旂敤鎵嶆湁"鏄叧閿俊鍙封€斺€擳UI 缂撳瓨缁堢灏哄涓斾笉璺熼殢 resize锛屼笌鏅€?shell 琛屼负涓嶅悓锛沬nit_command 绫荤殑鑷姩鍚姩鍛戒护搴斿湪缁堢灏哄纭畾鍚庡啀鍙戯紝鍚﹀垯 TUI 鎷垮埌鐨勬槸 PTY 鍚姩榛樿鍊硷紙80锛夛紱杩炵画鐩叉敼鏃犳晥鏃惰鍥炲埌"浠€涔堝満鏅墠鏈?/ 娌℃湁璇ョ幇璞?鐨勫姣旀潵缂╁皬鑼冨洿銆?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 22 complete（init_command 延迟到 cols 同步后，cargo check 绿，待 dev 实测） |
-| 我要去哪里？ | 用户 cargo tauri dev 实测：claude 输入超长不再左移；留意 pwsh prompt 先短暂闪现再进 claude（预期副作用） |
-| 目标是什么？ | 修掉"只有 claude 才有的输入左移"——根因是 claude 作为启动命令在 PTY 80×24 时就启动、缓存 80 列不跟随 resize |
-| 我学到了什么？ | "只有某 TUI 才有" = TUI 缓存终端尺寸不跟随 resize（vs 普通 shell 实时读），init_command 必须在尺寸确定后发；连续盲改无效时要回到"什么场景才有/没有该现象"的对比缩小范围；Rust 工具链现已可用，cargo check 能验证后端改动 |
-| 我做了什么？ | AskUserQuestion 确认 claude = 启动命令自动启动 + local.rs init_command 启动即发 → 第一次 resize 后发（pending_init + Resize 分支 take）+ cargo check PASS |
+| 鎴戝湪鍝噷锛?| 闃舵 22 complete锛坕nit_command 寤惰繜鍒?cols 鍚屾鍚庯紝cargo check 缁匡紝寰?dev 瀹炴祴锛?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 cargo tauri dev 瀹炴祴锛歝laude 杈撳叆瓒呴暱涓嶅啀宸︾Щ锛涚暀鎰?pwsh prompt 鍏堢煭鏆傞棯鐜板啀杩?claude锛堥鏈熷壇浣滅敤锛?|
+| 鐩爣鏄粈涔堬紵 | 淇帀"鍙湁 claude 鎵嶆湁鐨勮緭鍏ュ乏绉?鈥斺€旀牴鍥犳槸 claude 浣滀负鍚姩鍛戒护鍦?PTY 80脳24 鏃跺氨鍚姩銆佺紦瀛?80 鍒椾笉璺熼殢 resize |
+| 鎴戝鍒颁簡浠€涔堬紵 | "鍙湁鏌?TUI 鎵嶆湁" = TUI 缂撳瓨缁堢灏哄涓嶈窡闅?resize锛坴s 鏅€?shell 瀹炴椂璇伙級锛宨nit_command 蹇呴』鍦ㄥ昂瀵哥‘瀹氬悗鍙戯紱杩炵画鐩叉敼鏃犳晥鏃惰鍥炲埌"浠€涔堝満鏅墠鏈?娌℃湁璇ョ幇璞?鐨勫姣旂缉灏忚寖鍥达紱Rust 宸ュ叿閾剧幇宸插彲鐢紝cargo check 鑳介獙璇佸悗绔敼鍔?|
+| 鎴戝仛浜嗕粈涔堬紵 | AskUserQuestion 纭 claude = 鍚姩鍛戒护鑷姩鍚姩 + local.rs init_command 鍚姩鍗冲彂 鈫?绗竴娆?resize 鍚庡彂锛坧ending_init + Resize 鍒嗘敮 take锛? cargo check PASS |
 
-### 阶段 23：中文 IME 输入左移 —— ConPTY 上游 bug（已知限制，应用层无法根治）（2026-06-19）
-- **现象（更精确线索）：** 阶段 22 后，用户进一步定位——左移**只在中文 IME 输入时发生**，字母/英文输入完全正常；PowerShell 和 claude 都有。
-- **排查（命中铁证）：** 搜索命中 [VSCode #255285 "Terminal viewport shifts left with Chinese IME"](https://github.com/microsoft/vscode/issues/255285)，现象/触发/根因**逐字匹配**——"IME composition string 打到第 4 个字符，整个终端视口水平左移；按空格完成输入后立即恢复"。
-- **根因：** **ConPTY 对中文 IME composition string 的宽度计算错误（miscalculation）**，触发不必要的视口左移。这是 **ConPTY 的上游 bug**。触发条件：会"每键重绘输入行"的程序（PSReadLine、claude/ink、gemini-cli）；vim / node / python REPL 不触发（它们不实时重绘输入行）—— 完美解释"字母正常（单宽，重绘无歧义）+ 中文左移（双宽 composition 宽度算错）+ PowerShell 和 claude 都有"。
-- **VSCode 确认的 workaround：** 禁用 ConPTY、改用 **winpty** 后端（VS Code `terminal.integrated.windowsEnableConpty: false`）。
-- **我们的困境（关键）：** 我们用的 **portable-pty 0.8.1 已移除 winpty 支持**（`src/win/` 只有 `conpty.rs`，无 `winpty.rs`；`NativePtySystem = ConPtySystem`）。所以 **winpty workaround 对我们不可行**。降级 portable-pty 或换 winpty-rs 代价大，且 **winpty 对中文 UTF-8 不友好**（走 Windows console codepage，可能引入中文乱码，比左移更糟）。
-- **结论：** 这是 **ConPTY 上游 bug，应用层无法完美修复**。需等微软修复（VSCode #255285 open，2025-07 报，目前未修；用户 Windows 11 26200 仍存在）。
-- **前几轮修复的价值（重要）：** 阶段 18-22 的修复（WebGL 透明残影 / padding cols 几何 / 字体 cols 时序 / PTY 同步时机 / TUI 启动时机）**都是对的、有价值的**——"字母输入完全正常换行"就是证明（cols 同步正确、PSReadLine 拿到真实列数）。**中文 IME 是唯一剩下的、独立的 ConPTY 上游限制**，与前几轮无关。
-- **实用缓解（对用户）：** ① 输入法确认（空格/回车）后左移**立即恢复**，影响仅 composition 输入过程中；② 避免一次打超长 composition，分段确认可减少触发；③ 等 Windows 更新修复 ConPTY。
-- **修改：** 本次无代码修改（应用层无法修复 ConPTY bug）；仅研究确认 + 文档记录，避免未来重复排查。
+### 闃舵 23锛氫腑鏂?IME 杈撳叆宸︾Щ 鈥斺€?ConPTY 涓婃父 bug锛堝凡鐭ラ檺鍒讹紝搴旂敤灞傛棤娉曟牴娌伙級锛?026-06-19锛?
+- **鐜拌薄锛堟洿绮剧‘绾跨储锛夛細** 闃舵 22 鍚庯紝鐢ㄦ埛杩涗竴姝ュ畾浣嶁€斺€斿乏绉?*鍙湪涓枃 IME 杈撳叆鏃跺彂鐢?*锛屽瓧姣?鑻辨枃杈撳叆瀹屽叏姝ｅ父锛汸owerShell 鍜?claude 閮芥湁銆?
+- **鎺掓煡锛堝懡涓搧璇侊級锛?* 鎼滅储鍛戒腑 [VSCode #255285 "Terminal viewport shifts left with Chinese IME"](https://github.com/microsoft/vscode/issues/255285)锛岀幇璞?瑙﹀彂/鏍瑰洜**閫愬瓧鍖归厤**鈥斺€?IME composition string 鎵撳埌绗?4 涓瓧绗︼紝鏁翠釜缁堢瑙嗗彛姘村钩宸︾Щ锛涙寜绌烘牸瀹屾垚杈撳叆鍚庣珛鍗虫仮澶?銆?
+- **鏍瑰洜锛?* **ConPTY 瀵逛腑鏂?IME composition string 鐨勫搴﹁绠楅敊璇紙miscalculation锛?*锛岃Е鍙戜笉蹇呰鐨勮鍙ｅ乏绉汇€傝繖鏄?**ConPTY 鐨勪笂娓?bug**銆傝Е鍙戞潯浠讹細浼?姣忛敭閲嶇粯杈撳叆琛?鐨勭▼搴忥紙PSReadLine銆乧laude/ink銆乬emini-cli锛夛紱vim / node / python REPL 涓嶈Е鍙戯紙瀹冧滑涓嶅疄鏃堕噸缁樿緭鍏ヨ锛夆€斺€?瀹岀編瑙ｉ噴"瀛楁瘝姝ｅ父锛堝崟瀹斤紝閲嶇粯鏃犳涔夛級+ 涓枃宸︾Щ锛堝弻瀹?composition 瀹藉害绠楅敊锛? PowerShell 鍜?claude 閮芥湁"銆?
+- **VSCode 纭鐨?workaround锛?* 绂佺敤 ConPTY銆佹敼鐢?**winpty** 鍚庣锛圴S Code `terminal.integrated.windowsEnableConpty: false`锛夈€?
+- **鎴戜滑鐨勫洶澧冿紙鍏抽敭锛夛細** 鎴戜滑鐢ㄧ殑 **portable-pty 0.8.1 宸茬Щ闄?winpty 鏀寔**锛坄src/win/` 鍙湁 `conpty.rs`锛屾棤 `winpty.rs`锛沗NativePtySystem = ConPtySystem`锛夈€傛墍浠?**winpty workaround 瀵规垜浠笉鍙**銆傞檷绾?portable-pty 鎴栨崲 winpty-rs 浠ｄ环澶э紝涓?**winpty 瀵逛腑鏂?UTF-8 涓嶅弸濂?*锛堣蛋 Windows console codepage锛屽彲鑳藉紩鍏ヤ腑鏂囦贡鐮侊紝姣斿乏绉绘洿绯燂級銆?
+- **缁撹锛?* 杩欐槸 **ConPTY 涓婃父 bug锛屽簲鐢ㄥ眰鏃犳硶瀹岀編淇**銆傞渶绛夊井杞慨澶嶏紙VSCode #255285 open锛?025-07 鎶ワ紝鐩墠鏈慨锛涚敤鎴?Windows 11 26200 浠嶅瓨鍦級銆?
+- **鍓嶅嚑杞慨澶嶇殑浠峰€硷紙閲嶈锛夛細** 闃舵 18-22 鐨勪慨澶嶏紙WebGL 閫忔槑娈嬪奖 / padding cols 鍑犱綍 / 瀛椾綋 cols 鏃跺簭 / PTY 鍚屾鏃舵満 / TUI 鍚姩鏃舵満锛?*閮芥槸瀵圭殑銆佹湁浠峰€肩殑**鈥斺€?瀛楁瘝杈撳叆瀹屽叏姝ｅ父鎹㈣"灏辨槸璇佹槑锛坈ols 鍚屾姝ｇ‘銆丳SReadLine 鎷垮埌鐪熷疄鍒楁暟锛夈€?*涓枃 IME 鏄敮涓€鍓╀笅鐨勩€佺嫭绔嬬殑 ConPTY 涓婃父闄愬埗**锛屼笌鍓嶅嚑杞棤鍏炽€?
+- **瀹炵敤缂撹В锛堝鐢ㄦ埛锛夛細** 鈶?杈撳叆娉曠‘璁わ紙绌烘牸/鍥炶溅锛夊悗宸︾Щ**绔嬪嵆鎭㈠**锛屽奖鍝嶄粎 composition 杈撳叆杩囩▼涓紱鈶?閬垮厤涓€娆℃墦瓒呴暱 composition锛屽垎娈电‘璁ゅ彲鍑忓皯瑙﹀彂锛涒憿 绛?Windows 鏇存柊淇 ConPTY銆?
+- **淇敼锛?* 鏈鏃犱唬鐮佷慨鏀癸紙搴旂敤灞傛棤娉曚慨澶?ConPTY bug锛夛紱浠呯爺绌剁‘璁?+ 鏂囨。璁板綍锛岄伩鍏嶆湭鏉ラ噸澶嶆帓鏌ャ€?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 23：确认中文 IME 左移是 ConPTY 上游 bug（VSCode #255285 铁证），应用层无法根治，记录为已知限制 |
-| 我要去哪里？ | 告知用户根因 + 困境（portable-pty 0.8.1 无 winpty）+ 实用缓解；等微软修复 ConPTY |
-| 目标是什么？ | 给"中文 IME 左移"一个准确、有据的结论，避免反复盲改 |
-| 我学到了什么？ | "只在某种输入（中文 IME / 双宽）才出"= 上游 CJK/IME 处理 bug 的信号；ConPTY 对 IME composition 宽度计算有已知 bug（VSCode 也中招）；portable-pty 0.8.x 已移除 winpty（只 ConPTY），winpty workaround 对我们不可行；遇到上游 bug 要查 VSCode/microsoft-terminal 同款 issue，比泛搜精准 |
-| 我做了什么？ | WebSearch 命中 VSCode #255285（铁证）+ webReader 读全文 + 确认 portable-pty 0.8.1 无 winpty（src/win/ 只有 conpty.rs）+ 记录已知限制 |
+| 鎴戝湪鍝噷锛?| 闃舵 23锛氱‘璁や腑鏂?IME 宸︾Щ鏄?ConPTY 涓婃父 bug锛圴SCode #255285 閾佽瘉锛夛紝搴旂敤灞傛棤娉曟牴娌伙紝璁板綍涓哄凡鐭ラ檺鍒?|
+| 鎴戣鍘诲摢閲岋紵 | 鍛婄煡鐢ㄦ埛鏍瑰洜 + 鍥板锛坧ortable-pty 0.8.1 鏃?winpty锛? 瀹炵敤缂撹В锛涚瓑寰蒋淇 ConPTY |
+| 鐩爣鏄粈涔堬紵 | 缁?涓枃 IME 宸︾Щ"涓€涓噯纭€佹湁鎹殑缁撹锛岄伩鍏嶅弽澶嶇洸鏀?|
+| 鎴戝鍒颁簡浠€涔堬紵 | "鍙湪鏌愮杈撳叆锛堜腑鏂?IME / 鍙屽锛夋墠鍑?= 涓婃父 CJK/IME 澶勭悊 bug 鐨勪俊鍙凤紱ConPTY 瀵?IME composition 瀹藉害璁＄畻鏈夊凡鐭?bug锛圴SCode 涔熶腑鎷涳級锛沺ortable-pty 0.8.x 宸茬Щ闄?winpty锛堝彧 ConPTY锛夛紝winpty workaround 瀵规垜浠笉鍙锛涢亣鍒颁笂娓?bug 瑕佹煡 VSCode/microsoft-terminal 鍚屾 issue锛屾瘮娉涙悳绮惧噯 |
+| 鎴戝仛浜嗕粈涔堬紵 | WebSearch 鍛戒腑 VSCode #255285锛堥搧璇侊級+ webReader 璇诲叏鏂?+ 纭 portable-pty 0.8.1 鏃?winpty锛坰rc/win/ 鍙湁 conpty.rs锛? 璁板綍宸茬煡闄愬埗 |
 
-### 阶段 24：回退阶段 22（init_command 延迟）—— 副作用不值（2026-06-19）
-- **决策：** 用户拍板回退阶段 22（local.rs init_command 延迟到首次 resize）。
-- **理由：** 阶段 22 修的"claude TUI 以 80 cols 启动"是真实但独立的问题，且**没修复**用户报告的左移（那其实是阶段 23 确认的 ConPTY 中文 IME 上游 bug）；而它的副作用——开 tab 时 PowerShell 提示符**先短暂闪现再进 claude**——可感知、不值。权衡后回退。
-- **改动：** `src-tauri/src/local.rs` writer task —— init_command 从"第一次 resize 后发"改回"启动时立即发"（恢复阶段 21 完成时的状态）；Resize 分支移除 pending_init 逻辑；保留一条注释说明为什么立即发 + 曾试过延迟但回退，避免未来重复尝试。
-- **保留不动：** 阶段 19（padding cols 几何）、20（字体 fit）、21（firstOutput 多次延迟 resize）、WebGL 条件加载——这些是 cols 正确性 / 同步 / 渲染的净收益，与阶段 22 无关，"字母正常换行"就是它们的成果。
-- **验证：** `cargo check` PASS（1.50s 增量）。
-- **结论：** 最终代码 = 阶段 19/20/21 + WebGL 条件加载**保留**，阶段 22 **回退**。中文 IME 左移 = ConPTY 上游 bug（阶段 23），应用层不修。
+### 闃舵 24锛氬洖閫€闃舵 22锛坕nit_command 寤惰繜锛夆€斺€?鍓綔鐢ㄤ笉鍊硷紙2026-06-19锛?
+- **鍐崇瓥锛?* 鐢ㄦ埛鎷嶆澘鍥為€€闃舵 22锛坙ocal.rs init_command 寤惰繜鍒伴娆?resize锛夈€?
+- **鐞嗙敱锛?* 闃舵 22 淇殑"claude TUI 浠?80 cols 鍚姩"鏄湡瀹炰絾鐙珛鐨勯棶棰橈紝涓?*娌′慨澶?*鐢ㄦ埛鎶ュ憡鐨勫乏绉伙紙閭ｅ叾瀹炴槸闃舵 23 纭鐨?ConPTY 涓枃 IME 涓婃父 bug锛夛紱鑰屽畠鐨勫壇浣滅敤鈥斺€斿紑 tab 鏃?PowerShell 鎻愮ず绗?*鍏堢煭鏆傞棯鐜板啀杩?claude**鈥斺€斿彲鎰熺煡銆佷笉鍊笺€傛潈琛″悗鍥為€€銆?
+- **鏀瑰姩锛?* `src-tauri/src/local.rs` writer task 鈥斺€?init_command 浠?绗竴娆?resize 鍚庡彂"鏀瑰洖"鍚姩鏃剁珛鍗冲彂"锛堟仮澶嶉樁娈?21 瀹屾垚鏃剁殑鐘舵€侊級锛汻esize 鍒嗘敮绉婚櫎 pending_init 閫昏緫锛涗繚鐣欎竴鏉℃敞閲婅鏄庝负浠€涔堢珛鍗冲彂 + 鏇捐瘯杩囧欢杩熶絾鍥為€€锛岄伩鍏嶆湭鏉ラ噸澶嶅皾璇曘€?
+- **淇濈暀涓嶅姩锛?* 闃舵 19锛坧adding cols 鍑犱綍锛夈€?0锛堝瓧浣?fit锛夈€?1锛坒irstOutput 澶氭寤惰繜 resize锛夈€乄ebGL 鏉′欢鍔犺浇鈥斺€旇繖浜涙槸 cols 姝ｇ‘鎬?/ 鍚屾 / 娓叉煋鐨勫噣鏀剁泭锛屼笌闃舵 22 鏃犲叧锛?瀛楁瘝姝ｅ父鎹㈣"灏辨槸瀹冧滑鐨勬垚鏋溿€?
+- **楠岃瘉锛?* `cargo check` PASS锛?.50s 澧為噺锛夈€?
+- **缁撹锛?* 鏈€缁堜唬鐮?= 闃舵 19/20/21 + WebGL 鏉′欢鍔犺浇**淇濈暀**锛岄樁娈?22 **鍥為€€**銆備腑鏂?IME 宸︾Щ = ConPTY 涓婃父 bug锛堥樁娈?23锛夛紝搴旂敤灞備笉淇€?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 24：回退阶段 22（init_command 延迟），cargo check 绿 |
-| 我要去哪里？ | 用户 dev 验证：开 claude tab 不再有 prompt 闪现（启动命令立即执行）；中文 IME 左移按已知限制（阶段 23）接受 |
-| 目标是什么？ | 移除阶段 22 的副作用（prompt 闪现），保留其余净收益修复 |
-| 我学到了什么？ | 修真问题也要权衡可感知副作用；当某个修复最终没命中用户真实问题（实为上游 bug）时，它的副作用就不值得，应回退；回退要留注释说明曾尝试 + 为什么放弃，防重复 |
-| 我做了什么？ | local.rs init_command 延迟 → 启动即发（回退阶段 22）+ 保留防重复注释 + cargo check PASS + 文档同步（progress 阶段 24 / README 移除阶段 22 条目） |
+| 鎴戝湪鍝噷锛?| 闃舵 24锛氬洖閫€闃舵 22锛坕nit_command 寤惰繜锛夛紝cargo check 缁?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 dev 楠岃瘉锛氬紑 claude tab 涓嶅啀鏈?prompt 闂幇锛堝惎鍔ㄥ懡浠ょ珛鍗虫墽琛岋級锛涗腑鏂?IME 宸︾Щ鎸夊凡鐭ラ檺鍒讹紙闃舵 23锛夋帴鍙?|
+| 鐩爣鏄粈涔堬紵 | 绉婚櫎闃舵 22 鐨勫壇浣滅敤锛坧rompt 闂幇锛夛紝淇濈暀鍏朵綑鍑€鏀剁泭淇 |
+| 鎴戝鍒颁簡浠€涔堬紵 | 淇湡闂涔熻鏉冭　鍙劅鐭ュ壇浣滅敤锛涘綋鏌愪釜淇鏈€缁堟病鍛戒腑鐢ㄦ埛鐪熷疄闂锛堝疄涓轰笂娓?bug锛夋椂锛屽畠鐨勫壇浣滅敤灏变笉鍊煎緱锛屽簲鍥為€€锛涘洖閫€瑕佺暀娉ㄩ噴璇存槑鏇惧皾璇?+ 涓轰粈涔堟斁寮冿紝闃查噸澶?|
+| 鎴戝仛浜嗕粈涔堬紵 | local.rs init_command 寤惰繜 鈫?鍚姩鍗冲彂锛堝洖閫€闃舵 22锛? 淇濈暀闃查噸澶嶆敞閲?+ cargo check PASS + 鏂囨。鍚屾锛坧rogress 闃舵 24 / README 绉婚櫎闃舵 22 鏉＄洰锛?|
 
-### 阶段 25：集成 AI 助手（多提供商聊天 + 命令生成/诊断/解释 + 主动巡检）（2026-06-19）
-- **目标：** 在终端工具内集成 AI，覆盖命令生成、输出诊断、命令解释、服务器巡检。多提供商（Claude/OpenAI/Ollama）、全局右侧聊天栏、API key 复用 vault、AI 调用在 Rust 后端流式输出。
-- **方案**（plan `twinkly-mapping-floyd.md`，已批准）：4 Phase。
-- **Phase 1 后端核心：** `Cargo.toml` +reqwest(rustls+json+stream)+futures-util；`db.rs` 加 `ai_settings`(单行,_enc key)+`ai_conversations` 表；新模块 `ai.rs`（Provider enum[Claude/OpenAi/Ollama] + 各自 endpoint/auth/body/SSE·NDJSON 解析 + `chat_stream` 流式 emit ai_token/done/error + vault 取 key[decrypt_with_key] + Linux/Windows 只读巡检脚本 + `inspect_health_ssh`[复用 ssh::exec_once]/`local`[std::process]）；`main.rs` +`mod ai` +5 命令(ai_chat/ai_inspect_health_ssh/ai_inspect_health_local/get_ai_settings/save_ai_settings，均 require_dek)。
-- **Phase 2 前端面板：** `package.json` +react-markdown+remark-gfm；`api.ts` +aiChat/onAiToken/onAiDone/onAiError + AiSettings/ChatMessage/AiContext 类型；`useAiConfig` hook(走 IPC)；新组件 `AiPanel.tsx`(全局 docked 右栏, 消息列表, 流式渲染, react-markdown, 代码块复制, 拖拽调宽)；`App.tsx` +showAiPanel/aiPanelWidth state + 挂载 + activeTab 上下文；`Sidebar` +🤖 按钮；`SettingsPanel` +🤖 AI 助手 Section(provider select/key/model/baseUrl/temperature)。
-- **Phase 3 终端集成：** `TerminalPanel` +onTerminalReady/onTerminalGone props(暴露 xterm 实例)；`App` 维护 Map<sessionId,Terminal> registry + getTerminal；`AiPanel` 采集选区[getSelection]/最近 40 行[buffer.active.getLine.translateToString]作上下文 + 代码块"插入终端"按钮[term.paste，不自动执行] + "附带选区"按钮。
-- **Phase 4 主动巡检：** `AiPanel` header +🔍 巡检按钮，按 connType 调 aiInspectHealthSsh(sessionId)/aiInspectHealthLocal，复用流式渲染健康报告。
-- **安全：** API key 全程 Rust（vault 加密，永不进 webview）；AI 命令默认只"插入终端"不自动执行（用户手动 Enter）；巡检脚本严格只读（free/df/top/uptime 等，无 rm/mv/>）；AI 调用经 vault（require_dek，未解锁则 AI 不可用）。
-- **验证：** `cargo check` PASS（Phase 1，reqwest 首次编译 23s）；`npx tsc --noEmit` PASS（Phase 2/3/4）。待 `cargo tauri dev` 实测：设置填 key → 🤖 聊天 → 流式回复；选中报错→附带选区→诊断；🔍 巡检→健康报告。
-- **修改文件：** 新增 `src-tauri/src/ai.rs`、`src/components/AiPanel.tsx`、`src/hooks/useAiConfig.ts`；修改 `Cargo.toml`、`db.rs`、`main.rs`、`package.json`、`api.ts`、`App.tsx`、`Sidebar.tsx`、`SettingsPanel.tsx`、`TerminalPanel.tsx`。
-- **遗留：** ① SSE 解析三家格式不同，最易出 bug 处（建议各 provider fixture 单测）；② vault 未解锁时 AI 不可用（UI 在错误消息提示）；③ CommandBar AI 入口省略（AiPanel 的"附带选区"已覆盖核心）；④ 巡检脚本 Linux/Windows 只读，可按需扩展。
+### 闃舵 25锛氶泦鎴?AI 鍔╂墜锛堝鎻愪緵鍟嗚亰澶?+ 鍛戒护鐢熸垚/璇婃柇/瑙ｉ噴 + 涓诲姩宸℃锛夛紙2026-06-19锛?
+- **鐩爣锛?* 鍦ㄧ粓绔伐鍏峰唴闆嗘垚 AI锛岃鐩栧懡浠ょ敓鎴愩€佽緭鍑鸿瘖鏂€佸懡浠よВ閲娿€佹湇鍔″櫒宸℃銆傚鎻愪緵鍟嗭紙Claude/OpenAI/Ollama锛夈€佸叏灞€鍙充晶鑱婂ぉ鏍忋€丄PI key 澶嶇敤 vault銆丄I 璋冪敤鍦?Rust 鍚庣娴佸紡杈撳嚭銆?
+- **鏂规**锛坧lan `twinkly-mapping-floyd.md`锛屽凡鎵瑰噯锛夛細4 Phase銆?
+- **Phase 1 鍚庣鏍稿績锛?* `Cargo.toml` +reqwest(rustls+json+stream)+futures-util锛沗db.rs` 鍔?`ai_settings`(鍗曡,_enc key)+`ai_conversations` 琛紱鏂版ā鍧?`ai.rs`锛圥rovider enum[Claude/OpenAi/Ollama] + 鍚勮嚜 endpoint/auth/body/SSE路NDJSON 瑙ｆ瀽 + `chat_stream` 娴佸紡 emit ai_token/done/error + vault 鍙?key[decrypt_with_key] + Linux/Windows 鍙宸℃鑴氭湰 + `inspect_health_ssh`[澶嶇敤 ssh::exec_once]/`local`[std::process]锛夛紱`main.rs` +`mod ai` +5 鍛戒护(ai_chat/ai_inspect_health_ssh/ai_inspect_health_local/get_ai_settings/save_ai_settings锛屽潎 require_dek)銆?
+- **Phase 2 鍓嶇闈㈡澘锛?* `package.json` +react-markdown+remark-gfm锛沗api.ts` +aiChat/onAiToken/onAiDone/onAiError + AiSettings/ChatMessage/AiContext 绫诲瀷锛沗useAiConfig` hook(璧?IPC)锛涙柊缁勪欢 `AiPanel.tsx`(鍏ㄥ眬 docked 鍙虫爮, 娑堟伅鍒楄〃, 娴佸紡娓叉煋, react-markdown, 浠ｇ爜鍧楀鍒? 鎷栨嫿璋冨)锛沗App.tsx` +showAiPanel/aiPanelWidth state + 鎸傝浇 + activeTab 涓婁笅鏂囷紱`Sidebar` +馃 鎸夐挳锛沗SettingsPanel` +馃 AI 鍔╂墜 Section(provider select/key/model/baseUrl/temperature)銆?
+- **Phase 3 缁堢闆嗘垚锛?* `TerminalPanel` +onTerminalReady/onTerminalGone props(鏆撮湶 xterm 瀹炰緥)锛沗App` 缁存姢 Map<sessionId,Terminal> registry + getTerminal锛沗AiPanel` 閲囬泦閫夊尯[getSelection]/鏈€杩?40 琛孾buffer.active.getLine.translateToString]浣滀笂涓嬫枃 + 浠ｇ爜鍧?鎻掑叆缁堢"鎸夐挳[term.paste锛屼笉鑷姩鎵ц] + "闄勫甫閫夊尯"鎸夐挳銆?
+- **Phase 4 涓诲姩宸℃锛?* `AiPanel` header +馃攳 宸℃鎸夐挳锛屾寜 connType 璋?aiInspectHealthSsh(sessionId)/aiInspectHealthLocal锛屽鐢ㄦ祦寮忔覆鏌撳仴搴锋姤鍛娿€?
+- **瀹夊叏锛?* API key 鍏ㄧ▼ Rust锛坴ault 鍔犲瘑锛屾案涓嶈繘 webview锛夛紱AI 鍛戒护榛樿鍙?鎻掑叆缁堢"涓嶈嚜鍔ㄦ墽琛岋紙鐢ㄦ埛鎵嬪姩 Enter锛夛紱宸℃鑴氭湰涓ユ牸鍙锛坒ree/df/top/uptime 绛夛紝鏃?rm/mv/>锛夛紱AI 璋冪敤缁?vault锛坮equire_dek锛屾湭瑙ｉ攣鍒?AI 涓嶅彲鐢級銆?
+- **楠岃瘉锛?* `cargo check` PASS锛圥hase 1锛宺eqwest 棣栨缂栬瘧 23s锛夛紱`npx tsc --noEmit` PASS锛圥hase 2/3/4锛夈€傚緟 `cargo tauri dev` 瀹炴祴锛氳缃～ key 鈫?馃 鑱婂ぉ 鈫?娴佸紡鍥炲锛涢€変腑鎶ラ敊鈫掗檮甯﹂€夊尯鈫掕瘖鏂紱馃攳 宸℃鈫掑仴搴锋姤鍛娿€?
+- **淇敼鏂囦欢锛?* 鏂板 `src-tauri/src/ai.rs`銆乣src/components/AiPanel.tsx`銆乣src/hooks/useAiConfig.ts`锛涗慨鏀?`Cargo.toml`銆乣db.rs`銆乣main.rs`銆乣package.json`銆乣api.ts`銆乣App.tsx`銆乣Sidebar.tsx`銆乣SettingsPanel.tsx`銆乣TerminalPanel.tsx`銆?
+- **閬楃暀锛?* 鈶?SSE 瑙ｆ瀽涓夊鏍煎紡涓嶅悓锛屾渶鏄撳嚭 bug 澶勶紙寤鸿鍚?provider fixture 鍗曟祴锛夛紱鈶?vault 鏈В閿佹椂 AI 涓嶅彲鐢紙UI 鍦ㄩ敊璇秷鎭彁绀猴級锛涒憿 CommandBar AI 鍏ュ彛鐪佺暐锛圓iPanel 鐨?闄勫甫閫夊尯"宸茶鐩栨牳蹇冿級锛涒懀 宸℃鑴氭湰 Linux/Windows 鍙锛屽彲鎸夐渶鎵╁睍銆?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 25 complete（AI 助手 4 Phase，cargo check + tsc 绿，待 dev 实测） |
-| 我要去哪里？ | 用户 cargo tauri dev 实测：填 key→聊天→流式；选区诊断；巡检报告 |
-| 目标是什么？ | 集成 AI 辅助命令生成/诊断/解释 + 服务器巡检，多提供商，vault 保护 key |
-| 我学到了什么？ | xterm buffer 读取(buffer.active.getLine.translateToString + getSelection)；reqwest SSE 用 bytes_stream + Vec<u8> 按行切(避免 UTF-8 跨 chunk 损坏)；Provider enum dispatch 比 async trait 简单；流式复用 window.emit(同 ssh_output)；API key 复用 vault(require_dek + encrypt_with_key)统一安全 |
-| 我做了什么？ | EnterPlanMode + 2 Explore agent 摸集成点 + AskUserQuestion 锁决策(多提供商/全局栏/vault/预设脚本) + 4 Phase 实现(ai.rs/AiPanel/registry/巡检) + cargo check + tsc 全绿 + 文档 |
+| 鎴戝湪鍝噷锛?| 闃舵 25 complete锛圓I 鍔╂墜 4 Phase锛宑argo check + tsc 缁匡紝寰?dev 瀹炴祴锛?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 cargo tauri dev 瀹炴祴锛氬～ key鈫掕亰澶┾啋娴佸紡锛涢€夊尯璇婃柇锛涘贰妫€鎶ュ憡 |
+| 鐩爣鏄粈涔堬紵 | 闆嗘垚 AI 杈呭姪鍛戒护鐢熸垚/璇婃柇/瑙ｉ噴 + 鏈嶅姟鍣ㄥ贰妫€锛屽鎻愪緵鍟嗭紝vault 淇濇姢 key |
+| 鎴戝鍒颁簡浠€涔堬紵 | xterm buffer 璇诲彇(buffer.active.getLine.translateToString + getSelection)锛況eqwest SSE 鐢?bytes_stream + Vec<u8> 鎸夎鍒?閬垮厤 UTF-8 璺?chunk 鎹熷潖)锛汸rovider enum dispatch 姣?async trait 绠€鍗曪紱娴佸紡澶嶇敤 window.emit(鍚?ssh_output)锛汚PI key 澶嶇敤 vault(require_dek + encrypt_with_key)缁熶竴瀹夊叏 |
+| 鎴戝仛浜嗕粈涔堬紵 | EnterPlanMode + 2 Explore agent 鎽搁泦鎴愮偣 + AskUserQuestion 閿佸喅绛?澶氭彁渚涘晢/鍏ㄥ眬鏍?vault/棰勮鑴氭湰) + 4 Phase 瀹炵幇(ai.rs/AiPanel/registry/宸℃) + cargo check + tsc 鍏ㄧ豢 + 鏂囨。 |
 
-### 阶段 26：AI 助手网络代理支持（2026-06-19）
-- **需求：** AI 助手需支持网络代理（国内访问 Claude/OpenAI 常需代理）。
-- **方案：** AI 设置加 `proxy_url` 字段；reqwest 加 `socks` feature 支持 SOCKS5。
-- **改动：** `Cargo.toml` reqwest +`socks` feature；`db.rs` `ai_settings` +`proxy_url` 列（+ `column_exists` ALTER 兼容老库）；`ai.rs` `LoadedSettings`/`load_settings` 读 `proxy_url`，`run_chat_stream` 创建 client 时按 `proxy_url` 配 `reqwest::Proxy::all`（支持 http/https/socks5/socks5h，url 内可含 `user:pass@host` 认证）；`main.rs` `get/save_ai_settings` +`proxy_url`；前端 `api.ts`/`useAiConfig` +`proxyUrl`；`SettingsPanel` AI 区 +"网络代理" Field。
-- **验证：** `cargo check` PASS（reqwest socks 编译 3.66s）；`npx tsc --noEmit` PASS。
-- **遗留：** `proxy_url` 明文存（代理地址非敏感；认证写 url 内）；如需独立认证字段后续加。
+### 闃舵 26锛欰I 鍔╂墜缃戠粶浠ｇ悊鏀寔锛?026-06-19锛?
+- **闇€姹傦細** AI 鍔╂墜闇€鏀寔缃戠粶浠ｇ悊锛堝浗鍐呰闂?Claude/OpenAI 甯搁渶浠ｇ悊锛夈€?
+- **鏂规锛?* AI 璁剧疆鍔?`proxy_url` 瀛楁锛況eqwest 鍔?`socks` feature 鏀寔 SOCKS5銆?
+- **鏀瑰姩锛?* `Cargo.toml` reqwest +`socks` feature锛沗db.rs` `ai_settings` +`proxy_url` 鍒楋紙+ `column_exists` ALTER 鍏煎鑰佸簱锛夛紱`ai.rs` `LoadedSettings`/`load_settings` 璇?`proxy_url`锛宍run_chat_stream` 鍒涘缓 client 鏃舵寜 `proxy_url` 閰?`reqwest::Proxy::all`锛堟敮鎸?http/https/socks5/socks5h锛寀rl 鍐呭彲鍚?`user:pass@host` 璁よ瘉锛夛紱`main.rs` `get/save_ai_settings` +`proxy_url`锛涘墠绔?`api.ts`/`useAiConfig` +`proxyUrl`锛沗SettingsPanel` AI 鍖?+"缃戠粶浠ｇ悊" Field銆?
+- **楠岃瘉锛?* `cargo check` PASS锛坮eqwest socks 缂栬瘧 3.66s锛夛紱`npx tsc --noEmit` PASS銆?
+- **閬楃暀锛?* `proxy_url` 鏄庢枃瀛橈紙浠ｇ悊鍦板潃闈炴晱鎰燂紱璁よ瘉鍐?url 鍐咃級锛涘闇€鐙珛璁よ瘉瀛楁鍚庣画鍔犮€?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 26 complete（AI 网络代理，cargo check + tsc 绿） |
-| 我要去哪里？ | 用户 dev 实测：填代理（如 http://127.0.0.1:7890）→ AI 请求走代理 |
-| 目标是什么？ | AI 助手支持 http/socks5 代理，应对无法直连 Claude/OpenAI 的环境 |
-| 我学到了什么？ | reqwest 代理用 `Proxy::all(url)`（socks5 需 `socks` feature）；url 内 `user:pass@host` 支持认证；SQLite 加列对已存在表用 `column_exists` + `ALTER`（CREATE IF NOT EXISTS 不加列） |
-| 我做了什么？ | 4 文件后端（Cargo/db/ai/main）+ 3 文件前端（api/hook/Settings）协调加 proxy_url，cargo check + tsc 全绿 |
+| 鎴戝湪鍝噷锛?| 闃舵 26 complete锛圓I 缃戠粶浠ｇ悊锛宑argo check + tsc 缁匡級 |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 dev 瀹炴祴锛氬～浠ｇ悊锛堝 http://127.0.0.1:7890锛夆啋 AI 璇锋眰璧颁唬鐞?|
+| 鐩爣鏄粈涔堬紵 | AI 鍔╂墜鏀寔 http/socks5 浠ｇ悊锛屽簲瀵规棤娉曠洿杩?Claude/OpenAI 鐨勭幆澧?|
+| 鎴戝鍒颁簡浠€涔堬紵 | reqwest 浠ｇ悊鐢?`Proxy::all(url)`锛坰ocks5 闇€ `socks` feature锛夛紱url 鍐?`user:pass@host` 鏀寔璁よ瘉锛汼QLite 鍔犲垪瀵瑰凡瀛樺湪琛ㄧ敤 `column_exists` + `ALTER`锛圕REATE IF NOT EXISTS 涓嶅姞鍒楋級 |
+| 鎴戝仛浜嗕粈涔堬紵 | 4 鏂囦欢鍚庣锛圕argo/db/ai/main锛? 3 鏂囦欢鍓嶇锛坅pi/hook/Settings锛夊崗璋冨姞 proxy_url锛宑argo check + tsc 鍏ㄧ豢 |
 
-### 阶段 27：全量安全 + 逻辑 + 冗余代码审计与修复（2026-06-22）
-- **需求：** 用户要求排查安全/逻辑漏洞与冗余/无效代码并处理。
-- **方法：** 并行派 4 个专家 agent（security-reviewer / rust-reviewer / typescript-reviewer / refactor-cleaner）全量扫 Rust + TS，汇总去重后逐项人工核实行号再修。
-- **关键环境确认：** `rustup`/`cargo 1.96.0` 实际已装（CLAUDE.md「未装」过时），故 Rust 改动可编译验证；依赖 `log`/`chrono`/`rand` 均在，无 `zeroize`/`shell-words`/`scopeguard`。
-- **修复（安全）：**
-  - `main.rs` IPC 结构体类型漂移（**线上 bug**）：`CommandHistoryItem`/`QuickCommandItem`/`QuickCommandExecItem` 加 `#[serde(rename_all="camelCase")]`。此前 wire 发 snake_case 而前端按 camelCase 读，导致快捷命令 `isGlobal`/`sortOrder` 全 `undefined`（分组错乱 + 排序失效）。`ConnectionConfig`/`FileEntry` 维持 snake_case（前端有意如此，注释明示，不动）。
-  - `main.rs` 拒绝空密码 SSH 认证：keyring 缺项时原走 `unwrap_or_default()` 发空串（可能触发服务器账户锁定），改为返回明确错误。
-  - `main.rs` `read_text_file`/`read_file_base64` TOCTOU：改「开一次 + 句柄 `metadata()` + `Take` 限长读」，杜绝路径二次解析被掉包/增长绕过尺寸上限。
-  - `backup.rs` 回滚版本路径穿越（纵深防御）：`is_valid_version` 仅放行 `^\d+(\.\d+)*$`；回滚 marker 原写 `"X (rolled back)"` 永不等于 `APP_VERSION` 致每次启动都备份，改写 `APP_VERSION`。
-  - `db.rs` `rename_folder`/`folder_has_children` LIKE 通配符注入：含 `%`/`_` 的文件夹名会误匹配并改写 `group_path`（数据损坏），改 `like_prefix_pattern` 转义 + `ESCAPE '\'`。
-  - `vault.rs` `LockoutState::save` 原子化：tmp+rename（唯一临时名避并发 rename 丢失），防崩溃留半截文件解析为 default 静默重置暴力破解计数。
-  - `proxy.rs` 代理目标 host 校验：拦 `\r\n`/控制符/空白，防 `CONNECT`/`Host` 头请求走私。
-- **修复（逻辑/健壮性）：**
-  - `db.rs` `add_command_history` 去重加 `AND pinned=0`，防重跑已置顶命令时静默丢置顶。
-  - `ssh.rs` `exec_once` 输出加 4 MiB 上限（防 `yes`/`cat /dev/zero` 在 20s 探测窗内 OOM），与交互通道 `append_capped` 对齐。
-  - `ai.rs` `truncate` 步进到 UTF-8 字符边界（原 `&s[..max]` 在 CJK 错误体上 panic）；`inspect_health_local` 加 20s 超时（原 PowerShell 挂起则 UI 永转）。
-  - `ftp.rs` 删手写 `days_to_ymd`，改 `chrono`（与 `vault.rs` 同款反模式，注释已警示）。
-  - 前端 `cmd-buffer.ts` 处理 UTF-16 代理对（原 emoji/生僻 CJK 拆成 lone surrogate 污染命令历史）。
-  - `zmodem-bridge.ts` `joinPath` 拒 `""`/`.`/`..` 叶子（防逃出下载目录）；ZMODEM 发送失败由「仅 console.error」改为 `this.abort()`，防 UI 无限转圈。
-  - `CommandBar.tsx` 输入聚焦改用 `containerRef` 限定本组件（原 `document.querySelector` 在多 tab 时聚焦到首个 tab）。
-  - `App.tsx` 持久化 `aiPanelWidth` 读取时 clamp 到面板自身 [300,720]（原越界值致面板不可用）。
-  - `SettingsPanel.tsx` 导入/导出密码改 `finally` 清零（原失败路径残留）；自定义主题 hex 先 `normHex` 归一为 `#RRGGBB` 再拼 alpha 后缀（原 `#RGB`/`#RRGGBBAA` 拼出无效 CSS 被静默丢弃）。
-- **清理（冗余/死代码）：** 删 `components/PassphraseDialog.tsx`（零引用整文件）；删 `api.ts` 死导出 `lockVault`/`onSshExit`/`SshExitPayload`（后端 `lock_vault` 命令保留，属可未来接线的能力面）；删 `TerminalPanel.tsx` 空 `forEach`；删 `Sidebar.tsx` 两处只写不读的 `dataset.connId`；`ConnectionDialog.tsx` 原始 `invoke("read_text_file")` 改用新增的类型化 `readTextFile` 包装（补齐三处同步约定）。
-- **验证：** `cargo check` PASS（0 warning）；`npx tsc --noEmit` PASS（0 error）。
-- **遗留/未处理（评估后有意不动）：** FTP 明文（FTPS 未实现，属产品决策，非代码缺陷）；`shell_path` 任意可执行（本地终端威胁模型为用户自伤，且改之伤 UX，仅注释提示）；`get_connection_password` 明文回传渲染层 + AI `base_url` SSRF（威胁模型为「渲染层被攻陷」，桌面自有 UI 风险较低，需产品级确认后再做 scheme 白名单/重认证）；本地终端输出无 cap（xterm 滚动缓冲自有上限，且为用户自伤 DoS，加合并会引入刷屏延迟，性价比低）；SFTP 每调用新开 channel（已知设计取舍）；`channel.wait()` 取消安全（已注释标注，待高流量观察）。
+### 闃舵 27锛氬叏閲忓畨鍏?+ 閫昏緫 + 鍐椾綑浠ｇ爜瀹¤涓庝慨澶嶏紙2026-06-22锛?
+- **闇€姹傦細** 鐢ㄦ埛瑕佹眰鎺掓煡瀹夊叏/閫昏緫婕忔礊涓庡啑浣?鏃犳晥浠ｇ爜骞跺鐞嗐€?
+- **鏂规硶锛?* 骞惰娲?4 涓笓瀹?agent锛坰ecurity-reviewer / rust-reviewer / typescript-reviewer / refactor-cleaner锛夊叏閲忔壂 Rust + TS锛屾眹鎬诲幓閲嶅悗閫愰」浜哄伐鏍稿疄琛屽彿鍐嶄慨銆?
+- **鍏抽敭鐜纭锛?* `rustup`/`cargo 1.96.0` 瀹為檯宸茶锛圕LAUDE.md銆屾湭瑁呫€嶈繃鏃讹級锛屾晠 Rust 鏀瑰姩鍙紪璇戦獙璇侊紱渚濊禆 `log`/`chrono`/`rand` 鍧囧湪锛屾棤 `zeroize`/`shell-words`/`scopeguard`銆?
+- **淇锛堝畨鍏級锛?*
+  - `main.rs` IPC 缁撴瀯浣撶被鍨嬫紓绉伙紙**绾夸笂 bug**锛夛細`CommandHistoryItem`/`QuickCommandItem`/`QuickCommandExecItem` 鍔?`#[serde(rename_all="camelCase")]`銆傛鍓?wire 鍙?snake_case 鑰屽墠绔寜 camelCase 璇伙紝瀵艰嚧蹇嵎鍛戒护 `isGlobal`/`sortOrder` 鍏?`undefined`锛堝垎缁勯敊涔?+ 鎺掑簭澶辨晥锛夈€俙ConnectionConfig`/`FileEntry` 缁存寔 snake_case锛堝墠绔湁鎰忓姝わ紝娉ㄩ噴鏄庣ず锛屼笉鍔級銆?
+  - `main.rs` 鎷掔粷绌哄瘑鐮?SSH 璁よ瘉锛歬eyring 缂洪」鏃跺師璧?`unwrap_or_default()` 鍙戠┖涓诧紙鍙兘瑙﹀彂鏈嶅姟鍣ㄨ处鎴烽攣瀹氾級锛屾敼涓鸿繑鍥炴槑纭敊璇€?
+  - `main.rs` `read_text_file`/`read_file_base64` TOCTOU锛氭敼銆屽紑涓€娆?+ 鍙ユ焺 `metadata()` + `Take` 闄愰暱璇汇€嶏紝鏉滅粷璺緞浜屾瑙ｆ瀽琚帀鍖?澧為暱缁曡繃灏哄涓婇檺銆?
+  - `backup.rs` 鍥炴粴鐗堟湰璺緞绌胯秺锛堢旱娣遍槻寰★級锛歚is_valid_version` 浠呮斁琛?`^\d+(\.\d+)*$`锛涘洖婊?marker 鍘熷啓 `"X (rolled back)"` 姘镐笉绛変簬 `APP_VERSION` 鑷存瘡娆″惎鍔ㄩ兘澶囦唤锛屾敼鍐?`APP_VERSION`銆?
+  - `db.rs` `rename_folder`/`folder_has_children` LIKE 閫氶厤绗︽敞鍏ワ細鍚?`%`/`_` 鐨勬枃浠跺す鍚嶄細璇尮閰嶅苟鏀瑰啓 `group_path`锛堟暟鎹崯鍧忥級锛屾敼 `like_prefix_pattern` 杞箟 + `ESCAPE '\'`銆?
+  - `vault.rs` `LockoutState::save` 鍘熷瓙鍖栵細tmp+rename锛堝敮涓€涓存椂鍚嶉伩骞跺彂 rename 涓㈠け锛夛紝闃插穿婧冪暀鍗婃埅鏂囦欢瑙ｆ瀽涓?default 闈欓粯閲嶇疆鏆村姏鐮磋В璁℃暟銆?
+  - `proxy.rs` 浠ｇ悊鐩爣 host 鏍￠獙锛氭嫤 `\r\n`/鎺у埗绗?绌虹櫧锛岄槻 `CONNECT`/`Host` 澶磋姹傝蛋绉併€?
+- **淇锛堥€昏緫/鍋ュ．鎬э級锛?*
+  - `db.rs` `add_command_history` 鍘婚噸鍔?`AND pinned=0`锛岄槻閲嶈窇宸茬疆椤跺懡浠ゆ椂闈欓粯涓㈢疆椤躲€?
+  - `ssh.rs` `exec_once` 杈撳嚭鍔?4 MiB 涓婇檺锛堥槻 `yes`/`cat /dev/zero` 鍦?20s 鎺㈡祴绐楀唴 OOM锛夛紝涓庝氦浜掗€氶亾 `append_capped` 瀵归綈銆?
+  - `ai.rs` `truncate` 姝ヨ繘鍒?UTF-8 瀛楃杈圭晫锛堝師 `&s[..max]` 鍦?CJK 閿欒浣撲笂 panic锛夛紱`inspect_health_local` 鍔?20s 瓒呮椂锛堝師 PowerShell 鎸傝捣鍒?UI 姘歌浆锛夈€?
+  - `ftp.rs` 鍒犳墜鍐?`days_to_ymd`锛屾敼 `chrono`锛堜笌 `vault.rs` 鍚屾鍙嶆ā寮忥紝娉ㄩ噴宸茶绀猴級銆?
+  - 鍓嶇 `cmd-buffer.ts` 澶勭悊 UTF-16 浠ｇ悊瀵癸紙鍘?emoji/鐢熷兓 CJK 鎷嗘垚 lone surrogate 姹℃煋鍛戒护鍘嗗彶锛夈€?
+  - `zmodem-bridge.ts` `joinPath` 鎷?`""`/`.`/`..` 鍙跺瓙锛堥槻閫冨嚭涓嬭浇鐩綍锛夛紱ZMODEM 鍙戦€佸け璐ョ敱銆屼粎 console.error銆嶆敼涓?`this.abort()`锛岄槻 UI 鏃犻檺杞湀銆?
+  - `CommandBar.tsx` 杈撳叆鑱氱劍鏀圭敤 `containerRef` 闄愬畾鏈粍浠讹紙鍘?`document.querySelector` 鍦ㄥ tab 鏃惰仛鐒﹀埌棣栦釜 tab锛夈€?
+  - `App.tsx` 鎸佷箙鍖?`aiPanelWidth` 璇诲彇鏃?clamp 鍒伴潰鏉胯嚜韬?[300,720]锛堝師瓒婄晫鍊艰嚧闈㈡澘涓嶅彲鐢級銆?
+  - `SettingsPanel.tsx` 瀵煎叆/瀵煎嚭瀵嗙爜鏀?`finally` 娓呴浂锛堝師澶辫触璺緞娈嬬暀锛夛紱鑷畾涔変富棰?hex 鍏?`normHex` 褰掍竴涓?`#RRGGBB` 鍐嶆嫾 alpha 鍚庣紑锛堝師 `#RGB`/`#RRGGBBAA` 鎷煎嚭鏃犳晥 CSS 琚潤榛樹涪寮冿級銆?
+- **娓呯悊锛堝啑浣?姝讳唬鐮侊級锛?* 鍒?`components/PassphraseDialog.tsx`锛堥浂寮曠敤鏁存枃浠讹級锛涘垹 `api.ts` 姝诲鍑?`lockVault`/`onSshExit`/`SshExitPayload`锛堝悗绔?`lock_vault` 鍛戒护淇濈暀锛屽睘鍙湭鏉ユ帴绾跨殑鑳藉姏闈級锛涘垹 `TerminalPanel.tsx` 绌?`forEach`锛涘垹 `Sidebar.tsx` 涓ゅ鍙啓涓嶈鐨?`dataset.connId`锛沗ConnectionDialog.tsx` 鍘熷 `invoke("read_text_file")` 鏀圭敤鏂板鐨勭被鍨嬪寲 `readTextFile` 鍖呰锛堣ˉ榻愪笁澶勫悓姝ョ害瀹氾級銆?
+- **楠岃瘉锛?* `cargo check` PASS锛? warning锛夛紱`npx tsc --noEmit` PASS锛? error锛夈€?
+- **閬楃暀/鏈鐞嗭紙璇勪及鍚庢湁鎰忎笉鍔級锛?* FTP 鏄庢枃锛團TPS 鏈疄鐜帮紝灞炰骇鍝佸喅绛栵紝闈炰唬鐮佺己闄凤級锛沗shell_path` 浠绘剰鍙墽琛岋紙鏈湴缁堢濞佽儊妯″瀷涓虹敤鎴疯嚜浼わ紝涓旀敼涔嬩激 UX锛屼粎娉ㄩ噴鎻愮ず锛夛紱`get_connection_password` 鏄庢枃鍥炰紶娓叉煋灞?+ AI `base_url` SSRF锛堝▉鑳佹ā鍨嬩负銆屾覆鏌撳眰琚敾闄枫€嶏紝妗岄潰鑷湁 UI 椋庨櫓杈冧綆锛岄渶浜у搧绾х‘璁ゅ悗鍐嶅仛 scheme 鐧藉悕鍗?閲嶈璇侊級锛涙湰鍦扮粓绔緭鍑烘棤 cap锛坸term 婊氬姩缂撳啿鑷湁涓婇檺锛屼笖涓虹敤鎴疯嚜浼?DoS锛屽姞鍚堝苟浼氬紩鍏ュ埛灞忓欢杩燂紝鎬т环姣斾綆锛夛紱SFTP 姣忚皟鐢ㄦ柊寮€ channel锛堝凡鐭ヨ璁″彇鑸嶏級锛沗channel.wait()` 鍙栨秷瀹夊叏锛堝凡娉ㄩ噴鏍囨敞锛屽緟楂樻祦閲忚瀵燂級銆?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 27 complete（安全+逻辑+冗余审计修复，cargo check + tsc 双绿） |
-| 我要去哪里？ | 用户 dev 实测：快捷命令分组/排序回归正常、导入导出/回滚/重命名文件夹/本地巡检路径无回归 |
-| 目标是什么？ | 清除安全漏洞与线上 bug（快捷命令类型漂移）、补齐健壮性、删冗余代码，全程零编译/类型回归 |
-| 我学到了什么？ | IPC 结构体命名两边必须同案（snake/camel 别混用，否则 TS 接口骗人、运行时 undefined）；`metadata(path)`+`read(path)` 是 TOCTOU，要开一次取句柄元数据；SQLite `LIKE` 的 `%`/`_` 在用户可控串里要 `ESCAPE`；原子写 lockout 等小文件别用裸 `fs::write`（崩溃留半截=静默重置安全计数）；rustup 实已装，CLAUDE.md 该条已过时 |
-| 我做了什么？ | 4 agent 并行扫 → 人工核实 → 修 12 处后端 + 12 处前端 + 删 1 文件/3 死导出，cargo check（0 warn）+ tsc（0 err）全绿，progress/README 同步 |
+| 鎴戝湪鍝噷锛?| 闃舵 27 complete锛堝畨鍏?閫昏緫+鍐椾綑瀹¤淇锛宑argo check + tsc 鍙岀豢锛?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 dev 瀹炴祴锛氬揩鎹峰懡浠ゅ垎缁?鎺掑簭鍥炲綊姝ｅ父銆佸鍏ュ鍑?鍥炴粴/閲嶅懡鍚嶆枃浠跺す/鏈湴宸℃璺緞鏃犲洖褰?|
+| 鐩爣鏄粈涔堬紵 | 娓呴櫎瀹夊叏婕忔礊涓庣嚎涓?bug锛堝揩鎹峰懡浠ょ被鍨嬫紓绉伙級銆佽ˉ榻愬仴澹€с€佸垹鍐椾綑浠ｇ爜锛屽叏绋嬮浂缂栬瘧/绫诲瀷鍥炲綊 |
+| 鎴戝鍒颁簡浠€涔堬紵 | IPC 缁撴瀯浣撳懡鍚嶄袱杈瑰繀椤诲悓妗堬紙snake/camel 鍒贩鐢紝鍚﹀垯 TS 鎺ュ彛楠椾汉銆佽繍琛屾椂 undefined锛夛紱`metadata(path)`+`read(path)` 鏄?TOCTOU锛岃寮€涓€娆″彇鍙ユ焺鍏冩暟鎹紱SQLite `LIKE` 鐨?`%`/`_` 鍦ㄧ敤鎴峰彲鎺т覆閲岃 `ESCAPE`锛涘師瀛愬啓 lockout 绛夊皬鏂囦欢鍒敤瑁?`fs::write`锛堝穿婧冪暀鍗婃埅=闈欓粯閲嶇疆瀹夊叏璁℃暟锛夛紱rustup 瀹炲凡瑁咃紝CLAUDE.md 璇ユ潯宸茶繃鏃?|
+| 鎴戝仛浜嗕粈涔堬紵 | 4 agent 骞惰鎵?鈫?浜哄伐鏍稿疄 鈫?淇?12 澶勫悗绔?+ 12 澶勫墠绔?+ 鍒?1 鏂囦欢/3 姝诲鍑猴紝cargo check锛? warn锛? tsc锛? err锛夊叏缁匡紝progress/README 鍚屾 |
 
-### 阶段 28：4 项体验优化（连接排序确认 / 广播去重 / 终端选区可见性 / Windows 任务栏图标）（2026-06-22）
-- **需求：** 用户提 4 点：①文件夹下连接是否按名排序 ②同连接开两 tab 时广播不应重复发 ③终端选中内容难以分辨（无选中色变化）④打包后任务栏显示默认图标（exe 图标正常）。
-- **改动：**
-  - **①连接排序——经核实已实现，无需改动。** `Sidebar.tsx:buildTree` 第 70-75 行 `sortRec` 已对 `n.children`（子文件夹）与 `n.conns`（连接）按 `name.localeCompare(..., "zh")` 排序；`:219` `useMemo(buildTree)` 重建；`:332-333` 非搜索态 `walk(tree)` 渲染的是排序后的树。结论：文件夹下连接已按名排序（中文 locale）。
-  - **②广播去重（`App.tsx:getBroadcastTargets`）：** 遍历广播组成员时按 `tab.connectionId` 去重——同连接开两 tab 只取首个 session，避免对同一台服务器重复发同一按键（双执行）。无 connectionId 的 tab 仍照常纳入。
-  - **③终端选区可见性（`TerminalPanel.tsx`）：** 根因——各主题 `selectionBackground` 多用低 alpha（`#RRGGBBAA` 末两位 `44`≈27% / `88`≈53%），在终端背景上几乎看不出。新增 `visibleSelection()` 把 alpha 提到 `cc`（≈80%，保留各主题原有色相），在 Terminal 构造处（`:143`）与重渲染处（`:408`）两处 `theme` spread 注入，覆盖普通/背景图两种渲染路径。
-  - **④Windows 任务栏图标（`main.rs` + `Cargo.toml`）：** exe 图标正常 ⇒ tauri-build 已正确嵌入图标资源；任务栏仍是默认 ⇒ 身份/分组问题。双保险：a) `run()` 起始处 `set_windows_app_user_model_id()` 经 shell32 内联 FFI 调 `SetCurrentProcessExplicitAppUserModelID("com.myshell.client")`（与 tauri.conf identifier 同值），必须在窗口创建前设置；b) `Cargo.toml` tauri 加 `image-ico` feature，`.setup()` 里 `window.set_icon(Image::from_bytes(include_bytes!("../icons/icon.ico")))` 显式给主窗口上图标。注意 Tauri 2.x 该版本 `set_icon` 直接吃 `Image` 非 `Option<Image>`（初版写 `Some(icon)` 编译报 E0308，已改）。
-- **验证：** `cargo check` PASS（0 warn，tauri 加 image-ico 重编 ~50s）；`npx tsc --noEmit` PASS（0 err）。
-- **遗留：** ④需用户重新 `cargo tauri build` 出包验证；若任务栏仍显示旧默认图标，多为 Windows 图标缓存（任务栏已固定快捷方式）/需取消固定重固定，或 `ie4uinit.exe -show` 刷新图标缓存。①确认无需改动。
+### 闃舵 28锛? 椤逛綋楠屼紭鍖栵紙杩炴帴鎺掑簭纭 / 骞挎挱鍘婚噸 / 缁堢閫夊尯鍙鎬?/ Windows 浠诲姟鏍忓浘鏍囷級锛?026-06-22锛?
+- **闇€姹傦細** 鐢ㄦ埛鎻?4 鐐癸細鈶犳枃浠跺す涓嬭繛鎺ユ槸鍚︽寜鍚嶆帓搴?鈶″悓杩炴帴寮€涓?tab 鏃跺箍鎾笉搴旈噸澶嶅彂 鈶㈢粓绔€変腑鍐呭闅句互鍒嗚鲸锛堟棤閫変腑鑹插彉鍖栵級鈶ｆ墦鍖呭悗浠诲姟鏍忔樉绀洪粯璁ゅ浘鏍囷紙exe 鍥炬爣姝ｅ父锛夈€?
+- **鏀瑰姩锛?*
+  - **鈶犺繛鎺ユ帓搴忊€斺€旂粡鏍稿疄宸插疄鐜帮紝鏃犻渶鏀瑰姩銆?* `Sidebar.tsx:buildTree` 绗?70-75 琛?`sortRec` 宸插 `n.children`锛堝瓙鏂囦欢澶癸級涓?`n.conns`锛堣繛鎺ワ級鎸?`name.localeCompare(..., "zh")` 鎺掑簭锛沗:219` `useMemo(buildTree)` 閲嶅缓锛沗:332-333` 闈炴悳绱㈡€?`walk(tree)` 娓叉煋鐨勬槸鎺掑簭鍚庣殑鏍戙€傜粨璁猴細鏂囦欢澶逛笅杩炴帴宸叉寜鍚嶆帓搴忥紙涓枃 locale锛夈€?
+  - **鈶″箍鎾幓閲嶏紙`App.tsx:getBroadcastTargets`锛夛細** 閬嶅巻骞挎挱缁勬垚鍛樻椂鎸?`tab.connectionId` 鍘婚噸鈥斺€斿悓杩炴帴寮€涓?tab 鍙彇棣栦釜 session锛岄伩鍏嶅鍚屼竴鍙版湇鍔″櫒閲嶅鍙戝悓涓€鎸夐敭锛堝弻鎵ц锛夈€傛棤 connectionId 鐨?tab 浠嶇収甯哥撼鍏ャ€?
+  - **鈶㈢粓绔€夊尯鍙鎬э紙`TerminalPanel.tsx`锛夛細** 鏍瑰洜鈥斺€斿悇涓婚 `selectionBackground` 澶氱敤浣?alpha锛坄#RRGGBBAA` 鏈袱浣?`44`鈮?7% / `88`鈮?3%锛夛紝鍦ㄧ粓绔儗鏅笂鍑犱箮鐪嬩笉鍑恒€傛柊澧?`visibleSelection()` 鎶?alpha 鎻愬埌 `cc`锛堚増80%锛屼繚鐣欏悇涓婚鍘熸湁鑹茬浉锛夛紝鍦?Terminal 鏋勯€犲锛坄:143`锛変笌閲嶆覆鏌撳锛坄:408`锛変袱澶?`theme` spread 娉ㄥ叆锛岃鐩栨櫘閫?鑳屾櫙鍥句袱绉嶆覆鏌撹矾寰勩€?
+  - **鈶indows 浠诲姟鏍忓浘鏍囷紙`main.rs` + `Cargo.toml`锛夛細** exe 鍥炬爣姝ｅ父 鈬?tauri-build 宸叉纭祵鍏ュ浘鏍囪祫婧愶紱浠诲姟鏍忎粛鏄粯璁?鈬?韬唤/鍒嗙粍闂銆傚弻淇濋櫓锛歛) `run()` 璧峰澶?`set_windows_app_user_model_id()` 缁?shell32 鍐呰仈 FFI 璋?`SetCurrentProcessExplicitAppUserModelID("com.myshell.client")`锛堜笌 tauri.conf identifier 鍚屽€硷級锛屽繀椤诲湪绐楀彛鍒涘缓鍓嶈缃紱b) `Cargo.toml` tauri 鍔?`image-ico` feature锛宍.setup()` 閲?`window.set_icon(Image::from_bytes(include_bytes!("../icons/icon.ico")))` 鏄惧紡缁欎富绐楀彛涓婂浘鏍囥€傛敞鎰?Tauri 2.x 璇ョ増鏈?`set_icon` 鐩存帴鍚?`Image` 闈?`Option<Image>`锛堝垵鐗堝啓 `Some(icon)` 缂栬瘧鎶?E0308锛屽凡鏀癸級銆?
+- **楠岃瘉锛?* `cargo check` PASS锛? warn锛宼auri 鍔?image-ico 閲嶇紪 ~50s锛夛紱`npx tsc --noEmit` PASS锛? err锛夈€?
+- **閬楃暀锛?* 鈶ｉ渶鐢ㄦ埛閲嶆柊 `cargo tauri build` 鍑哄寘楠岃瘉锛涜嫢浠诲姟鏍忎粛鏄剧ず鏃ч粯璁ゅ浘鏍囷紝澶氫负 Windows 鍥炬爣缂撳瓨锛堜换鍔℃爮宸插浐瀹氬揩鎹锋柟寮忥級/闇€鍙栨秷鍥哄畾閲嶅浐瀹氾紝鎴?`ie4uinit.exe -show` 鍒锋柊鍥炬爣缂撳瓨銆傗憼纭鏃犻渶鏀瑰姩銆?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 28 complete（4 项优化：排序确认/广播去重/选区可见/任务栏图标，cargo + tsc 双绿） |
-| 我要去哪里？ | 用户 dev 实测选区高亮 + 广播去重；出包验证任务栏图标 |
-| 目标是什么？ | 解决用户提的 4 个体验点，零回归 |
-| 我学到了什么？ | xterm `selectionBackground` 支持 8 位 hex `#RRGGBBAA`，alpha 太低则选区不可见；Windows「exe 图标对、任务栏默认」几乎都是缺 AUMID（`SetCurrentProcessExplicitAppUserModelID`，须窗口创建前设）；Tauri 2.x `WebviewWindow::set_icon` 签名是 `Image` 而非 `Option<Image>`（版本相关，报错为准）；`#[link(name="shell32")] extern "system"` 可免 winapi feature 直接调系统 API |
-| 我做了什么？ | ①确认已排序 ②getBroadcastTargets 按 connectionId 去重 ③visibleSelection 提 alpha 注入两处 ④AUMID + set_icon 双保险（+image-ico feature），cargo/tsc 双绿，progress/README 同步 |
+| 鎴戝湪鍝噷锛?| 闃舵 28 complete锛? 椤逛紭鍖栵細鎺掑簭纭/骞挎挱鍘婚噸/閫夊尯鍙/浠诲姟鏍忓浘鏍囷紝cargo + tsc 鍙岀豢锛?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 dev 瀹炴祴閫夊尯楂樹寒 + 骞挎挱鍘婚噸锛涘嚭鍖呴獙璇佷换鍔℃爮鍥炬爣 |
+| 鐩爣鏄粈涔堬紵 | 瑙ｅ喅鐢ㄦ埛鎻愮殑 4 涓綋楠岀偣锛岄浂鍥炲綊 |
+| 鎴戝鍒颁簡浠€涔堬紵 | xterm `selectionBackground` 鏀寔 8 浣?hex `#RRGGBBAA`锛宎lpha 澶綆鍒欓€夊尯涓嶅彲瑙侊紱Windows銆宔xe 鍥炬爣瀵广€佷换鍔℃爮榛樿銆嶅嚑涔庨兘鏄己 AUMID锛坄SetCurrentProcessExplicitAppUserModelID`锛岄』绐楀彛鍒涘缓鍓嶈锛夛紱Tauri 2.x `WebviewWindow::set_icon` 绛惧悕鏄?`Image` 鑰岄潪 `Option<Image>`锛堢増鏈浉鍏筹紝鎶ラ敊涓哄噯锛夛紱`#[link(name="shell32")] extern "system"` 鍙厤 winapi feature 鐩存帴璋冪郴缁?API |
+| 鎴戝仛浜嗕粈涔堬紵 | 鈶犵‘璁ゅ凡鎺掑簭 鈶etBroadcastTargets 鎸?connectionId 鍘婚噸 鈶isibleSelection 鎻?alpha 娉ㄥ叆涓ゅ 鈶UMID + set_icon 鍙屼繚闄╋紙+image-ico feature锛夛紝cargo/tsc 鍙岀豢锛宲rogress/README 鍚屾 |
 
-### 阶段 29：SFTP 打开即报 "Read dir failed: No such file" + 版本号 1.4.2（2026-06-22）
-- **需求：** ①版本号改 1.4.2；②连接 `sftp_perceptualCenter@...` 后 SFTP 面板直接报 `Read dir failed: No such file: No such file`，用户反馈「连接 sftp 异常」。
-- **根因（②）：** `SftpPanel.tsx` 初始路径用 `~`（SSH/SFTP 惯用的 home 快捷），但 **SFTP 协议 + russh-sftp 把 `~` 当字面目录名**——没有 shell 做展开，服务器上又没有名为 `~` 的目录，于是 `read_dir("~")` 返回 `SSH_FX_NO_SUCH_FILE`，`format!("Read dir failed: {}", e)` 把 russh-sftp 的「状态码名: 服务器消息」渲染成 `No such file: No such file`（所以重复两次）。与 SFTP 子系统是否可用、shell 通道是否秒退（ExitStatus=1，该账号疑似 nologin/chroot 的 SFTP-only 账号）无关——子系统通道开得起来，错在路径。
-- **改动：**
-  - `src-tauri/src/sftp.rs` 新增 `resolve_path(sftp, path)`：遇 `~` / `~/` / `~/foo` 时先 `sftp.canonicalize(".")`（SFTP REALPATH，返回服务器默认目录=home）再拼后缀；绝对/相对路径原样透传。`list_dir` / `create_dir` / `remove` / `rename` 四处入口统一走它。`list_dir` 的子项 `full_path` 改用解析后的绝对路径，使从 `~` 进下一级后地址栏自然变成真实绝对路径（`/home/.../name`），而非停留在 `~`。
-  - 注意所有权：`read_dir`/`remove_file`/`remove_dir` 都是 `P: Into<String>`，传 owned `String` 会被 move 掉、之后再 `format!` 用就报 use-after-move；统一传 `resolved.as_str()`（`&str: Into<String>`，借用不 move）。`rename` 两参各 move 一次、用后不再访问，OK。
-  - 版本号 1.4.1 → 1.4.2：改 `Cargo.toml`（唯一真源）后跑 `npm run version:sync` 同步到 `package.json` + `package-lock.json`；`tauri.conf.json` 无需版本字段（Tauri v2 直接读 Cargo.toml）。
-  - **附带修复（阻断编译的遗留 typo）：** `Cargo.toml` 里 `rusqlite` 的 feature 写成了 `bundclaudled`（不存在的 feature），cargo 直接报 `does not have that feature` 全量编不过。改回正确的 `bundled`（与 CLAUDE.md「rusqlite (bundled)」一致）。该 typo 正是会话开始时 `git status` 里那个未提交的 `M src-tauri/Cargo.toml`。
-- **验证：** `npx tsc --noEmit` PASS（0 err）；`cargo check` PASS（0 warn，33.8s）。`canonicalize`/`read_dir`/`rename`/`remove_file`/`remove_dir`/`create_dir` 签名均已对照 russh-sftp 2.3.0 源码确认（`canonicalize` 在 `client/session.rs:127`，`read_dir` 返回可迭代的 `ReadDir`）。
-- **遗留 / 待用户实测：** chroot 型 SFTP-only 账号若 home 在 chroot 内不存在，服务器会把 CWD 落在 `/`，此时 `canonicalize(".")` 返回 `/`、列 `/`，不会再报 No such file（降级正确）。需用户 dev 实测该连接的 SFTP 面板能正常列目录。
+### 闃舵 29锛歋FTP 鎵撳紑鍗虫姤 "Read dir failed: No such file" + 鐗堟湰鍙?1.4.2锛?026-06-22锛?
+- **闇€姹傦細** 鈶犵増鏈彿鏀?1.4.2锛涒憽杩炴帴 `sftp_perceptualCenter@...` 鍚?SFTP 闈㈡澘鐩存帴鎶?`Read dir failed: No such file: No such file`锛岀敤鎴峰弽棣堛€岃繛鎺?sftp 寮傚父銆嶃€?
+- **鏍瑰洜锛堚憽锛夛細** `SftpPanel.tsx` 鍒濆璺緞鐢?`~`锛圫SH/SFTP 鎯敤鐨?home 蹇嵎锛夛紝浣?**SFTP 鍗忚 + russh-sftp 鎶?`~` 褰撳瓧闈㈢洰褰曞悕**鈥斺€旀病鏈?shell 鍋氬睍寮€锛屾湇鍔″櫒涓婂張娌℃湁鍚嶄负 `~` 鐨勭洰褰曪紝浜庢槸 `read_dir("~")` 杩斿洖 `SSH_FX_NO_SUCH_FILE`锛宍format!("Read dir failed: {}", e)` 鎶?russh-sftp 鐨勩€岀姸鎬佺爜鍚? 鏈嶅姟鍣ㄦ秷鎭€嶆覆鏌撴垚 `No such file: No such file`锛堟墍浠ラ噸澶嶄袱娆★級銆備笌 SFTP 瀛愮郴缁熸槸鍚﹀彲鐢ㄣ€乻hell 閫氶亾鏄惁绉掗€€锛圗xitStatus=1锛岃璐﹀彿鐤戜技 nologin/chroot 鐨?SFTP-only 璐﹀彿锛夋棤鍏斥€斺€斿瓙绯荤粺閫氶亾寮€寰楄捣鏉ワ紝閿欏湪璺緞銆?
+- **鏀瑰姩锛?*
+  - `src-tauri/src/sftp.rs` 鏂板 `resolve_path(sftp, path)`锛氶亣 `~` / `~/` / `~/foo` 鏃跺厛 `sftp.canonicalize(".")`锛圫FTP REALPATH锛岃繑鍥炴湇鍔″櫒榛樿鐩綍=home锛夊啀鎷煎悗缂€锛涚粷瀵?鐩稿璺緞鍘熸牱閫忎紶銆俙list_dir` / `create_dir` / `remove` / `rename` 鍥涘鍏ュ彛缁熶竴璧板畠銆俙list_dir` 鐨勫瓙椤?`full_path` 鏀圭敤瑙ｆ瀽鍚庣殑缁濆璺緞锛屼娇浠?`~` 杩涗笅涓€绾у悗鍦板潃鏍忚嚜鐒跺彉鎴愮湡瀹炵粷瀵硅矾寰勶紙`/home/.../name`锛夛紝鑰岄潪鍋滅暀鍦?`~`銆?
+  - 娉ㄦ剰鎵€鏈夋潈锛歚read_dir`/`remove_file`/`remove_dir` 閮芥槸 `P: Into<String>`锛屼紶 owned `String` 浼氳 move 鎺夈€佷箣鍚庡啀 `format!` 鐢ㄥ氨鎶?use-after-move锛涚粺涓€浼?`resolved.as_str()`锛坄&str: Into<String>`锛屽€熺敤涓?move锛夈€俙rename` 涓ゅ弬鍚?move 涓€娆°€佺敤鍚庝笉鍐嶈闂紝OK銆?
+  - 鐗堟湰鍙?1.4.1 鈫?1.4.2锛氭敼 `Cargo.toml`锛堝敮涓€鐪熸簮锛夊悗璺?`npm run version:sync` 鍚屾鍒?`package.json` + `package-lock.json`锛沗tauri.conf.json` 鏃犻渶鐗堟湰瀛楁锛圱auri v2 鐩存帴璇?Cargo.toml锛夈€?
+  - **闄勫甫淇锛堥樆鏂紪璇戠殑閬楃暀 typo锛夛細** `Cargo.toml` 閲?`rusqlite` 鐨?feature 鍐欐垚浜?`bundclaudled`锛堜笉瀛樺湪鐨?feature锛夛紝cargo 鐩存帴鎶?`does not have that feature` 鍏ㄩ噺缂栦笉杩囥€傛敼鍥炴纭殑 `bundled`锛堜笌 CLAUDE.md銆宺usqlite (bundled)銆嶄竴鑷达級銆傝 typo 姝ｆ槸浼氳瘽寮€濮嬫椂 `git status` 閲岄偅涓湭鎻愪氦鐨?`M src-tauri/Cargo.toml`銆?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛? err锛夛紱`cargo check` PASS锛? warn锛?3.8s锛夈€俙canonicalize`/`read_dir`/`rename`/`remove_file`/`remove_dir`/`create_dir` 绛惧悕鍧囧凡瀵圭収 russh-sftp 2.3.0 婧愮爜纭锛坄canonicalize` 鍦?`client/session.rs:127`锛宍read_dir` 杩斿洖鍙凯浠ｇ殑 `ReadDir`锛夈€?
+- **閬楃暀 / 寰呯敤鎴峰疄娴嬶細** chroot 鍨?SFTP-only 璐﹀彿鑻?home 鍦?chroot 鍐呬笉瀛樺湪锛屾湇鍔″櫒浼氭妸 CWD 钀藉湪 `/`锛屾鏃?`canonicalize(".")` 杩斿洖 `/`銆佸垪 `/`锛屼笉浼氬啀鎶?No such file锛堥檷绾ф纭級銆傞渶鐢ㄦ埛 dev 瀹炴祴璇ヨ繛鎺ョ殑 SFTP 闈㈡澘鑳芥甯稿垪鐩綍銆?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 29 complete（SFTP `~` 展开修复 + 版本 1.4.2 + 顺手修 rusqlite feature typo），cargo + tsc 双绿 |
-| 我要去哪里？ | 用户 dev 实测 `sftp_perceptualCenter` 连接的 SFTP 面板能正常列目录、进退、增删改名 |
-| 目标是什么？ | 解决「连接 sftp 异常」线上 bug，版本号升 1.4.2，零回归 |
-| 我学到了什么？ | SFTP 协议无 shell，`~` 不展开——所有 `~` 都得用 REALPATH(canonicalize ".") 解析；russh-sftp 各方法多泛型 `Into<String>`，传 owned String 会 move，要 `.as_str()`；russh-sftp 错误显示是「状态码名: 服务器消息」故 No such file 重复两次；版本号单一真源在 Cargo.toml，sync-version.mjs 负责扩散 |
-| 我做了什么？ | sftp.rs 加 resolve_path 并接入四入口（含所有权修正）、版本 1.4.1→1.4.2（+sync）、修 `bundclaudled`→`bundled` 编译阻断 typo，cargo/tsc 双绿，progress/README 同步 |
+| 鎴戝湪鍝噷锛?| 闃舵 29 complete锛圫FTP `~` 灞曞紑淇 + 鐗堟湰 1.4.2 + 椤烘墜淇?rusqlite feature typo锛夛紝cargo + tsc 鍙岀豢 |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 dev 瀹炴祴 `sftp_perceptualCenter` 杩炴帴鐨?SFTP 闈㈡澘鑳芥甯稿垪鐩綍銆佽繘閫€銆佸鍒犳敼鍚?|
+| 鐩爣鏄粈涔堬紵 | 瑙ｅ喅銆岃繛鎺?sftp 寮傚父銆嶇嚎涓?bug锛岀増鏈彿鍗?1.4.2锛岄浂鍥炲綊 |
+| 鎴戝鍒颁簡浠€涔堬紵 | SFTP 鍗忚鏃?shell锛宍~` 涓嶅睍寮€鈥斺€旀墍鏈?`~` 閮藉緱鐢?REALPATH(canonicalize ".") 瑙ｆ瀽锛況ussh-sftp 鍚勬柟娉曞娉涘瀷 `Into<String>`锛屼紶 owned String 浼?move锛岃 `.as_str()`锛況ussh-sftp 閿欒鏄剧ず鏄€岀姸鎬佺爜鍚? 鏈嶅姟鍣ㄦ秷鎭€嶆晠 No such file 閲嶅涓ゆ锛涚増鏈彿鍗曚竴鐪熸簮鍦?Cargo.toml锛宻ync-version.mjs 璐熻矗鎵╂暎 |
+| 鎴戝仛浜嗕粈涔堬紵 | sftp.rs 鍔?resolve_path 骞舵帴鍏ュ洓鍏ュ彛锛堝惈鎵€鏈夋潈淇锛夈€佺増鏈?1.4.1鈫?.4.2锛?sync锛夈€佷慨 `bundclaudled`鈫抈bundled` 缂栬瘧闃绘柇 typo锛宑argo/tsc 鍙岀豢锛宲rogress/README 鍚屾 |
 
-### 阶段 30：SFTP 点击目录报 "SSH session not found" —— shell 通道关闭误删整个 session（2026-06-22）
-- **需求：** 阶段 29 修完 `~` 展开后，用户实测 SFTP 面板能进入（列 home 成功），但「点击目录后提示 SSH session not found」。
-- **根因：** `channel_reader` 在 shell **通道**关闭时（EOF/Close/`exit`/ExitStatus）执行 `sessions.remove(&session_id)`，把整个 `SshSession` 连同 `Arc<Handle>` 一起从 map 删掉。但 russh 是「一条 SSH 连接多路复用多个通道」——shell 通道死了 ≠ SSH 连接死了，SFTP 子系统通道是 shell 通道的兄弟，靠同一个 `Arc<Handle>` 开新通道。该账号是 SFTP-only（nologin/chroot），shell 秒退（ExitStatus=1）→ reader 退出 → 删 session → 后续所有 SFTP 调用 `get_sftp_session` 找不到 session → "SSH session not found"。第一次列目录能成功只是因为面板挂载时抢在 reader 退出前完成了 `read_dir`。
-- **改动：**
-  - `src-tauri/src/ssh.rs`：
-    - `channel_reader` 不再接收 `sessions` 参数、不再在退出时 `map.remove`（删 `HashMap` import；`Mutex` 仍被 `SshClient.db` 用，保留）。改为只在 loop 内 emit `ssh_closed` 后退出。shell 通道关闭只是「终端断了」，session（连接）保留供 SFTP/exec 继续开新通道。
-    - `disconnect()` 成为唯一删 session 的点：`sessions.remove(session_id)` 取出所有权 → 给 reader 发 `Disconnect`（best-effort，SFTP-only 账号 reader 已退，no-op）→ 函数结束 drop `SshSession` → drop `Arc<Handle>` → 关闭 SSH 连接（任何在飞的 SFTP `Arc::clone` 释放后）。`ssh::disconnect` 因此变 idempotent（session 不在 map 返回 Ok）。
-    - `connect()` 同步去掉 `sessions_arc` 的 clone 与传参。
-  - `src/App.tsx::handleCloseTab`：原来仅在 `tab.status === "connected"` 时断开。但 SFTP-only 账号 shell 秒退后 `onSshClosed → onDisconnected` 把 status 置 "disconnected"，关 tab 时跳过 `sshDisconnect` → session 泄漏。改为：SSH/SFTP 分支无条件 `sshDisconnect`（依赖后端 idempotent）；FTP/local 仍只在 connected 时断（二者非 idempotent / 清理模型不同）。
-- **验证：** `npx tsc --noEmit` PASS（0 err）；`cargo check` PASS（0 warn，4.4s）。
-- **行为影响（正面）：** 普通账号在 shell 里敲 `exit` 后，SFTP 面板仍可用（连接未断，只是 shell 通道关了）——与 FinalShell 等一致。真正断开的连接会留在 map 里直到用户关 tab（终端已显示 [Connection closed]，对死 handle 的 SFTP 调用返回清晰错误而非崩溃），可接受。
-- **遗留 / 待实测：** 需用户 dev 实测该连接：①进 SFTP 面板能正常进退目录、增删改名 ②关 tab 后 session 被清理（无泄漏）。app 退出时 `drain_all_sessions` 仍只发 Disconnect 不清 map（依赖 OS 回收 TCP，与 FTP 一致，main.rs drain_all_sessions 上方注释已说明）。
+### 闃舵 30锛歋FTP 鐐瑰嚮鐩綍鎶?"SSH session not found" 鈥斺€?shell 閫氶亾鍏抽棴璇垹鏁翠釜 session锛?026-06-22锛?
+- **闇€姹傦細** 闃舵 29 淇畬 `~` 灞曞紑鍚庯紝鐢ㄦ埛瀹炴祴 SFTP 闈㈡澘鑳借繘鍏ワ紙鍒?home 鎴愬姛锛夛紝浣嗐€岀偣鍑荤洰褰曞悗鎻愮ず SSH session not found銆嶃€?
+- **鏍瑰洜锛?* `channel_reader` 鍦?shell **閫氶亾**鍏抽棴鏃讹紙EOF/Close/`exit`/ExitStatus锛夋墽琛?`sessions.remove(&session_id)`锛屾妸鏁翠釜 `SshSession` 杩炲悓 `Arc<Handle>` 涓€璧蜂粠 map 鍒犳帀銆備絾 russh 鏄€屼竴鏉?SSH 杩炴帴澶氳矾澶嶇敤澶氫釜閫氶亾銆嶁€斺€攕hell 閫氶亾姝讳簡 鈮?SSH 杩炴帴姝讳簡锛孲FTP 瀛愮郴缁熼€氶亾鏄?shell 閫氶亾鐨勫厔寮燂紝闈犲悓涓€涓?`Arc<Handle>` 寮€鏂伴€氶亾銆傝璐﹀彿鏄?SFTP-only锛坣ologin/chroot锛夛紝shell 绉掗€€锛圗xitStatus=1锛夆啋 reader 閫€鍑?鈫?鍒?session 鈫?鍚庣画鎵€鏈?SFTP 璋冪敤 `get_sftp_session` 鎵句笉鍒?session 鈫?"SSH session not found"銆傜涓€娆″垪鐩綍鑳芥垚鍔熷彧鏄洜涓洪潰鏉挎寕杞芥椂鎶㈠湪 reader 閫€鍑哄墠瀹屾垚浜?`read_dir`銆?
+- **鏀瑰姩锛?*
+  - `src-tauri/src/ssh.rs`锛?
+    - `channel_reader` 涓嶅啀鎺ユ敹 `sessions` 鍙傛暟銆佷笉鍐嶅湪閫€鍑烘椂 `map.remove`锛堝垹 `HashMap` import锛沗Mutex` 浠嶈 `SshClient.db` 鐢紝淇濈暀锛夈€傛敼涓哄彧鍦?loop 鍐?emit `ssh_closed` 鍚庨€€鍑恒€俿hell 閫氶亾鍏抽棴鍙槸銆岀粓绔柇浜嗐€嶏紝session锛堣繛鎺ワ級淇濈暀渚?SFTP/exec 缁х画寮€鏂伴€氶亾銆?
+    - `disconnect()` 鎴愪负鍞竴鍒?session 鐨勭偣锛歚sessions.remove(session_id)` 鍙栧嚭鎵€鏈夋潈 鈫?缁?reader 鍙?`Disconnect`锛坆est-effort锛孲FTP-only 璐﹀彿 reader 宸查€€锛宯o-op锛夆啋 鍑芥暟缁撴潫 drop `SshSession` 鈫?drop `Arc<Handle>` 鈫?鍏抽棴 SSH 杩炴帴锛堜换浣曞湪椋炵殑 SFTP `Arc::clone` 閲婃斁鍚庯級銆俙ssh::disconnect` 鍥犳鍙?idempotent锛坰ession 涓嶅湪 map 杩斿洖 Ok锛夈€?
+    - `connect()` 鍚屾鍘绘帀 `sessions_arc` 鐨?clone 涓庝紶鍙傘€?
+  - `src/App.tsx::handleCloseTab`锛氬師鏉ヤ粎鍦?`tab.status === "connected"` 鏃舵柇寮€銆備絾 SFTP-only 璐﹀彿 shell 绉掗€€鍚?`onSshClosed 鈫?onDisconnected` 鎶?status 缃?"disconnected"锛屽叧 tab 鏃惰烦杩?`sshDisconnect` 鈫?session 娉勬紡銆傛敼涓猴細SSH/SFTP 鍒嗘敮鏃犳潯浠?`sshDisconnect`锛堜緷璧栧悗绔?idempotent锛夛紱FTP/local 浠嶅彧鍦?connected 鏃舵柇锛堜簩鑰呴潪 idempotent / 娓呯悊妯″瀷涓嶅悓锛夈€?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛? err锛夛紱`cargo check` PASS锛? warn锛?.4s锛夈€?
+- **琛屼负褰卞搷锛堟闈級锛?* 鏅€氳处鍙峰湪 shell 閲屾暡 `exit` 鍚庯紝SFTP 闈㈡澘浠嶅彲鐢紙杩炴帴鏈柇锛屽彧鏄?shell 閫氶亾鍏充簡锛夆€斺€斾笌 FinalShell 绛変竴鑷淬€傜湡姝ｆ柇寮€鐨勮繛鎺ヤ細鐣欏湪 map 閲岀洿鍒扮敤鎴峰叧 tab锛堢粓绔凡鏄剧ず [Connection closed]锛屽姝?handle 鐨?SFTP 璋冪敤杩斿洖娓呮櫚閿欒鑰岄潪宕╂簝锛夛紝鍙帴鍙椼€?
+- **閬楃暀 / 寰呭疄娴嬶細** 闇€鐢ㄦ埛 dev 瀹炴祴璇ヨ繛鎺ワ細鈶犺繘 SFTP 闈㈡澘鑳芥甯歌繘閫€鐩綍銆佸鍒犳敼鍚?鈶″叧 tab 鍚?session 琚竻鐞嗭紙鏃犳硠婕忥級銆俛pp 閫€鍑烘椂 `drain_all_sessions` 浠嶅彧鍙?Disconnect 涓嶆竻 map锛堜緷璧?OS 鍥炴敹 TCP锛屼笌 FTP 涓€鑷达紝main.rs drain_all_sessions 涓婃柟娉ㄩ噴宸茶鏄庯級銆?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 30 complete（session 生命周期与 shell 通道解耦 + 关 tab 清理），cargo + tsc 双绿 |
-| 我要去哪里？ | 用户 dev 实测 SFTP 进退/增删改名 + 关 tab 无泄漏 |
-| 目标是什么？ | 彻底修好 SFTP-only 账号「连接 sftp 异常」，零回归 |
-| 我学到了什么？ | russh 一条连接多路复用多通道，shell 通道死 ≠ 连接死，session 生命周期不能绑死在 shell reader 上；删 `HashMap` import 前要先确认没被 `SshClient.db` 之外的 Mutex 复用；改后端 cleanup 语义要顺带审前端的关 tab / status 门控，否则「后端保留 session、前端跳过 disconnect」会泄漏 |
-| 我做了什么？ | channel_reader 去掉 sessions 参数与 map.remove（+删 HashMap import）；disconnect() 改为唯一删 session 点并 idempotent；App.tsx 关 tab 时 SSH/SFTP 无条件断开；cargo/tsc 双绿，progress/README 同步 |
+| 鎴戝湪鍝噷锛?| 闃舵 30 complete锛坰ession 鐢熷懡鍛ㄦ湡涓?shell 閫氶亾瑙ｈ€?+ 鍏?tab 娓呯悊锛夛紝cargo + tsc 鍙岀豢 |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 dev 瀹炴祴 SFTP 杩涢€€/澧炲垹鏀瑰悕 + 鍏?tab 鏃犳硠婕?|
+| 鐩爣鏄粈涔堬紵 | 褰诲簳淇ソ SFTP-only 璐﹀彿銆岃繛鎺?sftp 寮傚父銆嶏紝闆跺洖褰?|
+| 鎴戝鍒颁簡浠€涔堬紵 | russh 涓€鏉¤繛鎺ュ璺鐢ㄥ閫氶亾锛宻hell 閫氶亾姝?鈮?杩炴帴姝伙紝session 鐢熷懡鍛ㄦ湡涓嶈兘缁戞鍦?shell reader 涓婏紱鍒?`HashMap` import 鍓嶈鍏堢‘璁ゆ病琚?`SshClient.db` 涔嬪鐨?Mutex 澶嶇敤锛涙敼鍚庣 cleanup 璇箟瑕侀『甯﹀鍓嶇鐨勫叧 tab / status 闂ㄦ帶锛屽惁鍒欍€屽悗绔繚鐣?session銆佸墠绔烦杩?disconnect銆嶄細娉勬紡 |
+| 鎴戝仛浜嗕粈涔堬紵 | channel_reader 鍘绘帀 sessions 鍙傛暟涓?map.remove锛?鍒?HashMap import锛夛紱disconnect() 鏀逛负鍞竴鍒?session 鐐瑰苟 idempotent锛汚pp.tsx 鍏?tab 鏃?SSH/SFTP 鏃犳潯浠舵柇寮€锛沜argo/tsc 鍙岀豢锛宲rogress/README 鍚屾 |
 
-### 阶段 31：SFTP 批量文件上传/下载（2026-06-22）
-- **需求：** SFTP 面板当前只有 删除 / 新建文件夹 / 重命名，缺少文件上传和下载能力。需要支持批量多选文件上传、批量下载到指定本地目录。文件夹递归可不做（YAGNI，v1 不含），覆盖策略采用直接覆盖（最简单）。
-- **改动：**
-  - `src-tauri/src/sftp.rs`（新增 ~210 行）：
-    - `upload(state, sid, local_paths: Vec<String>, remote_dest_dir, request_id, window)` — 预 stat（`tokio::fs::metadata` 取 size/total、跳过目录）、顺序传输每个文件（`sftp::create` = CREATE|TRUNCATE|WRITE → 32KB 缓冲循环 `AsyncReadExt::read`→`AsyncWriteExt::write_all`）、`flush()` 驱动 write acks 完成（russh-sftp 2.3 `File` 无显式 `close()`——`Drop` impl 用 `close_nowait` 释放 handle）、进度 emit 节流 120ms、单文件失败记录后继续下一个、收尾 `sftp_transfer_done`。
-    - `download(state, sid, remote_paths: Vec<String>, local_dest_dir, request_id, window)` — 对称：`sftp::open` = READ → `metadata().size` 累加 → `tokio::fs::create_dir_all` → 32KB 循环 `file.read`→`local.write_all` → `flush()`。
-    - 三个事件结构体（camelCase serde）：`TransferProgressPayload`、`TransferDonePayload`、`TransferErrorPayload`（后者在实现中未被直接构造——致命错误用 `sftp::upload`/`download` 返回 `Err` 由前端 `.catch` 处理——删掉了以消除 warning）。
-    - 辅助函数 `basename(path)`（用 `std::path::Path::file_name` 防路径逃逸）、`emit_transfer_progress`。
-    - 通道复用：一个 `SftpSession`（一条子系统通道）处理整批文件，各文件各自 open/close handle，开销可控。
-  - `src-tauri/src/main.rs`：
-    - `sftp_upload` / `sftp_download` 两个 `#[tauri::command]` 包装（`WebviewWindow` 注入，同 `ssh_connect` 范式）。
-    - `generate_handler!` 注册（紧跟 `sftp_rename` 之后）。
-  - `src/api.ts`：
-    - `sftpUpload(sessionId, localPaths, remoteDestDir, requestId)` / `sftpDownload(sessionId, remotePaths, localDestDir, requestId)` invoke 包装。
-    - 三个 requestId 过滤事件监听器：`onSftpTransferProgress`、`onSftpTransferDone`、`onSftpTransferError`（后者配套删除的后端事件）。
-    - 导出类型 `SftpTransferProgressPayload`、`SftpTransferDonePayload`。
-  - `src/components/SftpPanel.tsx`（全面改写）：
-    - **多选**：文件行加 `checkbox`（`selected: Set<string>` 存 `entry.path`），切换目录时清空选区。
-    - **工具栏**：⬆ 上传按钮（`open({ multiple: true })` 选本地文件 → `runTransfer` → `sftpUpload`）；⬇ 下载按钮（选中文件项数 > 0 时启用 → `open({ directory: true })` 选目标目录 → `sftpDownload`，仅收集 `!is_dir` 的选中项，文件夹合同不纳入）。
-    - **`runTransfer`**（上传/下载共享的事件生命周期）：`requestId = crypto.randomUUID()`；`setTransfer` 初始化状态 → `onSftpTransferProgress` + `onSftpTransferDone` 订阅（先于 invoke，防漏早期事件）→ 启动调用 → 完成标记 `done: true` → 回调刷新目录（上传时）。
-    - **`TransferOverlay`**：底部绝对定位浮层，显示阶段名（上传中/下载中/完成）、当前文件名、`fileIndex/fileCount`、总进度条 `bytesDone/bytesTotal`（百分比 width transition）、完成态列出前 3 条 per-file 错误（若有）；关闭按钮清掉监听器。外部点击不关闭（防误触中断用户读错误详情）。
-    - 原有工具栏 `ToolBtn` / 格式化 / 目录操作等保持不变。
-    - 仅 SSH source 显示上传/下载按钮（FTP source 为 `display: none` 的简并——本次未动 FTP，但二进制复用同一 `SftpPanel`）。
-- **已读 russh-sftp 2.3.0 源码核对（`~/.cargo/registry/src/…/russh-sftp-2.3.0/src/client/`）：**
-  - `session.rs:97` `create()` → `CREATE|TRUNCATE|WRITE` — 确认覆盖语义正确。
-  - `session.rs:90-91` `open()` → `OpenFlags::READ` — 确认只读。
-  - `fs/file.rs:135-142` `Drop` — `close_nowait(handle)` 释放 handle；无显式 `close()` 方法，初版编译报 `no method close`，改为仅 `flush()` + scope drop。
-  - `fs/file.rs:260-294` `AsyncWrite::poll_write` — 支持并发 write ack，`flush()` 驱动全部 ack 完成。
-- **验证：** `npx tsc --noEmit` PASS（0 err）；`cargo check` PASS（0 warn，8.6s）。对话内中断的 `cargo check` 已在续会重跑确认。
-- **遗留 / 待实测：** `cargo tauri dev` 手测——上传多选文件 → 进度浮层走完 → 目录刷新出现新文件；下载选中多文件 → 选目标目录 → 本地得到这些文件。覆盖已有文件生效。`sftpTransferError`（fatal channel error）在 `runTransfer` 的 `.catch` 里兜底，不一定有后端事件触发——设计上是双重保险。非 SSH source 面板无按钮，不做多余操作。
+### 闃舵 31锛歋FTP 鎵归噺鏂囦欢涓婁紶/涓嬭浇锛?026-06-22锛?
+- **闇€姹傦細** SFTP 闈㈡澘褰撳墠鍙湁 鍒犻櫎 / 鏂板缓鏂囦欢澶?/ 閲嶅懡鍚嶏紝缂哄皯鏂囦欢涓婁紶鍜屼笅杞借兘鍔涖€傞渶瑕佹敮鎸佹壒閲忓閫夋枃浠朵笂浼犮€佹壒閲忎笅杞藉埌鎸囧畾鏈湴鐩綍銆傛枃浠跺す閫掑綊鍙笉鍋氾紙YAGNI锛寁1 涓嶅惈锛夛紝瑕嗙洊绛栫暐閲囩敤鐩存帴瑕嗙洊锛堟渶绠€鍗曪級銆?
+- **鏀瑰姩锛?*
+  - `src-tauri/src/sftp.rs`锛堟柊澧?~210 琛岋級锛?
+    - `upload(state, sid, local_paths: Vec<String>, remote_dest_dir, request_id, window)` 鈥?棰?stat锛坄tokio::fs::metadata` 鍙?size/total銆佽烦杩囩洰褰曪級銆侀『搴忎紶杈撴瘡涓枃浠讹紙`sftp::create` = CREATE|TRUNCATE|WRITE 鈫?32KB 缂撳啿寰幆 `AsyncReadExt::read`鈫抈AsyncWriteExt::write_all`锛夈€乣flush()` 椹卞姩 write acks 瀹屾垚锛坮ussh-sftp 2.3 `File` 鏃犳樉寮?`close()`鈥斺€擿Drop` impl 鐢?`close_nowait` 閲婃斁 handle锛夈€佽繘搴?emit 鑺傛祦 120ms銆佸崟鏂囦欢澶辫触璁板綍鍚庣户缁笅涓€涓€佹敹灏?`sftp_transfer_done`銆?
+    - `download(state, sid, remote_paths: Vec<String>, local_dest_dir, request_id, window)` 鈥?瀵圭О锛歚sftp::open` = READ 鈫?`metadata().size` 绱姞 鈫?`tokio::fs::create_dir_all` 鈫?32KB 寰幆 `file.read`鈫抈local.write_all` 鈫?`flush()`銆?
+    - 涓変釜浜嬩欢缁撴瀯浣擄紙camelCase serde锛夛細`TransferProgressPayload`銆乣TransferDonePayload`銆乣TransferErrorPayload`锛堝悗鑰呭湪瀹炵幇涓湭琚洿鎺ユ瀯閫犫€斺€旇嚧鍛介敊璇敤 `sftp::upload`/`download` 杩斿洖 `Err` 鐢卞墠绔?`.catch` 澶勭悊鈥斺€斿垹鎺変簡浠ユ秷闄?warning锛夈€?
+    - 杈呭姪鍑芥暟 `basename(path)`锛堢敤 `std::path::Path::file_name` 闃茶矾寰勯€冮€革級銆乣emit_transfer_progress`銆?
+    - 閫氶亾澶嶇敤锛氫竴涓?`SftpSession`锛堜竴鏉″瓙绯荤粺閫氶亾锛夊鐞嗘暣鎵规枃浠讹紝鍚勬枃浠跺悇鑷?open/close handle锛屽紑閿€鍙帶銆?
+  - `src-tauri/src/main.rs`锛?
+    - `sftp_upload` / `sftp_download` 涓や釜 `#[tauri::command]` 鍖呰锛坄WebviewWindow` 娉ㄥ叆锛屽悓 `ssh_connect` 鑼冨紡锛夈€?
+    - `generate_handler!` 娉ㄥ唽锛堢揣璺?`sftp_rename` 涔嬪悗锛夈€?
+  - `src/api.ts`锛?
+    - `sftpUpload(sessionId, localPaths, remoteDestDir, requestId)` / `sftpDownload(sessionId, remotePaths, localDestDir, requestId)` invoke 鍖呰銆?
+    - 涓変釜 requestId 杩囨护浜嬩欢鐩戝惉鍣細`onSftpTransferProgress`銆乣onSftpTransferDone`銆乣onSftpTransferError`锛堝悗鑰呴厤濂楀垹闄ょ殑鍚庣浜嬩欢锛夈€?
+    - 瀵煎嚭绫诲瀷 `SftpTransferProgressPayload`銆乣SftpTransferDonePayload`銆?
+  - `src/components/SftpPanel.tsx`锛堝叏闈㈡敼鍐欙級锛?
+    - **澶氶€?*锛氭枃浠惰鍔?`checkbox`锛坄selected: Set<string>` 瀛?`entry.path`锛夛紝鍒囨崲鐩綍鏃舵竻绌洪€夊尯銆?
+    - **宸ュ叿鏍?*锛氣瑔 涓婁紶鎸夐挳锛坄open({ multiple: true })` 閫夋湰鍦版枃浠?鈫?`runTransfer` 鈫?`sftpUpload`锛夛紱猬?涓嬭浇鎸夐挳锛堥€変腑鏂囦欢椤规暟 > 0 鏃跺惎鐢?鈫?`open({ directory: true })` 閫夌洰鏍囩洰褰?鈫?`sftpDownload`锛屼粎鏀堕泦 `!is_dir` 鐨勯€変腑椤癸紝鏂囦欢澶瑰悎鍚屼笉绾冲叆锛夈€?
+    - **`runTransfer`**锛堜笂浼?涓嬭浇鍏变韩鐨勪簨浠剁敓鍛藉懆鏈燂級锛歚requestId = crypto.randomUUID()`锛沗setTransfer` 鍒濆鍖栫姸鎬?鈫?`onSftpTransferProgress` + `onSftpTransferDone` 璁㈤槄锛堝厛浜?invoke锛岄槻婕忔棭鏈熶簨浠讹級鈫?鍚姩璋冪敤 鈫?瀹屾垚鏍囪 `done: true` 鈫?鍥炶皟鍒锋柊鐩綍锛堜笂浼犳椂锛夈€?
+    - **`TransferOverlay`**锛氬簳閮ㄧ粷瀵瑰畾浣嶆诞灞傦紝鏄剧ず闃舵鍚嶏紙涓婁紶涓?涓嬭浇涓?瀹屾垚锛夈€佸綋鍓嶆枃浠跺悕銆乣fileIndex/fileCount`銆佹€昏繘搴︽潯 `bytesDone/bytesTotal`锛堢櫨鍒嗘瘮 width transition锛夈€佸畬鎴愭€佸垪鍑哄墠 3 鏉?per-file 閿欒锛堣嫢鏈夛級锛涘叧闂寜閽竻鎺夌洃鍚櫒銆傚閮ㄧ偣鍑讳笉鍏抽棴锛堥槻璇Е涓柇鐢ㄦ埛璇婚敊璇鎯咃級銆?
+    - 鍘熸湁宸ュ叿鏍?`ToolBtn` / 鏍煎紡鍖?/ 鐩綍鎿嶄綔绛変繚鎸佷笉鍙樸€?
+    - 浠?SSH source 鏄剧ず涓婁紶/涓嬭浇鎸夐挳锛團TP source 涓?`display: none` 鐨勭畝骞垛€斺€旀湰娆℃湭鍔?FTP锛屼絾浜岃繘鍒跺鐢ㄥ悓涓€ `SftpPanel`锛夈€?
+- **宸茶 russh-sftp 2.3.0 婧愮爜鏍稿锛坄~/.cargo/registry/src/鈥?russh-sftp-2.3.0/src/client/`锛夛細**
+  - `session.rs:97` `create()` 鈫?`CREATE|TRUNCATE|WRITE` 鈥?纭瑕嗙洊璇箟姝ｇ‘銆?
+  - `session.rs:90-91` `open()` 鈫?`OpenFlags::READ` 鈥?纭鍙銆?
+  - `fs/file.rs:135-142` `Drop` 鈥?`close_nowait(handle)` 閲婃斁 handle锛涙棤鏄惧紡 `close()` 鏂规硶锛屽垵鐗堢紪璇戞姤 `no method close`锛屾敼涓轰粎 `flush()` + scope drop銆?
+  - `fs/file.rs:260-294` `AsyncWrite::poll_write` 鈥?鏀寔骞跺彂 write ack锛宍flush()` 椹卞姩鍏ㄩ儴 ack 瀹屾垚銆?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛? err锛夛紱`cargo check` PASS锛? warn锛?.6s锛夈€傚璇濆唴涓柇鐨?`cargo check` 宸插湪缁細閲嶈窇纭銆?
+- **閬楃暀 / 寰呭疄娴嬶細** `cargo tauri dev` 鎵嬫祴鈥斺€斾笂浼犲閫夋枃浠?鈫?杩涘害娴眰璧板畬 鈫?鐩綍鍒锋柊鍑虹幇鏂版枃浠讹紱涓嬭浇閫変腑澶氭枃浠?鈫?閫夌洰鏍囩洰褰?鈫?鏈湴寰楀埌杩欎簺鏂囦欢銆傝鐩栧凡鏈夋枃浠剁敓鏁堛€俙sftpTransferError`锛坒atal channel error锛夊湪 `runTransfer` 鐨?`.catch` 閲屽厹搴曪紝涓嶄竴瀹氭湁鍚庣浜嬩欢瑙﹀彂鈥斺€旇璁′笂鏄弻閲嶄繚闄┿€傞潪 SSH source 闈㈡澘鏃犳寜閽紝涓嶅仛澶氫綑鎿嶄綔銆?
 
-### 阶段 32：连接类型图标替换为 iconfont 字体图标（2026-06-22）
-- **需求：** ftp / sftp / 本地 / ssh 的连接图标原先用 emoji（📤/📁/💻/🖥️），跨平台渲染不一致、不同系统字形差异大。用户提供了一份 iconfont.cn 字体包（`G:/桌面/font_tm10hhyy2ag`，4 个字形：电脑/ftp/服务器/SFTP），要求用这套字体图标替换。
-- **改动：**
-  - 新增 `src/assets/iconfont/iconfont.ttf` + `iconfont.css`（从字体包拷入；CSS 改为相对路径 `url("./iconfont.ttf")`，Vite 构建时 base64 内联进打包 CSS）。
-  - `src/styles/global.css` 顶部 `@import "../assets/iconfont/iconfont.css";`（仅引入一次）。
-  - 新增 `src/components/ConnIcon.tsx`：`ConnIcon` 组件（`connType` → `icon-*` class，`size` 控制 font-size，颜色走 `currentColor` 语义化映射 `CONN_COLOR`：ssh 主蓝 / sftp 副青 / ftp 警告黄 / local 次级灰）。
-  - `Sidebar.tsx`：删 `CONN_ICONS` emoji map，连接行 + 空状态用 `ConnIcon`。
-  - `ConnectionDialog.tsx`：`TYPE_OPTIONS` 去掉 emoji `icon` 字段，`TypeSelector` 按钮用 `ConnIcon`。
-  - `TabBar.tsx`：标签连接类型图标用 `ConnIcon`（颜色 `inherit`，跟随 tab 文字色）。
-  - `QuickCommandsPanel.tsx` 下拉里的 `🖥️` 是 `<option>` 文本（DOM `<option>` 无法用字体 class，只能放纯文本/emoji）——保留不动，不替换。
-- **验证：** `npx tsc --noEmit` PASS（0 err）；`npx vite build` PASS（CSS 13.65kB 含 base64 字体，无额外 ttf 产物）。
-- **设计取舍：** 颜色语义化集中到 `CONN_COLOR` 单一源，三处调用方（侧栏/对话框/标签栏）颜色一致；`color: inherit` 允许调用方覆盖（如对话框选中态用主色）。`<option>` 不替换是 DOM 限制，非遗漏。
+### 闃舵 32锛氳繛鎺ョ被鍨嬪浘鏍囨浛鎹负 iconfont 瀛椾綋鍥炬爣锛?026-06-22锛?
+- **闇€姹傦細** ftp / sftp / 鏈湴 / ssh 鐨勮繛鎺ュ浘鏍囧師鍏堢敤 emoji锛堭煋?馃搧/馃捇/馃枼锔忥級锛岃法骞冲彴娓叉煋涓嶄竴鑷淬€佷笉鍚岀郴缁熷瓧褰㈠樊寮傚ぇ銆傜敤鎴锋彁渚涗簡涓€浠?iconfont.cn 瀛椾綋鍖咃紙`G:/妗岄潰/font_tm10hhyy2ag`锛? 涓瓧褰細鐢佃剳/ftp/鏈嶅姟鍣?SFTP锛夛紝瑕佹眰鐢ㄨ繖濂楀瓧浣撳浘鏍囨浛鎹€?
+- **鏀瑰姩锛?*
+  - 鏂板 `src/assets/iconfont/iconfont.ttf` + `iconfont.css`锛堜粠瀛椾綋鍖呮嫹鍏ワ紱CSS 鏀逛负鐩稿璺緞 `url("./iconfont.ttf")`锛孷ite 鏋勫缓鏃?base64 鍐呰仈杩涙墦鍖?CSS锛夈€?
+  - `src/styles/global.css` 椤堕儴 `@import "../assets/iconfont/iconfont.css";`锛堜粎寮曞叆涓€娆★級銆?
+  - 鏂板 `src/components/ConnIcon.tsx`锛歚ConnIcon` 缁勪欢锛坄connType` 鈫?`icon-*` class锛宍size` 鎺у埗 font-size锛岄鑹茶蛋 `currentColor` 璇箟鍖栨槧灏?`CONN_COLOR`锛歴sh 涓昏摑 / sftp 鍓潚 / ftp 璀﹀憡榛?/ local 娆＄骇鐏帮級銆?
+  - `Sidebar.tsx`锛氬垹 `CONN_ICONS` emoji map锛岃繛鎺ヨ + 绌虹姸鎬佺敤 `ConnIcon`銆?
+  - `ConnectionDialog.tsx`锛歚TYPE_OPTIONS` 鍘绘帀 emoji `icon` 瀛楁锛宍TypeSelector` 鎸夐挳鐢?`ConnIcon`銆?
+  - `TabBar.tsx`锛氭爣绛捐繛鎺ョ被鍨嬪浘鏍囩敤 `ConnIcon`锛堥鑹?`inherit`锛岃窡闅?tab 鏂囧瓧鑹诧級銆?
+  - `QuickCommandsPanel.tsx` 涓嬫媺閲岀殑 `馃枼锔廯 鏄?`<option>` 鏂囨湰锛圖OM `<option>` 鏃犳硶鐢ㄥ瓧浣?class锛屽彧鑳芥斁绾枃鏈?emoji锛夆€斺€斾繚鐣欎笉鍔紝涓嶆浛鎹€?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛? err锛夛紱`npx vite build` PASS锛圕SS 13.65kB 鍚?base64 瀛椾綋锛屾棤棰濆 ttf 浜х墿锛夈€?
+- **璁捐鍙栬垗锛?* 棰滆壊璇箟鍖栭泦涓埌 `CONN_COLOR` 鍗曚竴婧愶紝涓夊璋冪敤鏂癸紙渚ф爮/瀵硅瘽妗?鏍囩鏍忥級棰滆壊涓€鑷达紱`color: inherit` 鍏佽璋冪敤鏂硅鐩栵紙濡傚璇濇閫変腑鎬佺敤涓昏壊锛夈€俙<option>` 涓嶆浛鎹㈡槸 DOM 闄愬埗锛岄潪閬楁紡銆?
 
-### 阶段 33：SFTP 连接一直提示重连（nologin 账户 shell 立即退出触发误报 ssh_closed）（2026-06-22）
-- **现象：** 打开一个 SFTP 连接，后端日志：`connected to sftp_xxx@host` → `channel_reader started` → `ExitStatus=1` → `Data 44 bytes` → `EOF` → `channel_reader exited`。前端 `SftpPanel` 收到 `ssh_closed`，状态变 `disconnected`，显示「连接已断开 / 重连」遮罩。但 SFTP 文件列表其实能正常拉。
-- **根因：** 该 SFTP 账户是 **nologin / SFTP-only** 账户（登录 shell 立即退出，ExitStatus=1）。`ssh::connect` 无条件 `request_pty` + `request_shell`——这种账户的 shell 一启动就退，`channel_reader` 走到 `Eof` 分支 emit `ssh_closed`。而 `SftpPanel`（作为独立 tab 渲染时）订阅了 `onSshClosed`（SftpPanel.tsx:121-139），把 shell 通道关闭误判成整个连接挂了 → 弹重连。阶段 30 的修复只让 `channel_reader` 不再从 map 删 session（所以 SFTP 操作还能用），但 `ssh_closed` 事件照样发，遮罩照样弹。
-- **关键认知：** SSH **连接** ≠ shell **通道**。russh 在一条 TCP 连接上多路复用多个通道；SFTP 子系统是 `get_sftp_session` 在同一 `Handle` 上新开的通道，完全不依赖那个 shell 通道。给 SFTP 连接请求 shell 本就没有意义，还撞上 nologin 账户的立即退出。
-- **修复（`src-tauri/src/ssh.rs::connect`）：** `conn_type == "sftp"` 时**跳过 PTY + shell 请求**——只 `channel_open_session`（验证连接可达 + 给 reader 一个通道用来探测真·TCP 断开），不附加任何程序。SFTP 实际走 `get_sftp_session` 自己开子系统通道。日志加 `[ssh:xxx] SFTP session — skipping PTY/shell request`。
-  - 保留 channel_reader 的 spawn：idle select! 循环代价可忽略，且当 TCP 真断时 `channel.wait()` 返回 None/Close → 发 `ssh_closed` → SftpPanel 正确提示重连（这是真断连，该提示）。nologin 账户的「shell 立即退出」误报被根除（不再请求 shell 就没有退出）。
-- **验证：** `cargo check` PASS（0 warn，12.7s）。待 dev 实测：SFTP 连接打开后不再弹重连遮罩、文件列表正常。
-- **影响面：** 仅 `ssh::connect` 一处分支；普通 SSH 终端连接路径完全不变（`is_sftp=false` 走原 PTY+shell 流程）。SFTP 的 disconnect 路径不变（reader 收 Disconnect → close channel；drop SshSession 关连接）。
+### 闃舵 33锛歋FTP 杩炴帴涓€鐩存彁绀洪噸杩烇紙nologin 璐︽埛 shell 绔嬪嵆閫€鍑鸿Е鍙戣鎶?ssh_closed锛夛紙2026-06-22锛?
+- **鐜拌薄锛?* 鎵撳紑涓€涓?SFTP 杩炴帴锛屽悗绔棩蹇楋細`connected to sftp_xxx@host` 鈫?`channel_reader started` 鈫?`ExitStatus=1` 鈫?`Data 44 bytes` 鈫?`EOF` 鈫?`channel_reader exited`銆傚墠绔?`SftpPanel` 鏀跺埌 `ssh_closed`锛岀姸鎬佸彉 `disconnected`锛屾樉绀恒€岃繛鎺ュ凡鏂紑 / 閲嶈繛銆嶉伄缃┿€備絾 SFTP 鏂囦欢鍒楄〃鍏跺疄鑳芥甯告媺銆?
+- **鏍瑰洜锛?* 璇?SFTP 璐︽埛鏄?**nologin / SFTP-only** 璐︽埛锛堢櫥褰?shell 绔嬪嵆閫€鍑猴紝ExitStatus=1锛夈€俙ssh::connect` 鏃犳潯浠?`request_pty` + `request_shell`鈥斺€旇繖绉嶈处鎴风殑 shell 涓€鍚姩灏遍€€锛宍channel_reader` 璧板埌 `Eof` 鍒嗘敮 emit `ssh_closed`銆傝€?`SftpPanel`锛堜綔涓虹嫭绔?tab 娓叉煋鏃讹級璁㈤槄浜?`onSshClosed`锛圫ftpPanel.tsx:121-139锛夛紝鎶?shell 閫氶亾鍏抽棴璇垽鎴愭暣涓繛鎺ユ寕浜?鈫?寮归噸杩炪€傞樁娈?30 鐨勪慨澶嶅彧璁?`channel_reader` 涓嶅啀浠?map 鍒?session锛堟墍浠?SFTP 鎿嶄綔杩樿兘鐢級锛屼絾 `ssh_closed` 浜嬩欢鐓ф牱鍙戯紝閬僵鐓ф牱寮广€?
+- **鍏抽敭璁ょ煡锛?* SSH **杩炴帴** 鈮?shell **閫氶亾**銆俽ussh 鍦ㄤ竴鏉?TCP 杩炴帴涓婂璺鐢ㄥ涓€氶亾锛汼FTP 瀛愮郴缁熸槸 `get_sftp_session` 鍦ㄥ悓涓€ `Handle` 涓婃柊寮€鐨勯€氶亾锛屽畬鍏ㄤ笉渚濊禆閭ｄ釜 shell 閫氶亾銆傜粰 SFTP 杩炴帴璇锋眰 shell 鏈氨娌℃湁鎰忎箟锛岃繕鎾炰笂 nologin 璐︽埛鐨勭珛鍗抽€€鍑恒€?
+- **淇锛坄src-tauri/src/ssh.rs::connect`锛夛細** `conn_type == "sftp"` 鏃?*璺宠繃 PTY + shell 璇锋眰**鈥斺€斿彧 `channel_open_session`锛堥獙璇佽繛鎺ュ彲杈?+ 缁?reader 涓€涓€氶亾鐢ㄦ潵鎺㈡祴鐪熉稵CP 鏂紑锛夛紝涓嶉檮鍔犱换浣曠▼搴忋€係FTP 瀹為檯璧?`get_sftp_session` 鑷繁寮€瀛愮郴缁熼€氶亾銆傛棩蹇楀姞 `[ssh:xxx] SFTP session 鈥?skipping PTY/shell request`銆?
+  - 淇濈暀 channel_reader 鐨?spawn锛歩dle select! 寰幆浠ｄ环鍙拷鐣ワ紝涓斿綋 TCP 鐪熸柇鏃?`channel.wait()` 杩斿洖 None/Close 鈫?鍙?`ssh_closed` 鈫?SftpPanel 姝ｇ‘鎻愮ず閲嶈繛锛堣繖鏄湡鏂繛锛岃鎻愮ず锛夈€俷ologin 璐︽埛鐨勩€宻hell 绔嬪嵆閫€鍑恒€嶈鎶ヨ鏍归櫎锛堜笉鍐嶈姹?shell 灏辨病鏈夐€€鍑猴級銆?
+- **楠岃瘉锛?* `cargo check` PASS锛? warn锛?2.7s锛夈€傚緟 dev 瀹炴祴锛歋FTP 杩炴帴鎵撳紑鍚庝笉鍐嶅脊閲嶈繛閬僵銆佹枃浠跺垪琛ㄦ甯搞€?
+- **褰卞搷闈細** 浠?`ssh::connect` 涓€澶勫垎鏀紱鏅€?SSH 缁堢杩炴帴璺緞瀹屽叏涓嶅彉锛坄is_sftp=false` 璧板師 PTY+shell 娴佺▼锛夈€係FTP 鐨?disconnect 璺緞涓嶅彉锛坮eader 鏀?Disconnect 鈫?close channel锛沝rop SshSession 鍏宠繛鎺ワ級銆?
 
-### 阶段 34：SFTP 文件面板视觉与 SSH 终端统一（2026-06-22）
-- **需求：** SFTP 文件列表的文件夹颜色（原先暖琥珀 `accent-secondary` 青绿）、类型 pill 徽章看着和 SSH 终端/侧栏风格不统一，整体偏「杂」。用户要求文件夹颜色和字体跟 SSH 一样，文件信息展示也重新优化。
-- **设计方向（high-end-visual-design 技能指引）：** 选 **Soft Structuralism** 质感（与现有 Carbon 设计系统一致——克制的中性灰 + 单一 accent-primary 蓝作为唯一强调色，避免多色噪点）。统一性优先于花哨：目录走 `accent-primary`（蓝），与 TerminalPanel/侧栏/TabBar 的 accent 语义完全一致。
-- **改动（`src/components/SftpPanel.tsx` 文件行 + 列头）：**
-  - **目录图标**：从「暖琥珀方块 + 双横线」改为标准文件夹轮廓（带淡 accent-primary 填充），描边/填充都用 `accent-primary` / `accent-primary-muted`——和 SSH 面板的 accent 蓝同一套语义。
-  - **目录名颜色**：`accent-secondary`（青绿）→ `accent-primary`（蓝），与图标同色。weight 保持 500。
-  - **类型列**：去掉「背景 pill 徽章」（`accent-secondary-muted` / `bg-surface-active` 底色 + 圆角）——这种多色徽章是视觉噪点。改为纯文本标签（目录 `accent-secondary` 文字、文件 `text-tertiary`），干净、把视觉焦点还给文件名。
-  - **文件图标**：精简为单页文档轮廓（去掉内部双横线细节），`text-tertiary` 描边，弱化到不抢戏。
-  - **选中态**：用 `accent-primary-muted` 底色整行高亮（替代仅 checkbox），hover 与 selected 互斥（selected 时 hover 不覆盖）。
-  - **间距/节奏**：列头/行 padding `5px 10px` → `5-6px 10px 5-6px 12px`（左侧多一点呼吸），gap `8` → `10`，列头字间距 `0.04em` → `0.06em`，过渡 `80ms ease` → `120ms cubic-bezier(0.4,0,0.2,1)`（与全局缓动一致）。
-  - **去掉每行 `borderBottom`**：消除密恐的横线网格，靠间距 + hover 区分行（更现代）。
-- **统一性兑现点：**
-  - 目录 accent 色现在 = TerminalPanel/侧栏/标签栏的 accent-primary 蓝（`CONN_COLOR.ssh`、`--accent-primary`）——SFTP 标签和 SSH 标签的「可交互/导航」视觉信号一致。
-  - 字体：文件名用应用 body 字体（`'Plus Jakarta Sans'` 栈，与全局一致），日期/权限用 `'JetBrains Mono'` 等宽——与 SSH 终端的等宽渲染呼应。
-- **验证：** `npx tsc --noEmit` PASS（0 err）。
-- **取舍：** 没动工具栏/路径栏/传输浮层——那些已经合理，本次聚焦用户指出的「文件夹颜色 + 文件信息展示」。类型列从徽章降级为文字是有意降噪；若后续要更丰富可按扩展名上语义色，但 YAGNI，先做克制版。
+### 闃舵 34锛歋FTP 鏂囦欢闈㈡澘瑙嗚涓?SSH 缁堢缁熶竴锛?026-06-22锛?
+- **闇€姹傦細** SFTP 鏂囦欢鍒楄〃鐨勬枃浠跺す棰滆壊锛堝師鍏堟殩鐞ョ弨 `accent-secondary` 闈掔豢锛夈€佺被鍨?pill 寰界珷鐪嬬潃鍜?SSH 缁堢/渚ф爮椋庢牸涓嶇粺涓€锛屾暣浣撳亸銆屾潅銆嶃€傜敤鎴疯姹傛枃浠跺す棰滆壊鍜屽瓧浣撹窡 SSH 涓€鏍凤紝鏂囦欢淇℃伅灞曠ず涔熼噸鏂颁紭鍖栥€?
+- **璁捐鏂瑰悜锛坔igh-end-visual-design 鎶€鑳芥寚寮曪級锛?* 閫?**Soft Structuralism** 璐ㄦ劅锛堜笌鐜版湁 Carbon 璁捐绯荤粺涓€鑷粹€斺€斿厠鍒剁殑涓€х伆 + 鍗曚竴 accent-primary 钃濅綔涓哄敮涓€寮鸿皟鑹诧紝閬垮厤澶氳壊鍣偣锛夈€傜粺涓€鎬т紭鍏堜簬鑺卞摠锛氱洰褰曡蛋 `accent-primary`锛堣摑锛夛紝涓?TerminalPanel/渚ф爮/TabBar 鐨?accent 璇箟瀹屽叏涓€鑷淬€?
+- **鏀瑰姩锛坄src/components/SftpPanel.tsx` 鏂囦欢琛?+ 鍒楀ご锛夛細**
+  - **鐩綍鍥炬爣**锛氫粠銆屾殩鐞ョ弨鏂瑰潡 + 鍙屾í绾裤€嶆敼涓烘爣鍑嗘枃浠跺す杞粨锛堝甫娣?accent-primary 濉厖锛夛紝鎻忚竟/濉厖閮界敤 `accent-primary` / `accent-primary-muted`鈥斺€斿拰 SSH 闈㈡澘鐨?accent 钃濆悓涓€濂楄涔夈€?
+  - **鐩綍鍚嶉鑹?*锛歚accent-secondary`锛堥潚缁匡級鈫?`accent-primary`锛堣摑锛夛紝涓庡浘鏍囧悓鑹层€倃eight 淇濇寔 500銆?
+  - **绫诲瀷鍒?*锛氬幓鎺夈€岃儗鏅?pill 寰界珷銆嶏紙`accent-secondary-muted` / `bg-surface-active` 搴曡壊 + 鍦嗚锛夆€斺€旇繖绉嶅鑹插窘绔犳槸瑙嗚鍣偣銆傛敼涓虹函鏂囨湰鏍囩锛堢洰褰?`accent-secondary` 鏂囧瓧銆佹枃浠?`text-tertiary`锛夛紝骞插噣銆佹妸瑙嗚鐒︾偣杩樼粰鏂囦欢鍚嶃€?
+  - **鏂囦欢鍥炬爣**锛氱簿绠€涓哄崟椤垫枃妗ｈ疆寤擄紙鍘绘帀鍐呴儴鍙屾í绾跨粏鑺傦級锛宍text-tertiary` 鎻忚竟锛屽急鍖栧埌涓嶆姠鎴忋€?
+  - **閫変腑鎬?*锛氱敤 `accent-primary-muted` 搴曡壊鏁磋楂樹寒锛堟浛浠ｄ粎 checkbox锛夛紝hover 涓?selected 浜掓枼锛坰elected 鏃?hover 涓嶈鐩栵級銆?
+  - **闂磋窛/鑺傚**锛氬垪澶?琛?padding `5px 10px` 鈫?`5-6px 10px 5-6px 12px`锛堝乏渚у涓€鐐瑰懠鍚革級锛実ap `8` 鈫?`10`锛屽垪澶村瓧闂磋窛 `0.04em` 鈫?`0.06em`锛岃繃娓?`80ms ease` 鈫?`120ms cubic-bezier(0.4,0,0.2,1)`锛堜笌鍏ㄥ眬缂撳姩涓€鑷达級銆?
+  - **鍘绘帀姣忚 `borderBottom`**锛氭秷闄ゅ瘑鎭愮殑妯嚎缃戞牸锛岄潬闂磋窛 + hover 鍖哄垎琛岋紙鏇寸幇浠ｏ級銆?
+- **缁熶竴鎬у厬鐜扮偣锛?*
+  - 鐩綍 accent 鑹茬幇鍦?= TerminalPanel/渚ф爮/鏍囩鏍忕殑 accent-primary 钃濓紙`CONN_COLOR.ssh`銆乣--accent-primary`锛夆€斺€擲FTP 鏍囩鍜?SSH 鏍囩鐨勩€屽彲浜や簰/瀵艰埅銆嶈瑙変俊鍙蜂竴鑷淬€?
+  - 瀛椾綋锛氭枃浠跺悕鐢ㄥ簲鐢?body 瀛椾綋锛坄'Plus Jakarta Sans'` 鏍堬紝涓庡叏灞€涓€鑷达級锛屾棩鏈?鏉冮檺鐢?`'JetBrains Mono'` 绛夊鈥斺€斾笌 SSH 缁堢鐨勭瓑瀹芥覆鏌撳懠搴斻€?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛? err锛夈€?
+- **鍙栬垗锛?* 娌″姩宸ュ叿鏍?璺緞鏍?浼犺緭娴眰鈥斺€旈偅浜涘凡缁忓悎鐞嗭紝鏈鑱氱劍鐢ㄦ埛鎸囧嚭鐨勩€屾枃浠跺す棰滆壊 + 鏂囦欢淇℃伅灞曠ず銆嶃€傜被鍨嬪垪浠庡窘绔犻檷绾т负鏂囧瓧鏄湁鎰忛檷鍣紱鑻ュ悗缁鏇翠赴瀵屽彲鎸夋墿灞曞悕涓婅涔夎壊锛屼絾 YAGNI锛屽厛鍋氬厠鍒剁増銆?
 
-### 阶段 35：FTP 连接失败「无后台日志 + 10060 裸错误」（2026-06-22）
-- **现象：** FTP 连不上，前端报 `FTP connect failed: Connection error: ...连接尝试失败 (os error 10060)`，且后台日志文件里**完全没有任何 ftp 相关记录**。用户问 IP/端口是否填错。
-- **根因 1（无日志）：** `ftp_connect`（main.rs）和 `ftp::connect`（ftp.rs）全程用 `eprintln!`/`Result?` —— 但 release 下 stderr 被 dup2 重定向到日志文件、debug 下打到控制台，且这些路径**根本没打任何日志**（ssh_connect 有 `log::info!`/`log::error!`，FTP 对应位置是空的）。所以「连不上 + 没日志」不是 bug，是 FTP 路径压根没接日志，与 SSH 不对称。
-- **根因 2（裸 10060）：** `os error 10060` = Windows `WSAETIMEDOUT`，TCP 三次握手在默认超时内没收到 SYN-ACK。**几乎从来不是密码错误**（密码错误会走到 `login()` 报 `FTP login failed`，不会到这一步），而是网络可达性：目标 IP/端口填错、防火墙拦截、FTP 服务没跑、或本机到服务器路由不通。但裸错误字符串没提示这点，用户只能瞎猜。
-- **改动：**
-  - `main.rs::ftp_connect`：入口加 `log::info!("[ftp] connect requested: user@host:port (tls=, passive=, proxy=)")`，结果分支 `log::info!`/`log::error!`（对称 ssh_connect 范式，与「日志按天滚动文件」一致）。
-  - `ftp.rs::connect`：直连分支 `AsyncFtpStream::connect` 失败时，**检测 10060/timeout 关键字**，改写错误为带中文诊断的提示：「TCP 连接超时（os error 10060）。通常不是密码错误，而是：目标 host:port 无法到达——防火墙拦截、IP/端口填错、或 FTP 服务未运行。先 ping/网络验证该地址端口是否可达」。代理分支保持原样（`connect_via_proxy` 已有 60s 超时 + 中文提示）。连接各阶段（connecting/TCP established/session ready）都打 `log::info!`。
-  - 把 `eprintln!` 换成 `log::info!`，这样 release 也能落盘日志文件（按天滚动）。
-- **验证：** `cargo check` PASS（0 warning，22.8s）。需重新 `cargo tauri dev` 才生效。
-- **给用户的排查指引（10060）：**
-  1. 确认 IP/端口——FTP 默认 21，但你这台用的非标端口要核实；`ftp_tls` 必须是 `none`（当前版本不支持 FTPS，填 implicit/explicit 会直接报「暂不支持」而非 10060）。
-  2. 网络可达性——在本机命令行 `Test-NetConnection <host> -Port <port>`（PowerShell）或 `telnet host port`，看 `TcpTestSucceeded` 是否 True。False 就是防火墙/路由/服务没起。
-  3. 是否走了代理——若 `proxy_type != none`，先关掉代理直连试，排除是代理环节超时。
-  4. 被动模式——`ftp_passive` 默认 true（NAT 友好），但 10060 发生在**控制连接建立阶段**，与被动/主动模式无关（那是数据连接的事），所以这个开关不影响本次报错。
+### 闃舵 35锛欶TP 杩炴帴澶辫触銆屾棤鍚庡彴鏃ュ織 + 10060 瑁搁敊璇€嶏紙2026-06-22锛?
+- **鐜拌薄锛?* FTP 杩炰笉涓婏紝鍓嶇鎶?`FTP connect failed: Connection error: ...杩炴帴灏濊瘯澶辫触 (os error 10060)`锛屼笖鍚庡彴鏃ュ織鏂囦欢閲?*瀹屽叏娌℃湁浠讳綍 ftp 鐩稿叧璁板綍**銆傜敤鎴烽棶 IP/绔彛鏄惁濉敊銆?
+- **鏍瑰洜 1锛堟棤鏃ュ織锛夛細** `ftp_connect`锛坢ain.rs锛夊拰 `ftp::connect`锛坒tp.rs锛夊叏绋嬬敤 `eprintln!`/`Result?` 鈥斺€?浣?release 涓?stderr 琚?dup2 閲嶅畾鍚戝埌鏃ュ織鏂囦欢銆乨ebug 涓嬫墦鍒版帶鍒跺彴锛屼笖杩欎簺璺緞**鏍规湰娌℃墦浠讳綍鏃ュ織**锛坰sh_connect 鏈?`log::info!`/`log::error!`锛孎TP 瀵瑰簲浣嶇疆鏄┖鐨勶級銆傛墍浠ャ€岃繛涓嶄笂 + 娌℃棩蹇椼€嶄笉鏄?bug锛屾槸 FTP 璺緞鍘嬫牴娌℃帴鏃ュ織锛屼笌 SSH 涓嶅绉般€?
+- **鏍瑰洜 2锛堣８ 10060锛夛細** `os error 10060` = Windows `WSAETIMEDOUT`锛孴CP 涓夋鎻℃墜鍦ㄩ粯璁よ秴鏃跺唴娌℃敹鍒?SYN-ACK銆?*鍑犱箮浠庢潵涓嶆槸瀵嗙爜閿欒**锛堝瘑鐮侀敊璇細璧板埌 `login()` 鎶?`FTP login failed`锛屼笉浼氬埌杩欎竴姝ワ級锛岃€屾槸缃戠粶鍙揪鎬э細鐩爣 IP/绔彛濉敊銆侀槻鐏鎷︽埅銆丗TP 鏈嶅姟娌¤窇銆佹垨鏈満鍒版湇鍔″櫒璺敱涓嶉€氥€備絾瑁搁敊璇瓧绗︿覆娌℃彁绀鸿繖鐐癸紝鐢ㄦ埛鍙兘鐬庣寽銆?
+- **鏀瑰姩锛?*
+  - `main.rs::ftp_connect`锛氬叆鍙ｅ姞 `log::info!("[ftp] connect requested: user@host:port (tls=, passive=, proxy=)")`锛岀粨鏋滃垎鏀?`log::info!`/`log::error!`锛堝绉?ssh_connect 鑼冨紡锛屼笌銆屾棩蹇楁寜澶╂粴鍔ㄦ枃浠躲€嶄竴鑷达級銆?
+  - `ftp.rs::connect`锛氱洿杩炲垎鏀?`AsyncFtpStream::connect` 澶辫触鏃讹紝**妫€娴?10060/timeout 鍏抽敭瀛?*锛屾敼鍐欓敊璇负甯︿腑鏂囪瘖鏂殑鎻愮ず锛氥€孴CP 杩炴帴瓒呮椂锛坥s error 10060锛夈€傞€氬父涓嶆槸瀵嗙爜閿欒锛岃€屾槸锛氱洰鏍?host:port 鏃犳硶鍒拌揪鈥斺€旈槻鐏鎷︽埅銆両P/绔彛濉敊銆佹垨 FTP 鏈嶅姟鏈繍琛屻€傚厛 ping/缃戠粶楠岃瘉璇ュ湴鍧€绔彛鏄惁鍙揪銆嶃€備唬鐞嗗垎鏀繚鎸佸師鏍凤紙`connect_via_proxy` 宸叉湁 60s 瓒呮椂 + 涓枃鎻愮ず锛夈€傝繛鎺ュ悇闃舵锛坈onnecting/TCP established/session ready锛夐兘鎵?`log::info!`銆?
+  - 鎶?`eprintln!` 鎹㈡垚 `log::info!`锛岃繖鏍?release 涔熻兘钀界洏鏃ュ織鏂囦欢锛堟寜澶╂粴鍔級銆?
+- **楠岃瘉锛?* `cargo check` PASS锛? warning锛?2.8s锛夈€傞渶閲嶆柊 `cargo tauri dev` 鎵嶇敓鏁堛€?
+- **缁欑敤鎴风殑鎺掓煡鎸囧紩锛?0060锛夛細**
+  1. 纭 IP/绔彛鈥斺€擣TP 榛樿 21锛屼絾浣犺繖鍙扮敤鐨勯潪鏍囩鍙ｈ鏍稿疄锛沗ftp_tls` 蹇呴』鏄?`none`锛堝綋鍓嶇増鏈笉鏀寔 FTPS锛屽～ implicit/explicit 浼氱洿鎺ユ姤銆屾殏涓嶆敮鎸併€嶈€岄潪 10060锛夈€?
+  2. 缃戠粶鍙揪鎬р€斺€斿湪鏈満鍛戒护琛?`Test-NetConnection <host> -Port <port>`锛圥owerShell锛夋垨 `telnet host port`锛岀湅 `TcpTestSucceeded` 鏄惁 True銆侳alse 灏辨槸闃茬伀澧?璺敱/鏈嶅姟娌¤捣銆?
+  3. 鏄惁璧颁簡浠ｇ悊鈥斺€旇嫢 `proxy_type != none`锛屽厛鍏虫帀浠ｇ悊鐩磋繛璇曪紝鎺掗櫎鏄唬鐞嗙幆鑺傝秴鏃躲€?
+  4. 琚姩妯″紡鈥斺€擿ftp_passive` 榛樿 true锛圢AT 鍙嬪ソ锛夛紝浣?10060 鍙戠敓鍦?*鎺у埗杩炴帴寤虹珛闃舵**锛屼笌琚姩/涓诲姩妯″紡鏃犲叧锛堥偅鏄暟鎹繛鎺ョ殑浜嬶級锛屾墍浠ヨ繖涓紑鍏充笉褰卞搷鏈鎶ラ敊銆?
 
-### 阶段 36：启动白屏消除（2026-06-23）
-- **现象：** 应用启动、跳到登录页之前有一段白屏过程。
-- **根因：** Tauri 窗口默认 `visible: true`，WebView 在 React 挂载首帧之前就把窗口显示出来；`index.html` 没有任何内联样式，白底裸 `#root` 被画出来 → 白闪。CSS 用了 `@import "../assets/iconfont/iconfont.css"`，在 import 完成前 body 无背景色。
-- **方案（彻底消除）：** 窗口先隐藏，等前端首帧真正绘制完再显示。
-  1. `tauri.conf.json` 主窗口加 `"visible": false`。
-  2. `main.rs::setup` 里 `app.listen_any("dom-ready", …)` → 收到事件后 `window.show()` + `set_focus()`；另起一个 4s `tokio::time::sleep` 安全网，前端若没发事件也强制显示（防止 JS 报错把窗口卡成永久不可见）。需 `use tauri::Listener;` 才能用 `listen_any`。
-  3. `src/main.tsx` 在 `ReactDOM.render` 之后，等两个 `requestAnimationFrame`（确保浏览器已提交绘制而非仅排队 React 工作），再 `emit("dom-ready")`；用动态 `import("@tauri-apps/api/event")` + try/catch，保证在纯浏览器（`npm run dev` 直接开网页）下也不报错。
-  4. `index.html` 内联兜底：`html/body` 背景写死 `#0d1117`（= 深色主题 `--bg-base`），`#root:empty::after` 画一个 `--accent-primary` 色的旋转 spinner——即便窗口已显示但 React 还没挂载（比如慢机器/安全网触发），看到的也是深色 + 加载圈，而非白屏。React 一挂载 `#root` 不再 `:empty`，spinner 自动消失。
-- **修改的文件：**
-  - `index.html` — 内联 boot splash 样式（深色背景 + `#root:empty` spinner）
-  - `src-tauri/tauri.conf.json` — 主窗口 `"visible": false`
-  - `src-tauri/src/main.rs` — `use tauri::Listener`；setup 里注册 `dom-ready` 监听 + 4s 强制显示安全网
-  - `src/main.tsx` — 双 rAF 后 `emit("dom-ready")`
-- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS（0 warning）。需 `cargo tauri dev` / `cargo tauri build` 才能看到效果（改了 Rust）。
-- **权衡/注意：**
-  - 安全网的 4s 是**最坏兜底**，正常路径前端几十毫秒就 emit 了，窗口几乎是即时出现——不会真的等到 4s。
-  - 用 `listen_any`（any-target）而非 `listen`，避免 sender label 匹配问题；事件名 `dom-ready` 是自定义的，不和 Tauri 内置冲突。
-  - 浅色主题用户：兜底背景是深色 `#0d1117`，仅存在于「窗口已显示但 React 未挂载」的极短瞬间；React 挂载后 `ColorSchemeProvider` 立即覆盖为浅色。可接受（这瞬间肉眼基本不可见）。
-  - 若将来加多窗口，每个新窗口要复刻同样的 visible:false + dom-ready 模式，否则新窗口会白闪。
+### 闃舵 36锛氬惎鍔ㄧ櫧灞忔秷闄わ紙2026-06-23锛?
+- **鐜拌薄锛?* 搴旂敤鍚姩銆佽烦鍒扮櫥褰曢〉涔嬪墠鏈変竴娈电櫧灞忚繃绋嬨€?
+- **鏍瑰洜锛?* Tauri 绐楀彛榛樿 `visible: true`锛學ebView 鍦?React 鎸傝浇棣栧抚涔嬪墠灏辨妸绐楀彛鏄剧ず鍑烘潵锛沗index.html` 娌℃湁浠讳綍鍐呰仈鏍峰紡锛岀櫧搴曡８ `#root` 琚敾鍑烘潵 鈫?鐧介棯銆侰SS 鐢ㄤ簡 `@import "../assets/iconfont/iconfont.css"`锛屽湪 import 瀹屾垚鍓?body 鏃犺儗鏅壊銆?
+- **鏂规锛堝交搴曟秷闄わ級锛?* 绐楀彛鍏堥殣钘忥紝绛夊墠绔甯х湡姝ｇ粯鍒跺畬鍐嶆樉绀恒€?
+  1. `tauri.conf.json` 涓荤獥鍙ｅ姞 `"visible": false`銆?
+  2. `main.rs::setup` 閲?`app.listen_any("dom-ready", 鈥?` 鈫?鏀跺埌浜嬩欢鍚?`window.show()` + `set_focus()`锛涘彟璧蜂竴涓?4s `tokio::time::sleep` 瀹夊叏缃戯紝鍓嶇鑻ユ病鍙戜簨浠朵篃寮哄埗鏄剧ず锛堥槻姝?JS 鎶ラ敊鎶婄獥鍙ｅ崱鎴愭案涔呬笉鍙锛夈€傞渶 `use tauri::Listener;` 鎵嶈兘鐢?`listen_any`銆?
+  3. `src/main.tsx` 鍦?`ReactDOM.render` 涔嬪悗锛岀瓑涓や釜 `requestAnimationFrame`锛堢‘淇濇祻瑙堝櫒宸叉彁浜ょ粯鍒惰€岄潪浠呮帓闃?React 宸ヤ綔锛夛紝鍐?`emit("dom-ready")`锛涚敤鍔ㄦ€?`import("@tauri-apps/api/event")` + try/catch锛屼繚璇佸湪绾祻瑙堝櫒锛坄npm run dev` 鐩存帴寮€缃戦〉锛変笅涔熶笉鎶ラ敊銆?
+  4. `index.html` 鍐呰仈鍏滃簳锛歚html/body` 鑳屾櫙鍐欐 `#0d1117`锛? 娣辫壊涓婚 `--bg-base`锛夛紝`#root:empty::after` 鐢讳竴涓?`--accent-primary` 鑹茬殑鏃嬭浆 spinner鈥斺€斿嵆渚跨獥鍙ｅ凡鏄剧ず浣?React 杩樻病鎸傝浇锛堟瘮濡傛參鏈哄櫒/瀹夊叏缃戣Е鍙戯級锛岀湅鍒扮殑涔熸槸娣辫壊 + 鍔犺浇鍦堬紝鑰岄潪鐧藉睆銆俁eact 涓€鎸傝浇 `#root` 涓嶅啀 `:empty`锛宻pinner 鑷姩娑堝け銆?
+- **淇敼鐨勬枃浠讹細**
+  - `index.html` 鈥?鍐呰仈 boot splash 鏍峰紡锛堟繁鑹茶儗鏅?+ `#root:empty` spinner锛?
+  - `src-tauri/tauri.conf.json` 鈥?涓荤獥鍙?`"visible": false`
+  - `src-tauri/src/main.rs` 鈥?`use tauri::Listener`锛泂etup 閲屾敞鍐?`dom-ready` 鐩戝惉 + 4s 寮哄埗鏄剧ず瀹夊叏缃?
+  - `src/main.tsx` 鈥?鍙?rAF 鍚?`emit("dom-ready")`
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛沗cargo check` PASS锛? warning锛夈€傞渶 `cargo tauri dev` / `cargo tauri build` 鎵嶈兘鐪嬪埌鏁堟灉锛堟敼浜?Rust锛夈€?
+- **鏉冭　/娉ㄦ剰锛?*
+  - 瀹夊叏缃戠殑 4s 鏄?*鏈€鍧忓厹搴?*锛屾甯歌矾寰勫墠绔嚑鍗佹绉掑氨 emit 浜嗭紝绐楀彛鍑犱箮鏄嵆鏃跺嚭鐜扳€斺€斾笉浼氱湡鐨勭瓑鍒?4s銆?
+  - 鐢?`listen_any`锛坅ny-target锛夎€岄潪 `listen`锛岄伩鍏?sender label 鍖归厤闂锛涗簨浠跺悕 `dom-ready` 鏄嚜瀹氫箟鐨勶紝涓嶅拰 Tauri 鍐呯疆鍐茬獊銆?
+  - 娴呰壊涓婚鐢ㄦ埛锛氬厹搴曡儗鏅槸娣辫壊 `#0d1117`锛屼粎瀛樺湪浜庛€岀獥鍙ｅ凡鏄剧ず浣?React 鏈寕杞姐€嶇殑鏋佺煭鐬棿锛汻eact 鎸傝浇鍚?`ColorSchemeProvider` 绔嬪嵆瑕嗙洊涓烘祬鑹层€傚彲鎺ュ彈锛堣繖鐬棿鑲夌溂鍩烘湰涓嶅彲瑙侊級銆?
+  - 鑻ュ皢鏉ュ姞澶氱獥鍙ｏ紝姣忎釜鏂扮獥鍙ｈ澶嶅埢鍚屾牱鐨?visible:false + dom-ready 妯″紡锛屽惁鍒欐柊绐楀彛浼氱櫧闂€?
 
-### 阶段 37：长按拖动连接到文件夹移动（2026-06-23）
-- **现象/需求：** 连接管理目前只能进编辑对话框改 `group_path` 来移动连接，太笨重。用户要：**长按连接拖到文件夹上松手即移动**，并防止误操作；且拖动时希望**只展示文件夹**（隐藏文件夹下的连接），避免文件夹里连接太多、要一直下滑才能拖到目标文件夹。
-- **方案：**
-  1. **后端新增专用单列更新命令** `move_connection(conn_id, new_group_path)`：`UPDATE connections SET group_path=?1 WHERE id=?2`，参数化防注入，**只改一列**，不碰 keyring、不重新加密 host/user/key（不像 `save_connection` 走 `INSERT OR REPLACE` + secret 重处理，移动是纯文件夹重分配，专用命令最干净安全）。`new_group_path` 经 `normalize_folder_path` 归一（`/` = 取消归类）。db.rs + main.rs + generate_handler 注册。
-  2. **前端 API** `moveConnection(connId, newGroupPath)`（api.ts，invoke 参数 camelCase → Rust snake）。
-  3. **交互核心** `useConnectionDrag`（新文件 `src/hooks/`）：pointer 事件 + `setPointerCapture`，**长按 600ms**（移动端工业标准；用户原提 2s，权衡后改 600ms 更跟手，仍实现为可调常量）+ **5px 移动取消阈值**（普通点击/双击绝不会误触发）。两阶段：
-     - Phase A（0→600ms，监听在捕获元素上）：超时 → 进入 B；pointermove>5px / pointerup / pointercancel / window blur / ESC → 清理取消。
-     - Phase B（拖拽中，监听在 document）：hit-test `document.elementFromPoint(x,y)?.closest('[data-folder-path]')`，`hoverFolderPath` 变化才 setState（防每帧重渲）；pointerup → 目标非空且≠当前文件夹则 `await moveConnection` + 自动展开 + `onRefresh`，否则无操作；ESC / pointercancel / blur → 取消。`isMovingRef` 防连点竞态。
-  4. **Sidebar 接线**：`walk` 给 FolderRow 传 `isDropTarget` + 根 div 加 `data-folder-path`，给 ConnRow 传 `draggingConnId` + `onPointerDown={beginDrag}`。**拖拽激活时（`isDragging`）列表切换为「只文件夹」视图**——`walk` 里 `isDragging` 时强制 `isOpen=true` 且只递归 `children`、跳过 `conns`，这样目标文件夹立即可见无需下滑；松手恢复原视图。FolderRow/ConnRow 用 `React.memo` 包裹（拖拽 hover 变化只重渲源行+目标行）。搜索结果视图不接 `beginDrag`（depth=0 无文件夹，拖拽不连贯）。`onContext` 在拖拽中早退。
-  5. **视觉**：被拖行 `opacity:0.4`+`shadow-glow`+`scale(1.02)`+**`pointerEvents:none`**（关键，否则 elementFromPoint 命中自己）；目标文件夹 `--accent-primary-muted` bg + `inset border-accent`；body `cursor:grabbing`+`userSelect:none`。不做跟随光标的 ghost（v1）。
-- **修改的文件：**
-  - `src-tauri/src/db.rs` — `move_connection`（参数化单列 UPDATE）
-  - `src-tauri/src/main.rs` — `move_connection` 命令 + 注册 `generate_handler!`
-  - `src/api.ts` — `moveConnection`
-  - `src/hooks/useConnectionDrag.ts` — **新文件**
-  - `src/components/Sidebar.tsx` — 接线、memo、data-folder-path、拖拽时只渲染文件夹、视觉分支、自动展开、onContext 早退
-- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS（0 warning）。需 `cargo tauri dev` 手测全交互。
-- **补充：拖动提示横幅（2026-06-23）**
-  - **现象：** 拖动没有任何提示，用户不知道这个手势的作用、也不确定当前会落到哪个文件夹。
-  - **改动：** `Sidebar.tsx` 新增 `DragHint` 组件，`isDragging` 时在列表顶部渲染横幅：accent 色背景 + border-accent，三行——「正在移动「连接名」」（说明作用）/「拖到文件夹上松开即可移动…ESC 或空白处取消」（说明操作）/「当前目标：📁 文件夹名」（或「移到文件夹上以选择」当悬停空白）。目标随 `dragState.hoverFolderPath` 实时更新（hit-test 已有的状态）。复用现有 `fadeIn` 动画。
-  - **验证：** `npx tsc --noEmit` PASS。
-- **已知限制：** 拖到列表上下边缘不自动滚动（`listContainer` overflowY:auto，v1 不做）；拖拽中 ConnRow 的 ⋯ 菜单若已开会保持；600ms 常量可调。
-- **关键坑（已规避）：** 被拖行必须 `pointerEvents:none`，否则 `elementFromPoint` 命中被拖行自身而非下层文件夹（本模式最常见 bug）；hit-test setState 必须 `!==` 守卫防每帧重渲整表；Phase A→B 切换时 `dragActivated` 标志 + 两次 releaseCapture 防止重复释放/泄漏 capture。
+### 闃舵 37锛氶暱鎸夋嫋鍔ㄨ繛鎺ュ埌鏂囦欢澶圭Щ鍔紙2026-06-23锛?
+- **鐜拌薄/闇€姹傦細** 杩炴帴绠＄悊鐩墠鍙兘杩涚紪杈戝璇濇鏀?`group_path` 鏉ョЩ鍔ㄨ繛鎺ワ紝澶閲嶃€傜敤鎴疯锛?*闀挎寜杩炴帴鎷栧埌鏂囦欢澶逛笂鏉炬墜鍗崇Щ鍔?*锛屽苟闃叉璇搷浣滐紱涓旀嫋鍔ㄦ椂甯屾湜**鍙睍绀烘枃浠跺す**锛堥殣钘忔枃浠跺す涓嬬殑杩炴帴锛夛紝閬垮厤鏂囦欢澶归噷杩炴帴澶銆佽涓€鐩翠笅婊戞墠鑳芥嫋鍒扮洰鏍囨枃浠跺す銆?
+- **鏂规锛?*
+  1. **鍚庣鏂板涓撶敤鍗曞垪鏇存柊鍛戒护** `move_connection(conn_id, new_group_path)`锛歚UPDATE connections SET group_path=?1 WHERE id=?2`锛屽弬鏁板寲闃叉敞鍏ワ紝**鍙敼涓€鍒?*锛屼笉纰?keyring銆佷笉閲嶆柊鍔犲瘑 host/user/key锛堜笉鍍?`save_connection` 璧?`INSERT OR REPLACE` + secret 閲嶅鐞嗭紝绉诲姩鏄函鏂囦欢澶归噸鍒嗛厤锛屼笓鐢ㄥ懡浠ゆ渶骞插噣瀹夊叏锛夈€俙new_group_path` 缁?`normalize_folder_path` 褰掍竴锛坄/` = 鍙栨秷褰掔被锛夈€俤b.rs + main.rs + generate_handler 娉ㄥ唽銆?
+  2. **鍓嶇 API** `moveConnection(connId, newGroupPath)`锛坅pi.ts锛宨nvoke 鍙傛暟 camelCase 鈫?Rust snake锛夈€?
+  3. **浜や簰鏍稿績** `useConnectionDrag`锛堟柊鏂囦欢 `src/hooks/`锛夛細pointer 浜嬩欢 + `setPointerCapture`锛?*闀挎寜 600ms**锛堢Щ鍔ㄧ宸ヤ笟鏍囧噯锛涚敤鎴峰師鎻?2s锛屾潈琛″悗鏀?600ms 鏇磋窡鎵嬶紝浠嶅疄鐜颁负鍙皟甯搁噺锛? **5px 绉诲姩鍙栨秷闃堝€?*锛堟櫘閫氱偣鍑?鍙屽嚮缁濅笉浼氳瑙﹀彂锛夈€備袱闃舵锛?
+     - Phase A锛?鈫?00ms锛岀洃鍚湪鎹曡幏鍏冪礌涓婏級锛氳秴鏃?鈫?杩涘叆 B锛沺ointermove>5px / pointerup / pointercancel / window blur / ESC 鈫?娓呯悊鍙栨秷銆?
+     - Phase B锛堟嫋鎷戒腑锛岀洃鍚湪 document锛夛細hit-test `document.elementFromPoint(x,y)?.closest('[data-folder-path]')`锛宍hoverFolderPath` 鍙樺寲鎵?setState锛堥槻姣忓抚閲嶆覆锛夛紱pointerup 鈫?鐩爣闈炵┖涓斺墵褰撳墠鏂囦欢澶瑰垯 `await moveConnection` + 鑷姩灞曞紑 + `onRefresh`锛屽惁鍒欐棤鎿嶄綔锛汦SC / pointercancel / blur 鈫?鍙栨秷銆俙isMovingRef` 闃茶繛鐐圭珵鎬併€?
+  4. **Sidebar 鎺ョ嚎**锛歚walk` 缁?FolderRow 浼?`isDropTarget` + 鏍?div 鍔?`data-folder-path`锛岀粰 ConnRow 浼?`draggingConnId` + `onPointerDown={beginDrag}`銆?*鎷栨嫿婵€娲绘椂锛坄isDragging`锛夊垪琛ㄥ垏鎹负銆屽彧鏂囦欢澶广€嶈鍥?*鈥斺€擿walk` 閲?`isDragging` 鏃跺己鍒?`isOpen=true` 涓斿彧閫掑綊 `children`銆佽烦杩?`conns`锛岃繖鏍风洰鏍囨枃浠跺す绔嬪嵆鍙鏃犻渶涓嬫粦锛涙澗鎵嬫仮澶嶅師瑙嗗浘銆侳olderRow/ConnRow 鐢?`React.memo` 鍖呰９锛堟嫋鎷?hover 鍙樺寲鍙噸娓叉簮琛?鐩爣琛岋級銆傛悳绱㈢粨鏋滆鍥句笉鎺?`beginDrag`锛坉epth=0 鏃犳枃浠跺す锛屾嫋鎷戒笉杩炶疮锛夈€俙onContext` 鍦ㄦ嫋鎷戒腑鏃╅€€銆?
+  5. **瑙嗚**锛氳鎷栬 `opacity:0.4`+`shadow-glow`+`scale(1.02)`+**`pointerEvents:none`**锛堝叧閿紝鍚﹀垯 elementFromPoint 鍛戒腑鑷繁锛夛紱鐩爣鏂囦欢澶?`--accent-primary-muted` bg + `inset border-accent`锛沚ody `cursor:grabbing`+`userSelect:none`銆備笉鍋氳窡闅忓厜鏍囩殑 ghost锛坴1锛夈€?
+- **淇敼鐨勬枃浠讹細**
+  - `src-tauri/src/db.rs` 鈥?`move_connection`锛堝弬鏁板寲鍗曞垪 UPDATE锛?
+  - `src-tauri/src/main.rs` 鈥?`move_connection` 鍛戒护 + 娉ㄥ唽 `generate_handler!`
+  - `src/api.ts` 鈥?`moveConnection`
+  - `src/hooks/useConnectionDrag.ts` 鈥?**鏂版枃浠?*
+  - `src/components/Sidebar.tsx` 鈥?鎺ョ嚎銆乵emo銆乨ata-folder-path銆佹嫋鎷芥椂鍙覆鏌撴枃浠跺す銆佽瑙夊垎鏀€佽嚜鍔ㄥ睍寮€銆乷nContext 鏃╅€€
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛沗cargo check` PASS锛? warning锛夈€傞渶 `cargo tauri dev` 鎵嬫祴鍏ㄤ氦浜掋€?
+- **琛ュ厖锛氭嫋鍔ㄦ彁绀烘í骞咃紙2026-06-23锛?*
+  - **鐜拌薄锛?* 鎷栧姩娌℃湁浠讳綍鎻愮ず锛岀敤鎴蜂笉鐭ラ亾杩欎釜鎵嬪娍鐨勪綔鐢ㄣ€佷篃涓嶇‘瀹氬綋鍓嶄細钀藉埌鍝釜鏂囦欢澶广€?
+  - **鏀瑰姩锛?* `Sidebar.tsx` 鏂板 `DragHint` 缁勪欢锛宍isDragging` 鏃跺湪鍒楄〃椤堕儴娓叉煋妯箙锛歛ccent 鑹茶儗鏅?+ border-accent锛屼笁琛屸€斺€斻€屾鍦ㄧЩ鍔ㄣ€岃繛鎺ュ悕銆嶃€嶏紙璇存槑浣滅敤锛?銆屾嫋鍒版枃浠跺す涓婃澗寮€鍗冲彲绉诲姩鈥SC 鎴栫┖鐧藉鍙栨秷銆嶏紙璇存槑鎿嶄綔锛?銆屽綋鍓嶇洰鏍囷細馃搧 鏂囦欢澶瑰悕銆嶏紙鎴栥€岀Щ鍒版枃浠跺す涓婁互閫夋嫨銆嶅綋鎮仠绌虹櫧锛夈€傜洰鏍囬殢 `dragState.hoverFolderPath` 瀹炴椂鏇存柊锛坔it-test 宸叉湁鐨勭姸鎬侊級銆傚鐢ㄧ幇鏈?`fadeIn` 鍔ㄧ敾銆?
+  - **楠岃瘉锛?* `npx tsc --noEmit` PASS銆?
+- **宸茬煡闄愬埗锛?* 鎷栧埌鍒楄〃涓婁笅杈圭紭涓嶈嚜鍔ㄦ粴鍔紙`listContainer` overflowY:auto锛寁1 涓嶅仛锛夛紱鎷栨嫿涓?ConnRow 鐨?鈰?鑿滃崟鑻ュ凡寮€浼氫繚鎸侊紱600ms 甯搁噺鍙皟銆?
+- **鍏抽敭鍧戯紙宸茶閬匡級锛?* 琚嫋琛屽繀椤?`pointerEvents:none`锛屽惁鍒?`elementFromPoint` 鍛戒腑琚嫋琛岃嚜韬€岄潪涓嬪眰鏂囦欢澶癸紙鏈ā寮忔渶甯歌 bug锛夛紱hit-test setState 蹇呴』 `!==` 瀹堝崼闃叉瘡甯ч噸娓叉暣琛紱Phase A鈫払 鍒囨崲鏃?`dragActivated` 鏍囧織 + 涓ゆ releaseCapture 闃叉閲嶅閲婃斁/娉勬紡 capture銆?
 
-## 五问重启检查
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 37 complete（长按拖连接到文件夹移动：后端 move_connection 单列更新 + 前端 useConnectionDrag 两阶段 + Sidebar 拖拽时只显示文件夹；tsc/cargo check 双绿），待 dev 手测全交互 |
-| 我要去哪里？ | 用户 `cargo tauri dev` 实测：长按 600ms 拖动、拖时只显示文件夹、松手移动+自动展开、ESC/空白区/同文件夹 无操作、点击/双击未被误伤 |
-| 目标是什么？ | 长按连接拖到文件夹即移动，防误操作（600ms+5px 阈值+ESC）；拖拽中只展示文件夹无需下滑找目标；重启后连接持久在目标文件夹 |
-| 我学到了什么？ | 移动连接应做专用单列 UPDATE（不碰 keyring/不重加密），比复用 save_connection 的 INSERT OR REPLACE 干净安全；长按拖拽用 pointer+setPointerCapture 两阶段（A 元素捕获检测长按、B 移到 document hit-test）；被拖行必须 pointerEvents:none 否则 elementFromPoint 命中自身（最常见 bug）；hit-test setState 必须 !== 守卫防每帧重渲整表；用户痛点「文件夹连接多要下滑找目标」用「拖拽时只渲染文件夹」优雅解决（walk 里 isDragging 分支强制展开+跳过 conns） |
-| 我做了什么？ | db.rs+main.rs move_connection 参数化单列更新并注册；api.ts moveConnection；新 useConnectionDrag hook（600ms/5px/两阶段/hit-test/in-flight 守卫）；Sidebar 接线+memo+data-folder-path+拖拽只显示文件夹+视觉+自动展开+onContext 早退；tsc+cargo check 双绿；progress 同步 |
+| 鎴戝湪鍝噷锛?| 闃舵 37 complete锛堥暱鎸夋嫋杩炴帴鍒版枃浠跺す绉诲姩锛氬悗绔?move_connection 鍗曞垪鏇存柊 + 鍓嶇 useConnectionDrag 涓ら樁娈?+ Sidebar 鎷栨嫿鏃跺彧鏄剧ず鏂囦欢澶癸紱tsc/cargo check 鍙岀豢锛夛紝寰?dev 鎵嬫祴鍏ㄤ氦浜?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri dev` 瀹炴祴锛氶暱鎸?600ms 鎷栧姩銆佹嫋鏃跺彧鏄剧ず鏂囦欢澶广€佹澗鎵嬬Щ鍔?鑷姩灞曞紑銆丒SC/绌虹櫧鍖?鍚屾枃浠跺す 鏃犳搷浣溿€佺偣鍑?鍙屽嚮鏈璇激 |
+| 鐩爣鏄粈涔堬紵 | 闀挎寜杩炴帴鎷栧埌鏂囦欢澶瑰嵆绉诲姩锛岄槻璇搷浣滐紙600ms+5px 闃堝€?ESC锛夛紱鎷栨嫿涓彧灞曠ず鏂囦欢澶规棤闇€涓嬫粦鎵剧洰鏍囷紱閲嶅惎鍚庤繛鎺ユ寔涔呭湪鐩爣鏂囦欢澶?|
+| 鎴戝鍒颁簡浠€涔堬紵 | 绉诲姩杩炴帴搴斿仛涓撶敤鍗曞垪 UPDATE锛堜笉纰?keyring/涓嶉噸鍔犲瘑锛夛紝姣斿鐢?save_connection 鐨?INSERT OR REPLACE 骞插噣瀹夊叏锛涢暱鎸夋嫋鎷界敤 pointer+setPointerCapture 涓ら樁娈碉紙A 鍏冪礌鎹曡幏妫€娴嬮暱鎸夈€丅 绉诲埌 document hit-test锛夛紱琚嫋琛屽繀椤?pointerEvents:none 鍚﹀垯 elementFromPoint 鍛戒腑鑷韩锛堟渶甯歌 bug锛夛紱hit-test setState 蹇呴』 !== 瀹堝崼闃叉瘡甯ч噸娓叉暣琛紱鐢ㄦ埛鐥涚偣銆屾枃浠跺す杩炴帴澶氳涓嬫粦鎵剧洰鏍囥€嶇敤銆屾嫋鎷芥椂鍙覆鏌撴枃浠跺す銆嶄紭闆呰В鍐筹紙walk 閲?isDragging 鍒嗘敮寮哄埗灞曞紑+璺宠繃 conns锛?|
+| 鎴戝仛浜嗕粈涔堬紵 | db.rs+main.rs move_connection 鍙傛暟鍖栧崟鍒楁洿鏂板苟娉ㄥ唽锛沘pi.ts moveConnection锛涙柊 useConnectionDrag hook锛?00ms/5px/涓ら樁娈?hit-test/in-flight 瀹堝崼锛夛紱Sidebar 鎺ョ嚎+memo+data-folder-path+鎷栨嫿鍙樉绀烘枃浠跺す+瑙嗚+鑷姩灞曞紑+onContext 鏃╅€€锛泃sc+cargo check 鍙岀豢锛沺rogress 鍚屾 |
 
-### 阶段 38：连接测试按钮 + AI 配置测试按钮 + AI 输入框加高（2026-06-23）
-- **需求（用户原话三条）：**
-  1. 新建/编辑连接对话框增加「测试」按钮——保存前先验证 ssh/sftp/ftp/local 能否连通。
-  2. 设置 → AI 助手，「保存 AI 配置」旁加「测试」按钮——验证当前填写的 provider/key/model/baseUrl 真能用，不必先保存。
-  3. 主页 AI 助手输入框加高——现在 `rows=2`，随便几个字就溢出。
-- **关键设计决策：**
-  - **连接测试抽公共拨号+认证段。** `ssh::connect` 原本把「拨号+认证」与「开 channel/PTY/shell/起 reader/插 session」揉在一起。抽出 `dial_and_authenticate(state, config, open_channel) -> Result<Handle, String>`（返回已认证 Handle，不注册 session、不起 reader、不请求 PTY/shell、不发事件），`connect` 与新增的 `ssh::test_connection` 都调它——**真实连接与测试走同一条认证/host-key TOFU 路径**，测试能抓到真实连接同样的失败。`open_channel=true` 时开一个 session channel 立即丢弃，校验「认证通过但服务器拒开 channel」（真实 SFTP 依赖的复用路径）。
-  - **AI 测试用非流式最小请求。** 复用 `load_settings`（vault 配置+解密 key）+ `Provider::{endpoint, auth_headers, build_body}` + `truncate`。`build_body` 默认 `stream:true`，测试里 `as_object_mut().insert("stream", false)` 覆盖 + `max_tokens=16`。prompt 用 `"ping"` + 系统提示「Reply with the single word: ok」。**非流式而非流式消费首 token**：单次 HTTP 往返，success/fail 语义干净，且**绝不 emit `ai_token`/`ai_done`**，不会干扰打开的 AiPanel 流式订阅。200 即视为认证+端点通过；`extract_reply_snippet` 尽力抽一行回复凑进成功消息，解析失败就降级。
-  - **AI 测试不自动保存。** 走 overrides：表单实时值（含未保存的 key）直传 `ai_test_settings`，空串/undefined 回退 vault 值（与保存的「空 key=保持不变」同语义）。用户可反复试 model/baseUrl/key 不落库。
-  - **AI 输入框用 `rows=4` + `minHeight:96` + `lineHeight:1.5`，不做 auto-grow。** auto-grow 要测 scrollHeight/处理 placeholder/shrink，得不偿失；固定 4 行 + minHeight 即解决「几个字溢出」。
-- **改动（后端）：**
-  - `ssh.rs` — 新增 `dial_and_authenticate`（从 `connect` 抽出拨号+认证）+ `test_connection`（dial+auth+开 channel+`handle.disconnect(Disconnect::ByApplication, ...)`，返回「连接成功（N ms，认证方式=密码/私钥）」）；`connect` 改调 helper；`use russh::Disconnect`。
-  - `ftp.rs` — `test_connection`（`connect`+`disconnect` QUIT，返回「连接成功（N ms，FTP 登录通过）」）；FTPS 会被 `connect` 直接拒。
-  - `local.rs` — `test_connection`（`spawn_blocking` 里 `native_pty_system().openpty`+`spawn_command`+立即 `child.kill()`+`wait`，返回「连接成功（N ms，shell 可启动）」；抓坏路径/缺可执行文件，不起 reader、不入 session map）。
-  - `ai.rs` — `AiTestOverrides` 结构 + `test_settings`（override→`load_settings`→`build_body`+`stream:false`+`max_tokens:16`→reqwest+可选 proxy→200 取 snippet / 非 200 截断报错）+ `extract_reply_snippet`。
-  - `main.rs` — `test_connection` 命令（复用 `ssh_connect`/`ftp_connect` 的 keyring 解析：表单密码优先、缺则按 `config.id` 取 keyring；password-auth 新建无 id 且无密码时拒绝测试防空密码触发锁号；整个探针套 15s `tokio::time::timeout`）+ `ai_test_settings` 命令；两命令注册进 `generate_handler!`。
-- **改动（前端）：**
-  - `api.ts` — `testConnection(config)`、`AiTestOverrides` 接口、`aiTestSettings(overrides?)`。
-  - `ConnectionDialog.tsx` — 抽 `buildConfig(): ConnectionConfig | null`（把 `handleSave` 的校验+配置组装搬出，`handleSave`/`handleTest` 共用，保证「测试的就是要保存的」）；新增 `testing`/`testResult` 状态 + `handleTest`；footer 改 `flexDirection:column`——上层放结果横幅（绿/红 + ✓/✗ + `word-break`，复用 `--success/--error` + `--success-muted/--error-muted`），下层按钮行在「取消」「保存」间插「测试」按钮（`marginRight:auto` 靠左、ghost 二级样式、`disabled=testing||saving`）。local 与 remote 共用同 footer（`buildConfig` 已按 connType 分支）。
-  - `SettingsPanel.tsx` — `aiTesting` 状态 + `handleTestAi`（表单值作 overrides 传 `aiTestSettings`，复用 `aiMsg` 显示，6s 清除）；「保存 AI 配置」前插「测试」按钮（ghost 二级，两按钮互 disabled）；import `aiTestSettings`。
-  - `AiPanel.tsx` — textarea `rows={2}→{4}`，`textareaStyle` 加 `lineHeight:1.5` + `minHeight:96`；不动 `btnStyle`（height:38）与 `alignItems:flex-end`，发送键自然贴底。
-- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS（0 warning，修了 `connect` 里 `let mut handle` → `let handle` 的未用 mut）。需 `cargo tauri dev` 手测三条交互。
-- **边界/错误处理要点：**
-  - 连接测试：空密码（新建无 id）先于网络返回「未填写密码，无法测试」（防空密码被计失败次数→锁号）；编辑模式无表单密码→按 id 取 keyring；Vault 锁定→`require_dek` 报错；FTPS→`connect` 直拒「暂不支持」原样透出；代理握手已有 10s 超时 + 外层 15s 兜底；任何分支都不入 session map（SSH `disconnect` / FTP QUIT / local `kill+wait`）；known_hosts TOFU 照常（MITM 主机键不匹配→测试失败）。
-  - AI 测试：未保存 key（表单有）→ override 直用；key 空+vault 有→用 vault；key 空+vault 空→`load_settings` 报「未配置 API key」；vault 锁→报「Vault 未解锁」；未知 provider→`Provider::parse` 报错；坏代理 URL→报「代理配置无效」；4xx/5xx→「AI 接口返回 {status}：{截断 body}」（典型 401 坏 key / 404 坏 baseUrl / 429 限流）；200 但 body 不可解析→snippet 空，成功消息降级；**无事件泄漏**。
-  - 输入框：Enter 仍发送、Shift+Enter 换行（现在多行更舒适）；placeholder 在 4 行内正常换行；巡检按钮/头部不受影响。
+### 闃舵 38锛氳繛鎺ユ祴璇曟寜閽?+ AI 閰嶇疆娴嬭瘯鎸夐挳 + AI 杈撳叆妗嗗姞楂橈紙2026-06-23锛?
+- **闇€姹傦紙鐢ㄦ埛鍘熻瘽涓夋潯锛夛細**
+  1. 鏂板缓/缂栬緫杩炴帴瀵硅瘽妗嗗鍔犮€屾祴璇曘€嶆寜閽€斺€斾繚瀛樺墠鍏堥獙璇?ssh/sftp/ftp/local 鑳藉惁杩為€氥€?
+  2. 璁剧疆 鈫?AI 鍔╂墜锛屻€屼繚瀛?AI 閰嶇疆銆嶆梺鍔犮€屾祴璇曘€嶆寜閽€斺€旈獙璇佸綋鍓嶅～鍐欑殑 provider/key/model/baseUrl 鐪熻兘鐢紝涓嶅繀鍏堜繚瀛樸€?
+  3. 涓婚〉 AI 鍔╂墜杈撳叆妗嗗姞楂樷€斺€旂幇鍦?`rows=2`锛岄殢渚垮嚑涓瓧灏辨孩鍑恒€?
+- **鍏抽敭璁捐鍐崇瓥锛?*
+  - **杩炴帴娴嬭瘯鎶藉叕鍏辨嫧鍙?璁よ瘉娈点€?* `ssh::connect` 鍘熸湰鎶娿€屾嫧鍙?璁よ瘉銆嶄笌銆屽紑 channel/PTY/shell/璧?reader/鎻?session銆嶆弶鍦ㄤ竴璧枫€傛娊鍑?`dial_and_authenticate(state, config, open_channel) -> Result<Handle, String>`锛堣繑鍥炲凡璁よ瘉 Handle锛屼笉娉ㄥ唽 session銆佷笉璧?reader銆佷笉璇锋眰 PTY/shell銆佷笉鍙戜簨浠讹級锛宍connect` 涓庢柊澧炵殑 `ssh::test_connection` 閮借皟瀹冣€斺€?*鐪熷疄杩炴帴涓庢祴璇曡蛋鍚屼竴鏉¤璇?host-key TOFU 璺緞**锛屾祴璇曡兘鎶撳埌鐪熷疄杩炴帴鍚屾牱鐨勫け璐ャ€俙open_channel=true` 鏃跺紑涓€涓?session channel 绔嬪嵆涓㈠純锛屾牎楠屻€岃璇侀€氳繃浣嗘湇鍔″櫒鎷掑紑 channel銆嶏紙鐪熷疄 SFTP 渚濊禆鐨勫鐢ㄨ矾寰勶級銆?
+  - **AI 娴嬭瘯鐢ㄩ潪娴佸紡鏈€灏忚姹傘€?* 澶嶇敤 `load_settings`锛坴ault 閰嶇疆+瑙ｅ瘑 key锛? `Provider::{endpoint, auth_headers, build_body}` + `truncate`銆俙build_body` 榛樿 `stream:true`锛屾祴璇曢噷 `as_object_mut().insert("stream", false)` 瑕嗙洊 + `max_tokens=16`銆俻rompt 鐢?`"ping"` + 绯荤粺鎻愮ず銆孯eply with the single word: ok銆嶃€?*闈炴祦寮忚€岄潪娴佸紡娑堣垂棣?token**锛氬崟娆?HTTP 寰€杩旓紝success/fail 璇箟骞插噣锛屼笖**缁濅笉 emit `ai_token`/`ai_done`**锛屼笉浼氬共鎵版墦寮€鐨?AiPanel 娴佸紡璁㈤槄銆?00 鍗宠涓鸿璇?绔偣閫氳繃锛沗extract_reply_snippet` 灏藉姏鎶戒竴琛屽洖澶嶅噾杩涙垚鍔熸秷鎭紝瑙ｆ瀽澶辫触灏遍檷绾с€?
+  - **AI 娴嬭瘯涓嶈嚜鍔ㄤ繚瀛樸€?* 璧?overrides锛氳〃鍗曞疄鏃跺€硷紙鍚湭淇濆瓨鐨?key锛夌洿浼?`ai_test_settings`锛岀┖涓?undefined 鍥為€€ vault 鍊硷紙涓庝繚瀛樼殑銆岀┖ key=淇濇寔涓嶅彉銆嶅悓璇箟锛夈€傜敤鎴峰彲鍙嶅璇?model/baseUrl/key 涓嶈惤搴撱€?
+  - **AI 杈撳叆妗嗙敤 `rows=4` + `minHeight:96` + `lineHeight:1.5`锛屼笉鍋?auto-grow銆?* auto-grow 瑕佹祴 scrollHeight/澶勭悊 placeholder/shrink锛屽緱涓嶅伩澶憋紱鍥哄畾 4 琛?+ minHeight 鍗宠В鍐炽€屽嚑涓瓧婧㈠嚭銆嶃€?
+- **鏀瑰姩锛堝悗绔級锛?*
+  - `ssh.rs` 鈥?鏂板 `dial_and_authenticate`锛堜粠 `connect` 鎶藉嚭鎷ㄥ彿+璁よ瘉锛? `test_connection`锛坉ial+auth+寮€ channel+`handle.disconnect(Disconnect::ByApplication, ...)`锛岃繑鍥炪€岃繛鎺ユ垚鍔燂紙N ms锛岃璇佹柟寮?瀵嗙爜/绉侀挜锛夈€嶏級锛沗connect` 鏀硅皟 helper锛沗use russh::Disconnect`銆?
+  - `ftp.rs` 鈥?`test_connection`锛坄connect`+`disconnect` QUIT锛岃繑鍥炪€岃繛鎺ユ垚鍔燂紙N ms锛孎TP 鐧诲綍閫氳繃锛夈€嶏級锛汧TPS 浼氳 `connect` 鐩存帴鎷掋€?
+  - `local.rs` 鈥?`test_connection`锛坄spawn_blocking` 閲?`native_pty_system().openpty`+`spawn_command`+绔嬪嵆 `child.kill()`+`wait`锛岃繑鍥炪€岃繛鎺ユ垚鍔燂紙N ms锛宻hell 鍙惎鍔級銆嶏紱鎶撳潖璺緞/缂哄彲鎵ц鏂囦欢锛屼笉璧?reader銆佷笉鍏?session map锛夈€?
+  - `ai.rs` 鈥?`AiTestOverrides` 缁撴瀯 + `test_settings`锛坥verride鈫抈load_settings`鈫抈build_body`+`stream:false`+`max_tokens:16`鈫抮eqwest+鍙€?proxy鈫?00 鍙?snippet / 闈?200 鎴柇鎶ラ敊锛? `extract_reply_snippet`銆?
+  - `main.rs` 鈥?`test_connection` 鍛戒护锛堝鐢?`ssh_connect`/`ftp_connect` 鐨?keyring 瑙ｆ瀽锛氳〃鍗曞瘑鐮佷紭鍏堛€佺己鍒欐寜 `config.id` 鍙?keyring锛沺assword-auth 鏂板缓鏃?id 涓旀棤瀵嗙爜鏃舵嫆缁濇祴璇曢槻绌哄瘑鐮佽Е鍙戦攣鍙凤紱鏁翠釜鎺㈤拡濂?15s `tokio::time::timeout`锛? `ai_test_settings` 鍛戒护锛涗袱鍛戒护娉ㄥ唽杩?`generate_handler!`銆?
+- **鏀瑰姩锛堝墠绔級锛?*
+  - `api.ts` 鈥?`testConnection(config)`銆乣AiTestOverrides` 鎺ュ彛銆乣aiTestSettings(overrides?)`銆?
+  - `ConnectionDialog.tsx` 鈥?鎶?`buildConfig(): ConnectionConfig | null`锛堟妸 `handleSave` 鐨勬牎楠?閰嶇疆缁勮鎼嚭锛宍handleSave`/`handleTest` 鍏辩敤锛屼繚璇併€屾祴璇曠殑灏辨槸瑕佷繚瀛樼殑銆嶏級锛涙柊澧?`testing`/`testResult` 鐘舵€?+ `handleTest`锛沠ooter 鏀?`flexDirection:column`鈥斺€斾笂灞傛斁缁撴灉妯箙锛堢豢/绾?+ 鉁?鉁?+ `word-break`锛屽鐢?`--success/--error` + `--success-muted/--error-muted`锛夛紝涓嬪眰鎸夐挳琛屽湪銆屽彇娑堛€嶃€屼繚瀛樸€嶉棿鎻掋€屾祴璇曘€嶆寜閽紙`marginRight:auto` 闈犲乏銆乬host 浜岀骇鏍峰紡銆乣disabled=testing||saving`锛夈€俵ocal 涓?remote 鍏辩敤鍚?footer锛坄buildConfig` 宸叉寜 connType 鍒嗘敮锛夈€?
+  - `SettingsPanel.tsx` 鈥?`aiTesting` 鐘舵€?+ `handleTestAi`锛堣〃鍗曞€间綔 overrides 浼?`aiTestSettings`锛屽鐢?`aiMsg` 鏄剧ず锛?s 娓呴櫎锛夛紱銆屼繚瀛?AI 閰嶇疆銆嶅墠鎻掋€屾祴璇曘€嶆寜閽紙ghost 浜岀骇锛屼袱鎸夐挳浜?disabled锛夛紱import `aiTestSettings`銆?
+  - `AiPanel.tsx` 鈥?textarea `rows={2}鈫抺4}`锛宍textareaStyle` 鍔?`lineHeight:1.5` + `minHeight:96`锛涗笉鍔?`btnStyle`锛坔eight:38锛変笌 `alignItems:flex-end`锛屽彂閫侀敭鑷劧璐村簳銆?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛沗cargo check` PASS锛? warning锛屼慨浜?`connect` 閲?`let mut handle` 鈫?`let handle` 鐨勬湭鐢?mut锛夈€傞渶 `cargo tauri dev` 鎵嬫祴涓夋潯浜や簰銆?
+- **杈圭晫/閿欒澶勭悊瑕佺偣锛?*
+  - 杩炴帴娴嬭瘯锛氱┖瀵嗙爜锛堟柊寤烘棤 id锛夊厛浜庣綉缁滆繑鍥炪€屾湭濉啓瀵嗙爜锛屾棤娉曟祴璇曘€嶏紙闃茬┖瀵嗙爜琚澶辫触娆℃暟鈫掗攣鍙凤級锛涚紪杈戞ā寮忔棤琛ㄥ崟瀵嗙爜鈫掓寜 id 鍙?keyring锛沄ault 閿佸畾鈫抈require_dek` 鎶ラ敊锛汧TPS鈫抈connect` 鐩存嫆銆屾殏涓嶆敮鎸併€嶅師鏍烽€忓嚭锛涗唬鐞嗘彙鎵嬪凡鏈?10s 瓒呮椂 + 澶栧眰 15s 鍏滃簳锛涗换浣曞垎鏀兘涓嶅叆 session map锛圫SH `disconnect` / FTP QUIT / local `kill+wait`锛夛紱known_hosts TOFU 鐓у父锛圡ITM 涓绘満閿笉鍖归厤鈫掓祴璇曞け璐ワ級銆?
+  - AI 娴嬭瘯锛氭湭淇濆瓨 key锛堣〃鍗曟湁锛夆啋 override 鐩寸敤锛沰ey 绌?vault 鏈夆啋鐢?vault锛沰ey 绌?vault 绌衡啋`load_settings` 鎶ャ€屾湭閰嶇疆 API key銆嶏紱vault 閿佲啋鎶ャ€孷ault 鏈В閿併€嶏紱鏈煡 provider鈫抈Provider::parse` 鎶ラ敊锛涘潖浠ｇ悊 URL鈫掓姤銆屼唬鐞嗛厤缃棤鏁堛€嶏紱4xx/5xx鈫掋€孉I 鎺ュ彛杩斿洖 {status}锛歿鎴柇 body}銆嶏紙鍏稿瀷 401 鍧?key / 404 鍧?baseUrl / 429 闄愭祦锛夛紱200 浣?body 涓嶅彲瑙ｆ瀽鈫抯nippet 绌猴紝鎴愬姛娑堟伅闄嶇骇锛?*鏃犱簨浠舵硠婕?*銆?
+  - 杈撳叆妗嗭細Enter 浠嶅彂閫併€丼hift+Enter 鎹㈣锛堢幇鍦ㄥ琛屾洿鑸掗€傦級锛沺laceholder 鍦?4 琛屽唴姝ｅ父鎹㈣锛涘贰妫€鎸夐挳/澶撮儴涓嶅彈褰卞搷銆?
 
-## 五问重启检查（阶段 38）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 38锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 38 complete（连接测试按钮 ssh/sftp/ftp/local + AI 配置测试按钮 + AI 输入框加高；后端 dial_and_authenticate 抽取 + test_connection/ai::test_settings + 两命令注册；前端 api.ts 包装 + ConnectionDialog buildConfig 抽取 + SettingsPanel/AiPanel 改动；tsc/cargo check 双绿），待 dev 手测三条交互 |
-| 我要去哪里？ | 用户 `cargo tauri dev` 实测：①新建 SSH 填表→测试→绿「连接成功 N ms」/ 错密码→红 Authentication failed；编辑已有（密码留空）→测试→后端取 keyring 成功；sftp/ftp/local 各分支；②AI 假 model→红 4xx、改回绿、填有效未保存 key→绿（验证 override）；③AiPanel 输几个字不溢出、多行粘贴明显变高 |
-| 目标是什么？ | 保存前验证连接/AI 配置可用（避免反复保存-连接-改-再保存）；AI 输入框不再几个字就溢出 |
-| 我学到了什么？ | 连接测试应抽公共拨号+认证段（dial_and_authenticate）让真实连接与测试同路径、同 host-key TOFU 保证；连接测试必须复用 ssh_connect/ftp_connect 的 keyring 解析 + 防空密码锁号 + 外层超时兜底；AI 测试用非流式最小请求（stream:false+max_tokens:16）而非消费首 token——干净且绝不 emit 事件污染 AiPanel；AI 测试走 overrides 不自动保存，符合「试了再决定」心智；textarea 加高用 rows+minHeight 而非 auto-grow（简单且解决痛点）；ConnectionDialog 抽 buildConfig 让 save/test 共用配置组装防漂移 |
-| 我做了什么？ | ssh.rs 抽 dial_and_authenticate + test_connection + use Disconnect、connect 改调 helper（修未用 mut）；ftp.rs test_connection；local.rs test_connection（spawn+kill+wait）；ai.rs AiTestOverrides+test_settings+extract_reply_snippet；main.rs test_connection（keyring 解析+防空密码+15s 超时）+ ai_test_settings 命令 + 两处 generate_handler 注册；api.ts testConnection/AiTestOverrides/aiTestSettings；ConnectionDialog 抽 buildConfig+testing/testResult 状态+handleTest+footer 加测试按钮与结果横幅；SettingsPanel aiTesting+handleTestAi+测试按钮+import；AiPanel rows=4+textareaStyle 加 lineHeight/minHeight；tsc+cargo check 双绿；progress+README 同步 |
+| 鎴戝湪鍝噷锛?| 闃舵 38 complete锛堣繛鎺ユ祴璇曟寜閽?ssh/sftp/ftp/local + AI 閰嶇疆娴嬭瘯鎸夐挳 + AI 杈撳叆妗嗗姞楂橈紱鍚庣 dial_and_authenticate 鎶藉彇 + test_connection/ai::test_settings + 涓ゅ懡浠ゆ敞鍐岋紱鍓嶇 api.ts 鍖呰 + ConnectionDialog buildConfig 鎶藉彇 + SettingsPanel/AiPanel 鏀瑰姩锛泃sc/cargo check 鍙岀豢锛夛紝寰?dev 鎵嬫祴涓夋潯浜や簰 |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri dev` 瀹炴祴锛氣憼鏂板缓 SSH 濉〃鈫掓祴璇曗啋缁裤€岃繛鎺ユ垚鍔?N ms銆? 閿欏瘑鐮佲啋绾?Authentication failed锛涚紪杈戝凡鏈夛紙瀵嗙爜鐣欑┖锛夆啋娴嬭瘯鈫掑悗绔彇 keyring 鎴愬姛锛泂ftp/ftp/local 鍚勫垎鏀紱鈶I 鍋?model鈫掔孩 4xx銆佹敼鍥炵豢銆佸～鏈夋晥鏈繚瀛?key鈫掔豢锛堥獙璇?override锛夛紱鈶iPanel 杈撳嚑涓瓧涓嶆孩鍑恒€佸琛岀矘璐存槑鏄惧彉楂?|
+| 鐩爣鏄粈涔堬紵 | 淇濆瓨鍓嶉獙璇佽繛鎺?AI 閰嶇疆鍙敤锛堥伩鍏嶅弽澶嶄繚瀛?杩炴帴-鏀?鍐嶄繚瀛橈級锛汚I 杈撳叆妗嗕笉鍐嶅嚑涓瓧灏辨孩鍑?|
+| 鎴戝鍒颁簡浠€涔堬紵 | 杩炴帴娴嬭瘯搴旀娊鍏叡鎷ㄥ彿+璁よ瘉娈碉紙dial_and_authenticate锛夎鐪熷疄杩炴帴涓庢祴璇曞悓璺緞銆佸悓 host-key TOFU 淇濊瘉锛涜繛鎺ユ祴璇曞繀椤诲鐢?ssh_connect/ftp_connect 鐨?keyring 瑙ｆ瀽 + 闃茬┖瀵嗙爜閿佸彿 + 澶栧眰瓒呮椂鍏滃簳锛汚I 娴嬭瘯鐢ㄩ潪娴佸紡鏈€灏忚姹傦紙stream:false+max_tokens:16锛夎€岄潪娑堣垂棣?token鈥斺€斿共鍑€涓旂粷涓?emit 浜嬩欢姹℃煋 AiPanel锛汚I 娴嬭瘯璧?overrides 涓嶈嚜鍔ㄤ繚瀛橈紝绗﹀悎銆岃瘯浜嗗啀鍐冲畾銆嶅績鏅猴紱textarea 鍔犻珮鐢?rows+minHeight 鑰岄潪 auto-grow锛堢畝鍗曚笖瑙ｅ喅鐥涚偣锛夛紱ConnectionDialog 鎶?buildConfig 璁?save/test 鍏辩敤閰嶇疆缁勮闃叉紓绉?|
+| 鎴戝仛浜嗕粈涔堬紵 | ssh.rs 鎶?dial_and_authenticate + test_connection + use Disconnect銆乧onnect 鏀硅皟 helper锛堜慨鏈敤 mut锛夛紱ftp.rs test_connection锛沴ocal.rs test_connection锛坰pawn+kill+wait锛夛紱ai.rs AiTestOverrides+test_settings+extract_reply_snippet锛沵ain.rs test_connection锛坘eyring 瑙ｆ瀽+闃茬┖瀵嗙爜+15s 瓒呮椂锛? ai_test_settings 鍛戒护 + 涓ゅ generate_handler 娉ㄥ唽锛沘pi.ts testConnection/AiTestOverrides/aiTestSettings锛汣onnectionDialog 鎶?buildConfig+testing/testResult 鐘舵€?handleTest+footer 鍔犳祴璇曟寜閽笌缁撴灉妯箙锛汼ettingsPanel aiTesting+handleTestAi+娴嬭瘯鎸夐挳+import锛汚iPanel rows=4+textareaStyle 鍔?lineHeight/minHeight锛泃sc+cargo check 鍙岀豢锛沺rogress+README 鍚屾 |
 
-### 阶段 39：版本号展示 + 自动检测更新 + 首启更新内容 + 字体字段移到底部（2026-06-24）
-- **需求（用户原话四条）：**
-  1. 界面添加版本号信息。
-  2. 设计自动检测更新和更新提示功能。
-  3. 版本更新后首次展示更新内容。
-  4. 新建连接，字体选择放在最下面，不要放在上面。
-- **关键设计决策：**
-  - **更新机制 = 轻量检测+提示，不集成 tauri-plugin-updater。** 不引签名密钥/manifest/CI 产物，契合 Gitee 托管；Rust 用已有 `reqwest` 查 Gitee `/releases/latest`，比对版本号有新版就提示 + 「去下载」跳浏览器。无 in-app 自动安装。
-  - **更新检测 HTTP 放 Rust（reqwest）不放前端 fetch。** 因为 `tauri.conf.json` CSP `connect-src 'self' ipc: http://ipc.localhost` 锁得很紧，前端 fetch Gitee 会被拦；Rust reqwest 不受 CSP 约束、规避 CORS、复用已有依赖。→ **无需放宽 CSP**。
-  - **更新内容来源 = 内置 CHANGELOG.md + Vite `?raw`。** 构建期内联成字符串打包进前端，离线可用、与已装版本严格对应；用已有 `react-markdown`+`remark-gfm` 渲染，不新增依赖。更新检测的「新版本」走远程、首启「更新内容」走本地 CHANGELOG——两条独立路径，内容源不同（远程=已发布最新，本地=已装版本的变更）。
-  - **打开外链 = Rust `open_external_url` 命令。** 复用已注册的 `tauri_plugin_shell::ShellExt`，强制校验 `http(s)://` 前缀（防 file:/任意协议），不新增 `@tauri-apps/plugin-shell` npm 包。`Shell::open` 已 deprecated（推荐 tauri-plugin-opener），但为单次打开不引第二个插件，`#[allow(deprecated)]` 留注说明。
-  - **节流：每 24h 才自动检测一次**（`localStorage lastUpdateCheck`），避免每次启动打 Gitee API 触发限流；「检查更新」按钮不受节流。**每版本只弹一次更新提示**（`localStorage lastNotifiedUpdateVersion`），同版本后续启动只留侧栏红点不弹窗。
-  - **首启更新内容（whatsnew）：** `localStorage knownVersion` vs 运行版本，不同（刚升级）→ 弹 changelog 一次，关闭时回写 knownVersion；首次安装（knownVersion 为 null）静默写入不打扰。
-  - **版本号位置 = 侧边栏底部**（常驻可见，点击开 About/更新内容对话框，有新版本时显红点）；设置面板「版本备份」区版本号保持不变。
-  - **字体字段移到 ConnectionDialog 最底部**（「分组」FieldGroup 之后），仅位置移动、条件与逻辑不变。
-- **改动（后端）：**
-  - `main.rs` — `UpdateInfo` 结构 + `GITEE_LATEST_RELEASE` 常量 + `check_for_updates()` async 命令（reqwest 10s 客户端 + 12s tokio timeout 兜底 + serde_json::Value 手取字段容错 + `is_newer`/`parse_version`/`truncate_chars`/`unix_now_secs`/`update_info_error` helper，**永不抛 Result**，失败全部降级 has_update:false+error）+ `open_external_url()` 命令（AppHandle 注入 + http(s) 校验 + `#[allow(deprecated)]` ShellExt::open）；两命令注册进 `generate_handler!`。不新增 Cargo 依赖。
-- **改动（前端）：**
-  - `api.ts` — `UpdateInfo` 接口 + `checkForUpdates()` + `openExternalUrl(url)`。
-  - `vite-env.d.ts` — `declare module "*.md?raw"` 让 `?raw` 导入过 tsc。
-  - `hooks/useUpdateCheck.ts`（新）— `useUpdateCheck(enabled)` → `{info,loading,checkNow}`；24h localStorage 节流；inFlight ref 防 StrictMode 双触发；失败静默。
-  - `components/AboutDialog.tsx`（新）— 单组件两 mode（whatsnew/about）；ReactMarkdown + remarkGfm 渲染 `CHANGELOG.md?raw`（inline components map，无需全局 CSS 类）；about 模式含「检查更新」按钮 + has_update 时绿 banner「去下载」。
-  - `components/Sidebar.tsx` — 新 props `version/updateAvailable/onOpenAbout`；`listContainer` 后插 footer（仅展开态）`MyShell v{version}` + 红点；点击开 about。
-  - `App.tsx` — `appVersion` state（vault ready 后 `getAppVersion`）+ whatsnew effect（knownVersion 比对）+ `useUpdateCheck` + 每版本一次提示 effect（lastNotifiedUpdateVersion）+ `closeAbout`（whatsnew 关闭回写 knownVersion）；渲染 `<AboutDialog>`；Sidebar 注入 version/updateAvailable/onOpenAbout。
-  - `components/ConnectionDialog.tsx` — 「终端」FieldGroup（字体）从基本设置下移到「分组」之后、表单容器最底。
-  - `CHANGELOG.md`（新，仓库根）— 版本化更新日志（v1.4.5 → 历史回溯），头注版本须与 Cargo.toml 一致。
-- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS（0 warning）。需 `cargo tauri dev` 手测：侧栏底部版本号 + 点击开 about + 检查更新（Gitee 有更高版本→绿 banner 去下载；最新→「当前已是最新版本」）；改 `localStorage myshell.knownVersion` 为旧版刷新→弹 whatsnew；检测到新版本首启弹 about、后续启动仅红点；断网/无 release 静默降级无弹窗无红点；新建连接对话框字体在最底（SSH/Local 显示、FTP/SFTP 不显示）。
-- **边界/错误处理要点：**
-  - 更新检测：网络失败/超时/非 2xx/解析失败/无 tag → 全部降级 `error` 字段非空 + has_update:false，绝不 panic/抛 Result；notes 截断 2000 字防爆前端；download_url 缺省回退 release_url；CSP 不放宽（HTTP 走 Rust）。
-  - 打开外链：非 http(s) 前缀拒绝；ShellExt 缺失返回「无法打开链接」。
-  - whatsnew：首次安装（knownVersion null）静默不弹；断网/检测失败不影响 whatsnew（whatsnew 走本地 CHANGELOG 不依赖网络）。
-  - 每版本提示：whatsnew 正显示时不抢屏（about 让位 whatsnew）；同 latest_version 后续启动仅红点。
-  - 节流键写失败（localStorage 满/禁用）不影响检查，仅可能下次启动早查一次。
+### 闃舵 39锛氱増鏈彿灞曠ず + 鑷姩妫€娴嬫洿鏂?+ 棣栧惎鏇存柊鍐呭 + 瀛椾綋瀛楁绉诲埌搴曢儴锛?026-06-24锛?
+- **闇€姹傦紙鐢ㄦ埛鍘熻瘽鍥涙潯锛夛細**
+  1. 鐣岄潰娣诲姞鐗堟湰鍙蜂俊鎭€?
+  2. 璁捐鑷姩妫€娴嬫洿鏂板拰鏇存柊鎻愮ず鍔熻兘銆?
+  3. 鐗堟湰鏇存柊鍚庨娆″睍绀烘洿鏂板唴瀹广€?
+  4. 鏂板缓杩炴帴锛屽瓧浣撻€夋嫨鏀惧湪鏈€涓嬮潰锛屼笉瑕佹斁鍦ㄤ笂闈€?
+- **鍏抽敭璁捐鍐崇瓥锛?*
+  - **鏇存柊鏈哄埗 = 杞婚噺妫€娴?鎻愮ず锛屼笉闆嗘垚 tauri-plugin-updater銆?* 涓嶅紩绛惧悕瀵嗛挜/manifest/CI 浜х墿锛屽鍚?Gitee 鎵樼锛汻ust 鐢ㄥ凡鏈?`reqwest` 鏌?Gitee `/releases/latest`锛屾瘮瀵圭増鏈彿鏈夋柊鐗堝氨鎻愮ず + 銆屽幓涓嬭浇銆嶈烦娴忚鍣ㄣ€傛棤 in-app 鑷姩瀹夎銆?
+  - **鏇存柊妫€娴?HTTP 鏀?Rust锛坮eqwest锛変笉鏀惧墠绔?fetch銆?* 鍥犱负 `tauri.conf.json` CSP `connect-src 'self' ipc: http://ipc.localhost` 閿佸緱寰堢揣锛屽墠绔?fetch Gitee 浼氳鎷︼紱Rust reqwest 涓嶅彈 CSP 绾︽潫銆佽閬?CORS銆佸鐢ㄥ凡鏈変緷璧栥€傗啋 **鏃犻渶鏀惧 CSP**銆?
+  - **鏇存柊鍐呭鏉ユ簮 = 鍐呯疆 CHANGELOG.md + Vite `?raw`銆?* 鏋勫缓鏈熷唴鑱旀垚瀛楃涓叉墦鍖呰繘鍓嶇锛岀绾垮彲鐢ㄣ€佷笌宸茶鐗堟湰涓ユ牸瀵瑰簲锛涚敤宸叉湁 `react-markdown`+`remark-gfm` 娓叉煋锛屼笉鏂板渚濊禆銆傛洿鏂版娴嬬殑銆屾柊鐗堟湰銆嶈蛋杩滅▼銆侀鍚€屾洿鏂板唴瀹广€嶈蛋鏈湴 CHANGELOG鈥斺€斾袱鏉＄嫭绔嬭矾寰勶紝鍐呭婧愪笉鍚岋紙杩滅▼=宸插彂甯冩渶鏂帮紝鏈湴=宸茶鐗堟湰鐨勫彉鏇达級銆?
+  - **鎵撳紑澶栭摼 = Rust `open_external_url` 鍛戒护銆?* 澶嶇敤宸叉敞鍐岀殑 `tauri_plugin_shell::ShellExt`锛屽己鍒舵牎楠?`http(s)://` 鍓嶇紑锛堥槻 file:/浠绘剰鍗忚锛夛紝涓嶆柊澧?`@tauri-apps/plugin-shell` npm 鍖呫€俙Shell::open` 宸?deprecated锛堟帹鑽?tauri-plugin-opener锛夛紝浣嗕负鍗曟鎵撳紑涓嶅紩绗簩涓彃浠讹紝`#[allow(deprecated)]` 鐣欐敞璇存槑銆?
+  - **鑺傛祦锛氭瘡 24h 鎵嶈嚜鍔ㄦ娴嬩竴娆?*锛坄localStorage lastUpdateCheck`锛夛紝閬垮厤姣忔鍚姩鎵?Gitee API 瑙﹀彂闄愭祦锛涖€屾鏌ユ洿鏂般€嶆寜閽笉鍙楄妭娴併€?*姣忕増鏈彧寮逛竴娆℃洿鏂版彁绀?*锛坄localStorage lastNotifiedUpdateVersion`锛夛紝鍚岀増鏈悗缁惎鍔ㄥ彧鐣欎晶鏍忕孩鐐逛笉寮圭獥銆?
+  - **棣栧惎鏇存柊鍐呭锛坵hatsnew锛夛細** `localStorage knownVersion` vs 杩愯鐗堟湰锛屼笉鍚岋紙鍒氬崌绾э級鈫?寮?changelog 涓€娆★紝鍏抽棴鏃跺洖鍐?knownVersion锛涢娆″畨瑁咃紙knownVersion 涓?null锛夐潤榛樺啓鍏ヤ笉鎵撴壈銆?
+  - **鐗堟湰鍙蜂綅缃?= 渚ц竟鏍忓簳閮?*锛堝父椹诲彲瑙侊紝鐐瑰嚮寮€ About/鏇存柊鍐呭瀵硅瘽妗嗭紝鏈夋柊鐗堟湰鏃舵樉绾㈢偣锛夛紱璁剧疆闈㈡澘銆岀増鏈浠姐€嶅尯鐗堟湰鍙蜂繚鎸佷笉鍙樸€?
+  - **瀛椾綋瀛楁绉诲埌 ConnectionDialog 鏈€搴曢儴**锛堛€屽垎缁勩€岶ieldGroup 涔嬪悗锛夛紝浠呬綅缃Щ鍔ㄣ€佹潯浠朵笌閫昏緫涓嶅彉銆?
+- **鏀瑰姩锛堝悗绔級锛?*
+  - `main.rs` 鈥?`UpdateInfo` 缁撴瀯 + `GITEE_LATEST_RELEASE` 甯搁噺 + `check_for_updates()` async 鍛戒护锛坮eqwest 10s 瀹㈡埛绔?+ 12s tokio timeout 鍏滃簳 + serde_json::Value 鎵嬪彇瀛楁瀹归敊 + `is_newer`/`parse_version`/`truncate_chars`/`unix_now_secs`/`update_info_error` helper锛?*姘镐笉鎶?Result**锛屽け璐ュ叏閮ㄩ檷绾?has_update:false+error锛? `open_external_url()` 鍛戒护锛圓ppHandle 娉ㄥ叆 + http(s) 鏍￠獙 + `#[allow(deprecated)]` ShellExt::open锛夛紱涓ゅ懡浠ゆ敞鍐岃繘 `generate_handler!`銆備笉鏂板 Cargo 渚濊禆銆?
+- **鏀瑰姩锛堝墠绔級锛?*
+  - `api.ts` 鈥?`UpdateInfo` 鎺ュ彛 + `checkForUpdates()` + `openExternalUrl(url)`銆?
+  - `vite-env.d.ts` 鈥?`declare module "*.md?raw"` 璁?`?raw` 瀵煎叆杩?tsc銆?
+  - `hooks/useUpdateCheck.ts`锛堟柊锛夆€?`useUpdateCheck(enabled)` 鈫?`{info,loading,checkNow}`锛?4h localStorage 鑺傛祦锛沬nFlight ref 闃?StrictMode 鍙岃Е鍙戯紱澶辫触闈欓粯銆?
+  - `components/AboutDialog.tsx`锛堟柊锛夆€?鍗曠粍浠朵袱 mode锛坵hatsnew/about锛夛紱ReactMarkdown + remarkGfm 娓叉煋 `CHANGELOG.md?raw`锛坕nline components map锛屾棤闇€鍏ㄥ眬 CSS 绫伙級锛沘bout 妯″紡鍚€屾鏌ユ洿鏂般€嶆寜閽?+ has_update 鏃剁豢 banner銆屽幓涓嬭浇銆嶃€?
+  - `components/Sidebar.tsx` 鈥?鏂?props `version/updateAvailable/onOpenAbout`锛沗listContainer` 鍚庢彃 footer锛堜粎灞曞紑鎬侊級`MyShell v{version}` + 绾㈢偣锛涚偣鍑诲紑 about銆?
+  - `App.tsx` 鈥?`appVersion` state锛坴ault ready 鍚?`getAppVersion`锛? whatsnew effect锛坘nownVersion 姣斿锛? `useUpdateCheck` + 姣忕増鏈竴娆℃彁绀?effect锛坙astNotifiedUpdateVersion锛? `closeAbout`锛坵hatsnew 鍏抽棴鍥炲啓 knownVersion锛夛紱娓叉煋 `<AboutDialog>`锛汼idebar 娉ㄥ叆 version/updateAvailable/onOpenAbout銆?
+  - `components/ConnectionDialog.tsx` 鈥?銆岀粓绔€岶ieldGroup锛堝瓧浣擄級浠庡熀鏈缃笅绉诲埌銆屽垎缁勩€嶄箣鍚庛€佽〃鍗曞鍣ㄦ渶搴曘€?
+  - `CHANGELOG.md`锛堟柊锛屼粨搴撴牴锛夆€?鐗堟湰鍖栨洿鏂版棩蹇楋紙v1.4.5 鈫?鍘嗗彶鍥炴函锛夛紝澶存敞鐗堟湰椤讳笌 Cargo.toml 涓€鑷淬€?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛沗cargo check` PASS锛? warning锛夈€傞渶 `cargo tauri dev` 鎵嬫祴锛氫晶鏍忓簳閮ㄧ増鏈彿 + 鐐瑰嚮寮€ about + 妫€鏌ユ洿鏂帮紙Gitee 鏈夋洿楂樼増鏈啋缁?banner 鍘讳笅杞斤紱鏈€鏂扳啋銆屽綋鍓嶅凡鏄渶鏂扮増鏈€嶏級锛涙敼 `localStorage myshell.knownVersion` 涓烘棫鐗堝埛鏂扳啋寮?whatsnew锛涙娴嬪埌鏂扮増鏈鍚脊 about銆佸悗缁惎鍔ㄤ粎绾㈢偣锛涙柇缃?鏃?release 闈欓粯闄嶇骇鏃犲脊绐楁棤绾㈢偣锛涙柊寤鸿繛鎺ュ璇濇瀛椾綋鍦ㄦ渶搴曪紙SSH/Local 鏄剧ず銆丗TP/SFTP 涓嶆樉绀猴級銆?
+- **杈圭晫/閿欒澶勭悊瑕佺偣锛?*
+  - 鏇存柊妫€娴嬶細缃戠粶澶辫触/瓒呮椂/闈?2xx/瑙ｆ瀽澶辫触/鏃?tag 鈫?鍏ㄩ儴闄嶇骇 `error` 瀛楁闈炵┖ + has_update:false锛岀粷涓?panic/鎶?Result锛沶otes 鎴柇 2000 瀛楅槻鐖嗗墠绔紱download_url 缂虹渷鍥為€€ release_url锛汣SP 涓嶆斁瀹斤紙HTTP 璧?Rust锛夈€?
+  - 鎵撳紑澶栭摼锛氶潪 http(s) 鍓嶇紑鎷掔粷锛汼hellExt 缂哄け杩斿洖銆屾棤娉曟墦寮€閾炬帴銆嶃€?
+  - whatsnew锛氶娆″畨瑁咃紙knownVersion null锛夐潤榛樹笉寮癸紱鏂綉/妫€娴嬪け璐ヤ笉褰卞搷 whatsnew锛坵hatsnew 璧版湰鍦?CHANGELOG 涓嶄緷璧栫綉缁滐級銆?
+  - 姣忕増鏈彁绀猴細whatsnew 姝ｆ樉绀烘椂涓嶆姠灞忥紙about 璁╀綅 whatsnew锛夛紱鍚?latest_version 鍚庣画鍚姩浠呯孩鐐广€?
+  - 鑺傛祦閿啓澶辫触锛坙ocalStorage 婊?绂佺敤锛変笉褰卞搷妫€鏌ワ紝浠呭彲鑳戒笅娆″惎鍔ㄦ棭鏌ヤ竴娆°€?
 
-## 五问重启检查（阶段 39）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 39锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 39 complete（侧栏版本号 + 轻量更新检测/提示 + 首启更新内容 + 字体移底；后端 check_for_updates/open_external_url + parse_ver/is_newer/truncate helper + 两命令注册；前端 UpdateInfo api 包装 + useUpdateCheck 节流 hook + AboutDialog 双 mode + CHANGELOG.md ?raw + Sidebar footer + App 装配 + ConnectionDialog 字段移位；tsc/cargo check 双绿），待 dev 手测 |
-| 我要去哪里？ | 用户 `cargo tauri dev` 实测：①侧栏底部 `MyShell v1.4.5` + 点击开 About；②About 点「检查更新」→Gitee 有更高版本→绿 banner「去下载」打开浏览器下载页 / 最新→「当前已是最新版本」/ 断网→「上次检查失败可重试」；③`localStorage.setItem("myshell.knownVersion","1.0.0")` 刷新→弹 whatsnew（changelog），关闭后回写、再刷新不弹；④字体字段在新建连接对话框最底（SSH/Local 显示、FTP/SFTP 不显示）；⑤每版本提示一次（检测到新版本首启弹 about，后续仅红点） |
-| 目标是什么？ | 版本号常驻可见；自动检测新版本并提示一次（非 naggy）+ 可手动检查；版本升级后首次启动展示更新内容；字体字段不挡常用输入区 |
-| 我学到了什么？ | 更新检测 HTTP 必须放 Rust——CSP 锁紧 connect-src，前端 fetch 外站被拦，Rust reqwest 不受 CSP 约束且规避 CORS（关键正确决策，避免放宽安全 CSP）；更新检测要永不抛 Result 全降级 error 字段（前端契约干净）；更新内容「内置 CHANGELOG.md ?raw」与「远程 release body」是两条独立路径，前者对应已装版本、离线可用，后者对应已发布最新（语义不同不能混）；首启 whatsnew 用 knownVersion 比对，首次安装（null）要静默不打扰；提示要防 naggy——24h 节流 + 每版本只弹一次（lastNotifiedUpdateVersion）；轻量检测+提示优于集成 tauri-plugin-updater（免签名密钥/manifest/CI，契合 Gitee 托管）；打开外链复用已注册的 shell plugin 不引新 npm 包，仅 `#[allow(deprecated)]` 应对上游迁移 opener；字体字段移位是纯位置改动零逻辑风险 |
-| 我做了什么？ | main.rs UpdateInfo+GITEE_LATEST+check_for_updates（reqwest+timeout+serde_json 手取+永不抛）+open_external_url（http(s) 校验+ShellExt+allow deprecated）+parse_ver/is_newer/truncate_chars/unix_now_secs/update_info_error helper+两命令注册；api.ts UpdateInfo/checkForUpdates/openExternalUrl；vite-env.d.ts `*.md?raw` 声明；useUpdateCheck.ts（24h 节流+inFlight ref+静默）；AboutDialog.tsx（whatsnew/about 双 mode+ReactMarkdown inline components）；Sidebar.tsx version footer+红点+onOpenAbout；App.tsx appVersion+whatsnew effect+useUpdateCheck+每版本提示 effect+closeAbout+渲染；ConnectionDialog.tsx 字体 FieldGroup 移底；CHANGELOG.md 版本化种子；tsc+cargo check 双绿；progress+README 同步 |
+| 鎴戝湪鍝噷锛?| 闃舵 39 complete锛堜晶鏍忕増鏈彿 + 杞婚噺鏇存柊妫€娴?鎻愮ず + 棣栧惎鏇存柊鍐呭 + 瀛椾綋绉诲簳锛涘悗绔?check_for_updates/open_external_url + parse_ver/is_newer/truncate helper + 涓ゅ懡浠ゆ敞鍐岋紱鍓嶇 UpdateInfo api 鍖呰 + useUpdateCheck 鑺傛祦 hook + AboutDialog 鍙?mode + CHANGELOG.md ?raw + Sidebar footer + App 瑁呴厤 + ConnectionDialog 瀛楁绉讳綅锛泃sc/cargo check 鍙岀豢锛夛紝寰?dev 鎵嬫祴 |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri dev` 瀹炴祴锛氣憼渚ф爮搴曢儴 `MyShell v1.4.5` + 鐐瑰嚮寮€ About锛涒憽About 鐐广€屾鏌ユ洿鏂般€嶁啋Gitee 鏈夋洿楂樼増鏈啋缁?banner銆屽幓涓嬭浇銆嶆墦寮€娴忚鍣ㄤ笅杞介〉 / 鏈€鏂扳啋銆屽綋鍓嶅凡鏄渶鏂扮増鏈€? 鏂綉鈫掋€屼笂娆℃鏌ュけ璐ュ彲閲嶈瘯銆嶏紱鈶localStorage.setItem("myshell.knownVersion","1.0.0")` 鍒锋柊鈫掑脊 whatsnew锛坈hangelog锛夛紝鍏抽棴鍚庡洖鍐欍€佸啀鍒锋柊涓嶅脊锛涒懀瀛椾綋瀛楁鍦ㄦ柊寤鸿繛鎺ュ璇濇鏈€搴曪紙SSH/Local 鏄剧ず銆丗TP/SFTP 涓嶆樉绀猴級锛涒懁姣忕増鏈彁绀轰竴娆★紙妫€娴嬪埌鏂扮増鏈鍚脊 about锛屽悗缁粎绾㈢偣锛?|
+| 鐩爣鏄粈涔堬紵 | 鐗堟湰鍙峰父椹诲彲瑙侊紱鑷姩妫€娴嬫柊鐗堟湰骞舵彁绀轰竴娆★紙闈?naggy锛? 鍙墜鍔ㄦ鏌ワ紱鐗堟湰鍗囩骇鍚庨娆″惎鍔ㄥ睍绀烘洿鏂板唴瀹癸紱瀛椾綋瀛楁涓嶆尅甯哥敤杈撳叆鍖?|
+| 鎴戝鍒颁簡浠€涔堬紵 | 鏇存柊妫€娴?HTTP 蹇呴』鏀?Rust鈥斺€擟SP 閿佺揣 connect-src锛屽墠绔?fetch 澶栫珯琚嫤锛孯ust reqwest 涓嶅彈 CSP 绾︽潫涓旇閬?CORS锛堝叧閿纭喅绛栵紝閬垮厤鏀惧瀹夊叏 CSP锛夛紱鏇存柊妫€娴嬭姘镐笉鎶?Result 鍏ㄩ檷绾?error 瀛楁锛堝墠绔绾﹀共鍑€锛夛紱鏇存柊鍐呭銆屽唴缃?CHANGELOG.md ?raw銆嶄笌銆岃繙绋?release body銆嶆槸涓ゆ潯鐙珛璺緞锛屽墠鑰呭搴斿凡瑁呯増鏈€佺绾垮彲鐢紝鍚庤€呭搴斿凡鍙戝竷鏈€鏂帮紙璇箟涓嶅悓涓嶈兘娣凤級锛涢鍚?whatsnew 鐢?knownVersion 姣斿锛岄娆″畨瑁咃紙null锛夎闈欓粯涓嶆墦鎵帮紱鎻愮ず瑕侀槻 naggy鈥斺€?4h 鑺傛祦 + 姣忕増鏈彧寮逛竴娆★紙lastNotifiedUpdateVersion锛夛紱杞婚噺妫€娴?鎻愮ず浼樹簬闆嗘垚 tauri-plugin-updater锛堝厤绛惧悕瀵嗛挜/manifest/CI锛屽鍚?Gitee 鎵樼锛夛紱鎵撳紑澶栭摼澶嶇敤宸叉敞鍐岀殑 shell plugin 涓嶅紩鏂?npm 鍖咃紝浠?`#[allow(deprecated)]` 搴斿涓婃父杩佺Щ opener锛涘瓧浣撳瓧娈电Щ浣嶆槸绾綅缃敼鍔ㄩ浂閫昏緫椋庨櫓 |
+| 鎴戝仛浜嗕粈涔堬紵 | main.rs UpdateInfo+GITEE_LATEST+check_for_updates锛坮eqwest+timeout+serde_json 鎵嬪彇+姘镐笉鎶涳級+open_external_url锛坔ttp(s) 鏍￠獙+ShellExt+allow deprecated锛?parse_ver/is_newer/truncate_chars/unix_now_secs/update_info_error helper+涓ゅ懡浠ゆ敞鍐岋紱api.ts UpdateInfo/checkForUpdates/openExternalUrl锛泇ite-env.d.ts `*.md?raw` 澹版槑锛泆seUpdateCheck.ts锛?4h 鑺傛祦+inFlight ref+闈欓粯锛夛紱AboutDialog.tsx锛坵hatsnew/about 鍙?mode+ReactMarkdown inline components锛夛紱Sidebar.tsx version footer+绾㈢偣+onOpenAbout锛汚pp.tsx appVersion+whatsnew effect+useUpdateCheck+姣忕増鏈彁绀?effect+closeAbout+娓叉煋锛汣onnectionDialog.tsx 瀛椾綋 FieldGroup 绉诲簳锛汣HANGELOG.md 鐗堟湰鍖栫瀛愶紱tsc+cargo check 鍙岀豢锛沺rogress+README 鍚屾 |
 
-### 阶段 40：发布流水线 + 开源安全审计（2026-06-24）
-- **发布流水线（一键 `打包`）：** 新增 `scripts/publish-gitee-release.mjs`（Gitee API 创建 release + `attach_files` 上传 .exe，Node 18+ fetch，带 4 次网络重试）；`.gitee-token` gitignored（永不进仓库）；CLAUDE.md 加「打包」规则 + 持久记忆。规则演进：初版全自动 → 用户加**确认门**（写完更新内容后停下，给作者确认版本号+changelog 才继续 build/push/publish）。宿主安全分类器独立拦 push-to-main 与公开 release 发布（与用户授权无关），用 `!` 前缀亲手放行。**踩坑**：`cargo tauri` 子命令未装→改 `npm run tauri:build`；`AboutDialog` 的 `../CHANGELOG.md?raw` 路径错（应是 `../../`，tsc 没抓到、vite 打包才暴露）。
-- **开源安全审计：** 全历史扫密钥/口令/邮箱/IP/内网主机名。结论——`.gitee-token` 从未进历史（安全）、无硬编码密钥、`ai.rs` 无默认 key、`.serena/` 只跟踪默认配置、活文档无运营信息。**修复**：6 个脚本里硬编码 `C:\Users\argus\.cargo\bin`→`%USERPROFILE%`/`$HOME`（可移植+脱敏）；`TerminalPanel.tsx` 注释 `argus@fn-na`→`user@host`。**决策**：作者身份（`argus<argustang@qq.com>`/`Dear唐先生`/`tang.li`）用户选择保留；故**跳过历史重写**（作者邮箱已全公开，清旧脚本里的 argus 收益≈0，不值强推风险）。残留暴露面：作者 QQ 邮箱+姓名在提交元数据（已知情保留）。LICENSE 实为 Apache 2.0 但 README 写 MIT（未修，开源规范小瑕疵）。
-- **发版：** v1.5.0（feature：版本号展示+自动检测更新+首启更新内容+字体移底，release 723458）→ v1.5.1（patch：开源整理，二进制与 1.5.0 等价，release 723544）。首次 1.5.0 发布吃 2 次 Gitee 网络超时（促成脚本加 retry）。
-- **验证：** `npx tsc --noEmit` + `cargo check` 双绿；两个 release 均已发布含 .exe。
+### 闃舵 40锛氬彂甯冩祦姘寸嚎 + 寮€婧愬畨鍏ㄥ璁★紙2026-06-24锛?
+- **鍙戝竷娴佹按绾匡紙涓€閿?`鎵撳寘`锛夛細** 鏂板 `scripts/publish-gitee-release.mjs`锛圙itee API 鍒涘缓 release + `attach_files` 涓婁紶 .exe锛孨ode 18+ fetch锛屽甫 4 娆＄綉缁滈噸璇曪級锛沗.gitee-token` gitignored锛堟案涓嶈繘浠撳簱锛夛紱CLAUDE.md 鍔犮€屾墦鍖呫€嶈鍒?+ 鎸佷箙璁板繂銆傝鍒欐紨杩涳細鍒濈増鍏ㄨ嚜鍔?鈫?鐢ㄦ埛鍔?*纭闂?*锛堝啓瀹屾洿鏂板唴瀹瑰悗鍋滀笅锛岀粰浣滆€呯‘璁ょ増鏈彿+changelog 鎵嶇户缁?build/push/publish锛夈€傚涓诲畨鍏ㄥ垎绫诲櫒鐙珛鎷?push-to-main 涓庡叕寮€ release 鍙戝竷锛堜笌鐢ㄦ埛鎺堟潈鏃犲叧锛夛紝鐢?`!` 鍓嶇紑浜叉墜鏀捐銆?*韪╁潙**锛歚cargo tauri` 瀛愬懡浠ゆ湭瑁呪啋鏀?`npm run tauri:build`锛沗AboutDialog` 鐨?`../CHANGELOG.md?raw` 璺緞閿欙紙搴旀槸 `../../`锛宼sc 娌℃姄鍒般€乿ite 鎵撳寘鎵嶆毚闇诧級銆?
+- **寮€婧愬畨鍏ㄥ璁★細** 鍏ㄥ巻鍙叉壂瀵嗛挜/鍙ｄ护/閭/IP/鍐呯綉涓绘満鍚嶃€傜粨璁衡€斺€擿.gitee-token` 浠庢湭杩涘巻鍙诧紙瀹夊叏锛夈€佹棤纭紪鐮佸瘑閽ャ€乣ai.rs` 鏃犻粯璁?key銆乣.serena/` 鍙窡韪粯璁ら厤缃€佹椿鏂囨。鏃犺繍钀ヤ俊鎭€?*淇**锛? 涓剼鏈噷纭紪鐮?`C:\Users\argus\.cargo\bin`鈫抈%USERPROFILE%`/`$HOME`锛堝彲绉绘+鑴辨晱锛夛紱`TerminalPanel.tsx` 娉ㄩ噴 `argus@fn-na`鈫抈user@host`銆?*鍐崇瓥**锛氫綔鑰呰韩浠斤紙`argus<argustang@qq.com>`/`Dear鍞愬厛鐢焋/`tang.li`锛夌敤鎴烽€夋嫨淇濈暀锛涙晠**璺宠繃鍘嗗彶閲嶅啓**锛堜綔鑰呴偖绠卞凡鍏ㄥ叕寮€锛屾竻鏃ц剼鏈噷鐨?argus 鏀剁泭鈮?锛屼笉鍊煎己鎺ㄩ闄╋級銆傛畫鐣欐毚闇查潰锛氫綔鑰?QQ 閭+濮撳悕鍦ㄦ彁浜ゅ厓鏁版嵁锛堝凡鐭ユ儏淇濈暀锛夈€侺ICENSE 瀹炰负 Apache 2.0 浣?README 鍐?MIT锛堟湭淇紝寮€婧愯鑼冨皬鐟曠柕锛夈€?
+- **鍙戠増锛?* v1.5.0锛坒eature锛氱増鏈彿灞曠ず+鑷姩妫€娴嬫洿鏂?棣栧惎鏇存柊鍐呭+瀛椾綋绉诲簳锛宺elease 723458锛夆啋 v1.5.1锛坧atch锛氬紑婧愭暣鐞嗭紝浜岃繘鍒朵笌 1.5.0 绛変环锛宺elease 723544锛夈€傞娆?1.5.0 鍙戝竷鍚?2 娆?Gitee 缃戠粶瓒呮椂锛堜績鎴愯剼鏈姞 retry锛夈€?
+- **楠岃瘉锛?* `npx tsc --noEmit` + `cargo check` 鍙岀豢锛涗袱涓?release 鍧囧凡鍙戝竷鍚?.exe銆?
 
-## 五问重启检查（阶段 40）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 40锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 40 complete（发布流水线 publish-gitee-release.mjs + 打包规则含确认门 + 开源审计修复 + v1.5.0/v1.5.1 双发版），均已推送 origin/main |
-| 我要去哪里？ | 后续发版直接「打包」→确认更新内容→自动 build+push+发 Gitee；开源后关注是否有遗漏 PII 反馈 |
-| 目标是什么？ | 一键可复现发版；开源前清掉个人路径/脱敏；既保留作者身份又让仓库对外干净 |
-| 我学到了什么？ | 发布脚本二进制上传用 Gitee `attach_files`（非 GitHub upload_url）；Node fetch 做 multipart 最稳（项目已保证有 Node）；安全分类器独立于用户授权会拦 push-main/公开发布，用 `!` 放行；`?raw` 导入路径要算对层级、tsc 不查运行期路径只查类型；开源审计要扫**全历史**而非仅工作区（但历史重写收益要看作者身份是否保留——保留则清文件内容收益≈0）；CRLF 警告无害（Windows）；确认门是好设计——无用户改动时如实建议跳过、用户仍要发就发 |
-| 我做了什么？ | publish-gitee-release.mjs（create release+attach_files+4次重试+token 解析 env/文件）；.gitignore 加 .gitee-token；CLAUDE.md 打包规则（8步含 3.5 确认门+分类器放行提示）+记忆/索引同步；6 脚本 cargo 路径脱敏+TerminalPanel 注释脱敏（提交 8ac7606）；发版 v1.5.0(723458)/v1.5.1(723544) 含 .exe；CHANGELOG/README/progress 同步 |
+| 鎴戝湪鍝噷锛?| 闃舵 40 complete锛堝彂甯冩祦姘寸嚎 publish-gitee-release.mjs + 鎵撳寘瑙勫垯鍚‘璁ら棬 + 寮€婧愬璁′慨澶?+ v1.5.0/v1.5.1 鍙屽彂鐗堬級锛屽潎宸叉帹閫?origin/main |
+| 鎴戣鍘诲摢閲岋紵 | 鍚庣画鍙戠増鐩存帴銆屾墦鍖呫€嶁啋纭鏇存柊鍐呭鈫掕嚜鍔?build+push+鍙?Gitee锛涘紑婧愬悗鍏虫敞鏄惁鏈夐仐婕?PII 鍙嶉 |
+| 鐩爣鏄粈涔堬紵 | 涓€閿彲澶嶇幇鍙戠増锛涘紑婧愬墠娓呮帀涓汉璺緞/鑴辨晱锛涙棦淇濈暀浣滆€呰韩浠藉張璁╀粨搴撳澶栧共鍑€ |
+| 鎴戝鍒颁簡浠€涔堬紵 | 鍙戝竷鑴氭湰浜岃繘鍒朵笂浼犵敤 Gitee `attach_files`锛堥潪 GitHub upload_url锛夛紱Node fetch 鍋?multipart 鏈€绋筹紙椤圭洰宸蹭繚璇佹湁 Node锛夛紱瀹夊叏鍒嗙被鍣ㄧ嫭绔嬩簬鐢ㄦ埛鎺堟潈浼氭嫤 push-main/鍏紑鍙戝竷锛岀敤 `!` 鏀捐锛沗?raw` 瀵煎叆璺緞瑕佺畻瀵瑰眰绾с€乼sc 涓嶆煡杩愯鏈熻矾寰勫彧鏌ョ被鍨嬶紱寮€婧愬璁¤鎵?*鍏ㄥ巻鍙?*鑰岄潪浠呭伐浣滃尯锛堜絾鍘嗗彶閲嶅啓鏀剁泭瑕佺湅浣滆€呰韩浠芥槸鍚︿繚鐣欌€斺€斾繚鐣欏垯娓呮枃浠跺唴瀹规敹鐩娾増0锛夛紱CRLF 璀﹀憡鏃犲锛圵indows锛夛紱纭闂ㄦ槸濂借璁♀€斺€旀棤鐢ㄦ埛鏀瑰姩鏃跺瀹炲缓璁烦杩囥€佺敤鎴蜂粛瑕佸彂灏卞彂 |
+| 鎴戝仛浜嗕粈涔堬紵 | publish-gitee-release.mjs锛坈reate release+attach_files+4娆￠噸璇?token 瑙ｆ瀽 env/鏂囦欢锛夛紱.gitignore 鍔?.gitee-token锛汣LAUDE.md 鎵撳寘瑙勫垯锛?姝ュ惈 3.5 纭闂?鍒嗙被鍣ㄦ斁琛屾彁绀猴級+璁板繂/绱㈠紩鍚屾锛? 鑴氭湰 cargo 璺緞鑴辨晱+TerminalPanel 娉ㄩ噴鑴辨晱锛堟彁浜?8ac7606锛夛紱鍙戠増 v1.5.0(723458)/v1.5.1(723544) 鍚?.exe锛汣HANGELOG/README/progress 鍚屾 |
 
-### 阶段 41：每次登录检查更新 + 左下角提示 + 自动下载安装（2026-06-24）
-- **需求（用户原话）：** 每次登录进入主页后检查一次新版本；网络设置 30s 超时；检查到新版本→左下角提示「发现新版本」+绿点；用户确认后自动下载并安装，下载失败再由用户点击页面下载安装。
-- **方案选型：** 自动安装两选——A 后端下载 .exe + 启动 NSIS 安装器（无签名，HTTPS+用户确认）；B 集成 tauri-plugin-updater（签名密钥+manifest+CI 改造）。选 **A**（契合现有 Gitee release 流水线、免签名基建），下载失败回退浏览器下载（用户原话）。
-- **改动（后端）：**
-  - `main.rs` — `check_for_updates` 超时 10s→**30s**（client builder timeout 覆盖全请求生命周期，去掉多余 tokio wrapper）；新增 `download_update(window,url)`：reqwest 流式下载到 `temp_dir/myshell-update-setup.exe`，`bytes_stream` 逐块写 tokio fs，每 256KB `window.emit("update_download_progress",{downloaded,total})` 节流，末尾补发 100%，返回临时路径；新增 `install_update(app,path)`：校验路径非 NUL/是文件/`.exe` 后缀，Windows 用 `CommandExt::creation_flags(DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP)` 分离启动，再 `app.exit(0)` 让安装器接管替换文件；两命令注册 `generate_handler!`；`use tauri::Emitter`（emit 方法所在 trait，2.11 拆出）。
-- **改动（前端）：**
-  - `api.ts` — `DownloadProgress` 接口 + `downloadUpdate(url)`/`installUpdate(path)`/`onUpdateDownloadProgress(handler)`。
-  - `hooks/useUpdateCheck.ts` — **去掉 24h 节流**，改「每会话（每次 enabled→true 即登录进主页）自动检查一次」`autoRanRef`；保留 `checkNow` 手动。
-  - `components/UpdateNotification.tsx`（新）— 左下角 fixed 卡片（`left:16;bottom:16`），绿点 +「发现新版本 vX.X.X」+✕ 忽略；四态机 prompt→downloading(进度条，订阅事件)→ready(安装并重启)→failed(浏览器下载+重试)；忽略按 `latest_version` 存 localStorage（更新版本再现）。
-  - `App.tsx` — 删旧的「每版本弹一次 About 模态」effect（换成更轻的左下角卡片）；渲染 `<UpdateNotification>`（vault ready + has_update 时）；保留侧栏绿点 + About 手动检查 + whatsnew 升级后更新日志。
-- **验证：** `npx tsc --noEmit` + `cargo check` 双绿。需 dev 手测：登录后自动检查；Gitee 有更高版本→左下角卡片+绿点；点「立即更新」→进度条→「安装并重启」→App 退出+NSIS 安装器(UAC)接管；断网/下载失败→「浏览器下载」回退。
-- **边界/错误处理要点：**
-  - 下载：url 必须 http(s)；HTTP 非 2xx/读流失败/写盘失败→`Err`，前端进 failed 态回退浏览器；下载 client timeout 300s（安装包几 MB 但慢网要给余量）；进度 total=0（无 Content-Length）时 UI 显示「下载中…」无百分比。
-  - 安装：路径含 NUL/非文件/非 `.exe` 拒绝（防被当任意文件启动器）；app.exit(0) 后安装器独立运行；perMachine 安装器触发 UAC（正常 Windows 安装 UX）。
-  - 提示防 naggy：忽略按版本记忆，同版本忽略后不再弹，更新版本才再现；侧栏绿点常驻 + 卡片可关。
-  - 安全：A 方案无签名校验，靠 HTTPS（Gitee TLS）+ 用户显式确认；未来防 MITM 再上 B（tauri-plugin-updater 签名校验）。
+### 闃舵 41锛氭瘡娆＄櫥褰曟鏌ユ洿鏂?+ 宸︿笅瑙掓彁绀?+ 鑷姩涓嬭浇瀹夎锛?026-06-24锛?
+- **闇€姹傦紙鐢ㄦ埛鍘熻瘽锛夛細** 姣忔鐧诲綍杩涘叆涓婚〉鍚庢鏌ヤ竴娆℃柊鐗堟湰锛涚綉缁滆缃?30s 瓒呮椂锛涙鏌ュ埌鏂扮増鏈啋宸︿笅瑙掓彁绀恒€屽彂鐜版柊鐗堟湰銆?缁跨偣锛涚敤鎴风‘璁ゅ悗鑷姩涓嬭浇骞跺畨瑁咃紝涓嬭浇澶辫触鍐嶇敱鐢ㄦ埛鐐瑰嚮椤甸潰涓嬭浇瀹夎銆?
+- **鏂规閫夊瀷锛?* 鑷姩瀹夎涓ら€夆€斺€擜 鍚庣涓嬭浇 .exe + 鍚姩 NSIS 瀹夎鍣紙鏃犵鍚嶏紝HTTPS+鐢ㄦ埛纭锛夛紱B 闆嗘垚 tauri-plugin-updater锛堢鍚嶅瘑閽?manifest+CI 鏀归€狅級銆傞€?**A**锛堝鍚堢幇鏈?Gitee release 娴佹按绾裤€佸厤绛惧悕鍩哄缓锛夛紝涓嬭浇澶辫触鍥為€€娴忚鍣ㄤ笅杞斤紙鐢ㄦ埛鍘熻瘽锛夈€?
+- **鏀瑰姩锛堝悗绔級锛?*
+  - `main.rs` 鈥?`check_for_updates` 瓒呮椂 10s鈫?*30s**锛坈lient builder timeout 瑕嗙洊鍏ㄨ姹傜敓鍛藉懆鏈燂紝鍘绘帀澶氫綑 tokio wrapper锛夛紱鏂板 `download_update(window,url)`锛歳eqwest 娴佸紡涓嬭浇鍒?`temp_dir/myshell-update-setup.exe`锛宍bytes_stream` 閫愬潡鍐?tokio fs锛屾瘡 256KB `window.emit("update_download_progress",{downloaded,total})` 鑺傛祦锛屾湯灏捐ˉ鍙?100%锛岃繑鍥炰复鏃惰矾寰勶紱鏂板 `install_update(app,path)`锛氭牎楠岃矾寰勯潪 NUL/鏄枃浠?`.exe` 鍚庣紑锛學indows 鐢?`CommandExt::creation_flags(DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP)` 鍒嗙鍚姩锛屽啀 `app.exit(0)` 璁╁畨瑁呭櫒鎺ョ鏇挎崲鏂囦欢锛涗袱鍛戒护娉ㄥ唽 `generate_handler!`锛沗use tauri::Emitter`锛坋mit 鏂规硶鎵€鍦?trait锛?.11 鎷嗗嚭锛夈€?
+- **鏀瑰姩锛堝墠绔級锛?*
+  - `api.ts` 鈥?`DownloadProgress` 鎺ュ彛 + `downloadUpdate(url)`/`installUpdate(path)`/`onUpdateDownloadProgress(handler)`銆?
+  - `hooks/useUpdateCheck.ts` 鈥?**鍘绘帀 24h 鑺傛祦**锛屾敼銆屾瘡浼氳瘽锛堟瘡娆?enabled鈫抰rue 鍗崇櫥褰曡繘涓婚〉锛夎嚜鍔ㄦ鏌ヤ竴娆°€峘autoRanRef`锛涗繚鐣?`checkNow` 鎵嬪姩銆?
+  - `components/UpdateNotification.tsx`锛堟柊锛夆€?宸︿笅瑙?fixed 鍗＄墖锛坄left:16;bottom:16`锛夛紝缁跨偣 +銆屽彂鐜版柊鐗堟湰 vX.X.X銆?鉁?蹇界暐锛涘洓鎬佹満 prompt鈫抎ownloading(杩涘害鏉★紝璁㈤槄浜嬩欢)鈫抮eady(瀹夎骞堕噸鍚?鈫抐ailed(娴忚鍣ㄤ笅杞?閲嶈瘯)锛涘拷鐣ユ寜 `latest_version` 瀛?localStorage锛堟洿鏂扮増鏈啀鐜帮級銆?
+  - `App.tsx` 鈥?鍒犳棫鐨勩€屾瘡鐗堟湰寮逛竴娆?About 妯℃€併€峞ffect锛堟崲鎴愭洿杞荤殑宸︿笅瑙掑崱鐗囷級锛涙覆鏌?`<UpdateNotification>`锛坴ault ready + has_update 鏃讹級锛涗繚鐣欎晶鏍忕豢鐐?+ About 鎵嬪姩妫€鏌?+ whatsnew 鍗囩骇鍚庢洿鏂版棩蹇椼€?
+- **楠岃瘉锛?* `npx tsc --noEmit` + `cargo check` 鍙岀豢銆傞渶 dev 鎵嬫祴锛氱櫥褰曞悗鑷姩妫€鏌ワ紱Gitee 鏈夋洿楂樼増鏈啋宸︿笅瑙掑崱鐗?缁跨偣锛涚偣銆岀珛鍗虫洿鏂般€嶁啋杩涘害鏉♀啋銆屽畨瑁呭苟閲嶅惎銆嶁啋App 閫€鍑?NSIS 瀹夎鍣?UAC)鎺ョ锛涙柇缃?涓嬭浇澶辫触鈫掋€屾祻瑙堝櫒涓嬭浇銆嶅洖閫€銆?
+- **杈圭晫/閿欒澶勭悊瑕佺偣锛?*
+  - 涓嬭浇锛歶rl 蹇呴』 http(s)锛汬TTP 闈?2xx/璇绘祦澶辫触/鍐欑洏澶辫触鈫抈Err`锛屽墠绔繘 failed 鎬佸洖閫€娴忚鍣紱涓嬭浇 client timeout 300s锛堝畨瑁呭寘鍑?MB 浣嗘參缃戣缁欎綑閲忥級锛涜繘搴?total=0锛堟棤 Content-Length锛夋椂 UI 鏄剧ず銆屼笅杞戒腑鈥︺€嶆棤鐧惧垎姣斻€?
+  - 瀹夎锛氳矾寰勫惈 NUL/闈炴枃浠?闈?`.exe` 鎷掔粷锛堥槻琚綋浠绘剰鏂囦欢鍚姩鍣級锛沘pp.exit(0) 鍚庡畨瑁呭櫒鐙珛杩愯锛沺erMachine 瀹夎鍣ㄨЕ鍙?UAC锛堟甯?Windows 瀹夎 UX锛夈€?
+  - 鎻愮ず闃?naggy锛氬拷鐣ユ寜鐗堟湰璁板繂锛屽悓鐗堟湰蹇界暐鍚庝笉鍐嶅脊锛屾洿鏂扮増鏈墠鍐嶇幇锛涗晶鏍忕豢鐐瑰父椹?+ 鍗＄墖鍙叧銆?
+  - 瀹夊叏锛欰 鏂规鏃犵鍚嶆牎楠岋紝闈?HTTPS锛圙itee TLS锛? 鐢ㄦ埛鏄惧紡纭锛涙湭鏉ラ槻 MITM 鍐嶄笂 B锛坱auri-plugin-updater 绛惧悕鏍￠獙锛夈€?
 
-## 五问重启检查（阶段 41）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 41锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 41 complete（每次登录检查 + 30s 超时 + 左下角提示卡片 + 自动下载安装器+失败回退浏览器；后端 check 超时 30s + download_update 流式带进度 + install_update 分离启动+exit；前端 api 包装 + useUpdateCheck 改每会话 + UpdateNotification 四态机 + App 装配去旧弹窗；tsc/cargo check 双绿），待 dev 手测整条更新链路 |
-| 我要去哪里？ | 用户 `cargo tauri dev` 实测：①登录后自动检查（不再 24h 节流）；②Gitee 发更高版本→左下角卡片「发现新版本 vX.X.X」+绿点；③点「立即更新」→进度条到 100%→「安装并重启」→App 退出、NSIS 安装器(UAC)接管安装；④断网或下载失败→「浏览器下载」打开 release 页 + 「重试」；⑤点✕忽略该版本后不再弹 |
-| 目标是什么？ | 登录即检查、30s 超时、左下角非打扰提示、确认后自动下载安装、失败回退手动 |
-| 我学到了什么？ | Tauri 2.11 把 emit 拆到 `Emitter` trait 需单独 import（报错才知）；reqwest `bytes_stream` + tokio fs 流式下载 + 每 256KB 节流 emit 进度是干净模式；Windows 启动外部安装器要 `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP` 才在父进程 exit 后存活；自动安装选「下载+启动安装器」(A) 而非 plugin-updater(B) 是为契合现有 Gitee release 免签名；用「每会话 autoRanRef」实现「每次登录检查一次」比 localStorage 节流更贴合语义；UI 状态机 prompt/downloading/ready/failed 让下载-安装-失败回退三种路径清晰 |
-| 我做了什么？ | main.rs check 超时 30s+去 tokio wrapper、download_update（reqwest stream+tokio fs+256KB 节流 emit+末尾 100%）install_update（NUL/文件/.exe 校验+creation_flags 分离+app.exit）、Emitter import、两命令注册；api.ts DownloadProgress/downloadUpdate/installUpdate/onUpdateDownloadProgress；useUpdateCheck 去 24h 节流改 autoRanRef 每会话一次；UpdateNotification.tsx 左下角卡片四态机+进度条+按版本忽略；App.tsx 删每版本弹 About effect+渲染 UpdateNotification；tsc+cargo check 双绿；progress+README 同步 |
+| 鎴戝湪鍝噷锛?| 闃舵 41 complete锛堟瘡娆＄櫥褰曟鏌?+ 30s 瓒呮椂 + 宸︿笅瑙掓彁绀哄崱鐗?+ 鑷姩涓嬭浇瀹夎鍣?澶辫触鍥為€€娴忚鍣紱鍚庣 check 瓒呮椂 30s + download_update 娴佸紡甯﹁繘搴?+ install_update 鍒嗙鍚姩+exit锛涘墠绔?api 鍖呰 + useUpdateCheck 鏀规瘡浼氳瘽 + UpdateNotification 鍥涙€佹満 + App 瑁呴厤鍘绘棫寮圭獥锛泃sc/cargo check 鍙岀豢锛夛紝寰?dev 鎵嬫祴鏁存潯鏇存柊閾捐矾 |
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛 `cargo tauri dev` 瀹炴祴锛氣憼鐧诲綍鍚庤嚜鍔ㄦ鏌ワ紙涓嶅啀 24h 鑺傛祦锛夛紱鈶itee 鍙戞洿楂樼増鏈啋宸︿笅瑙掑崱鐗囥€屽彂鐜版柊鐗堟湰 vX.X.X銆?缁跨偣锛涒憿鐐广€岀珛鍗虫洿鏂般€嶁啋杩涘害鏉″埌 100%鈫掋€屽畨瑁呭苟閲嶅惎銆嶁啋App 閫€鍑恒€丯SIS 瀹夎鍣?UAC)鎺ョ瀹夎锛涒懀鏂綉鎴栦笅杞藉け璐モ啋銆屾祻瑙堝櫒涓嬭浇銆嶆墦寮€ release 椤?+ 銆岄噸璇曘€嶏紱鈶ょ偣鉁曞拷鐣ヨ鐗堟湰鍚庝笉鍐嶅脊 |
+| 鐩爣鏄粈涔堬紵 | 鐧诲綍鍗虫鏌ャ€?0s 瓒呮椂銆佸乏涓嬭闈炴墦鎵版彁绀恒€佺‘璁ゅ悗鑷姩涓嬭浇瀹夎銆佸け璐ュ洖閫€鎵嬪姩 |
+| 鎴戝鍒颁簡浠€涔堬紵 | Tauri 2.11 鎶?emit 鎷嗗埌 `Emitter` trait 闇€鍗曠嫭 import锛堟姤閿欐墠鐭ワ級锛況eqwest `bytes_stream` + tokio fs 娴佸紡涓嬭浇 + 姣?256KB 鑺傛祦 emit 杩涘害鏄共鍑€妯″紡锛沇indows 鍚姩澶栭儴瀹夎鍣ㄨ `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP` 鎵嶅湪鐖惰繘绋?exit 鍚庡瓨娲伙紱鑷姩瀹夎閫夈€屼笅杞?鍚姩瀹夎鍣ㄣ€?A) 鑰岄潪 plugin-updater(B) 鏄负濂戝悎鐜版湁 Gitee release 鍏嶇鍚嶏紱鐢ㄣ€屾瘡浼氳瘽 autoRanRef銆嶅疄鐜般€屾瘡娆＄櫥褰曟鏌ヤ竴娆°€嶆瘮 localStorage 鑺傛祦鏇磋创鍚堣涔夛紱UI 鐘舵€佹満 prompt/downloading/ready/failed 璁╀笅杞?瀹夎-澶辫触鍥為€€涓夌璺緞娓呮櫚 |
+| 鎴戝仛浜嗕粈涔堬紵 | main.rs check 瓒呮椂 30s+鍘?tokio wrapper銆乨ownload_update锛坮eqwest stream+tokio fs+256KB 鑺傛祦 emit+鏈熬 100%锛塱nstall_update锛圢UL/鏂囦欢/.exe 鏍￠獙+creation_flags 鍒嗙+app.exit锛夈€丒mitter import銆佷袱鍛戒护娉ㄥ唽锛沘pi.ts DownloadProgress/downloadUpdate/installUpdate/onUpdateDownloadProgress锛泆seUpdateCheck 鍘?24h 鑺傛祦鏀?autoRanRef 姣忎細璇濅竴娆★紱UpdateNotification.tsx 宸︿笅瑙掑崱鐗囧洓鎬佹満+杩涘害鏉?鎸夌増鏈拷鐣ワ紱App.tsx 鍒犳瘡鐗堟湰寮?About effect+娓叉煋 UpdateNotification锛泃sc+cargo check 鍙岀豢锛沺rogress+README 鍚屾 |
 
-### 阶段 42：更新日志注释泄露修复 + 发布暂存缓冲区方案（2026-06-24）
-- **需求：** ①「更新内容」对话框把 CHANGELOG.md 头部 HTML 注释 `<!-- 版本号须与… -->` 当文本显示了，要去掉；②讨论并落地省 token 的更新内容生成方案——每完成一项改动追加到暂存 md，打包时基于暂存总结、不再反推 git diff，打包后清空。
-- **bug 修复：** `AboutDialog.tsx` 渲染 CHANGELOG 前用 `cleanChangelog = changelog.replace(/<!--[\s\S]*?-->/g,"").replace(/\n{3,}/g,"\n\n").trim()` 剥掉所有 HTML 注释（不依赖 react-markdown 对注释的处理行为，最稳）。
-- **发布暂存方案（用户确认三点：纳入 git / 绑 doc-after-feature / git diff 兜底）：**
-  - 新增 `RELEASE_NOTES_STAGING.md`（仓库根，git 跟踪）— terse 缓冲区：`baseline: v1.6.0` + 「待发布条目」（一行一条 `- <emoji> <一句话>`）。
-  - CLAUDE.md `doc-after-feature` 规则扩展：每完成改动，写 progress.md 阶段日志的**同时**追加一行到 staging。
-  - CLAUDE.md `打包` 流程改写：版本号由 staging 条目类型定（有 ✨→minor，纯修复→patch）；更新内容以 staging 为**主**、`git diff --stat baseline..HEAD` 仅作完整性校验防漏；发布后清空 staging 待发布条目并更新 baseline。
-  - 记忆 `release-notes-staging.md` + MEMORY.md 索引同步。
-- **决策要点：** 「保证每次问答都记录」无法机械强制（需 LLM 判断记不记/怎么概括），靠行为规则——绑已有 doc-after-feature 触发点搭车，可靠性最高；staging 只记会话内改动，故保留 git diff 兜底防漏。
-- **验证：** `npx tsc --noEmit` PASS。staging 已种入本次 bug 修复条目，待下次打包（v1.6.1 patch）。
+### 闃舵 42锛氭洿鏂版棩蹇楁敞閲婃硠闇蹭慨澶?+ 鍙戝竷鏆傚瓨缂撳啿鍖烘柟妗堬紙2026-06-24锛?
+- **闇€姹傦細** 鈶犮€屾洿鏂板唴瀹广€嶅璇濇鎶?CHANGELOG.md 澶撮儴 HTML 娉ㄩ噴 `<!-- 鐗堟湰鍙烽』涓庘€?-->` 褰撴枃鏈樉绀轰簡锛岃鍘绘帀锛涒憽璁ㄨ骞惰惤鍦扮渷 token 鐨勬洿鏂板唴瀹圭敓鎴愭柟妗堚€斺€旀瘡瀹屾垚涓€椤规敼鍔ㄨ拷鍔犲埌鏆傚瓨 md锛屾墦鍖呮椂鍩轰簬鏆傚瓨鎬荤粨銆佷笉鍐嶅弽鎺?git diff锛屾墦鍖呭悗娓呯┖銆?
+- **bug 淇锛?* `AboutDialog.tsx` 娓叉煋 CHANGELOG 鍓嶇敤 `cleanChangelog = changelog.replace(/<!--[\s\S]*?-->/g,"").replace(/\n{3,}/g,"\n\n").trim()` 鍓ユ帀鎵€鏈?HTML 娉ㄩ噴锛堜笉渚濊禆 react-markdown 瀵规敞閲婄殑澶勭悊琛屼负锛屾渶绋筹級銆?
+- **鍙戝竷鏆傚瓨鏂规锛堢敤鎴风‘璁や笁鐐癸細绾冲叆 git / 缁?doc-after-feature / git diff 鍏滃簳锛夛細**
+  - 鏂板 `RELEASE_NOTES_STAGING.md`锛堜粨搴撴牴锛実it 璺熻釜锛夆€?terse 缂撳啿鍖猴細`baseline: v1.6.0` + 銆屽緟鍙戝竷鏉＄洰銆嶏紙涓€琛屼竴鏉?`- <emoji> <涓€鍙ヨ瘽>`锛夈€?
+  - CLAUDE.md `doc-after-feature` 瑙勫垯鎵╁睍锛氭瘡瀹屾垚鏀瑰姩锛屽啓 progress.md 闃舵鏃ュ織鐨?*鍚屾椂**杩藉姞涓€琛屽埌 staging銆?
+  - CLAUDE.md `鎵撳寘` 娴佺▼鏀瑰啓锛氱増鏈彿鐢?staging 鏉＄洰绫诲瀷瀹氾紙鏈?鉁ㄢ啋minor锛岀函淇鈫抪atch锛夛紱鏇存柊鍐呭浠?staging 涓?*涓?*銆乣git diff --stat baseline..HEAD` 浠呬綔瀹屾暣鎬ф牎楠岄槻婕忥紱鍙戝竷鍚庢竻绌?staging 寰呭彂甯冩潯鐩苟鏇存柊 baseline銆?
+  - 璁板繂 `release-notes-staging.md` + MEMORY.md 绱㈠紩鍚屾銆?
+- **鍐崇瓥瑕佺偣锛?* 銆屼繚璇佹瘡娆￠棶绛旈兘璁板綍銆嶆棤娉曟満姊板己鍒讹紙闇€ LLM 鍒ゆ柇璁颁笉璁?鎬庝箞姒傛嫭锛夛紝闈犺涓鸿鍒欌€斺€旂粦宸叉湁 doc-after-feature 瑙﹀彂鐐规惌杞︼紝鍙潬鎬ф渶楂橈紱staging 鍙浼氳瘽鍐呮敼鍔紝鏁呬繚鐣?git diff 鍏滃簳闃叉紡銆?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS銆俿taging 宸茬鍏ユ湰娆?bug 淇鏉＄洰锛屽緟涓嬫鎵撳寘锛坴1.6.1 patch锛夈€?
 
-## 五问重启检查（阶段 42）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 42锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 42 complete（CHANGELOG 注释泄露修复 + 发布暂存方案落地：RELEASE_NOTES_STAGING.md + CLAUDE.md 规则 + 记忆；tsc 绿），staging 已种 bug 修复条目，待打包 |
-| 我要去哪里？ | 下次 `打包` → 读 staging 直接生成 v1.6.1 changelog（不再反推 diff）+ git diff 防漏 + 发布后清空 staging |
-| 目标是什么？ | 更新内容对话框不泄露 HTML 注释；省 token、更准、可复现的 changelog 生成流程 |
-| 我学到了什么？ | react-markdown 对 HTML 注释的处理不可靠，渲染前正则剥 `<!-- -->` 最稳；「每次问答记录」是行为规则非机械强制，绑已有稳定规则（doc-after-feature）搭车最可靠；staging 为主 + git diff 兜底是"准确描述"与"不漏"的互补组合；用户要的是 token 效率+准确性，事后反推 diff 既贵又易失真 |
-| 我做了什么？ | AboutDialog cleanChangelog 剥注释；RELEASE_NOTES_STAGING.md（baseline v1.6.0 + bug 修复种子条目）；CLAUDE.md doc-after-feature 加追加 staging + 打包流程改写（staging 为主/diff 防漏/版本号按类型/发布后清空+更新 baseline）；记忆 release-notes-staging + MEMORY 索引；progress 阶段42；tsc 绿 |
+| 鎴戝湪鍝噷锛?| 闃舵 42 complete锛圕HANGELOG 娉ㄩ噴娉勯湶淇 + 鍙戝竷鏆傚瓨鏂规钀藉湴锛歊ELEASE_NOTES_STAGING.md + CLAUDE.md 瑙勫垯 + 璁板繂锛泃sc 缁匡級锛宻taging 宸茬 bug 淇鏉＄洰锛屽緟鎵撳寘 |
+| 鎴戣鍘诲摢閲岋紵 | 涓嬫 `鎵撳寘` 鈫?璇?staging 鐩存帴鐢熸垚 v1.6.1 changelog锛堜笉鍐嶅弽鎺?diff锛? git diff 闃叉紡 + 鍙戝竷鍚庢竻绌?staging |
+| 鐩爣鏄粈涔堬紵 | 鏇存柊鍐呭瀵硅瘽妗嗕笉娉勯湶 HTML 娉ㄩ噴锛涚渷 token銆佹洿鍑嗐€佸彲澶嶇幇鐨?changelog 鐢熸垚娴佺▼ |
+| 鎴戝鍒颁簡浠€涔堬紵 | react-markdown 瀵?HTML 娉ㄩ噴鐨勫鐞嗕笉鍙潬锛屾覆鏌撳墠姝ｅ垯鍓?`<!-- -->` 鏈€绋筹紱銆屾瘡娆￠棶绛旇褰曘€嶆槸琛屼负瑙勫垯闈炴満姊板己鍒讹紝缁戝凡鏈夌ǔ瀹氳鍒欙紙doc-after-feature锛夋惌杞︽渶鍙潬锛泂taging 涓轰富 + git diff 鍏滃簳鏄?鍑嗙‘鎻忚堪"涓?涓嶆紡"鐨勪簰琛ョ粍鍚堬紱鐢ㄦ埛瑕佺殑鏄?token 鏁堢巼+鍑嗙‘鎬э紝浜嬪悗鍙嶆帹 diff 鏃㈣吹鍙堟槗澶辩湡 |
+| 鎴戝仛浜嗕粈涔堬紵 | AboutDialog cleanChangelog 鍓ユ敞閲婏紱RELEASE_NOTES_STAGING.md锛坆aseline v1.6.0 + bug 淇绉嶅瓙鏉＄洰锛夛紱CLAUDE.md doc-after-feature 鍔犺拷鍔?staging + 鎵撳寘娴佺▼鏀瑰啓锛坰taging 涓轰富/diff 闃叉紡/鐗堟湰鍙锋寜绫诲瀷/鍙戝竷鍚庢竻绌?鏇存柊 baseline锛夛紱璁板繂 release-notes-staging + MEMORY 绱㈠紩锛沺rogress 闃舵42锛泃sc 缁?|
 
-### 阶段 43：发布 v1.6.2 —— 更新流程打磨 + 安装稳定性（2026-06-24）
-- **需求：** `打包` v1.6.2。本次内容全部为更新功能本身的体验打磨与稳定性修复（来自 staging 5 条）。
-- **发布内容（staging 主导 + git diff 防漏，5 条全映射，无遗漏）：**
-  - 🛠️ 更新弹窗简化为单层卡片（去双层玻璃外壳），按钮「忽略」/「更新」；AboutDialog「去下载」→「更新」（自动下载安装，失败回退浏览器）。
-  - 🐛 「安装并重启」os error 740（请求的操作需要提升）—— 非管理员用户点更新报错；改用 `ShellExecuteW` + `runas` 触发 UAC 提权（main.rs）。
-  - 🐛 更新弹窗版本号显示 `vv1.6.1`（tag 已含 v 前缀时重复添加）。
-  - 🐛 进度条点击更新时先跳中间再从 0 开始（`pct` 为 null 时初始宽度 30% → 0%）。
-- **版本号：** staging 全是 🐛/🛠️ 无 ✨ → patch：v1.6.1 → **v1.6.2**。
-- **流程执行：** 用户确认闸门通过后 —— `tsc` PASS / `cargo check` PASS / `tauri:build` 成功（installer `MyShell_1.6.2_x64-setup.exe` 5.99MB）/ commit `release: v1.6.2` + push / Gitee release id=724075 创建 + 资产上传成功 / staging 清空 + baseline→v1.6.2。
-- **决策要点：** staging 流程首次完整跑通（v1.6.1 是落地方案时种的种子）；`git diff --stat 37a3dba..HEAD` 显示 5 文件改动，逐一核对均被 staging 覆盖（含 App.tsx 删 1 行 onOpenAbout 属弹窗简化、main.rs 属 740 修复），无需补条目。
-- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS；`tauri:build` exit 0；发布 URL：https://gitee.com/argustang/myshell/releases/tag/v1.6.2
+### 闃舵 43锛氬彂甯?v1.6.2 鈥斺€?鏇存柊娴佺▼鎵撶（ + 瀹夎绋冲畾鎬э紙2026-06-24锛?
+- **闇€姹傦細** `鎵撳寘` v1.6.2銆傛湰娆″唴瀹瑰叏閮ㄤ负鏇存柊鍔熻兘鏈韩鐨勪綋楠屾墦纾ㄤ笌绋冲畾鎬т慨澶嶏紙鏉ヨ嚜 staging 5 鏉★級銆?
+- **鍙戝竷鍐呭锛坰taging 涓诲 + git diff 闃叉紡锛? 鏉″叏鏄犲皠锛屾棤閬楁紡锛夛細**
+  - 馃洜锔?鏇存柊寮圭獥绠€鍖栦负鍗曞眰鍗＄墖锛堝幓鍙屽眰鐜荤拑澶栧３锛夛紝鎸夐挳銆屽拷鐣ャ€?銆屾洿鏂般€嶏紱AboutDialog銆屽幓涓嬭浇銆嶁啋銆屾洿鏂般€嶏紙鑷姩涓嬭浇瀹夎锛屽け璐ュ洖閫€娴忚鍣級銆?
+  - 馃悰 銆屽畨瑁呭苟閲嶅惎銆峯s error 740锛堣姹傜殑鎿嶄綔闇€瑕佹彁鍗囷級鈥斺€?闈炵鐞嗗憳鐢ㄦ埛鐐规洿鏂版姤閿欙紱鏀圭敤 `ShellExecuteW` + `runas` 瑙﹀彂 UAC 鎻愭潈锛坢ain.rs锛夈€?
+  - 馃悰 鏇存柊寮圭獥鐗堟湰鍙锋樉绀?`vv1.6.1`锛坱ag 宸插惈 v 鍓嶇紑鏃堕噸澶嶆坊鍔狅級銆?
+  - 馃悰 杩涘害鏉＄偣鍑绘洿鏂版椂鍏堣烦涓棿鍐嶄粠 0 寮€濮嬶紙`pct` 涓?null 鏃跺垵濮嬪搴?30% 鈫?0%锛夈€?
+- **鐗堟湰鍙凤細** staging 鍏ㄦ槸 馃悰/馃洜锔?鏃?鉁?鈫?patch锛歷1.6.1 鈫?**v1.6.2**銆?
+- **娴佺▼鎵ц锛?* 鐢ㄦ埛纭闂搁棬閫氳繃鍚?鈥斺€?`tsc` PASS / `cargo check` PASS / `tauri:build` 鎴愬姛锛坕nstaller `MyShell_1.6.2_x64-setup.exe` 5.99MB锛? commit `release: v1.6.2` + push / Gitee release id=724075 鍒涘缓 + 璧勪骇涓婁紶鎴愬姛 / staging 娓呯┖ + baseline鈫抳1.6.2銆?
+- **鍐崇瓥瑕佺偣锛?* staging 娴佺▼棣栨瀹屾暣璺戦€氾紙v1.6.1 鏄惤鍦版柟妗堟椂绉嶇殑绉嶅瓙锛夛紱`git diff --stat 37a3dba..HEAD` 鏄剧ず 5 鏂囦欢鏀瑰姩锛岄€愪竴鏍稿鍧囪 staging 瑕嗙洊锛堝惈 App.tsx 鍒?1 琛?onOpenAbout 灞炲脊绐楃畝鍖栥€乵ain.rs 灞?740 淇锛夛紝鏃犻渶琛ユ潯鐩€?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛沗cargo check` PASS锛沗tauri:build` exit 0锛涘彂甯?URL锛歨ttps://gitee.com/argustang/myshell/releases/tag/v1.6.2
 
-## 五问重启检查（阶段 43）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 43锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 43 complete —— v1.6.2 已发布到 Gitee（installer 上传成功），staging 已清空、baseline→v1.6.2，release: v1.6.2 + 清空 staging 两个 commit 均已 push 到 main |
-| 我要去哪里？ | 下一项改动完成时按 doc-after-feature 追加 staging 条目；下次 `打包` 再走同流程（读 staging→定版本号→changelog→确认闸门→构建发布） |
-| 目标是什么？ | 让用户更新体验顺滑（弹窗不花哨、版本号正确、进度条不跳、非管理员也能一键升级） |
-| 我学到了什么？ | staging 驱动的发布流程首次端到端跑通，5 条种子全部准确映射、无补条需求；临时发布说明 `.release-notes-v1.6.2.md` 用完即弃（.gitignore 不在，但本地文件未提交、后续可删）；`git diff --stat baseline..HEAD` 作为兜底确实只起防漏校验、这次零补条 |
-| 我做了什么？ | 版本 bump 1.6.2 + sync；CHANGELOG/README 加 v1.6.2 节 + badge；tsc+cargo check+tauri:build；commit+push release: v1.6.2；Gitee 发布（id=724075，installer 上传）；staging 清空 + baseline→v1.6.2 commit+push；progress 阶段43 |
+| 鎴戝湪鍝噷锛?| 闃舵 43 complete 鈥斺€?v1.6.2 宸插彂甯冨埌 Gitee锛坕nstaller 涓婁紶鎴愬姛锛夛紝staging 宸叉竻绌恒€乥aseline鈫抳1.6.2锛宺elease: v1.6.2 + 娓呯┖ staging 涓や釜 commit 鍧囧凡 push 鍒?main |
+| 鎴戣鍘诲摢閲岋紵 | 涓嬩竴椤规敼鍔ㄥ畬鎴愭椂鎸?doc-after-feature 杩藉姞 staging 鏉＄洰锛涗笅娆?`鎵撳寘` 鍐嶈蛋鍚屾祦绋嬶紙璇?staging鈫掑畾鐗堟湰鍙封啋changelog鈫掔‘璁ら椄闂ㄢ啋鏋勫缓鍙戝竷锛?|
+| 鐩爣鏄粈涔堬紵 | 璁╃敤鎴锋洿鏂颁綋楠岄『婊戯紙寮圭獥涓嶈姳鍝ㄣ€佺増鏈彿姝ｇ‘銆佽繘搴︽潯涓嶈烦銆侀潪绠＄悊鍛樹篃鑳戒竴閿崌绾э級 |
+| 鎴戝鍒颁簡浠€涔堬紵 | staging 椹卞姩鐨勫彂甯冩祦绋嬮娆＄鍒扮璺戦€氾紝5 鏉＄瀛愬叏閮ㄥ噯纭槧灏勩€佹棤琛ユ潯闇€姹傦紱涓存椂鍙戝竷璇存槑 `.release-notes-v1.6.2.md` 鐢ㄥ畬鍗冲純锛?gitignore 涓嶅湪锛屼絾鏈湴鏂囦欢鏈彁浜ゃ€佸悗缁彲鍒狅級锛沗git diff --stat baseline..HEAD` 浣滀负鍏滃簳纭疄鍙捣闃叉紡鏍￠獙銆佽繖娆￠浂琛ユ潯 |
+| 鎴戝仛浜嗕粈涔堬紵 | 鐗堟湰 bump 1.6.2 + sync锛汣HANGELOG/README 鍔?v1.6.2 鑺?+ badge锛泃sc+cargo check+tauri:build锛沜ommit+push release: v1.6.2锛汫itee 鍙戝竷锛坕d=724075锛宨nstaller 涓婁紶锛夛紱staging 娓呯┖ + baseline鈫抳1.6.2 commit+push锛沺rogress 闃舵43 |
 
-### 阶段 44：发布 v1.6.3 —— 表单必填校验 + AI 交互细节（2026-06-25）
-- **需求：** `打包` v1.6.3。本次内容为表单必填校验体系与 AI 面板交互细节优化（来自 staging 6 条）。
-- **发布内容（staging 主导 + git diff 防漏，6 条全映射，无遗漏）：**
-  - 🛠️ AI 面板终端输出截断：自动附带的终端输出限制 5000 字符，超长时显示截断提示（AiPanel.tsx `capRecentOutput`）。
-  - 🛠️ AI 面板引用内容折叠：用户引用内容默认单行，双击展开完整内容（MessageBubble 双击切换）。
-  - 🛠️ 新建连接必填校验：保存时标红必填字段、自动聚焦首个未填项并抖动（ConnectionDialog validate() + fieldErrors + shakeNonce）。
-  - 🛠️ 连接名称自动填充优化：手动修改名称后不再被主机输入覆盖（handleHostChange 基于 prevHost 判断）。
-  - 🛠️ 快捷命令必填标注：名称和命令字段标红星号，未填写时禁用保存（QuickCommandsPanel field-error）。
-  - 🛠️ 自定义主题色校验：HEX 格式校验，非法输入时禁用保存（SettingsPanel isValidHex + canSave）。
-- **版本号：** staging 全是 🛠️ 无 ✨ → patch：v1.6.2 → **v1.6.3**。
-- **流程执行：** 用户确认闸门通过后 —— `tsc` PASS / `cargo check` PASS / `tauri:build` 成功（installer `MyShell_1.6.3_x64-setup.exe`）/ commit + push / Gitee 发布 / staging 清空 + baseline→v1.6.3。
-- **决策要点：** 5 个文件改动（AiPanel/ConnectionDialog/QuickCommandsPanel/SettingsPanel/global.css），逐一核对均被 staging 覆盖，无需补条目。
-- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS；`tauri:build` exit 0；发布 URL：https://gitee.com/argustang/myshell/releases/tag/v1.6.3
+### 闃舵 44锛氬彂甯?v1.6.3 鈥斺€?琛ㄥ崟蹇呭～鏍￠獙 + AI 浜や簰缁嗚妭锛?026-06-25锛?
+- **闇€姹傦細** `鎵撳寘` v1.6.3銆傛湰娆″唴瀹逛负琛ㄥ崟蹇呭～鏍￠獙浣撶郴涓?AI 闈㈡澘浜や簰缁嗚妭浼樺寲锛堟潵鑷?staging 6 鏉★級銆?
+- **鍙戝竷鍐呭锛坰taging 涓诲 + git diff 闃叉紡锛? 鏉″叏鏄犲皠锛屾棤閬楁紡锛夛細**
+  - 馃洜锔?AI 闈㈡澘缁堢杈撳嚭鎴柇锛氳嚜鍔ㄩ檮甯︾殑缁堢杈撳嚭闄愬埗 5000 瀛楃锛岃秴闀挎椂鏄剧ず鎴柇鎻愮ず锛圓iPanel.tsx `capRecentOutput`锛夈€?
+  - 馃洜锔?AI 闈㈡澘寮曠敤鍐呭鎶樺彔锛氱敤鎴峰紩鐢ㄥ唴瀹归粯璁ゅ崟琛岋紝鍙屽嚮灞曞紑瀹屾暣鍐呭锛圡essageBubble 鍙屽嚮鍒囨崲锛夈€?
+  - 馃洜锔?鏂板缓杩炴帴蹇呭～鏍￠獙锛氫繚瀛樻椂鏍囩孩蹇呭～瀛楁銆佽嚜鍔ㄨ仛鐒﹂涓湭濉」骞舵姈鍔紙ConnectionDialog validate() + fieldErrors + shakeNonce锛夈€?
+  - 馃洜锔?杩炴帴鍚嶇О鑷姩濉厖浼樺寲锛氭墜鍔ㄤ慨鏀瑰悕绉板悗涓嶅啀琚富鏈鸿緭鍏ヨ鐩栵紙handleHostChange 鍩轰簬 prevHost 鍒ゆ柇锛夈€?
+  - 馃洜锔?蹇嵎鍛戒护蹇呭～鏍囨敞锛氬悕绉板拰鍛戒护瀛楁鏍囩孩鏄熷彿锛屾湭濉啓鏃剁鐢ㄤ繚瀛橈紙QuickCommandsPanel field-error锛夈€?
+  - 馃洜锔?鑷畾涔変富棰樿壊鏍￠獙锛欻EX 鏍煎紡鏍￠獙锛岄潪娉曡緭鍏ユ椂绂佺敤淇濆瓨锛圫ettingsPanel isValidHex + canSave锛夈€?
+- **鐗堟湰鍙凤細** staging 鍏ㄦ槸 馃洜锔?鏃?鉁?鈫?patch锛歷1.6.2 鈫?**v1.6.3**銆?
+- **娴佺▼鎵ц锛?* 鐢ㄦ埛纭闂搁棬閫氳繃鍚?鈥斺€?`tsc` PASS / `cargo check` PASS / `tauri:build` 鎴愬姛锛坕nstaller `MyShell_1.6.3_x64-setup.exe`锛? commit + push / Gitee 鍙戝竷 / staging 娓呯┖ + baseline鈫抳1.6.3銆?
+- **鍐崇瓥瑕佺偣锛?* 5 涓枃浠舵敼鍔紙AiPanel/ConnectionDialog/QuickCommandsPanel/SettingsPanel/global.css锛夛紝閫愪竴鏍稿鍧囪 staging 瑕嗙洊锛屾棤闇€琛ユ潯鐩€?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛沗cargo check` PASS锛沗tauri:build` exit 0锛涘彂甯?URL锛歨ttps://gitee.com/argustang/myshell/releases/tag/v1.6.3
 
-## 五问重启检查（阶段 44）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 44锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 44 complete —— v1.6.3 已发布，staging 已清空、baseline→v1.6.3 |
-| 我要去哪里？ | 下一项改动完成时按 doc-after-feature 追加 staging 条目 |
-| 目标是什么？ | 表单交互体验一致化：必填字段有视觉反馈、AI 上下文不溢出 |
-| 我学到了什么？ | ConnectionDialog 的 validate() 改为全量校验（不 short-circuit），配合 fieldErrors + shakeNonce 实现多字段同时标红 + 抖动；连接名称自动填充的「骑手检测」（name === prevHost）比原来的 touchedRef 更精准 |
-| 我做了什么？ | 版本 bump 1.6.3 + sync；CHANGELOG/README 加 v1.6.3 节 + badge；tsc+cargo check+tauri:build；commit+push；Gitee 发布；staging 清空 + baseline→v1.6.3；progress 阶段44 |
-
-### 阶段 45：发布 v1.7.0 —— 侧栏交互增强 + 会话管理面板 + 广播级联重连（2026-06-25）
-- **需求：** `打包` v1.7.0。本次内容为侧栏拖拽调宽、会话/广播下拉面板、广播级联重连、AI 选区折叠等新功能，以及广播去重确认、连接校验增强、多项 bug 修复。
-- **发布内容（staging 主导 + git diff 防漏，11 条全映射，无遗漏）：**
-  - ✨ 侧栏拖拽调宽：连接管理面板支持拖拽调整宽度（宽度持久化），鼠标悬停连接名可查看全称及主机地址（Sidebar drag handle + localStorage + Tooltip）。
-  - ✨ 会话管理面板：新增「当前会话」与「广播」下拉面板，可查看全部标签页全称、快速切换与关闭，支持一键清理所有掉线会话（SessionDropdownPanel + TabBar）。
-  - ✨ 广播级联重连：点击重连一个掉线会话，同广播组其他掉线会话自动一起重连（App.tsx cascadeReconnect）。
-  - ✨ AI 选区预览折叠：AI 助手选区预览默认单行展示，双击展开完整内容（AiPanel MessageBubble）。
-  - 🛠️ 广播重复加入确认：同连接重复加入广播组时弹出确认对话框，支持「本次会话不再提醒」（BroadcastDupDialog + sessionStorage）。
-  - 🛠️ 连接对话框校验增强：必填项标注红色星号，校验不通过时字段红框抖动并精确提示缺失项（ConnectionDialog）。
-  - 🛠️ 主题色与快捷命令校验：自定义主题颜色输入增加 hex 格式校验，快捷命令必填项标注星号。
-  - 🐛 广播组重连脱组：修复广播组成员重连后因 sessionId 变更而脱组的问题。
-  - 🐛 连接名称同步中断：修复连接名称跟随主机地址输入时首个字符后停止同步的问题。
-  - 🐛 AI 上下文溢出：AI 助手自动附带的最近输出内容限制为 5K 字符，选区内容不受限。
-- **版本号：** staging 含 ✨新增 → minor：v1.6.3 → **v1.7.0**。
-- **流程执行：** 用户确认闸门通过后 —— `tsc` PASS / `cargo check` PASS / `tauri:build` 成功（installer `MyShell_1.7.0_x64-setup.exe`）/ commit + push / Gitee 发布 / staging 清空 + baseline→v1.7.0。
-- **决策要点：** 用户只要 CHANGELOG 放 ✨新增 4 条，🛠️/🐛 条目记录在 progress 但不写入 CHANGELOG。
-- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS；`tauri:build` exit 0
-
-## 五问重启检查（阶段 45）
-| 问题 | 答案 |
-|------|------|
-| 我在哪里？ | 阶段 45 complete —— v1.7.0 已发布，staging 已清空、baseline→v1.7.0 |
-| 我要去哪里？ | 下一项改动完成时按 doc-after-feature 追加 staging 条目 |
-| 目标是什么？ | 侧栏可调宽、会话面板统一管理、广播级联重连减少手动操作 |
-| 我学到了什么？ | BroadcastDupDialog 用 sessionStorage 记忆"本次不再提醒"偏好（重启重置）；SessionDropdownPanel 统一管理当前会话和广播组；广播级联重连通过 groupId 过滤同组掉线会话 |
-| 我做了什么？ | 版本 bump 1.7.0 + sync；CHANGELOG/README 加 v1.7.0 节 + badge；tsc+cargo check+tauri:build；commit+push；Gitee 发布；staging 清空 + baseline→v1.7.0；progress 阶段45 |
-
-
-### 闃舵 46锛氬彂甯?v1.9.0 鈥斺€?缁堢娓叉煋鍋ュ．鎬?+ 鍏ㄩ摼璺棩蹇楃洃鎺э紙2026-06-29锛?- **闇€姹傦細** 鎺ヨ繛涓や釜鏀瑰姩鏀跺熬鍙戝竷銆傗憼淇閮ㄥ垎鐢ㄦ埛缁堢鍏夋爣/閫夊尯涓嶅彲瑙侊紙xterm 娓叉煋鍣ㄥ眰闂锛夛紱鈶″悗鍙版棩蹇楃洃鎺у寮猴紝渚夸簬寮傚父璇婃柇銆傞檮甯︽妸璁剧疆闈㈡澘閲嶆瀯涓哄垎绫诲鑸€?- **鍙戝竷鍐呭锛坰taging 涓绘簮锛夛細**
-  - 鉁ㄦ柊澧?璁剧疆闈㈡澘宸﹀彸鍒嗘爮瀵艰埅锛堝瑙?AI/瀹夊叏/鏁版嵁绠＄悊/蹇嵎鍛戒护锛?  - 鉁ㄦ柊澧?缁堢娓叉煋鍚庣鍙€夛紙鑷姩/Canvas/WebGL/DOM锛?  - 鉁ㄦ柊澧?鍏ㄥ眬鏃ュ織鐩戞帶锛堝墠绔穿婧?鏈崟鑾峰紓甯歌浆鍙戝埌鍚庡彴鏃ュ織锛?  - 馃洜锔忎紭鍖?缁堢榛樿鏀圭敤 Canvas 娓叉煋鍣?+ 鏉″舰鍏夋爣锛坈ursorStyle:bar锛夛紝鍏夋爣绋冲畾鍙涓斾繚鐣欓棯鐑?  - 馃洜锔忎紭鍖?鍚庣鍏抽敭璺緞琛ュ叏鏃ュ織锛圫SH/SFTP/鏈湴缁堢/鏁版嵁搴?澶囦唤/AI/浠ｇ悊锛?  - 馃洜锔忎紭鍖?璁剧疆鏂板銆岀鐢?GPU 纭欢鍔犻€熴€嶅紑鍏筹紙閲嶅惎鐢熸晥锛孏PU 鍚堟垚寮傚父鍏滃簳锛?  - 馃悰淇 forceVisibleCursor 娉ㄩ噴澹版槑 cursorStyle:bar 浣嗕唬鐮佷粠鏈缃殑閬楃暀缂洪櫡
-- **鐗堟湰鍙凤細** staging 鍚?鉁ㄦ柊澧?鈫?minor锛歷1.8.0 鈫?**v1.9.0**
-- **娴佺▼鎵ц锛?* 瀹屾暣鎬ф牳鏌ワ紙18 鏂囦欢鍚?2 鏂版枃浠讹紝鍏ㄥ湪宸ヤ綔鍖烘湭鎻愪氦锛屽崟鐙?git status 妫€鏌ワ級鈫?鐢ㄦ埛纭闂ㄩ€氳繃 鈫?tsc PASS / cargo check PASS / tauri:build exit 0锛圡yShell_1.9.0_x64-setup.exe锛夆啋 commit+push锛坮elease: v1.9.0, 21 鏂囦欢 +1064/-133锛夆啋 Gitee 鍙戝竷 release id=728056 鈫?staging 娓呯┖ + baseline鈫抳1.9.0
-- **鍐崇瓥瑕佺偣锛?* 鈶犲厜鏍囬棶棰樻牴鍥犲湪 xterm.js 娓叉煋鍣ㄥ眰锛圵ebGL 鍏夋爣鍙犲姞灞傚悎鎴愬け璐ャ€丏OM 娓叉煋鍣?focus 渚濊禆锛夛紝闈?WebView/Electron 涔嬮€夛紝鍥犳涓嶈縼绉?Electron锛汣anvas 娓叉煋鍣ㄦ妸鍏夋爣鐩存帴鐢诲湪鐢诲竷涓婃渶绋冲仴銆傗憽GPU 寮€鍏崇敤 Rust 鏍囧織鏂囦欢锛堥潪 localStorage锛夛紝鍥犻渶鍦?WebView2 鍒涘缓鍓嶈銆傗憿鍓嶇閿欒杞彂鍒板悓涓€浠芥棩蹇楁枃浠讹紝鍓嶅悗绔椂闂寸嚎鍙榻愩€?- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛沗cargo check` PASS锛沗tauri:build` exit 0锛涘彂甯?URL锛歨ttps://gitee.com/argustang/myshell/releases/tag/v1.9.0
-
-## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 46锛?| 闂 | 绛旀 |
-|------|------|
-| 鎴戝湪鍝噷锛?| 闃舵 46 complete 鈥斺€?v1.9.0 宸插彂甯冿紝staging 宸叉竻绌恒€乥aseline鈫抳1.9.0 |
+| 鎴戝湪鍝噷锛?| 闃舵 44 complete 鈥斺€?v1.6.3 宸插彂甯冿紝staging 宸叉竻绌恒€乥aseline鈫抳1.6.3 |
 | 鎴戣鍘诲摢閲岋紵 | 涓嬩竴椤规敼鍔ㄥ畬鎴愭椂鎸?doc-after-feature 杩藉姞 staging 鏉＄洰 |
-| 鐩爣鏄粈涔堬紵 | 缁堢鍏夋爣/閫夊尯鍙鎬ф牴鍥犱慨澶?+ 寮傚父鍙瘖鏂紙鏃ュ織鍏ㄩ摼璺鐩栵級 |
-| 鎴戝鍒颁簡浠€涔堬紵 | xterm 娓叉煋鍣ㄩ€夋嫨鏄厜鏍囬棶棰樼殑鏍稿績锛岄潪 webview 鏂规锛汫PU 绂佺敤椤诲湪 webview 鍒涘缓鍓嶈鐜鍙橀噺锛涘墠绔敊璇浆鍙戝埌 Rust 鏃ュ織鏄瘖鏂墠绔紓甯哥殑鏈夋晥鎵嬫 |
-| 鎴戝仛浜嗕粈涔堬紵 | 鐗堟湰 bump 1.9.0+sync锛汣HANGELOG/README 鍔?v1.9.0 鑺傦紱Canvas 娓叉煋鍣?cursorStyle 淇+娓叉煋鍣?GPU 寮€鍏筹紱Rust 7 妯″潡+鍓嶇鍏ㄥ眬鏃ュ織锛泃sc+cargo+tauri:build锛沜ommit+push锛汫itee 鍙戝竷锛泂taging 娓呯┖锛沵emory 鍚屾 CLAUDE.md 缁忛獙锛沺rogress 闃舵46 |
+| 鐩爣鏄粈涔堬紵 | 琛ㄥ崟浜や簰浣撻獙涓€鑷村寲锛氬繀濉瓧娈垫湁瑙嗚鍙嶉銆丄I 涓婁笅鏂囦笉婧㈠嚭 |
+| 鎴戝鍒颁簡浠€涔堬紵 | ConnectionDialog 鐨?validate() 鏀逛负鍏ㄩ噺鏍￠獙锛堜笉 short-circuit锛夛紝閰嶅悎 fieldErrors + shakeNonce 瀹炵幇澶氬瓧娈靛悓鏃舵爣绾?+ 鎶栧姩锛涜繛鎺ュ悕绉拌嚜鍔ㄥ～鍏呯殑銆岄獞鎵嬫娴嬨€嶏紙name === prevHost锛夋瘮鍘熸潵鐨?touchedRef 鏇寸簿鍑?|
+| 鎴戝仛浜嗕粈涔堬紵 | 鐗堟湰 bump 1.6.3 + sync锛汣HANGELOG/README 鍔?v1.6.3 鑺?+ badge锛泃sc+cargo check+tauri:build锛沜ommit+push锛汫itee 鍙戝竷锛泂taging 娓呯┖ + baseline鈫抳1.6.3锛沺rogress 闃舵44 |
 
+### 闃舵 45锛氬彂甯?v1.7.0 鈥斺€?渚ф爮浜や簰澧炲己 + 浼氳瘽绠＄悊闈㈡澘 + 骞挎挱绾ц仈閲嶈繛锛?026-06-25锛?
+- **闇€姹傦細** `鎵撳寘` v1.7.0銆傛湰娆″唴瀹逛负渚ф爮鎷栨嫿璋冨銆佷細璇?骞挎挱涓嬫媺闈㈡澘銆佸箍鎾骇鑱旈噸杩炪€丄I 閫夊尯鎶樺彔绛夋柊鍔熻兘锛屼互鍙婂箍鎾幓閲嶇‘璁ゃ€佽繛鎺ユ牎楠屽寮恒€佸椤?bug 淇銆?
+- **鍙戝竷鍐呭锛坰taging 涓诲 + git diff 闃叉紡锛?1 鏉″叏鏄犲皠锛屾棤閬楁紡锛夛細**
+  - 鉁?渚ф爮鎷栨嫿璋冨锛氳繛鎺ョ鐞嗛潰鏉挎敮鎸佹嫋鎷借皟鏁村搴︼紙瀹藉害鎸佷箙鍖栵級锛岄紶鏍囨偓鍋滆繛鎺ュ悕鍙煡鐪嬪叏绉板強涓绘満鍦板潃锛圫idebar drag handle + localStorage + Tooltip锛夈€?
+  - 鉁?浼氳瘽绠＄悊闈㈡澘锛氭柊澧炪€屽綋鍓嶄細璇濄€嶄笌銆屽箍鎾€嶄笅鎷夐潰鏉匡紝鍙煡鐪嬪叏閮ㄦ爣绛鹃〉鍏ㄧО銆佸揩閫熷垏鎹笌鍏抽棴锛屾敮鎸佷竴閿竻鐞嗘墍鏈夋帀绾夸細璇濓紙SessionDropdownPanel + TabBar锛夈€?
+  - 鉁?骞挎挱绾ц仈閲嶈繛锛氱偣鍑婚噸杩炰竴涓帀绾夸細璇濓紝鍚屽箍鎾粍鍏朵粬鎺夌嚎浼氳瘽鑷姩涓€璧烽噸杩烇紙App.tsx cascadeReconnect锛夈€?
+  - 鉁?AI 閫夊尯棰勮鎶樺彔锛欰I 鍔╂墜閫夊尯棰勮榛樿鍗曡灞曠ず锛屽弻鍑诲睍寮€瀹屾暣鍐呭锛圓iPanel MessageBubble锛夈€?
+  - 馃洜锔?骞挎挱閲嶅鍔犲叆纭锛氬悓杩炴帴閲嶅鍔犲叆骞挎挱缁勬椂寮瑰嚭纭瀵硅瘽妗嗭紝鏀寔銆屾湰娆′細璇濅笉鍐嶆彁閱掋€嶏紙BroadcastDupDialog + sessionStorage锛夈€?
+  - 馃洜锔?杩炴帴瀵硅瘽妗嗘牎楠屽寮猴細蹇呭～椤规爣娉ㄧ孩鑹叉槦鍙凤紝鏍￠獙涓嶉€氳繃鏃跺瓧娈电孩妗嗘姈鍔ㄥ苟绮剧‘鎻愮ず缂哄け椤癸紙ConnectionDialog锛夈€?
+  - 馃洜锔?涓婚鑹蹭笌蹇嵎鍛戒护鏍￠獙锛氳嚜瀹氫箟涓婚棰滆壊杈撳叆澧炲姞 hex 鏍煎紡鏍￠獙锛屽揩鎹峰懡浠ゅ繀濉」鏍囨敞鏄熷彿銆?
+  - 馃悰 骞挎挱缁勯噸杩炶劚缁勶細淇骞挎挱缁勬垚鍛橀噸杩炲悗鍥?sessionId 鍙樻洿鑰岃劚缁勭殑闂銆?
+  - 馃悰 杩炴帴鍚嶇О鍚屾涓柇锛氫慨澶嶈繛鎺ュ悕绉拌窡闅忎富鏈哄湴鍧€杈撳叆鏃堕涓瓧绗﹀悗鍋滄鍚屾鐨勯棶棰樸€?
+  - 馃悰 AI 涓婁笅鏂囨孩鍑猴細AI 鍔╂墜鑷姩闄勫甫鐨勬渶杩戣緭鍑哄唴瀹归檺鍒朵负 5K 瀛楃锛岄€夊尯鍐呭涓嶅彈闄愩€?
+- **鐗堟湰鍙凤細** staging 鍚?鉁ㄦ柊澧?鈫?minor锛歷1.6.3 鈫?**v1.7.0**銆?
+- **娴佺▼鎵ц锛?* 鐢ㄦ埛纭闂搁棬閫氳繃鍚?鈥斺€?`tsc` PASS / `cargo check` PASS / `tauri:build` 鎴愬姛锛坕nstaller `MyShell_1.7.0_x64-setup.exe`锛? commit + push / Gitee 鍙戝竷 / staging 娓呯┖ + baseline鈫抳1.7.0銆?
+- **鍐崇瓥瑕佺偣锛?* 鐢ㄦ埛鍙 CHANGELOG 鏀?鉁ㄦ柊澧?4 鏉★紝馃洜锔?馃悰 鏉＄洰璁板綍鍦?progress 浣嗕笉鍐欏叆 CHANGELOG銆?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛沗cargo check` PASS锛沗tauri:build` exit 0
 
-### 阶段 47：日志脱敏 + 左下角反馈入口（2026-07-09）
-- **需求：** 完善日志输出并对核心信息脱敏；左下角增加反馈入口，允许用户提交反馈（填写描述 + 添加图片 + 自动附上脱敏后的日志），通过 Web3Forms 提交到指定邮箱。
-- **架构（根据前期讨论调整）：**
-  - **提交渠道：选定 Web3Forms。** issue 直连的 token 打包进 app 会泄露，不能用；SMTP 凭据密码同问题，排除；后端中转要部署，排除了。Web3Forms access_key 公开安全（官方模型，泄漏最多致收件箱垃圾，不会账号被盗），选中。
-  - **图片处理：免费版不支持附件，因此图片打包成本地 zip（用 fflate），用户可选手动附带。
-  - **Origin 风险：** Tauri 桌面端 origin 未被官方证实，先实现后实测；被拦截则用本地 zip 兜底，并提示联系 Web3Forms 放行 tauri.localhost。
-- **实现：**
-  - **日志脱敏（模块①）：** 新增 redact.rs，提供 host()、user()、scrub_log_text()。策略：IP 保留首+尾段，中间掩码（例如 192.168.1.10→192.*.*.10）；主机名/用户名保留首尾字符；长度≤2 字符整体掩码为 ***。
-  - **脱敏触点：** ssh.rs:272（已知主机地址日志，含代理主机+目标主机）、ftp.rs:49（连接日志，含主机名）、ftp.rs:75（登录日志，含用户名）、ssh.rs known_hosts 3 条日志（含主机名）。密码/密钥本身不记录，维持现状。
-  - **暴露日志给前端（模块②）：** 新增 3 个 tauri command：get_feedback_log（返回脱敏后的日志，含当天+昨天，最大 200KB，尾部截断）、reveal_path（打开日志目录，白名单校验）、save_feedback_zip（将前端 zip 存入 feedback/ 子目录，文件名过滤）。
-  - **反馈入口（模块③a）：** Sidebar 版权 footer 上方加"反馈与建议"行，镜像现有 footer 模式，点击打开 FeedbackDialog。
-  - **FeedbackDialog 组件（模块③b）：** 类型（问题报告/功能建议/其他）+ 描述（必填）+ 联系方式（选填）+ 截图（getDisplayMedia 截屏，不可用时降级为本地选图）+ 本地选图（用 plugin-dialog open）+ 自动附上日志（可展开查看/编辑，可取消）。
-  - **提交逻辑：** 始终先存本地 zip（含 feedback.txt + 日志+ 图片，保底通道）；再 fetch Web3Forms POST（文本+ 日志，免费版无附件）；成功则提示打开文件夹；失败（含 403 Origin 拦截）显示错误+ 本地 zip 兜底。
-  - **App.tsx 接线（模块③c）：** showFeedback state + Sidebar onOpenFeedback prop + 渲染 FeedbackDialog。
-- **安全：** ⑴ 密码本身不记录；⑵ host/user/proxy 在点重 API 离开前脱敏；⑶ get_feedback_log 读出后再跑 scrub_log_text 二次脱敏（防住历史日志/第三方库输出）；⑷ reveal_path 白名单限制到 myshell/logs（不 xml 允许任意路径）；⑸ save_feedback_zip 文件名过滤（只 alphanum/-/_/.）。
-- **验证：** `npx tsc --noEmit` PASS（前端已通过）；Rust 侧未编译（环境无 rustup），待 cargo check 验证；待填入 Web3Forms access_key 后实测提交。
-- **优先级：** ①为最高，用户需要反馈通道；②必须实测 Origin（不知是否上线）。
-- **已知限制：** Web3Forms 实测如果被 403 拦截，则需 ⑴联系 Web3Forms 支持放行 tauri.localhost，或 ⑵切换到企业微信/钉钉 webhook（但图片需额外图床）。
-
-## 五问重启检查（阶段 47）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 45锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 47 complete —— 日志脱敏+ 反馈面板已写完，tsc PASS；Rust 侧未编译（环境无 rustup）。 |
-| 我要去哪里？ | ⑴ 安装 Rust 后 cargo check 验证 Rust 侧；⑵ 填入真实 Web3Forms key 后实测提交是否受 Origin 限制；⑶ 如果被拦截，联系支持或切换方案。 |
-| 目标是什么？ | 让用户能方便地报告问题/ 提建议，同时不泄露 token 精机密码/私有接场码。 |
-| 我学到了什么？ | 设计时的讨论：弄清 Gitee token 不能打包进 app，所以放弃 issue 方案；选用 Web3Forms（邮箱，access_key 公开安全）；图片用本地 zip 因路径简单，会为用户多 redux 同一组件（镜像现有 about/feedback 行）。 |
-| 我做了什么？ | redact.rs 脱敏模块（二次脱敏）；5 处日志点+ 1 处脱敏；get_feedback_log/ reveal_path/ save_feedback_zip 3 个 command；FeedbackDialog 全套；Sidebar 入口+ App.tsx 接线；fflate 依赖；tsc PASS。 |
+| 鎴戝湪鍝噷锛?| 闃舵 45 complete 鈥斺€?v1.7.0 宸插彂甯冿紝staging 宸叉竻绌恒€乥aseline鈫抳1.7.0 |
+| 鎴戣鍘诲摢閲岋紵 | 涓嬩竴椤规敼鍔ㄥ畬鎴愭椂鎸?doc-after-feature 杩藉姞 staging 鏉＄洰 |
+| 鐩爣鏄粈涔堬紵 | 渚ф爮鍙皟瀹姐€佷細璇濋潰鏉跨粺涓€绠＄悊銆佸箍鎾骇鑱旈噸杩炲噺灏戞墜鍔ㄦ搷浣?|
+| 鎴戝鍒颁簡浠€涔堬紵 | BroadcastDupDialog 鐢?sessionStorage 璁板繂"鏈涓嶅啀鎻愰啋"鍋忓ソ锛堥噸鍚噸缃級锛汼essionDropdownPanel 缁熶竴绠＄悊褰撳墠浼氳瘽鍜屽箍鎾粍锛涘箍鎾骇鑱旈噸杩為€氳繃 groupId 杩囨护鍚岀粍鎺夌嚎浼氳瘽 |
+| 鎴戝仛浜嗕粈涔堬紵 | 鐗堟湰 bump 1.7.0 + sync锛汣HANGELOG/README 鍔?v1.7.0 鑺?+ badge锛泃sc+cargo check+tauri:build锛沜ommit+push锛汫itee 鍙戝竷锛泂taging 娓呯┖ + baseline鈫抳1.7.0锛沺rogress 闃舵45 |
 
-### 阶段 48：反馈提交改造为 mailto + 修复（2026-07-13）
-- **需求：** Web3Forms 在 Tauri 桌面端被 403 拦截（origin 不支持），第三方图床（ImgBB/Telegraph）涉嫌违法被封禁。需要彻底重构反馈提交渠道。
-- **方案演进：** ⑴ 先考虑自建 Cloudflare Worker + R2 + Resend（HMAC 签名、速率限制、MIME 校验），代码已写完但用户最终放弃（部署运维成本）；⑵ 改为简洁可靠的 mailto 方案——唤起本地邮件客户端，反馈内容复制到剪贴板。
-- **实现：**
-  - **Rust（main.rs）：** `open_external_url` 白名单增加 `mailto:` 支持；新增 `clear_feedback_dir` 命令（关闭反馈窗口时清空 feedback/ 目录）；`reveal_path` 白名单从 `logs/` 扩展到 `myshell/` 父目录（修复打开 feedback 文件夹无效）；新增 `try_focus_existing_explorer`（Win32 EnumWindows 查找已打开的同名资源管理器窗口，找到则激活前置，不重复打开）。
-  - **前端（FeedbackDialog.tsx）：** 删除 Web3Forms/Telegraph 全套代码；`handleSubmit` 改为：保存本地 zip → 剪贴板复制反馈内容 → `openExternalUrl(mailto:...)` 唤起邮件客户端（只带主题，URL 短不丢）→ `window.alert()` 弹窗提醒用户 Ctrl+V 粘贴 + 拖附件。
-  - **前端（api.ts）：** 删除 `uploadScreenshot`/`submitFeedback`/`FeedbackImage`；新增 `clearFeedbackDir` wrapper。
-  - **新增 Gitee Issue 入口：** 反馈窗口 footer 左侧加链接，点击打开 `gitee.com/argustang/myshell/issues/new`。
-  - **失败 UI 重设计：** 提交失败时 ❌ 红色醒目提示，与成功 ✅ 绿色明显区分。
-  - **失败日志：** `handleSubmit` 所有 catch 块增加 `writeFrontendLog`，网络错误写入应用日志。
-- **安全：** 删除了编译进二进制的 IMGBB_API_KEY（图床已封禁）；mailto 不经过任何第三方服务。
-- **验证：** `npx tsc --noEmit` PASS；`cargo check` PASS；release 打包成功。
-- **已知限制：** mailto 无法自动添加附件，需用户手动拖 zip 进邮件；邮件客户端选择器与资源管理器窗口存在焦点竞争（已通过"不自动打开文件夹"规避）。
 
-## 五问重启检查（阶段 48）
-| 问题 | 答案 |
+### 闂冭埖顔?46閿涙艾褰傜敮?v1.9.0 閳ユ柡鈧?缂佸牏顏〒鍙夌厠閸嬨儱锛庨幀?+ 閸忋劑鎽肩捄顖涙）韫囨娲冮幒褝绱?026-06-29閿?- **闂団偓濮瑰偊绱?* 閹恒儴绻涙稉銈勯嚋閺€鐟板З閺€璺虹啲閸欐垵绔烽妴鍌楁喖娣囶喖顦查柈銊ュ瀻閻劍鍩涚紒鍫㈩伂閸忓鐖?闁灏稉宥呭讲鐟欎緤绱檟term 濞撳弶鐓嬮崳銊ョ湴闂傤噣顣介敍澶涚幢閳垛€虫倵閸欑増妫╄箛妤冩磧閹貉冾杻瀵尨绱濇笟澶哥艾瀵倸鐖剁拠濠冩焽閵嗗倿妾敮锔藉Ω鐠佸墽鐤嗛棃銏℃緲闁插秵鐎稉鍝勫瀻缁顕遍懜顏傗偓?- **閸欐垵绔烽崘鍛啇閿涘澃taging 娑撶粯绨敍澶涚窗**
+  - 閴併劍鏌婃晶?鐠佸墽鐤嗛棃銏℃緲瀹革箑褰搁崚鍡樼埉鐎佃壈鍩呴敍鍫濐樆鐟?AI/鐎瑰鍙?閺佺増宓佺粻锛勬倞/韫囶偅宓庨崨鎴掓姢閿?  - 閴併劍鏌婃晶?缂佸牏顏〒鍙夌厠閸氬海顏崣顖炩偓澶涚礄閼奉亜濮?Canvas/WebGL/DOM閿?  - 閴併劍鏌婃晶?閸忋劌鐪弮銉ョ箶閻╂垶甯堕敍鍫濆缁旑垰绌垮┃?閺堫亝宕熼懢宄扮磽鐢瓕娴嗛崣鎴濆煂閸氬骸褰撮弮銉ョ箶閿?  - 棣冩礈閿斿繋绱崠?缂佸牏顏妯款吇閺€鍦暏 Canvas 濞撳弶鐓嬮崳?+ 閺夆€宠埌閸忓鐖ｉ敍鍧坲rsorStyle:bar閿涘绱濋崗澶嬬垼缁嬪啿鐣鹃崣顖濐潌娑撴柧绻氶悾娆撴／閻?  - 棣冩礈閿斿繋绱崠?閸氬海顏崗鎶芥暛鐠侯垰绶炵悰銉ュ弿閺冦儱绻旈敍鍦玈H/SFTP/閺堫剙婀寸紒鍫㈩伂/閺佺増宓佹惔?婢跺洣鍞?AI/娴狅絿鎮婇敍?  - 棣冩礈閿斿繋绱崠?鐠佸墽鐤嗛弬鏉款杻閵嗗瞼顩﹂悽?GPU 绾兛娆㈤崝鐘烩偓鐔粹偓宥呯磻閸忕绱欓柌宥呮儙閻㈢喐鏅ラ敍瀛廝U 閸氬牊鍨氬鍌氱埗閸忔粌绨抽敍?  - 棣冩偘娣囶喖顦?forceVisibleCursor 濞夈劑鍣存竟鐗堟 cursorStyle:bar 娴ｅ棔鍞惍浣风矤閺堫亣顔曠純顔炬畱闁鏆€缂傛椽娅?
+- **閻楀牊婀伴崣鍑ょ窗** staging 閸?閴併劍鏌婃晶?閳?minor閿涙1.8.0 閳?**v1.9.0**
+- **濞翠胶鈻奸幍褑顢戦敍?* 鐎瑰本鏆ｉ幀褎鐗抽弻銉礄18 閺傚洣娆㈤崥?2 閺傜増鏋冩禒璁圭礉閸忋劌婀銉ょ稊閸栫儤婀幓鎰唉閿涘苯宕熼悪?git status 濡偓閺屻儻绱氶埆?閻劍鍩涚涵顔款吇闂傘劑鈧俺绻?閳?tsc PASS / cargo check PASS / tauri:build exit 0閿涘湣yShell_1.9.0_x64-setup.exe閿涘鍟?commit+push閿涘澁elease: v1.9.0, 21 閺傚洣娆?+1064/-133閿涘鍟?Gitee 閸欐垵绔?release id=728056 閳?staging 濞撳懐鈹?+ baseline閳姵1.9.0
+- **閸愬磭鐡ョ憰浣哄仯閿?* 閳剁姴鍘滈弽鍥６妫版ɑ鐗撮崶鐘叉躬 xterm.js 濞撳弶鐓嬮崳銊ョ湴閿涘湹ebGL 閸忓鐖ｉ崣鐘插鐏炲倸鎮庨幋鎰亼鐠愩儯鈧笍OM 濞撳弶鐓嬮崳?focus 娓氭繆绂嗛敍澶涚礉闂?WebView/Electron 娑斿鈧绱濋崶鐘愁劃娑撳秷绺肩粔?Electron閿涙保anvas 濞撳弶鐓嬮崳銊﹀Ω閸忓鐖ｉ惄瀛樺复閻㈣婀悽璇茬娑撳﹥娓剁粙鍐蹭淮閵嗗倵鎲紾PU 瀵偓閸忓磭鏁?Rust 閺嶅洤绻旈弬鍥︽閿涘牓娼?localStorage閿涘绱濋崶鐘绘付閸?WebView2 閸掓稑缂撻崜宥堫嚢閵嗗倵鎲块崜宥囶伂闁挎瑨顕ゆ潪顒€褰傞崚鏉挎倱娑撯偓娴犺姤妫╄箛妤佹瀮娴犺绱濋崜宥呮倵缁旑垱妞傞梻瀵稿殠閸欘垰顕鎰┾偓?- **妤犲矁鐦夐敍?* `npx tsc --noEmit` PASS閿涙矖cargo check` PASS閿涙矖tauri:build` exit 0閿涙稑褰傜敮?URL閿涙ttps://gitee.com/argustang/myshell/releases/tag/v1.9.0
+
+## 娴滄棃妫堕柌宥呮儙濡偓閺屻儻绱欓梼鑸殿唽 46閿?| 闂傤噣顣?| 缁涙梹顢?|
 |------|------|
-| 我在哪里？ | 阶段 48 complete —— 反馈提交改造为 mailto 方案，已发布 v1.10.2。 |
-| 我要去哪里？ | 下一个功能或用户反馈的新需求。 |
-| 目标是什么？ | 让用户能可靠地提交反馈，不依赖不稳定的第三方服务。 |
-| 我学到了什么？ | mailto body 在 QQ 邮箱等客户端会被模板替换/丢弃，不能依赖 body 参数传内容；剪贴板是 100% 可靠的替代；explorer 和 mailto 窗口有焦点竞争，不能同时自动弹出。 |
-| 我做了什么？ | main.rs（mailto 白名单、clear_feedback_dir、reveal_path 白名单扩展、explorer 去重）；api.ts（删旧 wrapper 加新）；FeedbackDialog.tsx（mailto 流程、剪贴板、弹窗提醒、Gitee 链接、失败红色 UI）；发布 v1.10.2 到 Gitee。 |
+| 閹存垵婀崫顏堝櫡閿?| 闂冭埖顔?46 complete 閳ユ柡鈧?v1.9.0 瀹告彃褰傜敮鍐跨礉staging 瀹稿弶绔荤粚鎭掆偓涔seline閳姵1.9.0 |
+| 閹存垼顩﹂崢璇叉憿闁插矉绱?| 娑撳绔存い瑙勬暭閸斻劌鐣幋鎰閹?doc-after-feature 鏉╄棄濮?staging 閺夛紕娲?|
+| 閻╊喗鐖ｉ弰顖欑矆娑斿牞绱?| 缂佸牏顏崗澶嬬垼/闁灏崣顖濐潌閹勭壌閸ョ姳鎱ㄦ径?+ 瀵倸鐖堕崣顖濈槚閺傤叏绱欓弮銉ョ箶閸忋劑鎽肩捄顖濐洬閻╂牭绱?|
+| 閹存垵顒熼崚棰佺啊娴犫偓娑斿牞绱?| xterm 濞撳弶鐓嬮崳銊┾偓澶嬪閺勵垰鍘滈弽鍥６妫版娈戦弽绋跨妇閿涘矂娼?webview 閺傝顢嶉敍姹玃U 缁備胶鏁ゆい璇叉躬 webview 閸掓稑缂撻崜宥堫啎閻滎垰顣ㄩ崣姗€鍣洪敍娑樺缁旑垶鏁婄拠顖濇祮閸欐垵鍩?Rust 閺冦儱绻旈弰顖濈槚閺傤厼澧犵粩顖氱磽鐢摜娈戦張澶嬫櫏閹靛顔?|
+| 閹存垵浠涙禍鍡曠矆娑斿牞绱?| 閻楀牊婀?bump 1.9.0+sync閿涙保HANGELOG/README 閸?v1.9.0 閼哄偊绱盋anvas 濞撳弶鐓嬮崳?cursorStyle 娣囶喖顦?濞撳弶鐓嬮崳?GPU 瀵偓閸忕绱盧ust 7 濡€虫健+閸撳秶顏崗銊ョ湰閺冦儱绻旈敍娉僺c+cargo+tauri:build閿涙矞ommit+push閿涙鲍itee 閸欐垵绔烽敍娉倀aging 濞撳懐鈹栭敍娌礶mory 閸氬本顒?CLAUDE.md 缂佸繘鐛欓敍娌簉ogress 闂冭埖顔?6 |
 
-### 阶段 49：发布 v1.11.0 —— AI 供应商左右布局 + 多模型管理 + 两步选择（2026-07-14）
-- **需求：** 设置→AI 助手界面改为左右布局（左侧供应商列表，右侧详情）；AI 聊天窗口模型选择改为两步（先选供应商再选模型）；仅展示用户自定义的已启用供应商，预设不再混入。
-- **数据模型变更：** 新增 ai_supplier_models 表（每供应商 N 个模型）；新增 ai_settings.active_model_string 列；新增 ai_models.is_enabled 列。
-- **后端（ai.rs）：** AiModelInfo 增加 models + is_enabled；4 个新命令（list/add/remove supplier_models + toggle_enabled）；fetch_models_for_supplier 服务端解密 key；test_settings 新增 supplier_id 参数；save_ai_model_cmd 支持 models 同步；set_active_ai_model_cmd 支持 model_string。
-- **前端：** SettingsPanel AI 标签页左右布局重写（左侧列表+开关，右侧详情+模型管理+Toast+创建校验）；AiPanel 两步级联选择器（过滤预设）；api.ts 新增 SupplierModel + 5 个函数；capabilities/main.json 新增 dialog 权限。
-- **版本号：** 含 3 项新增 → minor：v1.10.2 → v1.11.0。
-- **验证：** tsc PASS；cargo check PASS；tauri:build exit 0；发布 URL：https://gitee.com/argustang/myshell/releases/tag/v1.11.0
 
-## 五问重启检查（阶段 49）
-| 问题 | 答案 |
+### 闃舵 47锛氭棩蹇楄劚鏁?+ 宸︿笅瑙掑弽棣堝叆鍙ｏ紙2026-07-09锛?
+- **闇€姹傦細** 瀹屽杽鏃ュ織杈撳嚭骞跺鏍稿績淇℃伅鑴辨晱锛涘乏涓嬭澧炲姞鍙嶉鍏ュ彛锛屽厑璁哥敤鎴锋彁浜ゅ弽棣堬紙濉啓鎻忚堪 + 娣诲姞鍥剧墖 + 鑷姩闄勪笂鑴辨晱鍚庣殑鏃ュ織锛夛紝閫氳繃 Web3Forms 鎻愪氦鍒版寚瀹氶偖绠便€?
+- **鏋舵瀯锛堟牴鎹墠鏈熻璁鸿皟鏁达級锛?*
+  - **鎻愪氦娓犻亾锛氶€夊畾 Web3Forms銆?* issue 鐩磋繛鐨?token 鎵撳寘杩?app 浼氭硠闇诧紝涓嶈兘鐢紱SMTP 鍑嵁瀵嗙爜鍚岄棶棰橈紝鎺掗櫎锛涘悗绔腑杞閮ㄧ讲锛屾帓闄や簡銆俉eb3Forms access_key 鍏紑瀹夊叏锛堝畼鏂规ā鍨嬶紝娉勬紡鏈€澶氳嚧鏀朵欢绠卞瀮鍦撅紝涓嶄細璐﹀彿琚洍锛夛紝閫変腑銆?
+  - **鍥剧墖澶勭悊锛氬厤璐圭増涓嶆敮鎸侀檮浠讹紝鍥犳鍥剧墖鎵撳寘鎴愭湰鍦?zip锛堢敤 fflate锛夛紝鐢ㄦ埛鍙€夋墜鍔ㄩ檮甯︺€?
+  - **Origin 椋庨櫓锛?* Tauri 妗岄潰绔?origin 鏈瀹樻柟璇佸疄锛屽厛瀹炵幇鍚庡疄娴嬶紱琚嫤鎴垯鐢ㄦ湰鍦?zip 鍏滃簳锛屽苟鎻愮ず鑱旂郴 Web3Forms 鏀捐 tauri.localhost銆?
+- **瀹炵幇锛?*
+  - **鏃ュ織鑴辨晱锛堟ā鍧椻憼锛夛細** 鏂板 redact.rs锛屾彁渚?host()銆乽ser()銆乻crub_log_text()銆傜瓥鐣ワ細IP 淇濈暀棣?灏炬锛屼腑闂存帺鐮侊紙渚嬪 192.168.1.10鈫?92.*.*.10锛夛紱涓绘満鍚?鐢ㄦ埛鍚嶄繚鐣欓灏惧瓧绗︼紱闀垮害鈮? 瀛楃鏁翠綋鎺╃爜涓?***銆?
+  - **鑴辨晱瑙︾偣锛?* ssh.rs:272锛堝凡鐭ヤ富鏈哄湴鍧€鏃ュ織锛屽惈浠ｇ悊涓绘満+鐩爣涓绘満锛夈€乫tp.rs:49锛堣繛鎺ユ棩蹇楋紝鍚富鏈哄悕锛夈€乫tp.rs:75锛堢櫥褰曟棩蹇楋紝鍚敤鎴峰悕锛夈€乻sh.rs known_hosts 3 鏉℃棩蹇楋紙鍚富鏈哄悕锛夈€傚瘑鐮?瀵嗛挜鏈韩涓嶈褰曪紝缁存寔鐜扮姸銆?
+  - **鏆撮湶鏃ュ織缁欏墠绔紙妯″潡鈶★級锛?* 鏂板 3 涓?tauri command锛歡et_feedback_log锛堣繑鍥炶劚鏁忓悗鐨勬棩蹇楋紝鍚綋澶?鏄ㄥぉ锛屾渶澶?200KB锛屽熬閮ㄦ埅鏂級銆乺eveal_path锛堟墦寮€鏃ュ織鐩綍锛岀櫧鍚嶅崟鏍￠獙锛夈€乻ave_feedback_zip锛堝皢鍓嶇 zip 瀛樺叆 feedback/ 瀛愮洰褰曪紝鏂囦欢鍚嶈繃婊わ級銆?
+  - **鍙嶉鍏ュ彛锛堟ā鍧椻憿a锛夛細** Sidebar 鐗堟潈 footer 涓婃柟鍔?鍙嶉涓庡缓璁?琛岋紝闀滃儚鐜版湁 footer 妯″紡锛岀偣鍑绘墦寮€ FeedbackDialog銆?
+  - **FeedbackDialog 缁勪欢锛堟ā鍧椻憿b锛夛細** 绫诲瀷锛堥棶棰樻姤鍛?鍔熻兘寤鸿/鍏朵粬锛? 鎻忚堪锛堝繀濉級+ 鑱旂郴鏂瑰紡锛堥€夊～锛? 鎴浘锛坓etDisplayMedia 鎴睆锛屼笉鍙敤鏃堕檷绾т负鏈湴閫夊浘锛? 鏈湴閫夊浘锛堢敤 plugin-dialog open锛? 鑷姩闄勪笂鏃ュ織锛堝彲灞曞紑鏌ョ湅/缂栬緫锛屽彲鍙栨秷锛夈€?
+  - **鎻愪氦閫昏緫锛?* 濮嬬粓鍏堝瓨鏈湴 zip锛堝惈 feedback.txt + 鏃ュ織+ 鍥剧墖锛屼繚搴曢€氶亾锛夛紱鍐?fetch Web3Forms POST锛堟枃鏈? 鏃ュ織锛屽厤璐圭増鏃犻檮浠讹級锛涙垚鍔熷垯鎻愮ず鎵撳紑鏂囦欢澶癸紱澶辫触锛堝惈 403 Origin 鎷︽埅锛夋樉绀洪敊璇? 鏈湴 zip 鍏滃簳銆?
+  - **App.tsx 鎺ョ嚎锛堟ā鍧椻憿c锛夛細** showFeedback state + Sidebar onOpenFeedback prop + 娓叉煋 FeedbackDialog銆?
+- **瀹夊叏锛?* 鈶?瀵嗙爜鏈韩涓嶈褰曪紱鈶?host/user/proxy 鍦ㄧ偣閲?API 绂诲紑鍓嶈劚鏁忥紱鈶?get_feedback_log 璇诲嚭鍚庡啀璺?scrub_log_text 浜屾鑴辨晱锛堥槻浣忓巻鍙叉棩蹇?绗笁鏂瑰簱杈撳嚭锛夛紱鈶?reveal_path 鐧藉悕鍗曢檺鍒跺埌 myshell/logs锛堜笉 xml 鍏佽浠绘剰璺緞锛夛紱鈶?save_feedback_zip 鏂囦欢鍚嶈繃婊わ紙鍙?alphanum/-/_/.锛夈€?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛堝墠绔凡閫氳繃锛夛紱Rust 渚ф湭缂栬瘧锛堢幆澧冩棤 rustup锛夛紝寰?cargo check 楠岃瘉锛涘緟濉叆 Web3Forms access_key 鍚庡疄娴嬫彁浜ゃ€?
+- **浼樺厛绾э細** 鈶犱负鏈€楂橈紝鐢ㄦ埛闇€瑕佸弽棣堥€氶亾锛涒憽蹇呴』瀹炴祴 Origin锛堜笉鐭ユ槸鍚︿笂绾匡級銆?
+- **宸茬煡闄愬埗锛?* Web3Forms 瀹炴祴濡傛灉琚?403 鎷︽埅锛屽垯闇€ 鈶磋仈绯?Web3Forms 鏀寔鏀捐 tauri.localhost锛屾垨 鈶靛垏鎹㈠埌浼佷笟寰俊/閽夐拤 webhook锛堜絾鍥剧墖闇€棰濆鍥惧簥锛夈€?
+
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 47锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 49 complete —— v1.11.0 已发布到 Gitee，staging 已清空、baseline→v1.11.0 |
-| 我要去哪里？ | 下一项改动完成时按 doc-after-feature 追加 staging 条目 |
-| 目标是什么？ | AI 供应商配置体验重构：左右布局清晰、多模型管理灵活、聊天窗口两步选择不混乱 |
-| 我学到了什么？ | Tauri v2 下 window.alert 映射到 dialog.message 需在 capabilities 显式授权；保存后 editKey 清空导致获取模型失败，解法是新增 fetch_models_for_supplier 服务端解密；测试需传 supplier_id 否则测全局活跃供应商 |
-| 我做了什么？ | db.rs + ai.rs + main.rs（数据模型 + 4 命令 + test 修复）；api.ts + SettingsPanel + AiPanel（前端重写）；capabilities dialog 权限；发布 v1.11.0 到 Gitee |
+| 鎴戝湪鍝噷锛?| 闃舵 47 complete 鈥斺€?鏃ュ織鑴辨晱+ 鍙嶉闈㈡澘宸插啓瀹岋紝tsc PASS锛汻ust 渚ф湭缂栬瘧锛堢幆澧冩棤 rustup锛夈€?|
+| 鎴戣鍘诲摢閲岋紵 | 鈶?瀹夎 Rust 鍚?cargo check 楠岃瘉 Rust 渚э紱鈶?濉叆鐪熷疄 Web3Forms key 鍚庡疄娴嬫彁浜ゆ槸鍚﹀彈 Origin 闄愬埗锛涒懚 濡傛灉琚嫤鎴紝鑱旂郴鏀寔鎴栧垏鎹㈡柟妗堛€?|
+| 鐩爣鏄粈涔堬紵 | 璁╃敤鎴疯兘鏂逛究鍦版姤鍛婇棶棰? 鎻愬缓璁紝鍚屾椂涓嶆硠闇?token 绮炬満瀵嗙爜/绉佹湁鎺ュ満鐮併€?|
+| 鎴戝鍒颁簡浠€涔堬紵 | 璁捐鏃剁殑璁ㄨ锛氬紕娓?Gitee token 涓嶈兘鎵撳寘杩?app锛屾墍浠ユ斁寮?issue 鏂规锛涢€夌敤 Web3Forms锛堥偖绠憋紝access_key 鍏紑瀹夊叏锛夛紱鍥剧墖鐢ㄦ湰鍦?zip 鍥犺矾寰勭畝鍗曪紝浼氫负鐢ㄦ埛澶?redux 鍚屼竴缁勪欢锛堥暅鍍忕幇鏈?about/feedback 琛岋級銆?|
+| 鎴戝仛浜嗕粈涔堬紵 | redact.rs 鑴辨晱妯″潡锛堜簩娆¤劚鏁忥級锛? 澶勬棩蹇楃偣+ 1 澶勮劚鏁忥紱get_feedback_log/ reveal_path/ save_feedback_zip 3 涓?command锛汧eedbackDialog 鍏ㄥ锛汼idebar 鍏ュ彛+ App.tsx 鎺ョ嚎锛沠flate 渚濊禆锛泃sc PASS銆?|
 
-### 阶段 50：升级安装——静默卸载旧版（NSIS 模板自定义）（2026-07-15）
-- **需求：** 用户反馈每次升级版本要"先点一次卸载、再点一次安装"很麻烦，希望合并成点一次。
-- **根因（官方源码实证）：** Tauri 默认 NSIS 模板 `installer.nsi` 的 `PageLeaveReinstall` → `reinst_uninstall` 块，调用旧版 `uninstall.exe` 时只追加 `_?=$4`（非静默），双击新安装包（普通模式）时旧版卸载器弹出完整卸载向导界面（确认页+进度页），造成"再卸载一轮"的体验。`installerHooks` 够不着这行（非宏插入点），必须用 `nsis.template` 接管整份模板。
-- **方案：** 新建 `src-tauri/nsis/installer.nsi`（=官方 tauri-v2.11.2 模板原文 + 文件头注释），唯一改动：`reinst_uninstall` 的 `StrCpy "$R1 _?=$4"` 改为 `"$R1 /S _?=$4"`（加 `/S` 静默）。`tauri.conf.json` 加 `"template": "nsis/installer.nsi"`。
-- **改动后体验：** 双击新包 → 欢迎页 → PageReinstall 页（默认选中"卸载后安装"，点一下下一步）→ 旧版**后台静默卸载（无界面）** → 装新版 → 完成。从 3 关交互降到 1 次"下一步"。
-- **边界情况（已确认安全）：** 无旧版时 `reinst_uninstall` 不执行；旧版在运行时静默卸载器自动 kill 进程；卸载失败退出码检查保留不变；`/S` 下不显示"删除应用数据"勾选框（升级期望行为，不删数据）。
-- **维护成本：** 接管模板后，今后 Tauri 升级若改了 `installer.nsi`，需 diff 新官方模板与本副本，把 `/S` 改动重新应用上去（文件头注释已写明）。
-- **验证：** `npm run tauri:build` exit 0；makensis 成功编译自定义模板，生成 `MyShell_1.11.0_x64-setup.exe`（`/S` 改动未破坏 NSIS 语法）。
+### 闃舵 48锛氬弽棣堟彁浜ゆ敼閫犱负 mailto + 淇锛?026-07-13锛?
+- **闇€姹傦細** Web3Forms 鍦?Tauri 妗岄潰绔 403 鎷︽埅锛坥rigin 涓嶆敮鎸侊級锛岀涓夋柟鍥惧簥锛圛mgBB/Telegraph锛夋秹瀚岃繚娉曡灏佺銆傞渶瑕佸交搴曢噸鏋勫弽棣堟彁浜ゆ笭閬撱€?
+- **鏂规婕旇繘锛?* 鈶?鍏堣€冭檻鑷缓 Cloudflare Worker + R2 + Resend锛圚MAC 绛惧悕銆侀€熺巼闄愬埗銆丮IME 鏍￠獙锛夛紝浠ｇ爜宸插啓瀹屼絾鐢ㄦ埛鏈€缁堟斁寮冿紙閮ㄧ讲杩愮淮鎴愭湰锛夛紱鈶?鏀逛负绠€娲佸彲闈犵殑 mailto 鏂规鈥斺€斿敜璧锋湰鍦伴偖浠跺鎴风锛屽弽棣堝唴瀹瑰鍒跺埌鍓创鏉裤€?
+- **瀹炵幇锛?*
+  - **Rust锛坢ain.rs锛夛細** `open_external_url` 鐧藉悕鍗曞鍔?`mailto:` 鏀寔锛涙柊澧?`clear_feedback_dir` 鍛戒护锛堝叧闂弽棣堢獥鍙ｆ椂娓呯┖ feedback/ 鐩綍锛夛紱`reveal_path` 鐧藉悕鍗曚粠 `logs/` 鎵╁睍鍒?`myshell/` 鐖剁洰褰曪紙淇鎵撳紑 feedback 鏂囦欢澶规棤鏁堬級锛涙柊澧?`try_focus_existing_explorer`锛圵in32 EnumWindows 鏌ユ壘宸叉墦寮€鐨勫悓鍚嶈祫婧愮鐞嗗櫒绐楀彛锛屾壘鍒板垯婵€娲诲墠缃紝涓嶉噸澶嶆墦寮€锛夈€?
+  - **鍓嶇锛團eedbackDialog.tsx锛夛細** 鍒犻櫎 Web3Forms/Telegraph 鍏ㄥ浠ｇ爜锛沗handleSubmit` 鏀逛负锛氫繚瀛樻湰鍦?zip 鈫?鍓创鏉垮鍒跺弽棣堝唴瀹?鈫?`openExternalUrl(mailto:...)` 鍞よ捣閭欢瀹㈡埛绔紙鍙甫涓婚锛孶RL 鐭笉涓級鈫?`window.alert()` 寮圭獥鎻愰啋鐢ㄦ埛 Ctrl+V 绮樿创 + 鎷栭檮浠躲€?
+  - **鍓嶇锛坅pi.ts锛夛細** 鍒犻櫎 `uploadScreenshot`/`submitFeedback`/`FeedbackImage`锛涙柊澧?`clearFeedbackDir` wrapper銆?
+  - **鏂板 Gitee Issue 鍏ュ彛锛?* 鍙嶉绐楀彛 footer 宸︿晶鍔犻摼鎺ワ紝鐐瑰嚮鎵撳紑 `gitee.com/argustang/myshell/issues/new`銆?
+  - **澶辫触 UI 閲嶈璁★細** 鎻愪氦澶辫触鏃?鉂?绾㈣壊閱掔洰鎻愮ず锛屼笌鎴愬姛 鉁?缁胯壊鏄庢樉鍖哄垎銆?
+  - **澶辫触鏃ュ織锛?* `handleSubmit` 鎵€鏈?catch 鍧楀鍔?`writeFrontendLog`锛岀綉缁滈敊璇啓鍏ュ簲鐢ㄦ棩蹇椼€?
+- **瀹夊叏锛?* 鍒犻櫎浜嗙紪璇戣繘浜岃繘鍒剁殑 IMGBB_API_KEY锛堝浘搴婂凡灏佺锛夛紱mailto 涓嶇粡杩囦换浣曠涓夋柟鏈嶅姟銆?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛沗cargo check` PASS锛況elease 鎵撳寘鎴愬姛銆?
+- **宸茬煡闄愬埗锛?* mailto 鏃犳硶鑷姩娣诲姞闄勪欢锛岄渶鐢ㄦ埛鎵嬪姩鎷?zip 杩涢偖浠讹紱閭欢瀹㈡埛绔€夋嫨鍣ㄤ笌璧勬簮绠＄悊鍣ㄧ獥鍙ｅ瓨鍦ㄧ劍鐐圭珵浜夛紙宸查€氳繃"涓嶈嚜鍔ㄦ墦寮€鏂囦欢澶?瑙勯伩锛夈€?
 
-## 五问重启检查（阶段 50）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 48锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 50 complete —— 自定义 NSIS 模板加 `/S` 静默旧版卸载，tauri:build 通过。 |
-| 我要去哪里？ | 下次发布时（`打包`）随版本一起上线；注意这是 installMode perMachine 下的改动，若将来切 installMode 需复核。 |
-| 目标是什么？ | 升级时双击一次安装包即自动卸载旧版并装新版，旧版卸载步骤不再弹向导界面。 |
-| 我学到了什么？ | Tauri NSIS 的 `installerHooks`（宏注入）够不着 `PageLeaveReinstall` 里的 `ExecWait` 调用；要改卸载器调用参数必须用 `nsis.template` 接管整份模板；`/S` 是 NSIS 卸载器静默标志（大写），配合 `_?=dir` 才能在原位执行。 |
-| 我做了什么？ | 新建 `src-tauri/nsis/installer.nsi`（官方模板 + reinst_uninstall 加 `/S` + 文件头注释）；`tauri.conf.json` 加 nsis.template 字段；tauri:build 验证通过；progress/staging/README 文档同步。 |
+| 鎴戝湪鍝噷锛?| 闃舵 48 complete 鈥斺€?鍙嶉鎻愪氦鏀归€犱负 mailto 鏂规锛屽凡鍙戝竷 v1.10.2銆?|
+| 鎴戣鍘诲摢閲岋紵 | 涓嬩竴涓姛鑳芥垨鐢ㄦ埛鍙嶉鐨勬柊闇€姹傘€?|
+| 鐩爣鏄粈涔堬紵 | 璁╃敤鎴疯兘鍙潬鍦版彁浜ゅ弽棣堬紝涓嶄緷璧栦笉绋冲畾鐨勭涓夋柟鏈嶅姟銆?|
+| 鎴戝鍒颁簡浠€涔堬紵 | mailto body 鍦?QQ 閭绛夊鎴风浼氳妯℃澘鏇挎崲/涓㈠純锛屼笉鑳戒緷璧?body 鍙傛暟浼犲唴瀹癸紱鍓创鏉挎槸 100% 鍙潬鐨勬浛浠ｏ紱explorer 鍜?mailto 绐楀彛鏈夌劍鐐圭珵浜夛紝涓嶈兘鍚屾椂鑷姩寮瑰嚭銆?|
+| 鎴戝仛浜嗕粈涔堬紵 | main.rs锛坢ailto 鐧藉悕鍗曘€乧lear_feedback_dir銆乺eveal_path 鐧藉悕鍗曟墿灞曘€乪xplorer 鍘婚噸锛夛紱api.ts锛堝垹鏃?wrapper 鍔犳柊锛夛紱FeedbackDialog.tsx锛坢ailto 娴佺▼銆佸壀璐存澘銆佸脊绐楁彁閱掋€丟itee 閾炬帴銆佸け璐ョ孩鑹?UI锛夛紱鍙戝竷 v1.10.2 鍒?Gitee銆?|
 
-### 阶段 51：修复 SSH 长命令静默期被误杀（inactivity_timeout → keepalive）（2026-07-15）
-- **现象：** 用户连接服务器切 root 后执行 `find . -maxdepth 1 -type f -printf "%TY-%Tm-%Td\n" | sort | uniq -c`，命令还没跑完就 `[Connection closed]`。同一台服务器用 MobaXterm 不退出。
-- **根因（russh 0.50.4 源码实证）：** `ssh.rs:284` 设了 `inactivity_timeout = 30s`。russh 的 inactivity timer 是**连接级**静默超时（`client/mod.rs:1033-1036`），30s 内没收到任何数据包就返回 `InactivityTimeout` 错误杀连接。`find | sort | uniq -c` 这种管道命令在 sort 阶段（阻塞式消费 stdin）长时间不向 PTY 输出任何字节 → 30s 触发 → `channel.wait()` 返回 `None` → `ssh_closed`。日志印证：两台服务器都在执行长命令后 `channel.wait returned None`，相隔约 77s（含切 root + 命令静默执行累计）。
-- **为什么 MobaXterm 不受影响：** OpenSSH 系不设 inactivity 超时，靠 keepalive 心跳维持连接。
-- **修复：** 去掉 `inactivity_timeout`，改用 `keepalive_interval = 15s` + `keepalive_max = 3`（连续 3 次无响应 ~45s 才判定死亡）。长命令静默期 keepalive 心跳维持连接；真挂死的服务器仍能在 ~45s 内检测到。
-- **验证：** `cargo check` PASS；dev 启动正常。
+### 闃舵 49锛氬彂甯?v1.11.0 鈥斺€?AI 渚涘簲鍟嗗乏鍙冲竷灞€ + 澶氭ā鍨嬬鐞?+ 涓ゆ閫夋嫨锛?026-07-14锛?
+- **闇€姹傦細** 璁剧疆鈫扐I 鍔╂墜鐣岄潰鏀逛负宸﹀彸甯冨眬锛堝乏渚т緵搴斿晢鍒楄〃锛屽彸渚ц鎯咃級锛汚I 鑱婂ぉ绐楀彛妯″瀷閫夋嫨鏀逛负涓ゆ锛堝厛閫変緵搴斿晢鍐嶉€夋ā鍨嬶級锛涗粎灞曠ず鐢ㄦ埛鑷畾涔夌殑宸插惎鐢ㄤ緵搴斿晢锛岄璁句笉鍐嶆贩鍏ャ€?
+- **鏁版嵁妯″瀷鍙樻洿锛?* 鏂板 ai_supplier_models 琛紙姣忎緵搴斿晢 N 涓ā鍨嬶級锛涙柊澧?ai_settings.active_model_string 鍒楋紱鏂板 ai_models.is_enabled 鍒椼€?
+- **鍚庣锛坅i.rs锛夛細** AiModelInfo 澧炲姞 models + is_enabled锛? 涓柊鍛戒护锛坙ist/add/remove supplier_models + toggle_enabled锛夛紱fetch_models_for_supplier 鏈嶅姟绔В瀵?key锛泃est_settings 鏂板 supplier_id 鍙傛暟锛泂ave_ai_model_cmd 鏀寔 models 鍚屾锛泂et_active_ai_model_cmd 鏀寔 model_string銆?
+- **鍓嶇锛?* SettingsPanel AI 鏍囩椤靛乏鍙冲竷灞€閲嶅啓锛堝乏渚у垪琛?寮€鍏筹紝鍙充晶璇︽儏+妯″瀷绠＄悊+Toast+鍒涘缓鏍￠獙锛夛紱AiPanel 涓ゆ绾ц仈閫夋嫨鍣紙杩囨护棰勮锛夛紱api.ts 鏂板 SupplierModel + 5 涓嚱鏁帮紱capabilities/main.json 鏂板 dialog 鏉冮檺銆?
+- **鐗堟湰鍙凤細** 鍚?3 椤规柊澧?鈫?minor锛歷1.10.2 鈫?v1.11.0銆?
+- **楠岃瘉锛?* tsc PASS锛沜argo check PASS锛泃auri:build exit 0锛涘彂甯?URL锛歨ttps://gitee.com/argustang/myshell/releases/tag/v1.11.0
 
-## 五问重启检查（阶段 51）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 49锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 51 complete —— keepalive 替代 inactivity_timeout，cargo check 通过，待用户实测长命令不再断开。 |
-| 我要去哪里？ | 用户实测验证；确认后随下次发布上线。 |
-| 目标是什么？ | 交互式 shell 跑长命令（find\|sort、tar、编译等）不再被误杀，同时仍能检测真挂死的服务器。 |
-| 我学到了什么？ | russh 的 inactivity_timeout 是连接级 idle timer（无数据包即杀），不适合交互式终端——长命令有合法长静默期；keepalive 才是正道（心跳维持+无响应才断），与 OpenSSH/MobaXterm 同思路。用户期望的"降级到 ias 再退出"在当前架构不存在（su 切 root 只是 PTY 内命令，SSH 会话层面是同一条连接）。 |
-| 我做了什么？ | `ssh.rs` 把 `inactivity_timeout=30s` 换成 `keepalive_interval=15s`+`keepalive_max=3`，更新注释说明根因和修复理由。 |
+| 鎴戝湪鍝噷锛?| 闃舵 49 complete 鈥斺€?v1.11.0 宸插彂甯冨埌 Gitee锛宻taging 宸叉竻绌恒€乥aseline鈫抳1.11.0 |
+| 鎴戣鍘诲摢閲岋紵 | 涓嬩竴椤规敼鍔ㄥ畬鎴愭椂鎸?doc-after-feature 杩藉姞 staging 鏉＄洰 |
+| 鐩爣鏄粈涔堬紵 | AI 渚涘簲鍟嗛厤缃綋楠岄噸鏋勶細宸﹀彸甯冨眬娓呮櫚銆佸妯″瀷绠＄悊鐏垫椿銆佽亰澶╃獥鍙ｄ袱姝ラ€夋嫨涓嶆贩涔?|
+| 鎴戝鍒颁簡浠€涔堬紵 | Tauri v2 涓?window.alert 鏄犲皠鍒?dialog.message 闇€鍦?capabilities 鏄惧紡鎺堟潈锛涗繚瀛樺悗 editKey 娓呯┖瀵艰嚧鑾峰彇妯″瀷澶辫触锛岃В娉曟槸鏂板 fetch_models_for_supplier 鏈嶅姟绔В瀵嗭紱娴嬭瘯闇€浼?supplier_id 鍚﹀垯娴嬪叏灞€娲昏穬渚涘簲鍟?|
+| 鎴戝仛浜嗕粈涔堬紵 | db.rs + ai.rs + main.rs锛堟暟鎹ā鍨?+ 4 鍛戒护 + test 淇锛夛紱api.ts + SettingsPanel + AiPanel锛堝墠绔噸鍐欙級锛沜apabilities dialog 鏉冮檺锛涘彂甯?v1.11.0 鍒?Gitee |
 
-### 阶段 52：匿名版本统计改为每次升级都弹窗询问（2026-07-15）
-- **需求：** 用户希望每次版本升级完成后都弹出匿名统计同意提示，而不是"首次同意后后续版本静默上报"。
-- **现状：** `usageStats.ts` 的 `checkReportNeeded` 对未上报版本会查 `hasStatsConsent()`——若之前同意过则静默上报不弹窗。
-- **修复：** `checkReportNeeded` 让 `hasConsent` 永远返回 false，App.tsx 永远走弹窗分支。`setStatsConsent` 仍记录偏好（以备回退）。弹窗文案从"同意后将记住偏好，后续版本升级自动统计不再询问"改为"每次升级到新版本都会询问一次"。
-- **验证：** `npx tsc --noEmit` PASS。
+### 闃舵 50锛氬崌绾у畨瑁呪€斺€旈潤榛樺嵏杞芥棫鐗堬紙NSIS 妯℃澘鑷畾涔夛級锛?026-07-15锛?
+- **闇€姹傦細** 鐢ㄦ埛鍙嶉姣忔鍗囩骇鐗堟湰瑕?鍏堢偣涓€娆″嵏杞姐€佸啀鐐逛竴娆″畨瑁?寰堥夯鐑︼紝甯屾湜鍚堝苟鎴愮偣涓€娆°€?
+- **鏍瑰洜锛堝畼鏂规簮鐮佸疄璇侊級锛?* Tauri 榛樿 NSIS 妯℃澘 `installer.nsi` 鐨?`PageLeaveReinstall` 鈫?`reinst_uninstall` 鍧楋紝璋冪敤鏃х増 `uninstall.exe` 鏃跺彧杩藉姞 `_?=$4`锛堥潪闈欓粯锛夛紝鍙屽嚮鏂板畨瑁呭寘锛堟櫘閫氭ā寮忥級鏃舵棫鐗堝嵏杞藉櫒寮瑰嚭瀹屾暣鍗歌浇鍚戝鐣岄潰锛堢‘璁ら〉+杩涘害椤碉級锛岄€犳垚"鍐嶅嵏杞戒竴杞?鐨勪綋楠屻€俙installerHooks` 澶熶笉鐫€杩欒锛堥潪瀹忔彃鍏ョ偣锛夛紝蹇呴』鐢?`nsis.template` 鎺ョ鏁翠唤妯℃澘銆?
+- **鏂规锛?* 鏂板缓 `src-tauri/nsis/installer.nsi`锛?瀹樻柟 tauri-v2.11.2 妯℃澘鍘熸枃 + 鏂囦欢澶存敞閲婏級锛屽敮涓€鏀瑰姩锛歚reinst_uninstall` 鐨?`StrCpy "$R1 _?=$4"` 鏀逛负 `"$R1 /S _?=$4"`锛堝姞 `/S` 闈欓粯锛夈€俙tauri.conf.json` 鍔?`"template": "nsis/installer.nsi"`銆?
+- **鏀瑰姩鍚庝綋楠岋細** 鍙屽嚮鏂板寘 鈫?娆㈣繋椤?鈫?PageReinstall 椤碉紙榛樿閫変腑"鍗歌浇鍚庡畨瑁?锛岀偣涓€涓嬩笅涓€姝ワ級鈫?鏃х増**鍚庡彴闈欓粯鍗歌浇锛堟棤鐣岄潰锛?* 鈫?瑁呮柊鐗?鈫?瀹屾垚銆備粠 3 鍏充氦浜掗檷鍒?1 娆?涓嬩竴姝?銆?
+- **杈圭晫鎯呭喌锛堝凡纭瀹夊叏锛夛細** 鏃犳棫鐗堟椂 `reinst_uninstall` 涓嶆墽琛岋紱鏃х増鍦ㄨ繍琛屾椂闈欓粯鍗歌浇鍣ㄨ嚜鍔?kill 杩涚▼锛涘嵏杞藉け璐ラ€€鍑虹爜妫€鏌ヤ繚鐣欎笉鍙橈紱`/S` 涓嬩笉鏄剧ず"鍒犻櫎搴旂敤鏁版嵁"鍕鹃€夋锛堝崌绾ф湡鏈涜涓猴紝涓嶅垹鏁版嵁锛夈€?
+- **缁存姢鎴愭湰锛?* 鎺ョ妯℃澘鍚庯紝浠婂悗 Tauri 鍗囩骇鑻ユ敼浜?`installer.nsi`锛岄渶 diff 鏂板畼鏂规ā鏉夸笌鏈壇鏈紝鎶?`/S` 鏀瑰姩閲嶆柊搴旂敤涓婂幓锛堟枃浠跺ご娉ㄩ噴宸插啓鏄庯級銆?
+- **楠岃瘉锛?* `npm run tauri:build` exit 0锛沵akensis 鎴愬姛缂栬瘧鑷畾涔夋ā鏉匡紝鐢熸垚 `MyShell_1.11.0_x64-setup.exe`锛坄/S` 鏀瑰姩鏈牬鍧?NSIS 璇硶锛夈€?
 
-## 五问重启检查（阶段 52）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 50锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 52 complete —— 统计弹窗改为每次版本升级都询问，tsc 通过，dev 重启中。 |
-| 我要去哪里？ | 用户实测确认弹窗行为；确认后随下次发布上线。 |
-| 目标是什么？ | 每次版本升级首次启动都征求用户同意，尊重用户对每次数据上报的知情选择权。 |
-| 我学到了什么？ | 改动最小化原则：只改 `checkReportNeeded` 返回值（hasConsent 恒 false），App.tsx 的分支逻辑完全不用动；保留 `setStatsConsent` 调用以备回退。 |
-| 我做了什么？ | `usageStats.ts` checkReportNeeded 改为恒弹窗；`StatsConsentDialog.tsx` 文案更新；tsc PASS。 |
+| 鎴戝湪鍝噷锛?| 闃舵 50 complete 鈥斺€?鑷畾涔?NSIS 妯℃澘鍔?`/S` 闈欓粯鏃х増鍗歌浇锛宼auri:build 閫氳繃銆?|
+| 鎴戣鍘诲摢閲岋紵 | 涓嬫鍙戝竷鏃讹紙`鎵撳寘`锛夐殢鐗堟湰涓€璧蜂笂绾匡紱娉ㄦ剰杩欐槸 installMode perMachine 涓嬬殑鏀瑰姩锛岃嫢灏嗘潵鍒?installMode 闇€澶嶆牳銆?|
+| 鐩爣鏄粈涔堬紵 | 鍗囩骇鏃跺弻鍑讳竴娆″畨瑁呭寘鍗宠嚜鍔ㄥ嵏杞芥棫鐗堝苟瑁呮柊鐗堬紝鏃х増鍗歌浇姝ラ涓嶅啀寮瑰悜瀵肩晫闈€?|
+| 鎴戝鍒颁簡浠€涔堬紵 | Tauri NSIS 鐨?`installerHooks`锛堝畯娉ㄥ叆锛夊涓嶇潃 `PageLeaveReinstall` 閲岀殑 `ExecWait` 璋冪敤锛涜鏀瑰嵏杞藉櫒璋冪敤鍙傛暟蹇呴』鐢?`nsis.template` 鎺ョ鏁翠唤妯℃澘锛沗/S` 鏄?NSIS 鍗歌浇鍣ㄩ潤榛樻爣蹇楋紙澶у啓锛夛紝閰嶅悎 `_?=dir` 鎵嶈兘鍦ㄥ師浣嶆墽琛屻€?|
+| 鎴戝仛浜嗕粈涔堬紵 | 鏂板缓 `src-tauri/nsis/installer.nsi`锛堝畼鏂规ā鏉?+ reinst_uninstall 鍔?`/S` + 鏂囦欢澶存敞閲婏級锛沗tauri.conf.json` 鍔?nsis.template 瀛楁锛泃auri:build 楠岃瘉閫氳繃锛沺rogress/staging/README 鏂囨。鍚屾銆?|
 
-### 阶段 53：修复匿名统计弹窗同版本每次启动都重复弹出（2026-07-17）
-- **现象：** 每次启动 MyShell 都弹出匿名统计同意弹窗，而不是预期的"每次版本升级后的首次启动才弹"。
-- **根因：** 弹窗触发逻辑以 `localStorage["myshell.statsVersion"]` 判断当前版本是否已处理过。该 key 只在 `reportVersion()` 网络上报**成功后**才写入（`usageStats.ts:96`）。当用户点"暂不"（decline）时，只调用了 `setStatsConsent(false)` 移除 consent key，**没有写入 statsVersion**；当用户点"允许"但网络失败时，同样不会写入。所以下次启动 `isVersionReported(version)` 仍为 false，弹窗再次出现。
-- **修复：** 新增 `markVersionHandled(version)` 函数，在 `onAgree` 和 `onDecline` 两个回调中都调用，确保用户做出决定后立即标记当前版本已处理。`reportVersion` 内部原有的 `localStorage.setItem(KEY_VERSION, ...)` 保留（同意时冗余写入，无害且向后兼容）。更新了 `isVersionReported` 和 `checkReportNeeded` 的注释，说明 KEY_VERSION 的语义是"已处理"（已询问并已决定），而不是"已上报"。
-- **验证：** `npx tsc --noEmit` PASS。
+### 闃舵 51锛氫慨澶?SSH 闀垮懡浠ら潤榛樻湡琚鏉€锛坕nactivity_timeout 鈫?keepalive锛夛紙2026-07-15锛?
+- **鐜拌薄锛?* 鐢ㄦ埛杩炴帴鏈嶅姟鍣ㄥ垏 root 鍚庢墽琛?`find . -maxdepth 1 -type f -printf "%TY-%Tm-%Td\n" | sort | uniq -c`锛屽懡浠よ繕娌¤窇瀹屽氨 `[Connection closed]`銆傚悓涓€鍙版湇鍔″櫒鐢?MobaXterm 涓嶉€€鍑恒€?
+- **鏍瑰洜锛坮ussh 0.50.4 婧愮爜瀹炶瘉锛夛細** `ssh.rs:284` 璁句簡 `inactivity_timeout = 30s`銆俽ussh 鐨?inactivity timer 鏄?*杩炴帴绾?*闈欓粯瓒呮椂锛坄client/mod.rs:1033-1036`锛夛紝30s 鍐呮病鏀跺埌浠讳綍鏁版嵁鍖呭氨杩斿洖 `InactivityTimeout` 閿欒鏉€杩炴帴銆俙find | sort | uniq -c` 杩欑绠￠亾鍛戒护鍦?sort 闃舵锛堥樆濉炲紡娑堣垂 stdin锛夐暱鏃堕棿涓嶅悜 PTY 杈撳嚭浠讳綍瀛楄妭 鈫?30s 瑙﹀彂 鈫?`channel.wait()` 杩斿洖 `None` 鈫?`ssh_closed`銆傛棩蹇楀嵃璇侊細涓ゅ彴鏈嶅姟鍣ㄩ兘鍦ㄦ墽琛岄暱鍛戒护鍚?`channel.wait returned None`锛岀浉闅旂害 77s锛堝惈鍒?root + 鍛戒护闈欓粯鎵ц绱锛夈€?
+- **涓轰粈涔?MobaXterm 涓嶅彈褰卞搷锛?* OpenSSH 绯讳笉璁?inactivity 瓒呮椂锛岄潬 keepalive 蹇冭烦缁存寔杩炴帴銆?
+- **淇锛?* 鍘绘帀 `inactivity_timeout`锛屾敼鐢?`keepalive_interval = 15s` + `keepalive_max = 3`锛堣繛缁?3 娆℃棤鍝嶅簲 ~45s 鎵嶅垽瀹氭浜★級銆傞暱鍛戒护闈欓粯鏈?keepalive 蹇冭烦缁存寔杩炴帴锛涚湡鎸傛鐨勬湇鍔″櫒浠嶈兘鍦?~45s 鍐呮娴嬪埌銆?
+- **楠岃瘉锛?* `cargo check` PASS锛沝ev 鍚姩姝ｅ父銆?
 
-## 五问重启检查（阶段 53）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 51锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 53 complete —— 匿名统计弹窗同版本重复弹出 bug 已修复，tsc 通过。 |
-| 我要去哪里？ | 用户实测确认同版本第二次启动不再弹窗；随下次发布上线。 |
-| 目标是什么？ | 同一版本下只弹一次统计同意弹窗（无论用户同意或拒绝），版本号变化才重新弹出。 |
-| 我学到了什么？ | 区分"已上报"和"已决定"两个语义：`statsVersion` 原本只在上报成功后写，漏掉了"用户拒绝"和"网络失败"两种场景。修复思路是把"标记版本已处理"的责任移到用户做出决定的回调里（agree/decline），而不是放在网络请求成功之后。 |
-| 我做了什么？ | `usageStats.ts` 新增 `markVersionHandled(version)` 并更新相关注释；`App.tsx` 在 onAgree/onDecline 中调用；tsc PASS。 |
+| 鎴戝湪鍝噷锛?| 闃舵 51 complete 鈥斺€?keepalive 鏇夸唬 inactivity_timeout锛宑argo check 閫氳繃锛屽緟鐢ㄦ埛瀹炴祴闀垮懡浠や笉鍐嶆柇寮€銆?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛瀹炴祴楠岃瘉锛涚‘璁ゅ悗闅忎笅娆″彂甯冧笂绾裤€?|
+| 鐩爣鏄粈涔堬紵 | 浜や簰寮?shell 璺戦暱鍛戒护锛坒ind\|sort銆乼ar銆佺紪璇戠瓑锛変笉鍐嶈璇潃锛屽悓鏃朵粛鑳芥娴嬬湡鎸傛鐨勬湇鍔″櫒銆?|
+| 鎴戝鍒颁簡浠€涔堬紵 | russh 鐨?inactivity_timeout 鏄繛鎺ョ骇 idle timer锛堟棤鏁版嵁鍖呭嵆鏉€锛夛紝涓嶉€傚悎浜や簰寮忕粓绔€斺€旈暱鍛戒护鏈夊悎娉曢暱闈欓粯鏈燂紱keepalive 鎵嶆槸姝ｉ亾锛堝績璺崇淮鎸?鏃犲搷搴旀墠鏂級锛屼笌 OpenSSH/MobaXterm 鍚屾€濊矾銆傜敤鎴锋湡鏈涚殑"闄嶇骇鍒?ias 鍐嶉€€鍑?鍦ㄥ綋鍓嶆灦鏋勪笉瀛樺湪锛坰u 鍒?root 鍙槸 PTY 鍐呭懡浠わ紝SSH 浼氳瘽灞傞潰鏄悓涓€鏉¤繛鎺ワ級銆?|
+| 鎴戝仛浜嗕粈涔堬紵 | `ssh.rs` 鎶?`inactivity_timeout=30s` 鎹㈡垚 `keepalive_interval=15s`+`keepalive_max=3`锛屾洿鏂版敞閲婅鏄庢牴鍥犲拰淇鐞嗙敱銆?|
 
-### 阶段 54：Linux deb 打包支持 + setup_file_logging 跨平台守卫修复（2026-07-18）
-- **目标：** 为 MyShell 增加 Linux .deb 产物，让 Ubuntu/Debian 用户能直接 `dpkg -i` 安装。本次只验证打包流程能跑通，**不进发布流水线**（版本保持 1.11.2，不推 Gitee，不改 CHANGELOG）。
-- **`tauri.conf.json` 改动：**
-  - `bundle.targets`：`["nsis"]` → `["nsis", "deb"]`。Windows 上跑 `tauri:build` 仍只产 nsis（Tauri 按宿主 OS 自动跳过不兼容目标），Linux 上同命令直接产 deb。一次配置、跨平台通用。
-  - 新增 `bundle.linux.deb.depends`：声明 4 个运行时依赖——`libwebkit2gtk-4.1-1`（Tauri v2 Linux WebView 必需）、`libgtk-3-0`（窗口/控件）、`libsecret-1-0`（`keyring` crate 的 `sync-secret-service` feature 用）、`libayatana-appindicator3-1`（托盘图标）。apt 安装 deb 时会自动拉这些库。
-- **`src-tauri/src/main.rs` 改动（修复跨平台编译）：** `setup_file_logging` 原属性是 `#[cfg(not(debug_assertions))]`，但函数体内部用的是 MSVC CRT 专属 API（`_open_osfhandle` / `_dup2` / `std::os::windows::io::AsRawHandle`）。release build 在 Linux 上编译时炸 `error[E0433]: cannot find 'windows' in os` 和 `error[E0599]: no method named 'as_raw_handle'`。修复：
-  - 原函数属性改为 `#[cfg(all(not(debug_assertions), windows))]`——Windows release 仍走 CRT 重定向 stderr 到日志文件。
-  - 新增 `#[cfg(all(not(debug_assertions), unix))]` 版本：**空 stub**。理由：Linux 上 stderr 默认就附加到启动进程（desktop launcher / shell），日志重定向不是 deb 能跑起来的必要条件；之前尝试用 `freopen` + `__stderr_location` 实现 Unix 等价版本，但 `__stderr_location` 是 glibc 专属符号（musl 上没有），依赖 FFI 反而增加风险。Linux 日志支持延后到后续版本，本次优先保证 deb 能产出。
-  - 新增 `#[cfg(debug_assertions)]` 的 debug 空 stub——debug build 本来就不重定向 stderr（Windows/Unix 都不），但原来靠 `#[cfg(not(debug_assertions))]` 隐式跳过；现在拆成 3 个 cfg 分支后需要显式补上 debug stub，否则 debug build 下 `setup_file_logging()` 调用点会找不到函数。
-- **本机环境准备（从零搭）：** 这台 Ubuntu 26.04 开发机原本完全没有 Rust 和 Tauri Linux 构建依赖。用户授权后跑了：
+### 闃舵 52锛氬尶鍚嶇増鏈粺璁℃敼涓烘瘡娆″崌绾ч兘寮圭獥璇㈤棶锛?026-07-15锛?
+- **闇€姹傦細** 鐢ㄦ埛甯屾湜姣忔鐗堟湰鍗囩骇瀹屾垚鍚庨兘寮瑰嚭鍖垮悕缁熻鍚屾剰鎻愮ず锛岃€屼笉鏄?棣栨鍚屾剰鍚庡悗缁増鏈潤榛樹笂鎶?銆?
+- **鐜扮姸锛?* `usageStats.ts` 鐨?`checkReportNeeded` 瀵规湭涓婃姤鐗堟湰浼氭煡 `hasStatsConsent()`鈥斺€旇嫢涔嬪墠鍚屾剰杩囧垯闈欓粯涓婃姤涓嶅脊绐椼€?
+- **淇锛?* `checkReportNeeded` 璁?`hasConsent` 姘歌繙杩斿洖 false锛孉pp.tsx 姘歌繙璧板脊绐楀垎鏀€俙setStatsConsent` 浠嶈褰曞亸濂斤紙浠ュ鍥為€€锛夈€傚脊绐楁枃妗堜粠"鍚屾剰鍚庡皢璁颁綇鍋忓ソ锛屽悗缁増鏈崌绾ц嚜鍔ㄧ粺璁′笉鍐嶈闂?鏀逛负"姣忔鍗囩骇鍒版柊鐗堟湰閮戒細璇㈤棶涓€娆?銆?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS銆?
+
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 52锛?
+| 闂 | 绛旀 |
+|------|------|
+| 鎴戝湪鍝噷锛?| 闃舵 52 complete 鈥斺€?缁熻寮圭獥鏀逛负姣忔鐗堟湰鍗囩骇閮借闂紝tsc 閫氳繃锛宒ev 閲嶅惎涓€?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛瀹炴祴纭寮圭獥琛屼负锛涚‘璁ゅ悗闅忎笅娆″彂甯冧笂绾裤€?|
+| 鐩爣鏄粈涔堬紵 | 姣忔鐗堟湰鍗囩骇棣栨鍚姩閮藉緛姹傜敤鎴峰悓鎰忥紝灏婇噸鐢ㄦ埛瀵规瘡娆℃暟鎹笂鎶ョ殑鐭ユ儏閫夋嫨鏉冦€?|
+| 鎴戝鍒颁簡浠€涔堬紵 | 鏀瑰姩鏈€灏忓寲鍘熷垯锛氬彧鏀?`checkReportNeeded` 杩斿洖鍊硷紙hasConsent 鎭?false锛夛紝App.tsx 鐨勫垎鏀€昏緫瀹屽叏涓嶇敤鍔紱淇濈暀 `setStatsConsent` 璋冪敤浠ュ鍥為€€銆?|
+| 鎴戝仛浜嗕粈涔堬紵 | `usageStats.ts` checkReportNeeded 鏀逛负鎭掑脊绐楋紱`StatsConsentDialog.tsx` 鏂囨鏇存柊锛泃sc PASS銆?|
+
+### 闃舵 53锛氫慨澶嶅尶鍚嶇粺璁″脊绐楀悓鐗堟湰姣忔鍚姩閮介噸澶嶅脊鍑猴紙2026-07-17锛?
+- **鐜拌薄锛?* 姣忔鍚姩 MyShell 閮藉脊鍑哄尶鍚嶇粺璁″悓鎰忓脊绐楋紝鑰屼笉鏄鏈熺殑"姣忔鐗堟湰鍗囩骇鍚庣殑棣栨鍚姩鎵嶅脊"銆?
+- **鏍瑰洜锛?* 寮圭獥瑙﹀彂閫昏緫浠?`localStorage["myshell.statsVersion"]` 鍒ゆ柇褰撳墠鐗堟湰鏄惁宸插鐞嗚繃銆傝 key 鍙湪 `reportVersion()` 缃戠粶涓婃姤**鎴愬姛鍚?*鎵嶅啓鍏ワ紙`usageStats.ts:96`锛夈€傚綋鐢ㄦ埛鐐?鏆備笉"锛坉ecline锛夋椂锛屽彧璋冪敤浜?`setStatsConsent(false)` 绉婚櫎 consent key锛?*娌℃湁鍐欏叆 statsVersion**锛涘綋鐢ㄦ埛鐐?鍏佽"浣嗙綉缁滃け璐ユ椂锛屽悓鏍蜂笉浼氬啓鍏ャ€傛墍浠ヤ笅娆″惎鍔?`isVersionReported(version)` 浠嶄负 false锛屽脊绐楀啀娆″嚭鐜般€?
+- **淇锛?* 鏂板 `markVersionHandled(version)` 鍑芥暟锛屽湪 `onAgree` 鍜?`onDecline` 涓や釜鍥炶皟涓兘璋冪敤锛岀‘淇濈敤鎴峰仛鍑哄喅瀹氬悗绔嬪嵆鏍囪褰撳墠鐗堟湰宸插鐞嗐€俙reportVersion` 鍐呴儴鍘熸湁鐨?`localStorage.setItem(KEY_VERSION, ...)` 淇濈暀锛堝悓鎰忔椂鍐椾綑鍐欏叆锛屾棤瀹充笖鍚戝悗鍏煎锛夈€傛洿鏂颁簡 `isVersionReported` 鍜?`checkReportNeeded` 鐨勬敞閲婏紝璇存槑 KEY_VERSION 鐨勮涔夋槸"宸插鐞?锛堝凡璇㈤棶骞跺凡鍐冲畾锛夛紝鑰屼笉鏄?宸蹭笂鎶?銆?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS銆?
+
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 53锛?
+| 闂 | 绛旀 |
+|------|------|
+| 鎴戝湪鍝噷锛?| 闃舵 53 complete 鈥斺€?鍖垮悕缁熻寮圭獥鍚岀増鏈噸澶嶅脊鍑?bug 宸蹭慨澶嶏紝tsc 閫氳繃銆?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛瀹炴祴纭鍚岀増鏈浜屾鍚姩涓嶅啀寮圭獥锛涢殢涓嬫鍙戝竷涓婄嚎銆?|
+| 鐩爣鏄粈涔堬紵 | 鍚屼竴鐗堟湰涓嬪彧寮逛竴娆＄粺璁″悓鎰忓脊绐楋紙鏃犺鐢ㄦ埛鍚屾剰鎴栨嫆缁濓級锛岀増鏈彿鍙樺寲鎵嶉噸鏂板脊鍑恒€?|
+| 鎴戝鍒颁簡浠€涔堬紵 | 鍖哄垎"宸蹭笂鎶?鍜?宸插喅瀹?涓や釜璇箟锛歚statsVersion` 鍘熸湰鍙湪涓婃姤鎴愬姛鍚庡啓锛屾紡鎺変簡"鐢ㄦ埛鎷掔粷"鍜?缃戠粶澶辫触"涓ょ鍦烘櫙銆備慨澶嶆€濊矾鏄妸"鏍囪鐗堟湰宸插鐞?鐨勮矗浠荤Щ鍒扮敤鎴峰仛鍑哄喅瀹氱殑鍥炶皟閲岋紙agree/decline锛夛紝鑰屼笉鏄斁鍦ㄧ綉缁滆姹傛垚鍔熶箣鍚庛€?|
+| 鎴戝仛浜嗕粈涔堬紵 | `usageStats.ts` 鏂板 `markVersionHandled(version)` 骞舵洿鏂扮浉鍏虫敞閲婏紱`App.tsx` 鍦?onAgree/onDecline 涓皟鐢紱tsc PASS銆?|
+
+### 闃舵 54锛歀inux deb 鎵撳寘鏀寔 + setup_file_logging 璺ㄥ钩鍙板畧鍗慨澶嶏紙2026-07-18锛?
+- **鐩爣锛?* 涓?MyShell 澧炲姞 Linux .deb 浜х墿锛岃 Ubuntu/Debian 鐢ㄦ埛鑳界洿鎺?`dpkg -i` 瀹夎銆傛湰娆″彧楠岃瘉鎵撳寘娴佺▼鑳借窇閫氾紝**涓嶈繘鍙戝竷娴佹按绾?*锛堢増鏈繚鎸?1.11.2锛屼笉鎺?Gitee锛屼笉鏀?CHANGELOG锛夈€?
+- **`tauri.conf.json` 鏀瑰姩锛?*
+  - `bundle.targets`锛歚["nsis"]` 鈫?`["nsis", "deb"]`銆俉indows 涓婅窇 `tauri:build` 浠嶅彧浜?nsis锛圱auri 鎸夊涓?OS 鑷姩璺宠繃涓嶅吋瀹圭洰鏍囷級锛孡inux 涓婂悓鍛戒护鐩存帴浜?deb銆備竴娆￠厤缃€佽法骞冲彴閫氱敤銆?
+  - 鏂板 `bundle.linux.deb.depends`锛氬０鏄?4 涓繍琛屾椂渚濊禆鈥斺€擿libwebkit2gtk-4.1-1`锛圱auri v2 Linux WebView 蹇呴渶锛夈€乣libgtk-3-0`锛堢獥鍙?鎺т欢锛夈€乣libsecret-1-0`锛坄keyring` crate 鐨?`sync-secret-service` feature 鐢級銆乣libayatana-appindicator3-1`锛堟墭鐩樺浘鏍囷級銆俛pt 瀹夎 deb 鏃朵細鑷姩鎷夎繖浜涘簱銆?
+- **`src-tauri/src/main.rs` 鏀瑰姩锛堜慨澶嶈法骞冲彴缂栬瘧锛夛細** `setup_file_logging` 鍘熷睘鎬ф槸 `#[cfg(not(debug_assertions))]`锛屼絾鍑芥暟浣撳唴閮ㄧ敤鐨勬槸 MSVC CRT 涓撳睘 API锛坄_open_osfhandle` / `_dup2` / `std::os::windows::io::AsRawHandle`锛夈€俽elease build 鍦?Linux 涓婄紪璇戞椂鐐?`error[E0433]: cannot find 'windows' in os` 鍜?`error[E0599]: no method named 'as_raw_handle'`銆備慨澶嶏細
+  - 鍘熷嚱鏁板睘鎬ф敼涓?`#[cfg(all(not(debug_assertions), windows))]`鈥斺€擶indows release 浠嶈蛋 CRT 閲嶅畾鍚?stderr 鍒版棩蹇楁枃浠躲€?
+  - 鏂板 `#[cfg(all(not(debug_assertions), unix))]` 鐗堟湰锛?*绌?stub**銆傜悊鐢憋細Linux 涓?stderr 榛樿灏遍檮鍔犲埌鍚姩杩涚▼锛坉esktop launcher / shell锛夛紝鏃ュ織閲嶅畾鍚戜笉鏄?deb 鑳借窇璧锋潵鐨勫繀瑕佹潯浠讹紱涔嬪墠灏濊瘯鐢?`freopen` + `__stderr_location` 瀹炵幇 Unix 绛変环鐗堟湰锛屼絾 `__stderr_location` 鏄?glibc 涓撳睘绗﹀彿锛坢usl 涓婃病鏈夛級锛屼緷璧?FFI 鍙嶈€屽鍔犻闄┿€侺inux 鏃ュ織鏀寔寤跺悗鍒板悗缁増鏈紝鏈浼樺厛淇濊瘉 deb 鑳戒骇鍑恒€?
+  - 鏂板 `#[cfg(debug_assertions)]` 鐨?debug 绌?stub鈥斺€攄ebug build 鏈潵灏变笉閲嶅畾鍚?stderr锛圵indows/Unix 閮戒笉锛夛紝浣嗗師鏉ラ潬 `#[cfg(not(debug_assertions))]` 闅愬紡璺宠繃锛涚幇鍦ㄦ媶鎴?3 涓?cfg 鍒嗘敮鍚庨渶瑕佹樉寮忚ˉ涓?debug stub锛屽惁鍒?debug build 涓?`setup_file_logging()` 璋冪敤鐐逛細鎵句笉鍒板嚱鏁般€?
+- **鏈満鐜鍑嗗锛堜粠闆舵惌锛夛細** 杩欏彴 Ubuntu 26.04 寮€鍙戞満鍘熸湰瀹屽叏娌℃湁 Rust 鍜?Tauri Linux 鏋勫缓渚濊禆銆傜敤鎴锋巿鏉冨悗璺戜簡锛?
   - `sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev librsvg2-dev libglib2.0-dev libsoup-3.0-dev libsecret-1-dev libayatana-appindicator3-dev libdbus-1-dev rustup`
-  - `rustup default stable`（装 rustc 1.97.1 + cargo 1.97.1）
-  - `npm install`（装 `@tauri-apps/cli` 和前端依赖；esbuild postinstall 被 npm allow-scripts 拦截但二进制已就位，不影响 build）
-- **验证：**
+  - `rustup default stable`锛堣 rustc 1.97.1 + cargo 1.97.1锛?
+  - `npm install`锛堣 `@tauri-apps/cli` 鍜屽墠绔緷璧栵紱esbuild postinstall 琚?npm allow-scripts 鎷︽埅浣嗕簩杩涘埗宸插氨浣嶏紝涓嶅奖鍝?build锛?
+- **楠岃瘉锛?*
   - `npx tsc --noEmit` PASS
-  - `cargo check --release` PASS（只剩一个无关的 `is_openai_protocol` dead_code warning）
-  - `npm run tauri:build` exit 0，产出 `src-tauri/target/release/bundle/deb/MyShell_1.11.2_amd64.deb`（9.7 MB，installed-size 29 MB）
-  - `dpkg-deb -I` 验证：`Package: my-shell`、`Version: 1.11.2`、`Architecture: amd64`、`Depends:` 含我们声明的 4 个库（Tauri 还自动追加它检测到的 `libwebkit2gtk-4.1-0`、`libgtk-3-0`）
-  - `dpkg-deb -c` 验证：布局正确——`usr/bin/myshell`（主程序）、`usr/share/applications/MyShell.desktop`（桌面入口）、`usr/share/icons/hicolor/{32,128,256,512}x*/apps/myshell.png`（hicolor 图标集）
-- **已知遗留：** Linux 上 release build 没有 stderr 重定向到日志文件（Unix stub 是空的）。Windows 行为完全不变。如果将来 Linux 也需要落盘日志，再实现 Unix 版本（用 `freopen` 而非 glibc 专属符号）。
+  - `cargo check --release` PASS锛堝彧鍓╀竴涓棤鍏崇殑 `is_openai_protocol` dead_code warning锛?
+  - `npm run tauri:build` exit 0锛屼骇鍑?`src-tauri/target/release/bundle/deb/MyShell_1.11.2_amd64.deb`锛?.7 MB锛宨nstalled-size 29 MB锛?
+  - `dpkg-deb -I` 楠岃瘉锛歚Package: my-shell`銆乣Version: 1.11.2`銆乣Architecture: amd64`銆乣Depends:` 鍚垜浠０鏄庣殑 4 涓簱锛圱auri 杩樿嚜鍔ㄨ拷鍔犲畠妫€娴嬪埌鐨?`libwebkit2gtk-4.1-0`銆乣libgtk-3-0`锛?
+  - `dpkg-deb -c` 楠岃瘉锛氬竷灞€姝ｇ‘鈥斺€擿usr/bin/myshell`锛堜富绋嬪簭锛夈€乣usr/share/applications/MyShell.desktop`锛堟闈㈠叆鍙ｏ級銆乣usr/share/icons/hicolor/{32,128,256,512}x*/apps/myshell.png`锛坔icolor 鍥炬爣闆嗭級
+- **宸茬煡閬楃暀锛?* Linux 涓?release build 娌℃湁 stderr 閲嶅畾鍚戝埌鏃ュ織鏂囦欢锛圲nix stub 鏄┖鐨勶級銆俉indows 琛屼负瀹屽叏涓嶅彉銆傚鏋滃皢鏉?Linux 涔熼渶瑕佽惤鐩樻棩蹇楋紝鍐嶅疄鐜?Unix 鐗堟湰锛堢敤 `freopen` 鑰岄潪 glibc 涓撳睘绗﹀彿锛夈€?
 
-## 五问重启检查（阶段 54）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 54锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 54 complete —— Linux deb 打包流程跑通，`MyShell_1.11.2_amd64.deb` 产物验证通过，待用户实测安装 + 运行。 |
-| 我要去哪里？ | 用户在 Ubuntu/Debian 上 `sudo dpkg -i MyShell_1.11.2_amd64.deb` 实测安装与运行；确认无误后随下次发布（`打包`）正式上线 Linux 产物。 |
-| 目标是什么？ | MyShell 能产出可直接 `dpkg -i` 安装的 .deb 包，apt 自动拉运行时依赖，安装后开始菜单/桌面图标齐全。 |
-| 我学到了什么？ | (1) 原仓库只针对 Windows，`setup_file_logging` 用了 MSVC CRT 专属 API 但只挂了 `cfg(not(debug_assertions))` 没 `cfg(windows)`，是典型的"只在 Windows 上测过"的坑。(2) Ubuntu 26.04 的 rustup 包把 binary 放 `/usr/bin/`、toolchain 放 `~/.rustup/`，跟官方 rustup 装到 `~/.cargo/bin/` 不一样，但功能等价。(3) `bundle.linux.deb.depends` 只是声明运行时依赖让 apt 自动拉，不影响 build-time 依赖——build 依赖仍需手动 `apt install *-dev`。(4) musl 没有 `__stderr_location` 这个 glibc 专属符号，跨发行版的 FFI 要避免依赖 glibc 内部符号。 |
-| 我做了什么？ | `tauri.conf.json`：targets 加 `deb` + 新增 `bundle.linux.deb.depends`。`src-tauri/src/main.rs`：`setup_file_logging` 拆三个 cfg 分支（windows release 实原实现 / unix release 空 stub / debug 空 stub）。apt + rustup + npm install 装好环境。tsc/cargo check/tauri:build 全 PASS，deb 产物 9.7 MB 生成并验证。progress/staging 文档同步。**版本保持 1.11.2，未进发布流水线，未推 git，未发 Gitee。** |
+| 鎴戝湪鍝噷锛?| 闃舵 54 complete 鈥斺€?Linux deb 鎵撳寘娴佺▼璺戦€氾紝`MyShell_1.11.2_amd64.deb` 浜х墿楠岃瘉閫氳繃锛屽緟鐢ㄦ埛瀹炴祴瀹夎 + 杩愯銆?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛鍦?Ubuntu/Debian 涓?`sudo dpkg -i MyShell_1.11.2_amd64.deb` 瀹炴祴瀹夎涓庤繍琛岋紱纭鏃犺鍚庨殢涓嬫鍙戝竷锛坄鎵撳寘`锛夋寮忎笂绾?Linux 浜х墿銆?|
+| 鐩爣鏄粈涔堬紵 | MyShell 鑳戒骇鍑哄彲鐩存帴 `dpkg -i` 瀹夎鐨?.deb 鍖咃紝apt 鑷姩鎷夎繍琛屾椂渚濊禆锛屽畨瑁呭悗寮€濮嬭彍鍗?妗岄潰鍥炬爣榻愬叏銆?|
+| 鎴戝鍒颁簡浠€涔堬紵 | (1) 鍘熶粨搴撳彧閽堝 Windows锛宍setup_file_logging` 鐢ㄤ簡 MSVC CRT 涓撳睘 API 浣嗗彧鎸備簡 `cfg(not(debug_assertions))` 娌?`cfg(windows)`锛屾槸鍏稿瀷鐨?鍙湪 Windows 涓婃祴杩?鐨勫潙銆?2) Ubuntu 26.04 鐨?rustup 鍖呮妸 binary 鏀?`/usr/bin/`銆乼oolchain 鏀?`~/.rustup/`锛岃窡瀹樻柟 rustup 瑁呭埌 `~/.cargo/bin/` 涓嶄竴鏍凤紝浣嗗姛鑳界瓑浠枫€?3) `bundle.linux.deb.depends` 鍙槸澹版槑杩愯鏃朵緷璧栬 apt 鑷姩鎷夛紝涓嶅奖鍝?build-time 渚濊禆鈥斺€攂uild 渚濊禆浠嶉渶鎵嬪姩 `apt install *-dev`銆?4) musl 娌℃湁 `__stderr_location` 杩欎釜 glibc 涓撳睘绗﹀彿锛岃法鍙戣鐗堢殑 FFI 瑕侀伩鍏嶄緷璧?glibc 鍐呴儴绗﹀彿銆?|
+| 鎴戝仛浜嗕粈涔堬紵 | `tauri.conf.json`锛歵argets 鍔?`deb` + 鏂板 `bundle.linux.deb.depends`銆俙src-tauri/src/main.rs`锛歚setup_file_logging` 鎷嗕笁涓?cfg 鍒嗘敮锛坵indows release 瀹炲師瀹炵幇 / unix release 绌?stub / debug 绌?stub锛夈€俛pt + rustup + npm install 瑁呭ソ鐜銆倀sc/cargo check/tauri:build 鍏?PASS锛宒eb 浜х墿 9.7 MB 鐢熸垚骞堕獙璇併€俻rogress/staging 鏂囨。鍚屾銆?*鐗堟湰淇濇寔 1.11.2锛屾湭杩涘彂甯冩祦姘寸嚎锛屾湭鎺?git锛屾湭鍙?Gitee銆?* |
 
-### 阶段 55：修复 deb 安装失败 —— webkit 包名 ABI 版本错（libwebkit2gtk-4.1-1 → -0）（2026-07-18）
-- **现象：** 阶段 54 的 deb 在 `dpkg -i` 时报：`my-shell 依赖于 libwebkit2gtk-4.1-1；然而：未安装软件包 libwebkit2gtk-4.1-1`，包进入 half-installed 状态。
-- **根因：** 阶段 54 在 `tauri.conf.json` 的 `bundle.linux.deb.depends` 里把 webkit 包名写成了 `libwebkit2gtk-4.1-1`（ Debian 命名惯例里 `-1` 是 SONAME 主版本）。但 webkit2gtk 在 2.44 之后做了一次 ABI 重命名：**新版 SONAME 是 `-0`**（即 `libwebkit2gtk-4.1.so.0`），Ubuntu 24.04+/Debian 13+/Fedora 41+ 全部只提供 `libwebkit2gtk-4.1-0`，`-1` 这个包名在当前发行版**完全不存在**。`apt-cache policy libwebkit2gtk-4.1-1` 候选版本为空验证了这点；`apt-cache policy libwebkit2gtk-4.1-0` 候选 `2.52.3-0ubuntu0.26.04.2`。
-- **另一坑：`dpkg -i` 不会自动解决依赖**。就算包名对，直接 `dpkg -i xxx.deb` 遇到任何缺失库都会配置失败。正确做法是 `sudo apt install ./xxx.deb`——apt 会读取 deb 声明的依赖并自动从仓库拉取。阶段 54 README 里给的 `dpkg -i` + `apt --fix-broken install` 兜底方案能用但不优雅，本次改为推荐 `apt install`。
-- **修复：** `tauri.conf.json` 把 `libwebkit2gtk-4.1-1` 改为 `libwebkit2gtk-4.1-0`，其余三个依赖（libgtk-3-0 / libsecret-1-0 / libayatana-appindicator3-1）包名都对、无需改。
-- **顺带撤回：** 中途尝试加 `linux.appitem.categories` 配置桌面入口分类，但 Tauri v2 schema 没这个字段（官方 Debian 文档明确：deb 配置只有 `files` 和 `depends`，不暴露 .desktop 的 Categories 设置；要自定义 Categories 必须用 `desktopTemplate`，引入额外文件维护）。本次撤回，Categories 留空——不影响安装、不影响图标，只是不出现在应用菜单分类下（GNOME 搜索仍可找到）。
-- **验证：**
-  - 重新打包（22 秒，二进制没改只重 bundle）：deb `Depends:` 行现为 `libwebkit2gtk-4.1-0, libgtk-3-0, libsecret-1-0, libayatana-appindicator3-1`（Tauri 自动检测又追加了重复的 webkit/gtk，无害）。
-  - `sudo apt install ./MyShell_1.11.2_amd64.deb` 成功安装配置，`dpkg -l my-shell` 显示 `ii`（已安装并配置）。
-  - `/usr/bin/myshell` 可执行，启动日志正常：`[backup] 已备份配置文件`、`[startup] database initialized`、`schema migration ok`（GUI 因测试环境无 display 被 timeout 杀，但 Rust 后端逻辑全跑通）。
-  - 桌面入口 `/usr/share/applications/MyShell.desktop` 与 hicolor 图标集（32/128/256/512）正确部署。
-  - 测试后 `sudo apt remove my-shell` 清理机器。
-- **结论：** Linux deb 全链路打通，apt 一行装好、运行时依赖自动解决、桌面入口与图标齐全。下次发布（`打包`）即可随 v1.11.3 或 v1.12.0 正式上线 Linux 产物。
+### 闃舵 55锛氫慨澶?deb 瀹夎澶辫触 鈥斺€?webkit 鍖呭悕 ABI 鐗堟湰閿欙紙libwebkit2gtk-4.1-1 鈫?-0锛夛紙2026-07-18锛?
+- **鐜拌薄锛?* 闃舵 54 鐨?deb 鍦?`dpkg -i` 鏃舵姤锛歚my-shell 渚濊禆浜?libwebkit2gtk-4.1-1锛涚劧鑰岋細鏈畨瑁呰蒋浠跺寘 libwebkit2gtk-4.1-1`锛屽寘杩涘叆 half-installed 鐘舵€併€?
+- **鏍瑰洜锛?* 闃舵 54 鍦?`tauri.conf.json` 鐨?`bundle.linux.deb.depends` 閲屾妸 webkit 鍖呭悕鍐欐垚浜?`libwebkit2gtk-4.1-1`锛?Debian 鍛藉悕鎯緥閲?`-1` 鏄?SONAME 涓荤増鏈級銆備絾 webkit2gtk 鍦?2.44 涔嬪悗鍋氫簡涓€娆?ABI 閲嶅懡鍚嶏細**鏂扮増 SONAME 鏄?`-0`**锛堝嵆 `libwebkit2gtk-4.1.so.0`锛夛紝Ubuntu 24.04+/Debian 13+/Fedora 41+ 鍏ㄩ儴鍙彁渚?`libwebkit2gtk-4.1-0`锛宍-1` 杩欎釜鍖呭悕鍦ㄥ綋鍓嶅彂琛岀増**瀹屽叏涓嶅瓨鍦?*銆俙apt-cache policy libwebkit2gtk-4.1-1` 鍊欓€夌増鏈负绌洪獙璇佷簡杩欑偣锛沗apt-cache policy libwebkit2gtk-4.1-0` 鍊欓€?`2.52.3-0ubuntu0.26.04.2`銆?
+- **鍙︿竴鍧戯細`dpkg -i` 涓嶄細鑷姩瑙ｅ喅渚濊禆**銆傚氨绠楀寘鍚嶅锛岀洿鎺?`dpkg -i xxx.deb` 閬囧埌浠讳綍缂哄け搴撻兘浼氶厤缃け璐ャ€傛纭仛娉曟槸 `sudo apt install ./xxx.deb`鈥斺€攁pt 浼氳鍙?deb 澹版槑鐨勪緷璧栧苟鑷姩浠庝粨搴撴媺鍙栥€傞樁娈?54 README 閲岀粰鐨?`dpkg -i` + `apt --fix-broken install` 鍏滃簳鏂规鑳界敤浣嗕笉浼橀泤锛屾湰娆℃敼涓烘帹鑽?`apt install`銆?
+- **淇锛?* `tauri.conf.json` 鎶?`libwebkit2gtk-4.1-1` 鏀逛负 `libwebkit2gtk-4.1-0`锛屽叾浣欎笁涓緷璧栵紙libgtk-3-0 / libsecret-1-0 / libayatana-appindicator3-1锛夊寘鍚嶉兘瀵广€佹棤闇€鏀广€?
+- **椤哄甫鎾ゅ洖锛?* 涓€斿皾璇曞姞 `linux.appitem.categories` 閰嶇疆妗岄潰鍏ュ彛鍒嗙被锛屼絾 Tauri v2 schema 娌¤繖涓瓧娈碉紙瀹樻柟 Debian 鏂囨。鏄庣‘锛歞eb 閰嶇疆鍙湁 `files` 鍜?`depends`锛屼笉鏆撮湶 .desktop 鐨?Categories 璁剧疆锛涜鑷畾涔?Categories 蹇呴』鐢?`desktopTemplate`锛屽紩鍏ラ澶栨枃浠剁淮鎶わ級銆傛湰娆℃挙鍥烇紝Categories 鐣欑┖鈥斺€斾笉褰卞搷瀹夎銆佷笉褰卞搷鍥炬爣锛屽彧鏄笉鍑虹幇鍦ㄥ簲鐢ㄨ彍鍗曞垎绫讳笅锛圙NOME 鎼滅储浠嶅彲鎵惧埌锛夈€?
+- **楠岃瘉锛?*
+  - 閲嶆柊鎵撳寘锛?2 绉掞紝浜岃繘鍒舵病鏀瑰彧閲?bundle锛夛細deb `Depends:` 琛岀幇涓?`libwebkit2gtk-4.1-0, libgtk-3-0, libsecret-1-0, libayatana-appindicator3-1`锛圱auri 鑷姩妫€娴嬪張杩藉姞浜嗛噸澶嶇殑 webkit/gtk锛屾棤瀹筹級銆?
+  - `sudo apt install ./MyShell_1.11.2_amd64.deb` 鎴愬姛瀹夎閰嶇疆锛宍dpkg -l my-shell` 鏄剧ず `ii`锛堝凡瀹夎骞堕厤缃級銆?
+  - `/usr/bin/myshell` 鍙墽琛岋紝鍚姩鏃ュ織姝ｅ父锛歚[backup] 宸插浠介厤缃枃浠禶銆乣[startup] database initialized`銆乣schema migration ok`锛圙UI 鍥犳祴璇曠幆澧冩棤 display 琚?timeout 鏉€锛屼絾 Rust 鍚庣閫昏緫鍏ㄨ窇閫氾級銆?
+  - 妗岄潰鍏ュ彛 `/usr/share/applications/MyShell.desktop` 涓?hicolor 鍥炬爣闆嗭紙32/128/256/512锛夋纭儴缃层€?
+  - 娴嬭瘯鍚?`sudo apt remove my-shell` 娓呯悊鏈哄櫒銆?
+- **缁撹锛?* Linux deb 鍏ㄩ摼璺墦閫氾紝apt 涓€琛岃濂姐€佽繍琛屾椂渚濊禆鑷姩瑙ｅ喅銆佹闈㈠叆鍙ｄ笌鍥炬爣榻愬叏銆備笅娆″彂甯冿紙`鎵撳寘`锛夊嵆鍙殢 v1.11.3 鎴?v1.12.0 姝ｅ紡涓婄嚎 Linux 浜х墿銆?
 
-## 五问重启检查（阶段 55）
-| 问题 | 答案 |
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 55锛?
+| 闂 | 绛旀 |
 |------|------|
-| 我在哪里？ | 阶段 55 complete —— webkit 包名 ABI 版本错已修，`apt install ./MyShell_*.deb` 实测安装成功，二进制能启动。 |
-| 我要去哪里？ | 用户在另一台 Ubuntu/Debian 机器实测 GUI 能正常显示、SSH/SFTP/本地终端能用；确认无误随下次 `打包` 正式上线。 |
-| 目标是什么？ | `sudo apt install ./MyShell_*_amd64.deb` 一行装好，apt 自动拉依赖，应用出现在应用菜单、桌面图标齐全。 |
-| 我学到了什么？ | (1) webkit2gtk 4.1 在 2.44 后 SONAME 从 `-1` 改成 `-0`（少见的 ABI 版本倒退命名），Ubuntu 24.04+/Debian 13+ 全部用 `-0`。(2) `dpkg -i` 不解决依赖、`apt install ./xxx.deb` 才是正解——写文档时给的命令要想清楚哪种场景。(3) Tauri v2 的 deb 配置 schema 非常克制（只有 files + depends），.desktop 的 Categories 要自定义必须 desktopTemplate，权衡后留空是更好的默认。(4) 阶段 54 没实测 apt install 就报"deb 生成验证通过"是乐观了——生成不等于能装，下次类似工作要跑到实际安装那一步。 |
-| 我做了什么？ | `tauri.conf.json`：`libwebkit2gtk-4.1-1` → `-0`，撤回误加的 `linux.appitem.categories`。重新打包 22 秒。`apt install ./deb` 实测成功，`dpkg -l` 显示 `ii`，二进制启动日志正常，桌面入口与图标齐全，测试后 remove 清理。staging / README / progress 文档同步——README 把 `dpkg -i` 改成 `apt install ./`。**版本保持 1.11.2，未进发布流水线，未推 git，未发 Gitee。** |
+| 鎴戝湪鍝噷锛?| 闃舵 55 complete 鈥斺€?webkit 鍖呭悕 ABI 鐗堟湰閿欏凡淇紝`apt install ./MyShell_*.deb` 瀹炴祴瀹夎鎴愬姛锛屼簩杩涘埗鑳藉惎鍔ㄣ€?|
+| 鎴戣鍘诲摢閲岋紵 | 鐢ㄦ埛鍦ㄥ彟涓€鍙?Ubuntu/Debian 鏈哄櫒瀹炴祴 GUI 鑳芥甯告樉绀恒€丼SH/SFTP/鏈湴缁堢鑳界敤锛涚‘璁ゆ棤璇殢涓嬫 `鎵撳寘` 姝ｅ紡涓婄嚎銆?|
+| 鐩爣鏄粈涔堬紵 | `sudo apt install ./MyShell_*_amd64.deb` 涓€琛岃濂斤紝apt 鑷姩鎷変緷璧栵紝搴旂敤鍑虹幇鍦ㄥ簲鐢ㄨ彍鍗曘€佹闈㈠浘鏍囬綈鍏ㄣ€?|
+| 鎴戝鍒颁簡浠€涔堬紵 | (1) webkit2gtk 4.1 鍦?2.44 鍚?SONAME 浠?`-1` 鏀规垚 `-0`锛堝皯瑙佺殑 ABI 鐗堟湰鍊掗€€鍛藉悕锛夛紝Ubuntu 24.04+/Debian 13+ 鍏ㄩ儴鐢?`-0`銆?2) `dpkg -i` 涓嶈В鍐充緷璧栥€乣apt install ./xxx.deb` 鎵嶆槸姝ｈВ鈥斺€斿啓鏂囨。鏃剁粰鐨勫懡浠よ鎯虫竻妤氬摢绉嶅満鏅€?3) Tauri v2 鐨?deb 閰嶇疆 schema 闈炲父鍏嬪埗锛堝彧鏈?files + depends锛夛紝.desktop 鐨?Categories 瑕佽嚜瀹氫箟蹇呴』 desktopTemplate锛屾潈琛″悗鐣欑┖鏄洿濂界殑榛樿銆?4) 闃舵 54 娌″疄娴?apt install 灏辨姤"deb 鐢熸垚楠岃瘉閫氳繃"鏄箰瑙備簡鈥斺€旂敓鎴愪笉绛変簬鑳借锛屼笅娆＄被浼煎伐浣滆璺戝埌瀹為檯瀹夎閭ｄ竴姝ャ€?|
+| 鎴戝仛浜嗕粈涔堬紵 | `tauri.conf.json`锛歚libwebkit2gtk-4.1-1` 鈫?`-0`锛屾挙鍥炶鍔犵殑 `linux.appitem.categories`銆傞噸鏂版墦鍖?22 绉掋€俙apt install ./deb` 瀹炴祴鎴愬姛锛宍dpkg -l` 鏄剧ず `ii`锛屼簩杩涘埗鍚姩鏃ュ織姝ｅ父锛屾闈㈠叆鍙ｄ笌鍥炬爣榻愬叏锛屾祴璇曞悗 remove 娓呯悊銆俿taging / README / progress 鏂囨。鍚屾鈥斺€擱EADME 鎶?`dpkg -i` 鏀规垚 `apt install ./`銆?*鐗堟湰淇濇寔 1.11.2锛屾湭杩涘彂甯冩祦姘寸嚎锛屾湭鎺?git锛屾湭鍙?Gitee銆?* |
 
-### 阶段 56：应用内更新支持平台分发 + Linux 浏览器跳转模式（2026-07-18）
-- **需求：** 阶段 54/55 让 Linux 能产出 deb，但用户问"当前更新是否会区分 Windows 版本和 Linux 版本"。调查后发现：**当前应用内更新链路完全是 Windows 专属**——
-  - `check_for_updates` 无脑取 Gitee release 的 `assets[0]` 作为 `download_url`，不区分平台（如果同一次 release 同时挂了 exe+deb，两个平台用户都被指向同一个文件）
-  - `download_update` 把文件保存为硬编码的 `myshell-update-setup.exe`
-  - `install_update` 在所有平台上 `if !lower.ends_with(".exe") { return Err("仅支持 .exe 安装包") }`，根本拒绝非 exe 文件
-  - 用户要的是"包里放平台标识让 Gitee 能判定"，这其实**不需要在包里放任何标识**——文件名后缀本身就是标识（`.exe` vs `.deb`），代码只需要按后缀过滤
-- **方案选型：** Linux 怎么"装"下载到的 deb 是复杂度的分水岭。四个方案 A/B/C/D 复杂度递增：A=跳浏览器让用户手动装（最简，几行代码）/ B=下载 deb + 弹提示 / C=pkexec apt install（要处理提权+apt输出）/ D=tauri-plugin-updater + AppImage（重构分发）。**用户选方案 A**——权衡后这是最稳的：Linux 自动安装 deb 涉及 pkexec 提权弹窗、apt 命令输出处理、替换正在运行的 `/usr/bin/myshell` 等一堆边界条件，留给后续方案做。
-- **设计洞察（关键省力点）：** 现有 UI 里**已经**有"浏览器下载"按钮——`UpdateNotification.tsx` 的 failed phase 和 `AboutDialog.tsx` 的 idle/failed phase 都有，通过 `openExternalUrl` 打开 URL；而 `open_external_url` 在 Linux 上**已经能工作**（走 Tauri shell plugin，自动 xdg-open）。所以最简做法是让 Linux **完全跳过下载/安装链路**，直接复用现有"打开浏览器"路径，只需要让前端知道"这是 browser 模式"。
-- **代码改动：**
-  - **`src-tauri/src/main.rs`**：
-    - `UpdateInfo` struct 末尾加字段 `update_strategy: String`（`"auto"` = Windows 走内置下载安装 / `"browser"` = Linux/macOS 跳浏览器 / 空串 = error path）
-    - `update_info_error` helper 给该字段填空串
-    - `check_for_updates` 重写 asset 选择：按平台挑后缀（Windows `.exe` / Linux `.deb` / 其他平台不挑），找不到匹配 asset 时退回 `release_url`。再加 `update_strategy` 赋值（Windows=auto / 其他=browser）。
-  - **`src/api.ts`**：`UpdateInfo` interface 镜像 `update_strategy: string`
-  - **`src/components/UpdateNotification.tsx`**：加 `const isBrowserMode = updateInfo.update_strategy === "browser"`；prompt phase 的副文案在 browser 模式下改为"当前系统暂不支持应用内自动更新，请前往下载页手动下载安装"；"更新"按钮在 browser 模式下替换为"打开下载页"（点击 `openExternalUrl(downloadUrl)`）。不进入 downloading/ready phase。
-  - **`src/components/AboutDialog.tsx`**：同样 `isBrowserMode` 判断；idle phase 在 browser 模式下只显示"打开下载页"按钮（替代"更新"+"网页下载"组合），副文案改为 Linux 说明。
-  - **`download_update` / `install_update` 完全不动**——Linux 路径根本不会调用它们，改了反而增加风险面。
-- **Windows 行为零变化：** Windows 下 `cfg!(target_os = "windows")` 让 `update_strategy = "auto"`、asset 后缀 = `.exe`，两个组件的 `isBrowserMode` 都为 false，完全走原 prompt→downloading→ready→install 流程。
-- **验证：**
+### 闃舵 56锛氬簲鐢ㄥ唴鏇存柊鏀寔骞冲彴鍒嗗彂 + Linux 娴忚鍣ㄨ烦杞ā寮忥紙2026-07-18锛?
+- **闇€姹傦細** 闃舵 54/55 璁?Linux 鑳戒骇鍑?deb锛屼絾鐢ㄦ埛闂?褰撳墠鏇存柊鏄惁浼氬尯鍒?Windows 鐗堟湰鍜?Linux 鐗堟湰"銆傝皟鏌ュ悗鍙戠幇锛?*褰撳墠搴旂敤鍐呮洿鏂伴摼璺畬鍏ㄦ槸 Windows 涓撳睘**鈥斺€?
+  - `check_for_updates` 鏃犺剳鍙?Gitee release 鐨?`assets[0]` 浣滀负 `download_url`锛屼笉鍖哄垎骞冲彴锛堝鏋滃悓涓€娆?release 鍚屾椂鎸備簡 exe+deb锛屼袱涓钩鍙扮敤鎴烽兘琚寚鍚戝悓涓€涓枃浠讹級
+  - `download_update` 鎶婃枃浠朵繚瀛樹负纭紪鐮佺殑 `myshell-update-setup.exe`
+  - `install_update` 鍦ㄦ墍鏈夊钩鍙颁笂 `if !lower.ends_with(".exe") { return Err("浠呮敮鎸?.exe 瀹夎鍖?) }`锛屾牴鏈嫆缁濋潪 exe 鏂囦欢
+  - 鐢ㄦ埛瑕佺殑鏄?鍖呴噷鏀惧钩鍙版爣璇嗚 Gitee 鑳藉垽瀹?锛岃繖鍏跺疄**涓嶉渶瑕佸湪鍖呴噷鏀句换浣曟爣璇?*鈥斺€旀枃浠跺悕鍚庣紑鏈韩灏辨槸鏍囪瘑锛坄.exe` vs `.deb`锛夛紝浠ｇ爜鍙渶瑕佹寜鍚庣紑杩囨护
+- **鏂规閫夊瀷锛?* Linux 鎬庝箞"瑁?涓嬭浇鍒扮殑 deb 鏄鏉傚害鐨勫垎姘村箔銆傚洓涓柟妗?A/B/C/D 澶嶆潅搴﹂€掑锛欰=璺虫祻瑙堝櫒璁╃敤鎴锋墜鍔ㄨ锛堟渶绠€锛屽嚑琛屼唬鐮侊級/ B=涓嬭浇 deb + 寮规彁绀?/ C=pkexec apt install锛堣澶勭悊鎻愭潈+apt杈撳嚭锛? D=tauri-plugin-updater + AppImage锛堥噸鏋勫垎鍙戯級銆?*鐢ㄦ埛閫夋柟妗?A**鈥斺€旀潈琛″悗杩欐槸鏈€绋崇殑锛歀inux 鑷姩瀹夎 deb 娑夊強 pkexec 鎻愭潈寮圭獥銆乤pt 鍛戒护杈撳嚭澶勭悊銆佹浛鎹㈡鍦ㄨ繍琛岀殑 `/usr/bin/myshell` 绛変竴鍫嗚竟鐣屾潯浠讹紝鐣欑粰鍚庣画鏂规鍋氥€?
+- **璁捐娲炲療锛堝叧閿渷鍔涚偣锛夛細** 鐜版湁 UI 閲?*宸茬粡**鏈?娴忚鍣ㄤ笅杞?鎸夐挳鈥斺€擿UpdateNotification.tsx` 鐨?failed phase 鍜?`AboutDialog.tsx` 鐨?idle/failed phase 閮芥湁锛岄€氳繃 `openExternalUrl` 鎵撳紑 URL锛涜€?`open_external_url` 鍦?Linux 涓?*宸茬粡鑳藉伐浣?*锛堣蛋 Tauri shell plugin锛岃嚜鍔?xdg-open锛夈€傛墍浠ユ渶绠€鍋氭硶鏄 Linux **瀹屽叏璺宠繃涓嬭浇/瀹夎閾捐矾**锛岀洿鎺ュ鐢ㄧ幇鏈?鎵撳紑娴忚鍣?璺緞锛屽彧闇€瑕佽鍓嶇鐭ラ亾"杩欐槸 browser 妯″紡"銆?
+- **浠ｇ爜鏀瑰姩锛?*
+  - **`src-tauri/src/main.rs`**锛?
+    - `UpdateInfo` struct 鏈熬鍔犲瓧娈?`update_strategy: String`锛坄"auto"` = Windows 璧板唴缃笅杞藉畨瑁?/ `"browser"` = Linux/macOS 璺虫祻瑙堝櫒 / 绌轰覆 = error path锛?
+    - `update_info_error` helper 缁欒瀛楁濉┖涓?
+    - `check_for_updates` 閲嶅啓 asset 閫夋嫨锛氭寜骞冲彴鎸戝悗缂€锛圵indows `.exe` / Linux `.deb` / 鍏朵粬骞冲彴涓嶆寫锛夛紝鎵句笉鍒板尮閰?asset 鏃堕€€鍥?`release_url`銆傚啀鍔?`update_strategy` 璧嬪€硷紙Windows=auto / 鍏朵粬=browser锛夈€?
+  - **`src/api.ts`**锛歚UpdateInfo` interface 闀滃儚 `update_strategy: string`
+  - **`src/components/UpdateNotification.tsx`**锛氬姞 `const isBrowserMode = updateInfo.update_strategy === "browser"`锛沺rompt phase 鐨勫壇鏂囨鍦?browser 妯″紡涓嬫敼涓?褰撳墠绯荤粺鏆備笉鏀寔搴旂敤鍐呰嚜鍔ㄦ洿鏂帮紝璇峰墠寰€涓嬭浇椤垫墜鍔ㄤ笅杞藉畨瑁?锛?鏇存柊"鎸夐挳鍦?browser 妯″紡涓嬫浛鎹负"鎵撳紑涓嬭浇椤?锛堢偣鍑?`openExternalUrl(downloadUrl)`锛夈€備笉杩涘叆 downloading/ready phase銆?
+  - **`src/components/AboutDialog.tsx`**锛氬悓鏍?`isBrowserMode` 鍒ゆ柇锛沬dle phase 鍦?browser 妯″紡涓嬪彧鏄剧ず"鎵撳紑涓嬭浇椤?鎸夐挳锛堟浛浠?鏇存柊"+"缃戦〉涓嬭浇"缁勫悎锛夛紝鍓枃妗堟敼涓?Linux 璇存槑銆?
+  - **`download_update` / `install_update` 瀹屽叏涓嶅姩**鈥斺€擫inux 璺緞鏍规湰涓嶄細璋冪敤瀹冧滑锛屾敼浜嗗弽鑰屽鍔犻闄╅潰銆?
+- **Windows 琛屼负闆跺彉鍖栵細** Windows 涓?`cfg!(target_os = "windows")` 璁?`update_strategy = "auto"`銆乤sset 鍚庣紑 = `.exe`锛屼袱涓粍浠剁殑 `isBrowserMode` 閮戒负 false锛屽畬鍏ㄨ蛋鍘?prompt鈫抎ownloading鈫抮eady鈫抜nstall 娴佺▼銆?
+- **楠岃瘉锛?*
   - `npx tsc --noEmit` PASS
-  - `cargo check --release` PASS（只剩无关的 `is_openai_protocol` dead_code warning）
-  - `npm run tauri:build` exit 0，产出新版 `MyShell_1.11.2_amd64.deb`（含本阶段代码）
-  - Windows 编译不受影响（cfg 分支保证）
-- **遗留：** Linux deb 用户检查到新版本时只能跳浏览器手动下载安装，不是真正的"应用内自动更新"。如果将来要做方案 C（pkexec apt 自动安装），改动点已经清晰：`install_update` 加 `#[cfg(target_os = "linux")]` 分支调 pkexec，`download_update` Linux 分支改文件名后缀为 `.deb`。本次不做。
+  - `cargo check --release` PASS锛堝彧鍓╂棤鍏崇殑 `is_openai_protocol` dead_code warning锛?
+  - `npm run tauri:build` exit 0锛屼骇鍑烘柊鐗?`MyShell_1.11.2_amd64.deb`锛堝惈鏈樁娈典唬鐮侊級
+  - Windows 缂栬瘧涓嶅彈褰卞搷锛坈fg 鍒嗘敮淇濊瘉锛?
+- **閬楃暀锛?* Linux deb 鐢ㄦ埛妫€鏌ュ埌鏂扮増鏈椂鍙兘璺虫祻瑙堝櫒鎵嬪姩涓嬭浇瀹夎锛屼笉鏄湡姝ｇ殑"搴旂敤鍐呰嚜鍔ㄦ洿鏂?銆傚鏋滃皢鏉ヨ鍋氭柟妗?C锛坧kexec apt 鑷姩瀹夎锛夛紝鏀瑰姩鐐瑰凡缁忔竻鏅帮細`install_update` 鍔?`#[cfg(target_os = "linux")]` 鍒嗘敮璋?pkexec锛宍download_update` Linux 鍒嗘敮鏀规枃浠跺悕鍚庣紑涓?`.deb`銆傛湰娆′笉鍋氥€?
 
-## 五问重启检查（阶段 56）
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 56锛?
+| 闂 | 绛旀 |
+|------|------|
+| 鎴戝湪鍝噷锛?| 闃舵 56 complete 鈥斺€?搴旂敤鍐呮洿鏂版敮鎸佸钩鍙板垎鍙戯紝Linux 璧版祻瑙堝櫒璺宠浆妯″紡锛宼sc/cargo check/tauri:build 鍏?PASS锛屾柊鐗?deb 宸茬敓鎴愩€?|
+| 鎴戣鍘诲摢閲岋紵 | git commit + push origin main锛堜笅涓€姝ワ級锛涚敤鎴峰湪 Linux 瀹炴祴"妫€鏌ユ洿鏂?寮圭獥鏄剧ず"鎵撳紑涓嬭浇椤?鎸夐挳涓旇兘璺虫祻瑙堝櫒銆?|
+
+### 闃舵 57锛欳LI + MCP Server 鈥斺€?璁?AI agent 浣跨敤 MyShell锛?026-07-21锛?
+- **闇€姹傦細** 鐢ㄦ埛甯屾湜 AI agent锛圕laude Code銆丆ursor銆乑Code 绛夛級鑳介€氳繃鍛戒护琛屽拰 MCP 鍗忚浣跨敤 MyShell 宸蹭繚瀛樼殑 SSH/SFTP 杩炴帴锛屾墽琛岃繙绋嬪懡浠ゃ€佺鐞嗚繙绋嬫枃浠躲€?
+- **鏋舵瀯閲嶆瀯锛圥hase 1锛夛細** 鎻愬彇 `myshell_core` 搴擄紙`src-tauri/src/lib.rs`锛夛紝灏?14 涓ā鍧椾粠 main.rs 鐨勭鏈?`mod` 鏀逛负搴撶殑 `pub mod`銆傛牳蹇冭В鑰︼細
+  - `State<'_, AppState>` 鈫?`&AppState`锛坰sh/sftp/local/ai 鍥涗釜妯″潡锛寏30 澶勭鍚嶏級
+  - `WebviewWindow` 鈫?`Arc<dyn EventSink>`锛堟柊澧?`EventSink` trait + `EventSinkExt` 鎵╁睍 trait锛?
+  - `tauri::async_runtime::spawn` 鈫?`tokio::spawn`
+  - db/crypto/vault/secrets/proxy/ftp/backup/redact/elevation 闆舵敼鍔紙鏈氨 Tauri-free锛?
+  - main.rs 鐦﹁韩涓虹函 Tauri 鍛戒护鍖呰灞?+ `WindowSink` 閫傞厤鍣?
+- **CLI 浜岃繘鍒讹紙Phase 2锛夛細** `src-tauri/src/bin/myshell-cli.rs`锛宑lap derive API锛?
+  - `myshell-cli list [--json]` 鈥?鍒楀嚭杩炴帴
+  - `myshell-cli exec <杩炴帴鍚? "鍛戒护" [--json] [--timeout N]` 鈥?杩滅▼鍛戒护鎵ц锛圓I 鏍稿績鍦烘櫙锛?
+  - `myshell-cli sftp ls/get/put/mkdir/rm/rename` 鈥?SFTP 鏂囦欢鎿嶄綔
+  - `myshell-cli ssh <杩炴帴鍚?` 鈥?浜や簰寮忕粓绔?
+  - `myshell-cli test <杩炴帴鍚?` 鈥?杩炴帴娴嬭瘯
+  - Vault 瑙ｉ攣锛歚MYSHELL_PASSPHRASE` 鐜鍙橀噺 > `--passphrase` 鍙傛暟 > 浜や簰鎻愮ず锛坮password锛?
+  - `--json` 鍏ㄥ眬閫夐」杈撳嚭鏈哄櫒鍙 JSON
+- **MCP Server锛圥hase 3锛夛細** `src-tauri/src/bin/myshell-mcp.rs`锛屾墜鍐?MCP 鍗忚锛圝SON-RPC 2.0 over stdio锛孋ontent-Length 甯э級锛?
+  - 9 涓?tools锛歚list_connections`銆乣ssh_exec`銆乣sftp_list`銆乣sftp_download`銆乣sftp_upload`銆乣sftp_mkdir`銆乣sftp_remove`銆乣sftp_rename`銆乣test_connection`
+  - 鍚姩鏃惰 `MYSHELL_PASSPHRASE` 鐜鍙橀噺瑙ｉ攣 vault
+  - 鍏煎 Claude Desktop / Cursor / ZCode 绛?MCP 瀹㈡埛绔?
+- **Cargo.toml 鍙樻洿锛?* 鏂板 `[lib] name = "myshell_core"` + `[[bin]] myshell-cli` + `[[bin]] myshell-mcp` + clap/rpassword 渚濊禆
+- **楠岃瘉锛?* `cargo check` 鍥涗釜鐩爣锛坙ib + 3 bin锛夊叏閮?PASS锛沗npx tsc --noEmit` PASS锛堝墠绔棤褰卞搷锛?
+- **AI 瀹㈡埛绔厤缃ず渚嬶細**
+  ```json
+  { "mcpServers": { "myshell": {
+      "command": "myshell-mcp",
+      "env": { "MYSHELL_PASSPHRASE": "your-master-password" }
+  }}}
+  ```
+
+### 闃舵 58锛歁CP 绠＄悊璁剧疆椤?+ keyring 瀹夊叏鍑瘉锛?026-07-21锛?
+- **闇€姹傦細** 鍦?GUI 璁剧疆闈㈡澘涓坊鍔?MCP 鏀寔绠＄悊椤甸潰锛岃鐢ㄦ埛鍙互鏂逛究鍦板惎鐢?绂佺敤 MCP銆佺鐞嗗瘑鐮侊紙Windows 鍑瘉绠＄悊鍣?DPAPI 鍔犲瘑锛夈€佽嚜鍔ㄦ娴嬪拰閰嶇疆 AI 宸ュ叿銆?
+- **鍚庣鏀瑰姩锛?*
+  - `src-tauri/src/mcp_tools.rs`锛堟柊妯″潡锛夛細AI 宸ュ叿瀹夎妫€娴嬶紙Claude/Opencode/Zcode锛夈€侀厤缃鍐欙紙鍘婚噸妫€娴嬶級銆佷簩杩涘埗璺緞瑙ｆ瀽
+  - `src-tauri/src/secrets.rs`锛氭柊澧?`set_mcp_passphrase` / `get_mcp_passphrase` / `delete_mcp_passphrase`锛坘eyring 鏈嶅姟 `myshell-mcp`锛?
+  - `src-tauri/src/main.rs`锛? 涓?MCP Tauri commands锛坉etect_tools, write_config, remove_config, save_passphrase 绛夛級
+  - `src-tauri/src/bin/myshell-cli.rs`锛歚vault save-passphrase` 鍛戒护锛堥獙璇佸瘑鐮佸悗鍐欏叆 keyring锛?
+- **鍓嶇鏀瑰姩锛?*
+  - `src/api.ts`锛? 涓?MCP API 灏佽鍑芥暟 + `AiToolInfo` 鎺ュ彛
+  - `src/components/SettingsPanel.tsx`锛氭柊澧?MCP鏀寔"渚ф爮鍒嗙被锛屽寘鍚細鍚敤/绂佺敤寮€鍏炽€乿ault 瀵嗙爜鍚屾鍒?keyring銆佷慨鏀?鍒犻櫎 keyring 瀵嗙爜銆丄I 宸ュ叿鑷姩妫€娴嬩笌涓€閿厤缃€佸瘑鐮佷慨鏀规椂鑷姩鍚屾 keyring
+- **瀹夊叏鏀硅繘锛?* 寮冪敤 `MYSHELL_PASSPHRASE` 鐜鍙橀噺鏄庢枃鏂规锛屾敼鐢?Windows 鍑瘉绠＄悊鍣紙DPAPI 鍔犲瘑锛夊瓨鍌?vault 涓诲瘑鐮?
+- **楠岃瘉锛?* `npx tsc --noEmit` PASS锛宍cargo check` 鍏ㄩ儴 PASS
+
+## 浜旈棶閲嶅惎妫€鏌ワ紙闃舵 58锛?
+| 闂 | 绛旀 |
+|------|------|
+| 鎴戝湪鍝噷锛?| 闃舵 57 complete 鈥斺€?CLI + MCP Server 瀹炵幇瀹屾瘯锛宑argo check 鍥涚洰鏍囧叏 PASS锛宼sc PASS銆?|
+| 鎴戣鍘诲摢閲岋紵 | git commit + push锛涚敤鎴峰疄娴?`myshell-cli list`銆乣myshell-cli exec`銆丮CP 瀹㈡埛绔繛鎺ャ€?|
+| 浠€涔堝彲鑳藉鑷村亸绂伙紵 | russh-sftp API 鍦ㄦ枃浠朵紶杈撴椂鍙兘鏈夎竟鐣岄棶棰橈紙澶ф枃浠躲€佺鍙烽摼鎺ワ級锛汳CP 鍗忚甯цВ鏋愬湪闈炴爣瀹㈡埛绔笂鍙兘闇€瑕佽皟鏁淬€?|
+| 涓嬩竴姝ユ渶灏忓彲楠岃瘉鍔ㄤ綔锛?| `cargo build --release` 浜у嚭涓変釜浜岃繘鍒讹紝鎵嬪姩杩愯 `myshell-cli vault status` 楠岃瘉鍩虹鍔熻兘銆?|
+| 閬楃暀鍊哄姟锛?| CLI 浜や簰寮?SSH 妯″紡鍦?Windows 涓婂彲鑳介渶瑕?raw mode 缁堢澶勭悊锛堝綋鍓嶆槸琛屾ā寮忥級锛汳CP Server 鏃犺繛鎺ユ睜锛堟瘡娆?tool call 鏂板缓 SSH 杩炴帴锛夈€?|
+| 鐩爣鏄粈涔堬紵 | Linux deb 鐢ㄦ埛涔熻兘鎰熺煡鍒版柊鐗堟湰骞舵嬁鍒板搴斿钩鍙扮殑瀹夎鍖咃紝涓嶄細琚敊璇湴鎸囧悜 Windows exe銆?|
+| 鎴戝鍒颁簡浠€涔堬紵 | (1) "鍖呴噷鏀惧钩鍙版爣璇?鏄啑浣欑殑鈥斺€旀枃浠跺悕鍚庣紑锛?exe/.deb锛夋湰韬氨鏄爣璇嗭紝浠ｇ爜鎸夊悗缂€杩囨护鍗冲彲銆?2) 澶嶇敤宸叉湁 UI 姣旀柊鍐?UI 鐪?90% 宸ヤ綔閲忥細鐜版湁 failed-phase 鐨?娴忚鍣ㄤ笅杞?鎸夐挳 + `open_external_url` 鍦?Linux 涓婂凡缁忚兘鐢紙Tauri shell plugin 鍐呯疆 xdg-open锛夛紝鍙渶鍔犱釜 `update_strategy` 瀛楁璁╁墠绔煡閬撹蛋鍝潯璺€?3) Linux 鑷姩瀹夎 deb 鐨勫鏉傚害杩滆秴"鎵撳寘"鈥斺€攑kexec/apt/鏇挎崲杩愯涓簩杩涘埗閮芥槸杈圭晫鏉′欢锛屾柟妗?A锛堣烦娴忚鍣級鏄姟瀹為€夋嫨銆?4) `cfg!(target_os = ...)` 鍦?Rust 琛ㄨ揪寮忛噷鑳界敤銆乣cfg!(windows)` 鍦ㄥ睘鎬т綅缃敤鈥斺€斿悓涓€姒傚康涓ょ璇硶銆?|
+| 鎴戝仛浜嗕粈涔堬紵 | `main.rs`锛歎pdateInfo 鍔?`update_strategy`銆乣check_for_updates` 鎸夊钩鍙扮瓫 asset + 璁剧瓥鐣ャ€乣update_info_error` 琛ュ瓧娈点€俙api.ts`锛氶暅鍍忓瓧娈点€俙UpdateNotification.tsx` + `AboutDialog.tsx`锛歜rowser 妯″紡鍒嗘敮锛堟寜閽?鏂囨锛夈€俙download_update`/`install_update` 涓嶅姩銆傞妫€鍏?PASS锛屾柊鐗?deb 鐢熸垚銆俿taging + progress 鍚屾銆?*鐗堟湰淇濇寔 1.11.2**锛屼笅涓€姝?commit + push origin main锛堜笉鍙?Gitee release锛夈€?|
+
+### 闃舵 59锛歁CP 楂樺嵄鎿嶄綔浜哄伐纭鏈哄埗锛?026-07-21锛?
+- **闇€姹傦細** AI agent 閫氳繃 MCP 鎵ц楂樺嵄鎿嶄綔锛堣繙绋嬪懡浠ゆ墽琛屻€佸垹闄ゆ枃浠躲€侀噸鍛藉悕銆佷笂浼犺鐩栵級鏃讹紝蹇呴』寮瑰嚭 OS 绾х‘璁ゅ璇濇锛岀敤鎴风偣鍑?纭"鍚庢墠鎵ц锛岀偣鍑?鍙栨秷"鍒欐嫆缁濄€備笉鍏佽 AI 璺宠繃纭銆?
+- **瀹炵幇锛?*
+  - `src-tauri/src/bin/myshell-mcp.rs`锛氭柊澧?`confirm_dangerous_operation()` 鍑芥暟锛岃皟鐢?Windows API `MessageBoxW` 寮瑰嚭妯℃€佽鍛婂璇濇锛圡B_YESNO | MB_ICONWARNING | MB_SYSTEMMODAL锛?
+  - 鍦?`ssh_exec`銆乣sftp_remove`銆乣sftp_rename`銆乣sftp_upload` 鍥涗釜楂樺嵄 tool 澶勭悊鍓嶆彃鍏ョ‘璁ゆ鏌?
+  - 纭閫氳繃鎵嶇户缁墽琛岋紝鎷掔粷鍒欒繑鍥?`isError: true` 鐨?JSON-RPC 鍝嶅簲
+  - 闈?Windows 鐜锛氭嫆缁濋珮鍗辨搷浣滃苟鎵撳嵃璀﹀憡
+- **璁捐鍐崇瓥锛?* MCP server 鏄敱 AI 宸ュ叿鍚姩鐨勭嫭绔嬭繘绋嬶紝鏃犳硶鐩存帴涓?GUI 閫氫俊銆傞噰鐢?OS 鍘熺敓瀵硅瘽妗嗘柟妗堬紝涓嶄緷璧?GUI 杩涚▼锛岀嫭绔嬪彲闈犮€?
+- **楠岃瘉锛?* `cargo check --bin myshell-mcp` PASS
+
+
+
+### 阶段 60：修复 MCP server 连接超时（ZCode 30000ms）（2026-07-21）
+- **症状：** ZCode（Desktop）启动 myshell-mcp.exe 后，30 秒后报 "MCP server myshell connection timed out after 30000ms"。手动 node 测试（pipe 注入 initialize）则正常。
+- **根因：** MCP server 启动时在主 async 任务里**同步**调用 vault unlock（PBKDF2-HMAC-SHA256 600k 次迭代 ≈ 1 秒），这段时间主线程被占满，`read_message` 无法响应 ZCode 发来的 initialize。ZCode 等不到 initialize 响应就判定超时。
+- **修复：**
+  - `src-tauri/src/bin/myshell-mcp.rs`：提取 `try_unlock_dek(passphrase) -> Result<[u8;32], String>`，vault 解锁逻辑搬到 `std::thread::spawn` 的后台线程，通过 `Arc::clone(&app.dek)` 把 DEK 写回。主 async 任务立即进入 JSON-RPC 循环。
+  - 加详细诊断日志：recv/sent 方法名 + id 写到 `%APPDATA%\\myshell\\logs\\mcp.log`（stdout 严格保留给 JSON-RPC，不能写任何调试输出）。
+  - 删除 `unlock()` 死代码（被 `try_unlock_dek` 取代）。
+- **验证：** 手动 node 模拟 ZCode 完整握手，initialize 3ms 响应，tools/list 3ms 响应，9 个工具全部列出。日志确认 `recv: initialize` → `sent: initialize response` → `recv: tools/list` → `sent: tools/list response` 完整链路。
+
+## 五问重启检查（阶段 60）
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 阶段 56 complete —— 应用内更新支持平台分发，Linux 走浏览器跳转模式，tsc/cargo check/tauri:build 全 PASS，新版 deb 已生成。 |
-| 我要去哪里？ | git commit + push origin main（下一步）；用户在 Linux 实测"检查更新"弹窗显示"打开下载页"按钮且能跳浏览器。 |
-| 目标是什么？ | Linux deb 用户也能感知到新版本并拿到对应平台的安装包，不会被错误地指向 Windows exe。 |
-| 我学到了什么？ | (1) "包里放平台标识"是冗余的——文件名后缀（.exe/.deb）本身就是标识，代码按后缀过滤即可。(2) 复用已有 UI 比新写 UI 省 90% 工作量：现有 failed-phase 的"浏览器下载"按钮 + `open_external_url` 在 Linux 上已经能用（Tauri shell plugin 内置 xdg-open），只需加个 `update_strategy` 字段让前端知道走哪条路。(3) Linux 自动安装 deb 的复杂度远超"打包"——pkexec/apt/替换运行中二进制都是边界条件，方案 A（跳浏览器）是务实选择。(4) `cfg!(target_os = ...)` 在 Rust 表达式里能用、`cfg!(windows)` 在属性位置用——同一概念两种语法。 |
-| 我做了什么？ | `main.rs`：UpdateInfo 加 `update_strategy`、`check_for_updates` 按平台筛 asset + 设策略、`update_info_error` 补字段。`api.ts`：镜像字段。`UpdateNotification.tsx` + `AboutDialog.tsx`：browser 模式分支（按钮+文案）。`download_update`/`install_update` 不动。预检全 PASS，新版 deb 生成。staging + progress 同步。**版本保持 1.11.2**，下一步 commit + push origin main（不发 Gitee release）。 |
+| 我在哪里？ | 阶段 60 complete —— MCP 连接超时已修复，手动模拟 ZCode 握手通过，9 个工具全部暴露。 |
+| 我要去哪里？ | 用户重启 ZCode 确认实际生效，然后打包完整 NSIS 安装包（含修复后的 mcp 二进制）。 |
+| 什么可能导致偏离？ | (1) ZCode 可能有自定义的超时/握手要求，比官方 MCP spec 更严；(2) 后台线程解锁完成前调用加密连接 tool 会失败（预期行为，会返回明确错误）。 |
+| 下一步最小可验证动作？ | 用户在 ZCode 设置 → MCP 看到 myshell 变成"已连接 + 9 个工具"；或者调用 `list_connections` tool 看到保存的连接列表。 |
+| 目标是什么？ | ZCode（及其他 AI agent）能稳定连接 myshell-mcp，调用 SSH/SFTP tool，高危操作弹 OS 对话框。 |
+
+
+### 阶段 61：MCP 工具描述 + server-level instructions（让 AI 知道何时调用）（2026-07-21）
+- **需求：** AI agent 是否会在正确场景调用 myshell MCP，取决于工具的 description 写得够不够明确。当前 description 太简短（如"列出远程目录"），AI 无法区分该用 myshell 还是自己的 shell 工具。
+- **改动：**
+  - **`tool_definitions()` 9 个工具 description 全部重写**：每个工具都包含 (1) WHEN TO USE 触发场景，(2) WHEN NOT TO USE 反例（关键！让 AI 知道何时不要用），(3) OUTPUT 格式，(4) SIDE EFFECTS / 危险提示（⚠️ HUMAN CONFIRMATION REQUIRED）。英文书写以兼容所有 AI 客户端。
+  - **新增 `SERVER_INSTRUCTIONS` 常量**：MCP 2025-06-18 规范新字段，放在 initialize 响应里。客户端会把它 prepend 到系统提示，告诉 AI 整个 myshell MCP 的定位（"this user's pre-saved server connections"）、触发关键词（"on prod-db" / "check web1"）、工作流（先 list_connections 取名字再调用）、安全模型（4 个高危工具会弹 OS 对话框）。
+  - `protocolVersion` 保持 2024-11-05（最大兼容性，spec 同主版本双向兼容；新字段 instructions 会被老客户端忽略）。
+- **验证：** `cargo build --release --bin myshell-mcp` PASS，`opencode mcp list` 3 个 MCP server（chrome-devtools / codegraph / myshell）全部 connected。
+
+## 五问重启检查（阶段 61）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 61 complete —— 工具描述和 server instructions 都已加上，opencode 验证连上。 |
+| 我要去哪里？ | 用户重启 ZCode 实测 AI 是否正确识别并调用 myshell 工具。 |
+| 什么可能导致偏离？ | (1) 部分老 MCP 客户端不支持 instructions 字段，但 description 仍然生效；(2) AI 可能仍然倾向于用自己的 shell 工具（习惯了），需要用户明确说"用 myshell"几次才会内化。 |
+| 下一步最小可验证动作？ | 用户在 ZCode 里问 "帮我看下 xxx 服务器上的 nginx 配置"，看 AI 是否主动调 list_connections → sftp_download。 |
+| 目标是什么？ | AI 在用户提到已保存的服务器时，自动选择 myshell MCP 工具，而不是用本地 shell 或询问连接信息。 |
+
+
+### 阶段 62：MCP 连接查找支持 host/IP + conn_type 自动消歧（2026-07-21）
+- **需求：** 用户问 "ssh 到 135.32.64.30" 时，希望 AI 能直接通过 IP 找到对应连接并执行。但用户实际有两个重名连接（同一 IP 既存 ssh 又存 sftp，name 都叫 IP），原 find_connection 用 `c.name == name` 匹配会命中第一条（sftp 那个），导致认证方式不对、失败。
+- **改动：**
+  - **`find_connection(query, expected_conn_type)`** 重写：
+    - 接受三种 query 形式：name（如 `prod-db`）/ group-path（如 `/production/prod-db`）/ host 或 IP（如 `135.32.64.30`）
+    - 三轮匹配：name 精确 → group-path 精确 → host 精确，每轮都按 `expected_conn_type` 过滤
+    - 单命中直接返回；多命中返回错误并列出候选项让 AI 转告用户
+    - 0 命中 + 有 type 提示时，额外检查不带 type 是否有命中，给出更友好错误（"找到了但类型是 sftp 不是 ssh"）
+  - **`ambiguous_error()`** 新增：格式化歧义错误，列出每个候选项的 type/group/user
+  - **8 个工具调用点改造**：ssh_exec → `Some("ssh")`；7 个 sftp_* → `Some("sftp")`；test_connection → `None`（接受任意类型）
+  - **工具描述 + SERVER_INSTRUCTIONS 同步更新**：明确告知 AI 可以用 name/group-path/host/IP 三种形式调用；conn_type 自动消歧；歧义时工具会列出候选项
+- **验证：** 实测 `ssh_exec {"connection":"135.32.64.30"}` 成功找到 ssh 类型那条连接（ias 用户），走到了 dial 阶段（仅因目标在内网无法连通才超时，查找逻辑本身正确）。`cargo build --release --bin myshell-mcp` PASS。
+
+## 五问重启检查（阶段 62）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 62 complete —— IP/host 查找 + conn_type 消歧全部实现并验证。 |
+| 我要去哪里？ | 用户重启 ZCode 实测："ssh 到 XXX.XXX.XXX.XXX" 应能直接找到对应 ssh 连接。 |
+| 什么可能导致偏离？ | (1) 同一 host 在同一 type 下存了多条（比如两个 ssh 到同一 IP 不同端口），仍会歧义——但这是用户数据问题，错误信息会引导。(2) AI 可能不主动用 IP，习惯先 list_connections 再传 name——可以接受。 |
+| 下一步最小可验证动作？ | 用户问 "ssh 到 135.32.64.30 跑下 uname -a"，看 AI 是否跳过 list_connections 直接调 ssh_exec。 |
+| 目标是什么？ | AI 用最自然的方式（名字/别名/IP）调用 myshell，对重名/多类型连接也能自动或经用户确认后选中正确的。 |
+
+
+### 阶段 63：终端截图功能 + 附件目录 + MCP screenshot_terminal 工具（2026-07-21）
+- **需求：** (1) CommandBar 加 📷 截图按钮，紧挨"快捷"按钮；(2) 截图范围仅终端 viewport，不含工具栏/输入命令栏/标签栏；(3) 截图自动保存到附件目录；(4) 附件目录在「设置 → MCP 支持」配置，首次打开提示；(5) MCP 新增 screenshot_terminal 工具，允许 AI 触发。
+- **架构决策：**
+  - 截图技术：html2canvas（primary）+ 直接复制 xterm 内部 canvas 像素（fallback，应对 webgl renderer 的空白问题）
+  - 截图目标：`term.element`（`.xterm` DOM 根）——CommandBar 是兄弟节点不是子节点，天然排除
+  - MCP screenshot_terminal：MCP server 是独立进程，无法访问 GUI 的 xterm DOM。采用"诚实告知"方案——工具返回一段中文指引让 AI 转告用户去 GUI 点 📷，并预先把连接信息、附件目录路径（或"未配置"提示）嵌入。避免假装能做到实际做不到的事。
+- **改动：**
+  - **后端** (`src-tauri/src/main.rs`)：
+    - `get_attachment_dir` / `set_attachment_dir`（仿 `gpu_disabled_flag_path`，文件 `<config_dir>/myshell/attachment-dir` 存路径）
+    - `save_screenshot(data_url, connection_name)`：base64 解码 PNG → 写入 `截图_<连接名>_<时间戳>.png` → 返回完整路径
+    - `show_in_folder(path)`：跨平台打开文件管理器并选中文件（Windows: `explorer.exe /select,`，macOS: `open -R`，Linux: `xdg-open`）
+  - **前端 API** (`src/api.ts`)：4 个封装函数
+  - **截图工具** (`src/utils/screenshot.ts` 新文件)：`captureTerminalToDataUrl(term)` 返回 PNG dataUrl；html2canvas 主路径，canvas fallback；空白 PNG 检测自动切换 fallback
+  - **CommandBar** (`src/components/CommandBar.tsx`)：新增 📷 按钮，相同样式，紧挨"快捷"按钮；Props 加 `onScreenshot`
+  - **TerminalPanel** (`src/components/TerminalPanel.tsx`)：
+    - Props 加 `connectionName`（用于文件名）
+    - `handleScreenshot()`：captureTerminalToDataUrl → saveScreenshot → toast 横幅（"正在截取"→"已保存：路径"+"打开"按钮 / "错误"）
+    - 截图状态 toast 4s 自动消失
+  - **App.tsx**：`connectionName={tab.name}` 透传
+  - **SettingsPanel** (`src/components/SettingsPanel.tsx`)：MCP 节新增"📎 附件目录"子区块，含「选择目录」/「打开目录」按钮；首次未配置显示警告横幅（localStorage 标记"已知晓"避免反复弹）
+  - **MCP** (`src-tauri/src/bin/myshell-mcp.rs`)：`screenshot_terminal` 工具定义 + 分发；`secrets_attachment_dir()` 辅助函数读附件目录
+- **验证：** `cargo check` PASS，`npx tsc --noEmit` PASS，`cargo build --release --bin myshell-mcp` PASS，`opencode mcp list` myshell connected（10 个工具）。
+
+## 五问重启检查（阶段 63）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 63 complete —— 截图按钮、附件目录、MCP screenshot 工具全部实现并编译通过。 |
+| 我要去哪里？ | 用户实测：(1) 设置 → MCP 支持 → 配置附件目录；(2) 打开任意 SSH tab → 点 📷 → 检查生成的 PNG 只含终端不含工具栏；(3) MCP screenshot_terminal 返回合理指引。 |
+| 什么可能导致偏离？ | (1) html2canvas 对 webgl renderer 可能仍空白——有 canvas fallback 兜底；(2) 首次截图前必须配置附件目录，否则会报错（已在 toast 中提示）；(3) xterm DOM 结构在新版本可能变化，导致 canvas fallback 路径找不到 .xterm-screen。 |
+| 下一步最小可验证动作？ | 用户打开 SSH tab 输出些内容（比如 ls / uname -a），点 📷，确认附件目录有新 PNG 且内容正确。 |
+| 目标是什么？ | 一键截取当前终端画面用于分享/留档；AI 能通过 MCP 引导用户完成截图并拿到文件位置。 |

@@ -1198,6 +1198,46 @@ export async function setGpuAccelerationDisabled(disabled: boolean): Promise<voi
   await invoke("set_gpu_acceleration_disabled", { disabled });
 }
 
+// ============ Attachment directory + screenshot ============
+//
+// The attachment directory is where terminal screenshots (and future MCP
+// attachments) are auto-saved. Configured by the user in Settings → MCP 支持.
+// `null` means "not configured yet" — the GUI prompts the user to set one on
+// first screenshot attempt.
+
+/** Read the configured attachment directory. `null` if not yet set. */
+export async function getAttachmentDir(): Promise<string | null> {
+  return invoke<string | null>("get_attachment_dir");
+}
+
+/**
+ * Persist the attachment directory. Validates the path (creates it if needed)
+ * and returns the canonical absolute path that was actually stored.
+ */
+export async function setAttachmentDir(dir: string): Promise<string> {
+  return invoke<string>("set_attachment_dir", { dir });
+}
+
+/**
+ * Save a PNG screenshot to the attachment directory.
+ *
+ * @param dataUrl  `data:image/png;base64,...` URL from canvas.toDataURL("image/png")
+ * @param connectionName  Used to build a human-friendly filename
+ * @returns Absolute path of the saved file
+ */
+export async function saveScreenshot(dataUrl: string, connectionName: string): Promise<string> {
+  return invoke<string>("save_screenshot", { dataUrl, connectionName });
+}
+
+/**
+ * Open a file/folder in the OS file manager. On Windows, selects the file in
+ * Explorer (like "Show in Folder"). On macOS, reveals in Finder. On Linux,
+ * opens the containing directory.
+ */
+export async function showInFolder(path: string): Promise<void> {
+  await invoke("show_in_folder", { path });
+}
+
 // ============ Frontend log forwarding ============
 //
 // The webview's console isn't persisted on the user's machine, so to diagnose
@@ -1219,4 +1259,57 @@ export function writeFrontendLog(level: FrontendLogLevel, message: string): void
   invoke("write_frontend_log", { level, message }).catch(() => {
     /* Swallow — logging must never throw. */
   });
+}
+
+// ============ MCP Server Management ============
+//
+// Configure and manage the myshell-mcp server for AI tools
+// (Claude Desktop / Opencode / Zcode).
+
+/** Detected AI tool with its config path and whether myshell is already configured. */
+export interface AiToolInfo {
+  /** "claude" | "opencode" | "zcode" */
+  id: string;
+  name: string;
+  /** Absolute path to the config file */
+  configPath: string;
+  /** true if the tool is installed (config file exists) */
+  installed: boolean;
+  /** true if myshell MCP server is already configured */
+  configured: boolean;
+}
+
+/** Get the absolute path to myshell-mcp.exe. */
+export async function getMcpBinaryPath(): Promise<string> {
+  return await invoke("mcp_get_binary_path");
+}
+
+/** Detect installed AI tools and whether they have myshell configured. */
+export async function mcpDetectTools(): Promise<AiToolInfo[]> {
+  return await invoke("mcp_detect_tools");
+}
+
+/** Write myshell MCP config to a specific tool. Returns true if written, false if already configured. */
+export async function mcpWriteConfig(toolId: string): Promise<boolean> {
+  return await invoke("mcp_write_config", { toolId });
+}
+
+/** Remove myshell from a tool's MCP config. */
+export async function mcpRemoveConfig(toolId: string): Promise<void> {
+  await invoke("mcp_remove_config", { toolId });
+}
+
+/** Save vault passphrase to OS keyring for MCP server. */
+export async function mcpSavePassphrase(passphrase: string): Promise<void> {
+  await invoke("mcp_save_passphrase", { passphrase });
+}
+
+/** Check if MCP passphrase exists in keyring. */
+export async function mcpHasPassphrase(): Promise<boolean> {
+  return await invoke("mcp_has_passphrase");
+}
+
+/** Delete stored MCP passphrase from keyring. */
+export async function mcpDeletePassphrase(): Promise<void> {
+  await invoke("mcp_delete_passphrase");
 }

@@ -1,13 +1,10 @@
-use crate::{AppState, ConnectionConfig};
+use crate::{AppState, ConnectionConfig, EventSink, EventSinkExt};
 use crate::proxy;
 use russh::client::{self, Handle, Msg};
 use russh::{Channel, ChannelMsg, Disconnect};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{Emitter, WebviewWindow};
-use tauri::async_runtime;
 use tokio::sync::mpsc;
-use tauri::State;
 
 #[derive(Debug)]
 pub enum SessionCommand {
@@ -268,7 +265,7 @@ where
 }
 
 pub async fn dial_and_authenticate(
-    state: &State<'_, AppState>,
+    state: &AppState,
     config: &ConnectionConfig,
     open_channel: bool,
 ) -> Result<Handle<SshClient>, String> {
@@ -389,7 +386,7 @@ pub async fn dial_and_authenticate(
 /// error"). Returns a human-readable success message with the wall-clock
 /// latency. Used by the `test_connection` command for the dialog "测试" button.
 pub async fn test_connection(
-    state: &State<'_, AppState>,
+    state: &AppState,
     config: &ConnectionConfig,
 ) -> Result<String, String> {
     let started = Instant::now();
@@ -412,8 +409,8 @@ pub async fn test_connection(
 }
 
 pub async fn connect(
-    state: State<'_, AppState>,
-    window: WebviewWindow,
+    state: &AppState,
+    sink: Arc<dyn EventSink>,
     config: ConnectionConfig,
 ) -> Result<String, String> {
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -422,7 +419,7 @@ pub async fn connect(
     // Dial + authenticate. The shared dial_and_authenticate helper is also
     // used by `test_connection`, so a real connect and a connection test
     // exercise the exact same dial/auth/host-key path.
-    let handle = dial_and_authenticate(&state, &config, false).await?;
+    let handle = dial_and_authenticate(state, &config, false).await?;
 
     // Open channel and request PTY
     log::info!("[ssh:{}] opening session channel", sid);
@@ -488,15 +485,15 @@ pub async fn connect(
     // `disconnect()`.
     let reader_sid = sid.clone();
 
-    async_runtime::spawn(async move {
-        channel_reader(window, reader_sid, channel, command_rx).await;
+    tokio::spawn(async move {
+        channel_reader(sink, reader_sid, channel, command_rx).await;
     });
 
     Ok(sid)
 }
 
 async fn channel_reader(
-    window: WebviewWindow,
+    sink: Arc<dyn EventSink>,
     session_id: String,
     mut channel: Channel<Msg>,
     mut command_rx: mpsc::UnboundedReceiver<SessionCommand>,
@@ -592,7 +589,7 @@ async fn channel_reader(
                     };
                     if !data.is_empty() {
                         handle_incoming_data(
-                            &window, &session_id, data, &mut buffer, &mut last_flush,
+                            &*sink, &session_id, data, &mut buffer, &mut last_flush,
                             &mut mode, &mut oo_eaten,
                         );
                     }
@@ -600,40 +597,40 @@ async fn channel_reader(
                 Some(ChannelMsg::ExtendedData { ref data, .. }) => {
                     log::debug!("[ssh:{}] ExtendedData {} bytes", session_id, data.len());
                     // stderr — treat as ordinary terminal output, never as ZMODEM.
-                    append_capped(&window, &session_id, &mut buffer, &data[..], &mut last_flush);
+                    append_capped(&*sink, &session_id, &mut buffer, &data[..], &mut last_flush);
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                     log::info!("[ssh:{}] ExitStatus={}", session_id, exit_status);
-                    let _ = window.emit("ssh_exit", serde_json::json!({
+                    sink.emit_raw("ssh_exit", serde_json::json!({
                         "sessionId": session_id,
                         "code": exit_status
                     }));
                 }
                 Some(ChannelMsg::Eof) => {
                     log::info!("[ssh:{}] EOF", session_id);
-                    flush_buffer(&window, &session_id, &mut buffer);
+                    flush_buffer(&*sink, &session_id, &mut buffer);
                     if mode == TermMode::Zmodem {
-                        let _ = window.emit("zmodem_end", &session_id);
+                        sink.emit("zmodem_end", &session_id);
                     }
-                    let _ = window.emit("ssh_closed", &session_id);
+                    sink.emit("ssh_closed", &session_id);
                     break;
                 }
                 Some(ChannelMsg::Close) => {
                     log::info!("[ssh:{}] Close", session_id);
-                    flush_buffer(&window, &session_id, &mut buffer);
+                    flush_buffer(&*sink, &session_id, &mut buffer);
                     if mode == TermMode::Zmodem {
-                        let _ = window.emit("zmodem_end", &session_id);
+                        sink.emit("zmodem_end", &session_id);
                     }
-                    let _ = window.emit("ssh_closed", &session_id);
+                    sink.emit("ssh_closed", &session_id);
                     break;
                 }
                 None => {
                     log::info!("[ssh:{}] channel.wait returned None", session_id);
-                    flush_buffer(&window, &session_id, &mut buffer);
+                    flush_buffer(&*sink, &session_id, &mut buffer);
                     if mode == TermMode::Zmodem {
-                        let _ = window.emit("zmodem_end", &session_id);
+                        sink.emit("zmodem_end", &session_id);
                     }
-                    let _ = window.emit("ssh_closed", &session_id);
+                    sink.emit("ssh_closed", &session_id);
                     break;
                 }
                 Some(other) => {
@@ -645,7 +642,7 @@ async fn channel_reader(
             // server trickles bytes. Coalesces bursts and mitigates tauri#13234.
             _ = flush_interval.tick() => {
                 if !buffer.is_empty() && last_flush.elapsed() >= Duration::from_millis(16) {
-                    flush_buffer(&window, &session_id, &mut buffer);
+                    flush_buffer(&*sink, &session_id, &mut buffer);
                     last_flush = Instant::now();
                 }
             }
@@ -673,7 +670,7 @@ async fn channel_reader(
 /// transition fires on ZFIN or 5× CAN. On Zmodem→Normal, `oo_eaten` is reset
 /// to 0 so the caller can strip the trailing OO bytes from the next chunks.
 fn handle_incoming_data(
-    window: &WebviewWindow,
+    sink: &dyn EventSink,
     session_id: &str,
     data: &[u8],
     buffer: &mut Vec<u8>,
@@ -686,7 +683,7 @@ fn handle_incoming_data(
             // Append to the shared terminal/ZMODEM-scan buffer. If no needle is
             // found the existing 16ms tick will coalesce-flush it as terminal
             // output via append_capped's threshold logic.
-            append_capped(window, session_id, buffer, data, last_flush);
+            append_capped(sink, session_id, buffer, data, last_flush);
 
             // Re-scan the full buffer for the ZMODEM auto-start sequence. It can
             // land anywhere — typically right after a prompt — so we can't only
@@ -700,20 +697,20 @@ fn handle_incoming_data(
 
                 // Force-flush the terminal prefix so xterm shows what came before
                 // the protocol switching point.
-                flush_buffer(window, session_id, buffer);
+                flush_buffer(sink, session_id, buffer);
 
                 let direction = detect_direction(&tail);
                 *mode = TermMode::Zmodem;
-                let _ = window.emit(
+                sink.emit(
                     "zmodem_start",
-                    ZmodemStartPayload {
+                    &ZmodemStartPayload {
                         session_id: session_id.to_string(),
                         direction,
                     },
                 );
-                let _ = window.emit(
+                sink.emit(
                     "zmodem_raw",
-                    SshOutputPayload {
+                    &SshOutputPayload {
                         session_id: session_id.to_string(),
                         data: tail,
                     },
@@ -724,9 +721,9 @@ fn handle_incoming_data(
             // Forward raw bytes to the frontend zmodem.js parser. Do NOT coalesce
             // on the 16ms tick — protocol framing is byte-precise and a delayed
             // flush would corrupt the parser's state machine.
-            let _ = window.emit(
+            sink.emit(
                 "zmodem_raw",
-                SshOutputPayload {
+                &SshOutputPayload {
                     session_id: session_id.to_string(),
                     data: data.to_vec(),
                 },
@@ -734,13 +731,13 @@ fn handle_incoming_data(
             if is_zmodem_end(data) {
                 *mode = TermMode::Normal;
                 *oo_eaten = 0; // arm the OO-stripping for the next chunks
-                let _ = window.emit("zmodem_end", session_id);
+                sink.emit("zmodem_end", &session_id);
             }
         }
     }
 }
 
-fn flush_buffer(window: &WebviewWindow, session_id: &str, buffer: &mut Vec<u8>) {
+fn flush_buffer(sink: &dyn EventSink, session_id: &str, buffer: &mut Vec<u8>) {
     if buffer.is_empty() {
         return;
     }
@@ -749,9 +746,7 @@ fn flush_buffer(window: &WebviewWindow, session_id: &str, buffer: &mut Vec<u8>) 
         data: std::mem::take(buffer),
     };
     log::debug!("[ssh:{}] flush {} bytes → ssh_output", session_id, payload.data.len());
-    if let Err(e) = window.emit("ssh_output", payload) {
-        log::warn!("[ssh:{}] emit ssh_output FAILED: {}", session_id, e);
-    }
+    sink.emit("ssh_output", &payload);
 }
 
 /// Hard cap on the in-flight output buffer. Prevents a hostile or chatty
@@ -768,7 +763,7 @@ const TRUNCATION_MARKER: &[u8] =
     b"\r\n\x1b[33m[output truncated: server sending too fast]\x1b[0m\r\n";
 
 fn append_capped(
-    window: &WebviewWindow,
+    sink: &dyn EventSink,
     session_id: &str,
     buffer: &mut Vec<u8>,
     incoming: &[u8],
@@ -782,20 +777,20 @@ fn append_capped(
         if space > 0 {
             buffer.extend_from_slice(&incoming[..space]);
         }
-        flush_buffer(window, session_id, buffer);
+        flush_buffer(sink, session_id, buffer);
         buffer.extend_from_slice(TRUNCATION_MARKER);
-        flush_buffer(window, session_id, buffer);
+        flush_buffer(sink, session_id, buffer);
         *last_flush = Instant::now();
         return;
     }
     if buffer.len() >= FLUSH_THRESHOLD {
-        flush_buffer(window, session_id, buffer);
+        flush_buffer(sink, session_id, buffer);
         *last_flush = Instant::now();
     }
 }
 
 pub async fn send_input(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     data: &[u8],
 ) -> Result<(), String> {
@@ -813,7 +808,7 @@ pub async fn send_input(
 }
 
 pub async fn resize_terminal(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     cols: u16,
     rows: u16,
@@ -835,7 +830,7 @@ pub async fn resize_terminal(
 }
 
 pub async fn disconnect(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
 ) -> Result<(), String> {
     // This is the single point that removes an SSH session from the map.
@@ -864,7 +859,7 @@ pub async fn disconnect(
 /// Push bytes produced by the frontend's zmodem.js (ZRINIT/ZRPOS/ZDATA acks,
 /// file payload during upload) into the SSH channel.
 pub async fn zmodem_send_bytes(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     data: &[u8],
 ) -> Result<(), String> {
@@ -884,7 +879,7 @@ pub async fn zmodem_send_bytes(
 /// Tell the reader task to fire the lrzsz abort sequence (8× CAN + backspaces).
 /// Used by the cancel button in the progress overlay.
 pub async fn zmodem_abort(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
 ) -> Result<(), String> {
     let sender = {
@@ -906,7 +901,7 @@ pub async fn zmodem_abort(
 /// interactive PTY channel is untouched — russh multiplexes channels over the
 /// same connection. Caller is responsible for timeout if needed.
 pub async fn exec_once(
-    state: &State<'_, AppState>,
+    state: &AppState,
     session_id: &str,
     command: &str,
 ) -> Result<String, String> {

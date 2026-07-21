@@ -1,11 +1,11 @@
 //! AI assistant — multi-provider chat (Claude / OpenAI / Ollama) with
 //! streaming token output to the frontend, plus server health inspection.
 //!
-//! Streaming reuses the same `window.emit` pattern as `ssh_output`: a tauri
-//! command calls [`chat_stream`], which resolves the provider config + key
+//! Streaming reuses the same `sink.emit` pattern as `ssh_output`: a command
+//! wrapper calls [`chat_stream`], which resolves the provider config + key
 //! from the vault-backed `ai_settings` table, fires an HTTP request, and
-//! emits `ai_token` / `ai_done` / `ai_error` events scoped to the originating
-//! webview as SSE/NDJSON chunks arrive. Health inspection runs a preset
+//! emits `ai_token` / `ai_done` / `ai_error` events via the `EventSink`
+//! as SSE/NDJSON chunks arrive. Health inspection runs a preset
 //! read-only script (SSH via `ssh::exec_once`, local via `std::process`) and
 //! feeds the collected metrics into the same streaming path.
 //!
@@ -15,9 +15,9 @@
 //! `Pin<Box<dyn Future>>` machinery and keeps everything concrete.
 
 use crate::{crypto, ssh, AppState};
+use crate::{EventSink, EventSinkExt};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use tauri::{Emitter, State, WebviewWindow};
 
 // ───────────────────────────── payloads (Rust → frontend) ─────────────────────────────
 
@@ -41,15 +41,15 @@ struct AiErrorPayload {
     error: String,
 }
 
-fn emit_error(window: &WebviewWindow, request_id: &str, error: impl Into<String>) {
+fn emit_error(sink: &dyn EventSink, request_id: &str, error: impl Into<String>) {
     let msg: String = error.into();
     // Every AI failure path (chat stream, health inspect, test) funnels
     // through here, so log once to capture the provider/HTTP reason for
     // post-mortem when a user reports "AI 不工作".
     log::warn!("[ai:{}] error: {}", request_id, msg);
-    let _ = window.emit(
+    sink.emit(
         "ai_error",
-        AiErrorPayload {
+        &AiErrorPayload {
             request_id: request_id.to_string(),
             error: msg,
         },
@@ -79,7 +79,7 @@ pub struct AiContext {
     pub conn_type: Option<String>,
 }
 
-/// Bundle the frontend's `ai_chat` args. Built by the tauri command wrapper
+/// Bundle the frontend's `ai_chat` args. Built by the command wrapper
 /// in `main.rs` (which takes the fields flat for idiomatic camelCase IPC).
 pub struct AiChatParams {
     pub request_id: String,
@@ -321,7 +321,7 @@ enum LineToken {
 /// Read the active AI model config and decrypt the API key with the session
 /// DEK. Prefers the multi-model `ai_models` table (via `active_model_id`);
 /// falls back to the legacy single-row `ai_settings` for backward compat.
-fn load_settings(state: &State<'_, AppState>) -> Result<LoadedSettings, String> {
+fn load_settings(state: &AppState) -> Result<LoadedSettings, String> {
     let dek = state
         .dek
         .lock()
@@ -436,7 +436,7 @@ fn decrypt_key(dek: &[u8; 32], api_key_enc: Option<&str>) -> Result<String, Stri
 /// with an optional override API key. Used by `test_settings` so the user can
 /// test the supplier they're editing rather than the globally-active one.
 fn load_settings_for_supplier(
-    state: &State<'_, AppState>,
+    state: &AppState,
     supplier_id: i64,
     override_key: Option<&str>,
 ) -> Result<LoadedSettings, String> {
@@ -489,7 +489,7 @@ fn load_settings_for_supplier(
 /// override key even when the active supplier has no key saved in the vault
 /// (e.g. create / edit-then-test before first save).
 fn load_settings_with_key(
-    state: &State<'_, AppState>,
+    state: &AppState,
     override_key: &str,
 ) -> Result<LoadedSettings, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -633,20 +633,20 @@ fn build_system(base: Option<String>, ctx: &Option<AiContext>) -> Option<String>
 /// `ai_error`; the caller always gets a terminal event (`ai_done` or
 /// `ai_error`), never a hanging stream.
 pub async fn chat_stream(
-    state: &State<'_, AppState>,
-    window: &WebviewWindow,
+    state: &AppState,
+    sink: &dyn EventSink,
     params: AiChatParams,
 ) -> Result<(), String> {
     let req_id = params.request_id.clone();
-    if let Err(e) = run_chat_stream(state, window, params).await {
-        emit_error(window, &req_id, e);
+    if let Err(e) = run_chat_stream(state, sink, params).await {
+        emit_error(sink, &req_id, e);
     }
     Ok(())
 }
 
 async fn run_chat_stream(
-    state: &State<'_, AppState>,
-    window: &WebviewWindow,
+    state: &AppState,
+    sink: &dyn EventSink,
     params: AiChatParams,
 ) -> Result<(), String> {
     let s = load_settings(state)?;
@@ -698,18 +698,18 @@ async fn run_chat_stream(
             let line = String::from_utf8_lossy(&line_bytes);
             match s.provider.token_from_line(&line) {
                 LineToken::Token(tok) => {
-                    let _ = window.emit(
+                    sink.emit(
                         "ai_token",
-                        AiTokenPayload {
+                        &AiTokenPayload {
                             request_id: req_id.clone(),
                             token: tok,
                         },
                     );
                 }
                 LineToken::Done => {
-                    let _ = window.emit(
+                    sink.emit(
                         "ai_done",
-                        AiDonePayload {
+                        &AiDonePayload {
                             request_id: req_id.clone(),
                         },
                     );
@@ -720,9 +720,9 @@ async fn run_chat_stream(
         }
     }
     // Stream ended without an explicit Done marker — still signal completion.
-    let _ = window.emit(
+    sink.emit(
         "ai_done",
-        AiDonePayload {
+        &AiDonePayload {
             request_id: req_id,
         },
     );
@@ -777,7 +777,7 @@ pub struct AiTestOverrides {
 /// emits `ai_token`/`ai_done` events — so it can't interfere with an open
 /// AiPanel's streaming subscriptions.
 pub async fn test_settings(
-    state: &State<'_, AppState>,
+    state: &AppState,
     overrides: AiTestOverrides,
 ) -> Result<String, String> {
     // Load the specific supplier being tested (or fall back to active one).
@@ -924,8 +924,8 @@ Write-Output "=== 运行中的服务 (前 20) ==="; Get-Service | Where-Object {
 /// (reuses `ssh::exec_once`, same path as `ssh_get_server_info`), then
 /// streams an AI health report.
 pub async fn inspect_health_ssh(
-    state: &State<'_, AppState>,
-    window: &WebviewWindow,
+    state: &AppState,
+    sink: &dyn EventSink,
     session_id: &str,
     request_id: &str,
 ) -> Result<(), String> {
@@ -955,11 +955,11 @@ pub async fn inspect_health_ssh(
             } else {
                 format!("执行巡检命令失败: {}", e)
             };
-            emit_error(window, request_id, msg);
+            emit_error(sink, request_id, msg);
             return Ok(());
         }
         Err(_) => {
-            emit_error(window, request_id, "巡检命令执行超时");
+            emit_error(sink, request_id, "巡检命令执行超时");
             return Ok(());
         }
     };
@@ -973,7 +973,7 @@ pub async fn inspect_health_ssh(
     }];
     chat_stream(
         state,
-        window,
+        sink,
         AiChatParams {
             request_id: request_id.to_string(),
             messages,
@@ -988,8 +988,8 @@ pub async fn inspect_health_ssh(
 /// read-only script via the OS shell — no PTY session needed, it's the
 /// user's own machine — then streams an AI health report.
 pub async fn inspect_health_local(
-    state: &State<'_, AppState>,
-    window: &WebviewWindow,
+    state: &AppState,
+    sink: &dyn EventSink,
     request_id: &str,
 ) -> Result<(), String> {
     // Match inspect_health_ssh's 20s cap. Without it, a hung PowerShell
@@ -1006,7 +1006,7 @@ pub async fn inspect_health_local(
     let raw = match raw {
         Ok(s) => s,
         Err(e) => {
-            emit_error(window, request_id, e);
+            emit_error(sink, request_id, e);
             return Ok(());
         }
     };
@@ -1020,7 +1020,7 @@ pub async fn inspect_health_local(
     }];
     chat_stream(
         state,
-        window,
+        sink,
         AiChatParams {
             request_id: request_id.to_string(),
             messages,
@@ -1094,7 +1094,7 @@ pub struct AiModelInfo {
 /// List all configured AI models (presets + user-created). Does NOT return
 /// api_key — only a `has_key` boolean so the UI can prompt for one.
 /// Each returned AiModelInfo includes its full model list (`models`).
-pub fn list_ai_models_cmd(state: &State<'_, AppState>) -> Result<Vec<AiModelInfo>, String> {
+pub fn list_ai_models_cmd(state: &AppState) -> Result<Vec<AiModelInfo>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = db
         .prepare(
@@ -1174,7 +1174,7 @@ fn load_supplier_models(
 }
 
 /// Get the currently active model id from ai_settings.
-pub fn get_active_model_id(state: &State<'_, AppState>) -> Result<Option<i64>, String> {
+pub fn get_active_model_id(state: &AppState) -> Result<Option<i64>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.query_row(
         "SELECT active_model_id FROM ai_settings WHERE id = 1",
@@ -1193,7 +1193,7 @@ pub fn get_active_model_id(state: &State<'_, AppState>) -> Result<Option<i64>, S
 /// with the given list (the primary model_id is always kept as a fallback
 /// even if not listed). On create, models are inserted after the supplier.
 pub fn save_ai_model_cmd(
-    state: &State<'_, AppState>,
+    state: &AppState,
     id: Option<i64>,
     name: String,
     provider: String,
@@ -1285,7 +1285,7 @@ fn sync_supplier_models(
 }
 
 /// Delete a user-created AI model. Presets (is_preset=1) cannot be deleted.
-pub fn delete_ai_model_cmd(state: &State<'_, AppState>, id: i64) -> Result<(), String> {
+pub fn delete_ai_model_cmd(state: &AppState, id: i64) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let affected = db
         .execute(
@@ -1308,7 +1308,7 @@ pub fn delete_ai_model_cmd(state: &State<'_, AppState>, id: i64) -> Result<(), S
 /// `model_string` selects the specific model_id within the supplier (None =
 /// fall back to the supplier's primary model_id).
 pub fn set_active_ai_model_cmd(
-    state: &State<'_, AppState>,
+    state: &AppState,
     id: i64,
     model_string: Option<String>,
 ) -> Result<(), String> {
@@ -1339,7 +1339,7 @@ pub fn set_active_ai_model_cmd(
 
 /// List all models for a given supplier (from ai_supplier_models).
 pub fn list_supplier_models_cmd(
-    state: &State<'_, AppState>,
+    state: &AppState,
     supplier_id: i64,
 ) -> Result<Vec<SupplierModelInfo>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -1348,7 +1348,7 @@ pub fn list_supplier_models_cmd(
 
 /// Add a model to a supplier. Returns the new row id.
 pub fn add_supplier_model_cmd(
-    state: &State<'_, AppState>,
+    state: &AppState,
     supplier_id: i64,
     model_id: String,
     label: Option<String>,
@@ -1372,7 +1372,7 @@ pub fn add_supplier_model_cmd(
 }
 
 /// Remove a single supplier model row by id.
-pub fn remove_supplier_model_cmd(state: &State<'_, AppState>, id: i64) -> Result<(), String> {
+pub fn remove_supplier_model_cmd(state: &AppState, id: i64) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.execute("DELETE FROM ai_supplier_models WHERE id = ?1", [id])
         .map_err(|e| e.to_string())?;
@@ -1382,7 +1382,7 @@ pub fn remove_supplier_model_cmd(state: &State<'_, AppState>, id: i64) -> Result
 /// Toggle the enabled flag of a supplier. Disabled suppliers are hidden from
 /// the AI chat model picker but kept in the settings list.
 pub fn toggle_ai_model_enabled_cmd(
-    state: &State<'_, AppState>,
+    state: &AppState,
     id: i64,
     enabled: bool,
 ) -> Result<(), String> {
@@ -1396,7 +1396,7 @@ pub fn toggle_ai_model_enabled_cmd(
 }
 
 /// Built-in preset definitions. Inserted on first launch if the table is empty.
-pub fn init_ai_presets_cmd(state: &State<'_, AppState>) -> Result<(), String> {
+pub fn init_ai_presets_cmd(state: &AppState) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
     // Only insert if no presets exist yet (idempotent).
@@ -1542,7 +1542,7 @@ pub async fn fetch_provider_models(
 /// after a save. Falls back to an override key when the supplier has no
 /// stored key yet (create / edit flow).
 pub async fn fetch_models_for_supplier(
-    state: &State<'_, AppState>,
+    state: &AppState,
     supplier_id: i64,
     override_key: Option<String>,
 ) -> Result<Vec<String>, String> {

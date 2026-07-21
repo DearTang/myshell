@@ -17,8 +17,14 @@ Frontend (run from repo root):
 Full app (run from `src-tauri/`):
 - `cargo tauri dev` — launch the desktop app with HMR (calls `npm run dev` via `beforeDevCommand`)
 - `cargo tauri build` — produce a distributable bundle (calls `npm run build` first)
-- `cargo build` — compile Rust backend only
+- `cargo build` — compile all Rust targets (GUI + CLI + MCP)
+- `cargo build --bin myshell` — compile only the GUI binary
+- `cargo build --bin myshell-cli` — compile only the CLI binary
+- `cargo build --bin myshell-mcp` — compile only the MCP server binary
 - `cargo check` — fast type/error check without codegen
+
+Building a release installer:
+- `scripts/build-release.bat` (Windows) or `scripts/build-release.sh` (Linux) — builds MCP + CLI binaries first, then runs `cargo tauri build`. The NSIS installer bundles `myshell-mcp.exe` alongside `myshell.exe` (configured in `nsis/installer.nsi`).
 
 `TAURI_DEV_HOST` env var forwards Vite HMR over the LAN (used for mobile/dev on another machine).
 
@@ -31,31 +37,77 @@ Rust and TS are bridged exclusively through Tauri commands. The wire contract:
 ```
 React component → src/api.ts (typed wrapper) → invoke("snake_case_name", { camelCaseArgs })
                                                        ↓
-src-tauri/src/main.rs #[tauri::command] fn snake_case_name(...) → ssh.rs / sftp.rs / db.rs
+src-tauri/src/main.rs #[tauri::command] fn snake_case_name(...) → myshell_core (ssh.rs / sftp.rs / db.rs)
 ```
 
 When adding a command, update **three** places in lockstep:
 1. `main.rs` — `#[tauri::command]` fn + registration in `generate_handler!`
-2. The relevant module (`ssh.rs` / `sftp.rs` / `db.rs`) for the actual logic
+2. The relevant module in `myshell_core` (`ssh.rs` / `sftp.rs` / `db.rs`) for the actual logic
 3. `src/api.ts` — typed wrapper so the frontend gets types
 
-Current command surface (see `generate_handler!` in `main.rs` for the full, ever-growing list): `get_connections`, `save_connection`, `delete_connection`, `ssh_connect`, `ssh_send`, `ssh_resize`, `ssh_disconnect`, `sftp_list_dir`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, plus vault / folder / quick-command / FTP commands and the local-terminal set `local_connect` / `local_send` / `local_resize` / `local_disconnect`.
+Current command surface (see `generate_handler!` in `main.rs` for the full list): `get_connections`, `save_connection`, `delete_connection`, `ssh_connect`, `ssh_send`, `ssh_resize`, `ssh_disconnect`, `sftp_list_dir`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, plus vault / folder / quick-command / FTP commands and the local-terminal set `local_connect` / `local_send` / `local_resize` / `local_disconnect`.
 
-Shared types (`ConnectionConfig`, `FileEntry`) are defined twice and must stay in sync: once in `src-tauri/src/main.rs` (serde-derived structs) and once in `src/api.ts` (TS interfaces).
+Shared types (`ConnectionConfig`, `FileEntry`) are defined in `src-tauri/src/lib.rs` (serde-derived structs, `myshell_core` crate) and mirrored in `src/api.ts` (TS interfaces). Update both in lockstep.
+
+### Three-binary architecture
+
+The project has **three binary targets** sharing the same `myshell_core` library:
+
+| Binary | Cargo target | Path | Purpose |
+|--------|-------------|------|---------|
+| `myshell` | `[[bin]]` | `src/main.rs` | Tauri GUI app (the desktop SSH/SFTP client) |
+| `myshell-cli` | `[[bin]]` | `src/bin/myshell-cli.rs` | CLI tool for AI agents and power users |
+| `myshell-mcp` | `[[bin]]` | `src/bin/myshell-mcp.rs` | MCP server for AI agent integration (stdio transport) |
+
+All three share the same database (`<config_dir>/myshell/connections.db`), vault, and keyring.
+
+### CLI binary (`myshell-cli`)
+
+Provides command-line access to saved SSH/SFTP connections:
+- `myshell-cli list [--json]` — list connections
+- `myshell-cli exec <连接名> "命令" [--json] [--timeout N]` — one-shot remote command execution
+- `myshell-cli sftp ls/get/put/mkdir/rm/rename` — SFTP file operations
+- `myshell-cli ssh <连接名>` — interactive terminal session
+- `myshell-cli test <连接名>` — test connection reachability
+- `myshell-cli vault status` — vault status check
+- `myshell-cli vault save-passphrase` — save vault master passphrase to OS keyring (DPAPI-encrypted) for MCP server use
+
+Vault unlock: OS keyring (via `myshell-cli vault save-passphrase`) > `--passphrase` flag > interactive prompt. The MCP server reads from keyring at startup (no env var needed).
+
+### MCP server (`myshell-mcp`)
+
+Exposes SSH/SFTP operations as MCP tools for AI agents (Claude Desktop, Cursor, ZCode, etc.):
+- Tools: `list_connections`, `ssh_exec`, `sftp_list`, `sftp_download`, `sftp_upload`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, `test_connection`
+- Transport: stdio (Content-Length framed JSON-RPC 2.0)
+- Auth: `MYSHELL_PASSPHRASE` env var on startup
+
+Auto-configuration: The GUI settings panel (MCP → "一键配置全部") auto-detects installed AI tools and writes configs. Manually configure other tools:
+
+- Claude Desktop: `<USERPROFILE>\.claude\mcp.json` → `mcpServers.myshell.command`
+- Opencode: `<USERPROFILE>\.config\opencode\opencode.json` → `mcp.myshell.command`
+- Zcode: `<USERPROFILE>\.zcode\cli\config.json` → `mcp.servers.myshell.command`
+- Cursor: `<USERPROFILE>\.cursor\mcp.json` → `mcpServers.myshell.command`
+
+**Safety: dangerous operation confirmation.** The MCP server blocks high-risk tools (`ssh_exec`, `sftp_remove`, `sftp_rename`, `sftp_upload`) behind a native Windows `MessageBoxW` dialog. Human must click "Yes" to proceed; "Cancel" returns an error. Cannot be bypassed by the AI agent.
 
 ### Rust backend (`src-tauri/src/`)
 
-- `main.rs` — types, `AppState`, command wrappers, Tauri builder
+- `lib.rs` — `myshell_core` library crate root. Holds shared types (`ConnectionConfig`, `FileEntry`, `AppState`), `EventSink` trait (abstracts Tauri's `WebviewWindow::emit` for CLI/MCP), and `pub mod` declarations for all 14 modules. This is the single source of truth for types used by GUI, CLI, and MCP binaries.
+- `main.rs` — Tauri GUI binary: thin `#[tauri::command]` wrappers calling into `myshell_core`, `WindowSink` adapter for `EventSink`, Tauri builder.
+- `bin/myshell-cli.rs` — CLI binary (clap-based)
+- `bin/myshell-mcp.rs` — MCP server binary (stdio JSON-RPC 2.0)
 - `ssh.rs` — russh client: connect, authenticate (password/pubkey), open PTY, send input, resize, disconnect
 - `sftp.rs` — russh-sftp: list/create/remove/rename. **Each SFTP call opens a fresh subsystem channel** (`get_sftp_session`) — there's no cached `SftpSession`.
 - `db.rs` — rusqlite (bundled) CRUD. DB lives at `<config_dir>/myshell/connections.db` (via the `dirs` crate).
 - `local.rs` — local terminal (`conn_type='local'`): spawns a shell under a PTY (`portable-pty`: ConPTY on Windows / openpty on Unix) and emits `ssh_output`/`ssh_closed` so `TerminalPanel` reuses the SSH render path. Reader runs on a `spawn_blocking` thread (portable-pty's reader is a blocking `Read`); a writer task owns the master for input/resize and kills the child on disconnect.
 
 `AppState` is registered via `.manage()` and accessed through `State<AppState>`. It holds:
-- `db: Mutex<rusqlite::Connection>` — single shared SQLite handle
-- `ssh_sessions: Mutex<HashMap<String, SshSession>>` — keyed by UUID session ID
-
-The frontend uses the session UUID as the tab ID, so `tab.id === sessionId` is an invariant.
+- `db: Arc<Mutex<rusqlite::Connection>>` — single shared SQLite handle
+- `ssh_sessions: Arc<Mutex<HashMap<String, SshSession>>>` — keyed by UUID session ID
+- `ftp_sessions: Arc<Mutex<HashMap<String, FtpSession>>>` — FTP sessions
+- `local_sessions: Arc<Mutex<HashMap<String, LocalSession>>>` — local PTY sessions
+- `zmodem_files: Mutex<HashMap<String, ZmodemFileHandle>>` — ZMODEM file handles
+- `dek: Arc<Mutex<Option<[u8; 32]>>>` — Data Encryption Key (None until vault unlocked)
 
 ### Frontend (`src/`)
 
@@ -69,13 +121,11 @@ The frontend uses the session UUID as the tab ID, so `tab.id === sessionId` is a
 
 ### Known incomplete spots
 
-- **SSH output wiring was rewritten but not yet compiled.** The original `ssh.rs` had a placeholder reader task that never ran — keystrokes flowed TO the server but output never came BACK. This has been refactored: the russh `Channel` is now owned by a `channel_reader` task that uses `tokio::select!` to multiplex commands (`SessionCommand::Input/Resize/Disconnect` via mpsc) with incoming `channel.wait()` messages, flushing bytes to the frontend via `window.emit("ssh_output", ...)` on a 16ms coalescing timer (mitigates [tauri#13234](https://github.com/tauri-apps/tauri/issues/13234)). Emits are scoped to the originating `WebviewWindow` (not broadcast via `AppHandle`) so a future second window can't read another tab's terminal. Output buffer is capped at 256KB with a `[output truncated]` marker to prevent frontend OOM. Frontend subscribes in `TerminalPanel.tsx` via `onSshOutput`/`onSshClosed`. Port input is validated to `[1, 65535]` in `ConnectionDialog.tsx`. `npx tsc --noEmit` passes; **the Rust side has not yet been compiled because rustup isn't installed**. Run `cargo build` from `src-tauri/` after installing Rust to verify.
 - `check_server_key` in `ssh.rs` returns `Ok(true)` unconditionally — accepts all host keys. Intentional placeholder; revisit before any release.
 - Passwords are stored plaintext in SQLite.
 - App/window close does not disconnect active sessions — SSH TCP connections leak until OS reaps them. Add a `RunEvent::Exit` handler in `main.rs` to drain `ssh_sessions`.
 - `load_secret_key` accepts arbitrary path (no canonicalization/allow-list) — file existence oracle.
 - Known risk: `channel.wait()` in `select!` may not be cancel-safe — if bytes are observed being dropped under high traffic, switch to `channel.make_reader()` + `tokio::io::split()`.
-- **Local terminal (`conn_type='local'`) code is written but not yet compiled** — rustup isn't installed in the editing environment, so `local.rs` + the 4 `local_*` commands are unverified. Run `cargo build` from `src-tauri/` after installing Rust; the most likely fix point is `portable-pty` 0.8 trait bounds on `take_writer`/`spawn_command`. Also: on Windows the PTY output follows the shell's console codepage — pwsh is UTF-8, but Windows PowerShell 5.1 on a zh-CN system may emit GBK and render mojibake in xterm. v1 emits raw bytes (no re-encode, matching SSH); mitigation TBD (`encoding_rs` decode in the reader, or inject `chcp 65001`). See `progress.md` 阶段10.
 - **Chinese IME input shifts the terminal viewport left — ConPTY upstream bug, not fixable at the app layer.** Typing Chinese via an IME in a line-redrawing program (PowerShell PSReadLine, Codex/ink) makes ConPTY miscalculate the composition string's width and emit a wrong cursor-position sequence, so xterm.js shifts the viewport left during composition; it snaps back when the IME is confirmed (space/enter). ASCII input is unaffected. Matches [VSCode #255285](https://github.com/microsoft/vscode/issues/255285) verbatim. VSCode's workaround is the winpty backend, but **`portable-pty` 0.8.1 has dropped winpty** (`src/win/` ships `conpty.rs` only), so we can't switch backends without replacing the PTY crate — and winpty is UTF-8-hostile (would trade this left-shift for Chinese mojibake). Accepted as a known limitation; waiting on Microsoft to fix ConPTY. See `progress.md` 阶段23. User workaround: confirm the IME often (the shift recovers instantly) and avoid very long single compositions.
 
 ## Living planning docs (Chinese)

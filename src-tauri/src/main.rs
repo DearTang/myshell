@@ -4,203 +4,24 @@
 // so users can still ship us diagnostics.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use myshell_core::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, State};
 use rand::RngCore;
 
-mod ssh;
-mod sftp;
-mod db;
-mod secrets;
-mod ftp;
-mod crypto;
-mod vault;
-mod proxy;
-mod backup;
-mod local;
-mod fonts;
-mod elevation;
-mod ai;
-mod redact;
+// ============ Tauri EventSink adapter ============
 
-// ============ Connection Config ============
+/// Bridges the core `EventSink` trait to Tauri's `WebviewWindow::emit`.
+/// Constructed per-command-call where a core function needs to emit events
+/// back to the frontend (ssh_output, sftp progress, ai tokens, etc.).
+struct WindowSink(tauri::WebviewWindow);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectionConfig {
-    pub id: String,
-    pub name: String,
-    pub host: String,
-    pub port: u16,
-    pub username: String,
-    pub auth_method: String, // "password" or "key"
-    /// Transient — used to shuttle the password from frontend to keyring on
-    /// save, and from keyring to ssh connect. Never persisted to SQLite.
-    pub password: Option<String>,
-    /// Private key PEM content (transient in memory). Encrypted at rest in
-    /// the `private_key_pem_enc` column. ssh.rs loads via
-    /// `russh::keys::decode_secret_key` from this string — no file IO.
-    pub private_key_pem: Option<String>,
-    /// ssh | sftp | ftp. SFTP rides on SSH (shared session id), FTP is a
-    /// standalone connection managed in `AppState::ftp_sessions`.
-    #[serde(default)]
-    pub conn_type: String,
-    /// Hierarchical folder path, e.g. "/prod/web". Root is "/".
-    #[serde(default = "default_group_path")]
-    pub group_path: String,
-    /// none | implicit | explicit — FTP/FTPS only.
-    #[serde(default = "default_ftp_tls")]
-    pub ftp_tls: String,
-    /// FTP passive mode toggle. True by default (NAT-friendly).
-    #[serde(default = "default_ftp_passive")]
-    pub ftp_passive: bool,
-    /// Proxy type: "none" | "socks5" | "http". Stored plaintext (not
-    /// sensitive — knowing you use SOCKS5 doesn't compromise anything).
-    #[serde(default = "default_proxy_type")]
-    pub proxy_type: String,
-    /// Proxy host (transient plaintext in memory; encrypted at rest as
-    /// `proxy_host_enc`). Surfaces internal network topology, treated as
-    /// same-sensitivity as `host`.
-    #[serde(default)]
-    pub proxy_host: Option<String>,
-    /// Proxy port. Small int, not sensitive — stored plaintext.
-    #[serde(default)]
-    pub proxy_port: Option<u16>,
-    /// Proxy auth username. Stored plaintext in DB (not a secret on its own).
-    #[serde(default)]
-    pub proxy_username: Option<String>,
-    /// Proxy auth password (transient). Resolved from keyring at connect
-    /// time, written to keyring at save time. Same scheme as `password`.
-    #[serde(default)]
-    pub proxy_password: Option<String>,
-    /// Local terminal only (`conn_type == "local"`): shell executable to
-    /// spawn, e.g. `pwsh.exe`, `powershell.exe`, `cmd.exe`, `wsl.exe`, or an
-    /// absolute path. Ignored for ssh/sftp/ftp. Plain column — a program
-    /// path isn't a secret.
-    #[serde(default)]
-    pub shell_path: Option<String>,
-    /// Local terminal only: optional shell arguments (e.g. `-d Ubuntu`).
-    #[serde(default)]
-    pub shell_args: Option<String>,
-    /// Optional command injected into the PTY right after the shell starts
-    /// (e.g. `claude` to auto-launch on open). Currently honored for local
-    /// terminals; SSH may use it later. Plain column — not a secret.
-    #[serde(default)]
-    pub init_command: Option<String>,
-    /// Optional per-connection terminal font override (family name). When set,
-    /// takes precedence over the global terminal font for this connection's
-    /// tabs. Plain column — not a secret.
-    #[serde(default)]
-    pub terminal_font: Option<String>,
-    pub created_at: String,
-}
-
-fn default_group_path() -> String {
-    "/".to_string()
-}
-
-fn default_ftp_tls() -> String {
-    "none".to_string()
-}
-
-fn default_ftp_passive() -> bool {
-    true
-}
-
-fn default_proxy_type() -> String {
-    "none".to_string()
-}
-
-// ============ SFTP File Entry ============
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileEntry {
-    pub name: String,
-    pub path: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub permissions: String,
-    pub modified: String,
-}
-
-// ============ Command History Entry ============
-
-// rename_all = camelCase so the wire fields (createdAt) match the TS
-// interface in api.ts. ConnectionConfig/FileEntry stay snake_case by
-// intentional convention (documented in api.ts); these list-item structs
-// use camelCase because the frontend reads createdAt/connectionId/sortOrder/
-// isGlobal directly off the payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommandHistoryItem {
-    pub id: i64,
-    pub command: String,
-    pub pinned: bool,
-    pub created_at: String,
-}
-
-// ============ Quick Command Entries ============
-
-/// A quick command as stored/managed (global or per-connection). Used by the
-/// management panel. `connection_id` is None for global scope.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuickCommandItem {
-    pub id: i64,
-    pub connection_id: Option<String>,
-    pub label: String,
-    pub command: String,
-    pub sort_order: i64,
-}
-
-/// A quick command flattened for the terminal execution panel: the union of
-/// global + current-connection commands, with an `is_global` flag for grouping.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuickCommandExecItem {
-    pub id: i64,
-    pub is_global: bool,
-    pub label: String,
-    pub command: String,
-}
-
-// ============ App State ============
-
-pub struct AppState {
-    /// Arc-wrapped so per-session SshClient handlers can clone a reference
-    /// for `check_server_key` lookups without borrowing State.
-    pub db: Arc<Mutex<rusqlite::Connection>>,
-    pub ssh_sessions: Arc<Mutex<std::collections::HashMap<String, ssh::SshSession>>>,
-    pub ftp_sessions: Arc<Mutex<std::collections::HashMap<String, ftp::FtpSession>>>,
-    /// Local PTY terminal sessions, keyed by UUID session id (== frontend
-    /// tab id, same invariant as ssh_sessions).
-    pub local_sessions: Arc<Mutex<std::collections::HashMap<String, local::LocalSession>>>,
-    pub zmodem_files: Mutex<HashMap<String, ZmodemFileHandle>>,
-    /// Data Encryption Key (DEK) — random 32-byte key for encrypting all
-    /// database columns and keyring entries. Derived once at setup and
-    /// stored encrypted by the login password. `None` until unlocked.
-    pub dek: Arc<Mutex<Option<[u8; 32]>>>,
-}
-
-/// Track open file handles for streaming ZMODEM file IO. Each transfer is
-/// keyed by a UUID so the frontend can talk about multiple concurrent files
-/// (multi-file rz, separate write handles per sz offer).
-pub struct ZmodemFileHandle {
-    pub kind: ZmodemFileKind,
-    pub path: String,
-    /// For reads: cached open file + total size. For writes: an append-mode
-    /// handle so each chunk writes without re-opening. We box these so the
-    /// enum variant stays cheap to move.
-    pub reader: Option<std::fs::File>,
-    pub writer: Option<std::fs::File>,
-    pub size: u64,
-}
-
-#[derive(PartialEq)]
-pub enum ZmodemFileKind {
-    Read,
-    Write,
+impl EventSink for WindowSink {
+    fn emit_raw(&self, event: &str, payload: serde_json::Value) {
+        let _ = self.0.emit(event, payload);
+    }
 }
 
 // ============ Connection Management Commands ============
@@ -492,16 +313,8 @@ fn import_connections(
 // end with master_key populated, after which the connection commands
 // can run.
 
-/// Extract the DEK from AppState or surface a friendly error if the
-/// vault is locked. Every command that touches encrypted columns calls this
-/// first — there's no implicit unlock.
-fn require_dek(state: &State<AppState>) -> Result<[u8; 32], String> {
-    state
-        .dek
-        .lock()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Vault 未解锁".to_string())
-}
+// require_dek is now in myshell_core (takes &AppState). Deref coercion
+// from &State<AppState> → &AppState makes existing call sites work unchanged.
 
 #[derive(Serialize)]
 struct VaultStatus {
@@ -1660,6 +1473,158 @@ fn set_gpu_acceleration_disabled(disabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+// ============ Attachment directory + screenshot save ============
+//
+// User-configurable directory where terminal screenshots (and other AI/MCP
+// attachments) are saved. Stored as a plain-text file containing the absolute
+// path the user picked via the directory picker. Defaults to None (not
+// configured) — the GUI prompts the user to set it the first time they try to
+// take a screenshot.
+
+/// Path of the marker file that stores the user's chosen attachment directory.
+/// The FILE's location is fixed (always <config_dir>/myshell/attachment-dir);
+/// the FILE's *contents* are the user-chosen directory path.
+fn attachment_dir_setting_path() -> Option<std::path::PathBuf> {
+    let mut path = dirs::config_dir()?;
+    path.push("myshell");
+    path.push("attachment-dir");
+    Some(path)
+}
+
+/// Read the user's configured attachment directory. `None` if not yet set.
+#[tauri::command]
+fn get_attachment_dir() -> Option<String> {
+    let path = attachment_dir_setting_path()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Persist the user's chosen attachment directory. Validates that the path
+/// exists (or creates it) before saving.
+#[tauri::command]
+fn set_attachment_dir(dir: String) -> Result<String, String> {
+    // Validate / create the target directory first — never remember a path
+    // that doesn't work.
+    let p = std::path::Path::new(&dir);
+    std::fs::create_dir_all(p).map_err(|e| format!("创建目录失败: {e}"))?;
+    let canonical = p.canonicalize()
+        .map_err(|e| format!("无法解析目录路径: {e}"))?
+        .to_string_lossy()
+        .to_string();
+    // Persist the canonical path.
+    let setting_path = attachment_dir_setting_path().ok_or_else(|| "无法定位配置目录".to_string())?;
+    if let Some(parent) = setting_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    }
+    std::fs::write(&setting_path, &canonical).map_err(|e| format!("写入配置失败: {e}"))?;
+    Ok(canonical)
+}
+
+/// Save a PNG screenshot to the attachment directory.
+///
+/// `data_url` is a `data:image/png;base64,...` URL (what canvas.toDataURL
+/// produces). `connection_name` is used to build a human-friendly filename.
+///
+/// Returns the absolute path of the saved file.
+#[tauri::command]
+fn save_screenshot(data_url: String, connection_name: String) -> Result<String, String> {
+    use base64::Engine as _;
+
+    // Strip the `data:image/png;base64,` prefix.
+    let b64_payload = data_url
+        .strip_prefix("data:image/png;base64,")
+        .ok_or_else(|| "期望 data:image/png;base64,... 格式".to_string())?;
+    let png_bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64_payload)
+        .map_err(|e| format!("base64 解码失败: {e}"))?;
+
+    // Resolve the attachment dir.
+    let dir_str = get_attachment_dir()
+        .ok_or_else(|| "未配置附件目录。请在「设置 → MCP 支持」中配置附件目录后重试。".to_string())?;
+    let dir = std::path::Path::new(&dir_str);
+    std::fs::create_dir_all(dir).map_err(|e| format!("附件目录不存在且无法创建: {e}"))?;
+
+    // Build filename: 截图_<conn>_<YYYYMMDD-HHmmss>.png
+    // Sanitize connection_name — Windows forbids \ / : * ? " < > |
+    let safe_name: String = connection_name
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect();
+    // %Y%m%d-%H%M%S%.3f = YYYYMMDD-HHMMSS.fff (3 millisecond digits). The
+    // fractional part prevents filename collisions when the user rapid-fires
+    // the 📷 button — multiple screenshots within the same second would
+    // otherwise overwrite each other.
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f");
+    let filename = format!("截图_{}_{}.png", safe_name, ts);
+    let filepath = dir.join(filename);
+
+    std::fs::write(&filepath, &png_bytes).map_err(|e| format!("写入截图文件失败: {e}"))?;
+
+    Ok(filepath.to_string_lossy().to_string())
+}
+
+/// Open a file or folder in the OS file manager. On Windows, selects the file
+/// in Explorer (like "Show in Folder"); on macOS, reveals in Finder; on Linux,
+/// opens the containing directory in xdg-open.
+#[tauri::command]
+fn show_in_folder(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("路径不存在: {}", path));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // `explorer.exe /select,<path>` selects the file in Explorer. For a
+        // directory, just open the directory.
+        use std::process::Command;
+        let arg = if p.is_dir() {
+            path.clone()
+        } else {
+            // /select, expects backslashes — canonicalize already gave us native
+            // separators on Windows.
+            format!("/select,{}", path)
+        };
+        Command::new("explorer.exe")
+            .arg(&arg)
+            .spawn()
+            .map_err(|e| format!("无法打开文件管理器: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        if p.is_dir() {
+            Command::new("open").arg(&path).spawn()
+        } else {
+            Command::new("open").args(["-R", &path]).spawn()
+        }
+        .map_err(|e| format!("无法打开 Finder: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use std::process::Command;
+        // xdg-open only opens directories, not "reveal file", so open the parent.
+        let target = if p.is_dir() { path.clone() } else {
+            p.parent().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| path.clone())
+        };
+        Command::new("xdg-open").arg(&target).spawn()
+            .map_err(|e| format!("无法打开文件管理器: {e}"))?;
+        Ok(())
+    }
+}
+
 // ============ Frontend log forwarding ============
 //
 // The webview's JS runtime (console) isn't persisted on the user's machine —
@@ -2300,7 +2265,7 @@ async fn ssh_connect(
         let key = require_dek(&state)?;
         config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
     }
-    let result = ssh::connect(state, window, config).await;
+    let result = ssh::connect(&state, Arc::new(WindowSink(window)), config).await;
     match &result {
         Ok(sid) => log::info!("[ssh:{}] connected to {}", sid, target),
         Err(e) => log::error!("[ssh] connect failed for {}: {}", target, e),
@@ -2387,7 +2352,7 @@ async fn local_connect(
     // No DEK/keyring resolution — a local shell has no credentials. The vault
     // must still be unlocked to list the connection row (enforced by
     // get_connections), but local_connect itself needs no secret.
-    match local::connect(state, window, config, 80, 24).await {
+    match local::connect(&state, Arc::new(WindowSink(window)), config, 80, 24).await {
         Ok(sid) => {
             log::info!("[local:{}] connected", sid);
             Ok(sid)
@@ -2467,9 +2432,10 @@ async fn ai_chat(
     system: Option<String>,
     context: Option<ai::AiContext>,
 ) -> Result<(), String> {
+    let sink = WindowSink(window);
     ai::chat_stream(
         &state,
-        &window,
+        &sink,
         ai::AiChatParams {
             request_id,
             messages,
@@ -2490,7 +2456,8 @@ async fn ai_inspect_health_ssh(
     session_id: String,
     request_id: String,
 ) -> Result<(), String> {
-    ai::inspect_health_ssh(&state, &window, &session_id, &request_id).await
+    let sink = WindowSink(window);
+    ai::inspect_health_ssh(&state, &sink, &session_id, &request_id).await
 }
 
 /// Run the read-only diagnostic script on the local machine, then stream an
@@ -2501,7 +2468,8 @@ async fn ai_inspect_health_local(
     window: tauri::WebviewWindow,
     request_id: String,
 ) -> Result<(), String> {
-    ai::inspect_health_local(&state, &window, &request_id).await
+    let sink = WindowSink(window);
+    ai::inspect_health_local(&state, &sink, &request_id).await
 }
 
 /// Read the AI provider config. The API key is NOT returned — only `has_key`.
@@ -3095,13 +3063,14 @@ async fn sftp_upload(
     state: State<'_, AppState>,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
+    let sink = WindowSink(window);
     sftp::upload(
         &state,
         &session_id,
         local_paths,
         &remote_dest_dir,
         &request_id,
-        &window,
+        &sink,
     )
     .await
 }
@@ -3117,13 +3086,14 @@ async fn sftp_download(
     state: State<'_, AppState>,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
+    let sink = WindowSink(window);
     sftp::download(
         &state,
         &session_id,
         remote_paths,
         &local_dest_dir,
         &request_id,
-        &window,
+        &sink,
     )
     .await
 }
@@ -3461,11 +3431,56 @@ fn sz_write_chunk(
 
 /// Close and flush a write handle.
 #[tauri::command]
-fn sz_close(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let mut files = state.zmodem_files.lock().map_err(|e| e.to_string())?;
-    files.remove(&id);
-    Ok(())
-}
+	fn sz_close(id: String, state: State<'_, AppState>) -> Result<(), String> {
+	    let mut files = state.zmodem_files.lock().map_err(|e| e.to_string())?;
+	    files.remove(&id);
+	    Ok(())
+	}
+
+	// ============ MCP Server Management ============
+
+	/// Get the absolute path to myshell-mcp.exe.
+	#[tauri::command]
+	fn mcp_get_binary_path() -> Result<String, String> {
+	    mcp_tools::mcp_binary_path()
+	}
+
+	/// Detect installed AI tools and whether they have myshell configured.
+	#[tauri::command]
+	fn mcp_detect_tools() -> Vec<mcp_tools::AiToolInfo> {
+	    mcp_tools::mcp_detect_tools()
+	}
+
+	/// Write myshell MCP config to a specific tool. Returns true if written, false if already configured.
+	#[tauri::command]
+	fn mcp_write_config(tool_id: String) -> Result<bool, String> {
+	    let binary_path = mcp_tools::mcp_binary_path()?;
+	    mcp_tools::mcp_write_config(&tool_id, &binary_path)
+	}
+
+	/// Remove myshell from a tool's MCP config.
+	#[tauri::command]
+	fn mcp_remove_config(tool_id: String) -> Result<(), String> {
+	    mcp_tools::mcp_remove_config(&tool_id)
+	}
+
+	/// Save vault passphrase to OS keyring for MCP server.
+	#[tauri::command]
+	fn mcp_save_passphrase(passphrase: String) -> Result<(), String> {
+	    secrets::set_mcp_passphrase(&passphrase)
+	}
+
+	/// Check if MCP passphrase exists in keyring.
+	#[tauri::command]
+	fn mcp_has_passphrase() -> bool {
+	    secrets::get_mcp_passphrase().ok().flatten().map(|p| !p.is_empty()).unwrap_or(false)
+	}
+
+	/// Delete stored MCP passphrase from keyring.
+	#[tauri::command]
+	fn mcp_delete_passphrase() -> Result<(), String> {
+	    secrets::delete_mcp_passphrase()
+	}
 
 // ============ Main ============
 
@@ -3685,6 +3700,10 @@ pub fn run() {
             install_update,
             get_gpu_acceleration_disabled,
             set_gpu_acceleration_disabled,
+            get_attachment_dir,
+            set_attachment_dir,
+            save_screenshot,
+            show_in_folder,
             write_frontend_log,
             get_connections,
             save_connection,
@@ -3768,6 +3787,13 @@ pub fn run() {
             reveal_path,
             save_feedback_zip,
             clear_feedback_dir,
+            mcp_get_binary_path,
+            mcp_detect_tools,
+            mcp_write_config,
+            mcp_remove_config,
+            mcp_save_passphrase,
+            mcp_has_passphrase,
+            mcp_delete_passphrase,
         ])
         .setup(|app| {
             // Seed built-in AI model presets on first launch (idempotent).

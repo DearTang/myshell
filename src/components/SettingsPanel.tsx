@@ -11,8 +11,17 @@ import {
   readFileBase64,
   isElevated,
   restartAsAdmin,
+  mcpDetectTools,
+  mcpWriteConfig,
+  mcpRemoveConfig,
+  mcpSavePassphrase,
+  mcpHasPassphrase,
+  mcpDeletePassphrase,
+  getAttachmentDir,
+  setAttachmentDir,
+  showInFolder,
 } from "../api";
-import type { BackupInfo } from "../api";
+import type { BackupInfo, AiToolInfo } from "../api";
 import { useTheme } from "../hooks/useTheme";
 import { useColorScheme } from "../hooks/useColorScheme";
 import { useTerminalFont } from "../hooks/useTerminalFont";
@@ -78,6 +87,7 @@ function findPresetName(provider: string, baseUrl?: string): string | null {
 const categories = [
   { id: "appearance", label: "外观", icon: "🎨" },
   { id: "ai", label: "AI 助手", icon: "🤖" },
+  { id: "mcp", label: "MCP 支持", icon: "🔌" },
   { id: "security", label: "安全", icon: "🔒" },
   { id: "data", label: "数据管理", icon: "💾" },
   { id: "quickCommands", label: "快捷命令", icon: "⚡" },
@@ -148,6 +158,19 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   const { rendererBackend, setRendererBackend } = useRendererPref();
   const [gpuDisabledInit, setGpuDisabledInit] = useState(false);
   const { gpuDisabled, setGpuDisabled } = useGpuPref(gpuDisabledInit);
+
+  // ── MCP server state ──
+  const [mcpEnabled, setMcpEnabled] = useState(false);
+  const [mcpPassphrase, setMcpPassphrase] = useState("");
+  const [mcpPassphraseStored, setMcpPassphraseStored] = useState(false);
+  const [mcpSaving, setMcpSaving] = useState(false);
+  const [mcpEditingPassphrase, setMcpEditingPassphrase] = useState(false);
+  const [mcpTools, setMcpTools] = useState<AiToolInfo[]>([]);
+  const [mcpConfiguring, setMcpConfiguring] = useState(false);
+  // ── Attachment directory (where screenshots are auto-saved) ──
+  const [attachmentDir, setAttachmentDirState] = useState<string | null>(null);
+  const [attachmentDirPicking, setAttachmentDirPicking] = useState(false);
+  const [attachmentDirAcknowledged, setAttachmentDirAcknowledged] = useState(false);
   useEffect(() => {
     let cancelled = false;
     readGpuDisabled()
@@ -161,6 +184,55 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
       cancelled = true;
     };
   }, []);
+
+  // ── MCP server initialization ──
+  useEffect(() => {
+    if (activeCategory !== "mcp") return;
+    let cancelled = false;
+    // Check if passphrase exists in keyring
+    mcpHasPassphrase()
+      .then((v) => { if (!cancelled) setMcpPassphraseStored(v); })
+      .catch(() => {});
+    // Detect installed tools
+    mcpDetectTools()
+      .then((tools) => {
+        if (!cancelled) {
+          setMcpTools(tools);
+          // If any tool is already configured, reflect that in the toggle
+          setMcpEnabled(tools.some((t) => t.configured));
+        }
+      })
+      .catch(() => {});
+    // Load attachment directory
+    getAttachmentDir()
+      .then((dir) => { if (!cancelled) setAttachmentDirState(dir); })
+      .catch(() => {});
+    // Load "user has acknowledged the attachment-dir prompt" flag
+    try {
+      const ack = localStorage.getItem("myshell-attachment-dir-acknowledged");
+      if (ack === "1") setAttachmentDirAcknowledged(true);
+    } catch {}
+    return () => { cancelled = true; };
+  }, [activeCategory]);
+
+  /** Pick a directory via the OS folder picker and persist it. */
+  async function pickAttachmentDir() {
+    setAttachmentDirPicking(true);
+    try {
+      const selected = await open({ directory: true, multiple: false });
+      if (typeof selected === "string") {
+        const canonical = await setAttachmentDir(selected);
+        setAttachmentDirState(canonical);
+        try { localStorage.setItem("myshell-attachment-dir-acknowledged", "1"); } catch {}
+        setAttachmentDirAcknowledged(true);
+      }
+    } catch (e) {
+      console.error("pickAttachmentDir failed:", e);
+    } finally {
+      setAttachmentDirPicking(false);
+    }
+  }
+
   // The GPU flag only takes effect on next launch. Track whether the in-memory
   // toggle disagrees with what's persisted so we can show "重启生效" / "已生效".
   const gpuPendingRestart = gpuDisabled !== gpuDisabledInit;
@@ -382,6 +454,14 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
     setPasswordSuccess(false);
     try {
       await changeMasterPassword(oldPass, newPass);
+      // Sync new passphrase to keyring for MCP server (if previously set)
+      if (mcpPassphraseStored && newPass) {
+        try {
+          await mcpSavePassphrase(newPass);
+        } catch {
+          // Non-fatal: user can re-set in MCP section
+        }
+      }
       setPasswordSuccess(true);
       setOldPass("");
       setNewPass("");
@@ -1739,6 +1819,448 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
               </div>
             </div>
           </Section>
+            </>
+          )}
+
+          {/* MCP Support — AI 工具集成 */}
+          {activeCategory === "mcp" && (
+            <>
+              <Section title="MCP 服务">
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 500 }}>启用 MCP 支持</div>
+                      <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>
+                        允许 AI 工具（Claude / Opencode / Zcode）通过 MyShell 操作远程服务器
+                      </div>
+                    </div>
+                    <Toggle
+                      checked={mcpEnabled}
+                      onChange={async (next) => {
+                        setMcpEnabled(next);
+                        if (!next) {
+                          // Disable: remove configs from all tools
+                          const tools = await mcpDetectTools();
+                          for (const t of tools) {
+                            if (t.configured) {
+                              await mcpRemoveConfig(t.id).catch(() => {});
+                            }
+                          }
+                          setMcpTools(await mcpDetectTools());
+                          showToast("ok", "已禁用 MCP 支持");
+                        } else {
+                          showToast("ok", "已启用 MCP 支持，请配置下方密码");
+                        }
+                      }}
+                    />
+                  </div>
+                </div>
+
+                {mcpEnabled && (
+                  <>
+                    {/* Passphrase management */}
+                    <div style={{
+                      marginBottom: 12,
+                      padding: 12,
+                      borderRadius: 8,
+                      background: "var(--bg-secondary)",
+                      border: "1px solid var(--border)",
+                    }}>
+                      <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 8 }}>
+                        🔐 Vault 密码同步
+                      </div>
+                      <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
+                        {mcpPassphraseStored
+                          ? "✓ 已配置安全凭证，MCP server 可自动解锁 vault"
+                          : "请输入 vault 主密码，将加密保存到 Windows 凭证管理器"}
+                      </div>
+                      {!mcpPassphraseStored && (
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <div style={{ flex: 1 }}>
+                          <Input
+                            type="password"
+                            placeholder="输入 vault 主密码"
+                            value={mcpPassphrase}
+                            onChange={(v) => setMcpPassphrase(v)}
+                          />
+                          </div>
+                          <button
+                            style={{
+                              padding: "6px 14px",
+                              borderRadius: 6,
+                              border: "1px solid var(--accent)",
+                              background: "var(--accent)",
+                              color: "#fff",
+                              fontSize: 12,
+                              cursor: mcpSaving ? "default" : "pointer",
+                              opacity: mcpSaving ? 0.6 : 1,
+                            }}
+                            disabled={mcpSaving || !mcpPassphrase}
+                            onClick={async () => {
+                              if (!mcpPassphrase) return;
+                              setMcpSaving(true);
+                              try {
+                                await mcpSavePassphrase(mcpPassphrase);
+                                setMcpPassphrase("");
+                                setMcpPassphraseStored(true);
+                                showToast("ok", "密码已安全保存到 Windows 凭证管理器");
+                              } catch (e: any) {
+                                showToast("err", `保存失败: ${e}`);
+                              } finally {
+                                setMcpSaving(false);
+                              }
+                            }}
+                          >
+                            {mcpSaving ? "保存中…" : "保存"}
+                          </button>
+                        </div>
+                      )}
+                      {mcpPassphraseStored && (
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button
+                            style={{
+                              padding: "6px 14px",
+                              borderRadius: 6,
+                              border: "1px solid var(--border)",
+                              background: "transparent",
+                              color: "var(--text)",
+                              fontSize: 12,
+                              cursor: "pointer",
+                            }}
+                            onClick={() => setMcpEditingPassphrase(true)}
+                          >
+                            修改密码
+                          </button>
+                          <button
+                            style={{
+                              padding: "6px 14px",
+                              borderRadius: 6,
+                              border: "1px solid var(--error)",
+                              background: "transparent",
+                              color: "var(--error)",
+                              fontSize: 12,
+                              cursor: "pointer",
+                            }}
+                            onClick={async () => {
+                              try {
+                                await mcpDeletePassphrase();
+                                setMcpPassphraseStored(false);
+                                showToast("ok", "已删除安全凭证");
+                              } catch (e: any) {
+                                showToast("err", `删除失败: ${e}`);
+                              }
+                            }}
+                          >
+                            删除
+                          </button>
+                        </div>
+                      )}
+                      {/* Edit passphrase dialog */}
+                      {mcpEditingPassphrase && (
+                        <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
+                          <div style={{ flex: 1 }}>
+                          <Input
+                            type="password"
+                            placeholder="输入新的 vault 主密码"
+                            value={mcpPassphrase}
+                            onChange={(v) => setMcpPassphrase(v)}
+                          />
+                          </div>
+                          <button
+                            style={{
+                              padding: "6px 14px",
+                              borderRadius: 6,
+                              border: "1px solid var(--accent)",
+                              background: "var(--accent)",
+                              color: "#fff",
+                              fontSize: 12,
+                              cursor: mcpSaving ? "default" : "pointer",
+                              opacity: mcpSaving ? 0.6 : 1,
+                            }}
+                            disabled={mcpSaving || !mcpPassphrase}
+                            onClick={async () => {
+                              if (!mcpPassphrase) return;
+                              setMcpSaving(true);
+                              try {
+                                await mcpSavePassphrase(mcpPassphrase);
+                                setMcpPassphrase("");
+                                setMcpEditingPassphrase(false);
+                                showToast("ok", "密码已更新");
+                              } catch (e: any) {
+                                showToast("err", `更新失败: ${e}`);
+                              } finally {
+                                setMcpSaving(false);
+                              }
+                            }}
+                          >
+                            {mcpSaving ? "保存中…" : "确认"}
+                          </button>
+                          <button
+                            style={{
+                              padding: "6px 14px",
+                              borderRadius: 6,
+                              border: "1px solid var(--border)",
+                              background: "transparent",
+                              color: "var(--text)",
+                              fontSize: 12,
+                              cursor: "pointer",
+                            }}
+                            onClick={() => {
+                              setMcpEditingPassphrase(false);
+                              setMcpPassphrase("");
+                            }}
+                          >
+                            取消
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Attachment Directory — where screenshots are auto-saved.
+                        First time the user opens MCP settings without this
+                        configured, show a warning banner pointing at the picker. */}
+                    <div style={{ marginBottom: 12 }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                        <div style={{ fontSize: 12, fontWeight: 500 }}>📎 附件目录</div>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          {attachmentDir && (
+                            <button
+                              onClick={() => attachmentDir && showInFolder(attachmentDir)}
+                              style={{
+                                padding: "4px 10px",
+                                borderRadius: 6,
+                                border: "1px solid var(--border)",
+                                background: "var(--bg-input)",
+                                color: "var(--text-secondary)",
+                                fontSize: 11,
+                                cursor: "pointer",
+                              }}
+                            >
+                              打开目录
+                            </button>
+                          )}
+                          <button
+                            onClick={pickAttachmentDir}
+                            disabled={attachmentDirPicking}
+                            style={{
+                              padding: "4px 10px",
+                              borderRadius: 6,
+                              border: "1px solid var(--accent-primary)",
+                              background: "var(--accent-primary)",
+                              color: "white",
+                              fontSize: 11,
+                              cursor: attachmentDirPicking ? "wait" : "pointer",
+                              opacity: attachmentDirPicking ? 0.6 : 1,
+                            }}
+                          >
+                            {attachmentDirPicking ? "选择中..." : attachmentDir ? "更改目录" : "选择目录"}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* First-time prompt: user hasn't set a dir AND hasn't
+                          acknowledged the warning yet. Banner invites them to
+                          configure. Once acknowledged, we don't nag again even
+                          if they unset it later. */}
+                      {!attachmentDir && !attachmentDirAcknowledged && (
+                        <div style={{
+                          padding: "8px 10px",
+                          borderRadius: 6,
+                          background: "var(--warning-bg, rgba(255, 200, 0, 0.08))",
+                          border: "1px solid var(--warning, #f0ad4e)",
+                          fontSize: 11,
+                          color: "var(--text-secondary)",
+                          marginBottom: 8,
+                        }}>
+                          ⚠️ 尚未配置附件目录。终端截图功能（CommandBar 的 📷 按钮）会保存到这里，请先选择一个目录。
+                        </div>
+                      )}
+
+                      {attachmentDir ? (
+                        <div style={{
+                          padding: "8px 10px",
+                          borderRadius: 6,
+                          background: "var(--bg-input)",
+                          border: "1px solid var(--border)",
+                          fontSize: 11,
+                          color: "var(--text-secondary)",
+                          fontFamily: "monospace",
+                          wordBreak: "break-all",
+                        }}>
+                          {attachmentDir}
+                        </div>
+                      ) : (
+                        <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                          未配置 — 截图按钮点击后会提示先来此配置
+                        </div>
+                      )}
+                      <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 6 }}>
+                        终端截图文件名为「截图_&lt;连接名&gt;_&lt;时间戳&gt;.png」，自动保存到此目录。
+                      </div>
+                    </div>
+
+                    {/* AI Tool Configuration */}
+                    <div style={{ marginBottom: 12 }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                        <div style={{ fontSize: 12, fontWeight: 500 }}>已安装的 AI 工具</div>
+                        <button
+                          style={{
+                            padding: "4px 10px",
+                            borderRadius: 6,
+                            border: "1px solid var(--border)",
+                            background: "transparent",
+                            color: "var(--text)",
+                            fontSize: 11,
+                            cursor: mcpConfiguring ? "default" : "pointer",
+                            opacity: mcpConfiguring ? 0.6 : 1,
+                          }}
+                          disabled={mcpConfiguring || !mcpPassphraseStored}
+                          onClick={async () => {
+                            setMcpConfiguring(true);
+                            try {
+                              const tools = await mcpDetectTools();
+                              let configured = 0;
+                              let skipped = 0;
+                              for (const tool of tools) {
+                                if (!tool.installed) continue;
+                                if (tool.configured) { skipped++; continue; }
+                                const written = await mcpWriteConfig(tool.id);
+                                if (written) configured++;
+                              }
+                              setMcpTools(await mcpDetectTools());
+                              showToast("ok", `配置完成：新增 ${configured} 个，跳过 ${skipped} 个已配置`);
+                            } catch (e: any) {
+                              showToast("err", `配置失败: ${e}`);
+                            } finally {
+                              setMcpConfiguring(false);
+                            }
+                          }}
+                        >
+                          {mcpConfiguring ? "配置中…" : "一键配置全部"}
+                        </button>
+                      </div>
+
+                      {!mcpPassphraseStored && (
+                        <div style={{
+                          padding: 10,
+                          borderRadius: 6,
+                          background: "var(--warning-muted)",
+                          border: "1px solid var(--warning)",
+                          fontSize: 11,
+                          color: "var(--warning)",
+                          marginBottom: 8,
+                        }}>
+                          ⚠ 请先配置上方密码，再配置 AI 工具
+                        </div>
+                      )}
+
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        {mcpTools.map((tool) => (
+                          <div
+                            key={tool.id}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              padding: "8px 12px",
+                              borderRadius: 6,
+                              background: "var(--bg-secondary)",
+                              border: "1px solid var(--border)",
+                            }}
+                          >
+                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              <span style={{ fontSize: 14 }}>
+                                {tool.id === "claude" ? "🤖" : tool.id === "opencode" ? "⚡" : "🔧"}
+                              </span>
+                              <div>
+                                <div style={{ fontSize: 12, fontWeight: 500 }}>{tool.name}</div>
+                                <div style={{ fontSize: 10, color: "var(--text-muted)" }}>
+                                  {tool.installed ? (
+                                    tool.configured ? (
+                                      <span style={{ color: "var(--success)" }}>✓ 已配置 MCP</span>
+                                    ) : (
+                                      <span>已安装，未配置</span>
+                                    )
+                                  ) : (
+                                    <span>未检测到</span>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                            <div style={{ display: "flex", gap: 6 }}>
+                              {tool.installed && !tool.configured && (
+                                <button
+                                  style={{
+                                    padding: "4px 10px",
+                                    borderRadius: 4,
+                                    border: "1px solid var(--accent)",
+                                    background: "var(--accent)",
+                                    color: "#fff",
+                                    fontSize: 11,
+                                    cursor: "pointer",
+                                  }}
+                                  onClick={async () => {
+                                    try {
+                                      const written = await mcpWriteConfig(tool.id);
+                                      setMcpTools(await mcpDetectTools());
+                                      showToast("ok", written ? `已为 ${tool.name} 配置 MCP` : "已存在，跳过");
+                                    } catch (e: any) {
+                                      showToast("err", `配置失败: ${e}`);
+                                    }
+                                  }}
+                                >
+                                  配置
+                                </button>
+                              )}
+                              {tool.configured && (
+                                <button
+                                  style={{
+                                    padding: "4px 10px",
+                                    borderRadius: 4,
+                                    border: "1px solid var(--error)",
+                                    background: "transparent",
+                                    color: "var(--error)",
+                                    fontSize: 11,
+                                    cursor: "pointer",
+                                  }}
+                                  onClick={async () => {
+                                    try {
+                                      await mcpRemoveConfig(tool.id);
+                                      setMcpTools(await mcpDetectTools());
+                                      showToast("ok", `已从 ${tool.name} 移除 MCP 配置`);
+                                    } catch (e: any) {
+                                      showToast("err", `移除失败: ${e}`);
+                                    }
+                                  }}
+                                >
+                                  移除
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div style={{
+                        marginTop: 10,
+                        padding: 10,
+                        borderRadius: 6,
+                        background: "var(--bg-secondary)",
+                        border: "1px solid var(--border)",
+                        fontSize: 11,
+                        color: "var(--text-muted)",
+                        lineHeight: 1.5,
+                      }}>
+                        <strong>其他 AI 工具？</strong>只需在 MCP 配置文件中添加如下 server：<br />
+                        <code style={{ fontSize: 10, background: "var(--bg-primary)", padding: "2px 4px", borderRadius: 3 }}>
+                          {'{"command": "…/myshell-mcp.exe"}'}
+                        </code><br />
+                        Claude Desktop → .claude/mcp.json | Cursor → .cursor/mcp.json | 其他工具可参考其 MCP 配置文档。
+                      </div>
+                    </div>
+                  </>
+                )}
+              </Section>
             </>
           )}
 

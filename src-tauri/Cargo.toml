@@ -1,8 +1,28 @@
 [package]
 name = "myshell"
-version = "1.11.2"
+version = "2.0.0"
 edition = "2021"
 description = "A Rust-based SSH/SFTP shell tool"
+# Three binaries share this crate (myshell / myshell-cli / myshell-mcp). `tauri dev`
+# internally runs `cargo run` without a --bin flag, so without this key cargo refuses
+# to pick one. Always default to the GUI binary.
+default-run = "myshell"
+
+[lib]
+name = "myshell_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "myshell"
+path = "src/main.rs"
+
+[[bin]]
+name = "myshell-cli"
+path = "src/bin/myshell-cli.rs"
+
+[[bin]]
+name = "myshell-mcp"
+path = "src/bin/myshell-mcp.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -43,6 +63,9 @@ font-kit = "0.14"
 # Regex for log redaction (scrubbing IPs / user@host from log text that
 # bypassed the point-of-origin masking, e.g. russh internals / old logs).
 regex = "1"
+# CLI binary: argument parsing + secure passphrase entry (no echo).
+clap = { version = "4", features = ["derive"] }
+rpassword = "0.1"
 
 # Windows-only: detect process elevation + relaunch as admin (ShellExecuteW
 # "runas"). Pulled in transitively by portable-pty/font-kit; declared here so we

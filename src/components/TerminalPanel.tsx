@@ -17,7 +17,11 @@ import {
   onZmodemRaw,
   onZmodemEnd,
   addCommandHistory,
+  saveScreenshot,
+  getAttachmentDir,
+  showInFolder,
 } from "../api";
+import { captureTerminalToDataUrl } from "../utils/screenshot";
 import type { ConnType } from "../api";
 import { ZmodemBridge, type ZmodemStatus } from "../zmodem-bridge";
 import { ZmodemProgressOverlay } from "./ZmodemProgressOverlay";
@@ -125,9 +129,12 @@ interface Props {
    * commands into it. Fired after the terminal opens; torn down on close. */
   onTerminalReady?: (sessionId: string, term: Terminal) => void;
   onTerminalGone?: (sessionId: string) => void;
+  /** Tab display name — used as part of the screenshot filename when the
+   * user hits the 📷 button in CommandBar. */
+  connectionName?: string;
 }
 
-export function TerminalPanel({ sessionId, connType, connectionId, fontOverride, rendererBackend, broadcastTargets, active = true, onDisconnected, status, onReconnect, onTerminalReady, onTerminalGone, onOpenQuickCommandsManage, onOpenAi }: Props) {
+export function TerminalPanel({ sessionId, connType, connectionId, fontOverride, rendererBackend, broadcastTargets, active = true, onDisconnected, status, onReconnect, onTerminalReady, onTerminalGone, onOpenQuickCommandsManage, onOpenAi, connectionName }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -184,6 +191,49 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
     speedBps: 0,
     error: null,
   });
+
+  // Screenshot status banner — shown transiently after the user clicks 📷.
+  // `state` is one of: "capturing" | "saved" | "error". Auto-clears after 4s
+  // via the timeout stored in `screenshotTimerRef`.
+  type ScreenshotState = { state: "capturing" } | { state: "saved"; path: string } | { state: "error"; message: string } | null;
+  const [screenshotStatus, setScreenshotStatus] = useState<ScreenshotState>(null);
+  const screenshotTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /** Capture the terminal viewport and save it to the attachment directory.
+   * Bound to the 📷 button in CommandBar. No-op if the xterm instance isn't
+   * mounted yet (rare race during tab open). */
+  const handleScreenshot = async () => {
+    const term = termRef.current;
+    if (!term) {
+      flashScreenshot({ state: "error", message: "终端尚未就绪，请稍候重试" });
+      return;
+    }
+    // Clear any previous banner + timer.
+    if (screenshotTimerRef.current) clearTimeout(screenshotTimerRef.current);
+    setScreenshotStatus({ state: "capturing" });
+
+    try {
+      const dataUrl = await captureTerminalToDataUrl(term);
+      if (!dataUrl) {
+        flashScreenshot({ state: "error", message: "截图失败：无法捕获终端画面" });
+        return;
+      }
+      const path = await saveScreenshot(dataUrl, connectionName || sessionId);
+      flashScreenshot({ state: "saved", path });
+    } catch (e: any) {
+      const msg = e?.message ? String(e.message) : String(e);
+      // The Rust side returns a localized error when the attachment dir isn't
+      // configured — surface it verbatim so the user knows what to fix.
+      flashScreenshot({ state: "error", message: msg.includes("附件目录") ? msg : `保存失败: ${msg}` });
+    }
+  };
+
+  /** Set the banner and auto-clear it after 4s. */
+  function flashScreenshot(s: ScreenshotState) {
+    setScreenshotStatus(s);
+    if (screenshotTimerRef.current) clearTimeout(screenshotTimerRef.current);
+    screenshotTimerRef.current = setTimeout(() => setScreenshotStatus(null), 4000);
+  }
 
   sessionIdRef.current = sessionId;
   connTypeRef.current = connType;
@@ -832,10 +882,85 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
           onReconnect={onReconnect}
           onOpenQuickCommandsManage={onOpenQuickCommandsManage}
           onOpenAi={onOpenAi}
+          onScreenshot={handleScreenshot}
           onRegisterRefresh={(fn) => {
             refreshHistoryRef.current = fn;
           }}
         />
+      )}
+
+      {/* Screenshot status banner — transient toast that appears after the
+          user clicks 📷. Sits at the bottom-right so it doesn't cover the
+          terminal content. Auto-dismisses after 4s (see flashScreenshot). */}
+      {screenshotStatus && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 12,
+            right: 12,
+            maxWidth: 420,
+            padding: "10px 14px",
+            borderRadius: "var(--radius-md)",
+            background: "var(--bg-elevated)",
+            border: `1px solid ${
+              screenshotStatus.state === "error" ? "var(--error)"
+              : screenshotStatus.state === "saved" ? "var(--success)"
+              : "var(--border-default)"
+            }`,
+            boxShadow: "var(--shadow-md)",
+            fontSize: 12,
+            color: "var(--text-primary)",
+            zIndex: 1000,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          {screenshotStatus.state === "capturing" && (
+            <>
+              <span style={{ animation: "spin 1s linear infinite" }}>⏳</span>
+              <span>正在截取终端...</span>
+            </>
+          )}
+          {screenshotStatus.state === "saved" && (
+            <>
+              <span style={{ color: "var(--success)" }}>✓</span>
+              <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                已保存：{screenshotStatus.path}
+              </span>
+              <button
+                onClick={async () => {
+                  // Open the containing folder in Explorer, selecting the file.
+                  try {
+                    const path = screenshotStatus?.state === "saved" ? screenshotStatus.path : "";
+                    if (path) await showInFolder(path);
+                  } catch {
+                    /* best-effort — ignore if open fails */
+                  }
+                }}
+                title="在文件管理器中显示"
+                style={{
+                  background: "var(--bg-input)",
+                  color: "var(--text-secondary)",
+                  border: "1px solid var(--border-default)",
+                  borderRadius: "var(--radius-sm)",
+                  padding: "3px 8px",
+                  fontSize: 11,
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                打开
+              </button>
+            </>
+          )}
+          {screenshotStatus.state === "error" && (
+            <>
+              <span style={{ color: "var(--error)" }}>✕</span>
+              <span style={{ flex: 1 }}>{screenshotStatus.message}</span>
+            </>
+          )}
+        </div>
       )}
     </div>
   );

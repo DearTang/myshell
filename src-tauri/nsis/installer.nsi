@@ -669,8 +669,11 @@ Section Install
 
   ; Copy external binaries
   {{#each binaries}}
-    File /a "/oname={{this}}" "{{no-escape @key}}"
+    File "/oname={{this}}" "{{no-escape @key}}"
   {{/each}}
+
+  ; Copy MCP server binary (bundled alongside main exe)
+  File "/oname=myshell-mcp.exe" "..\..\myshell-mcp.exe"
 
   ; Create file associations
   {{#each file_associations as |association| ~}}
@@ -806,6 +809,9 @@ Section Uninstall
   {{#each binaries}}
     Delete "$INSTDIR\\{{this}}"
   {{/each}}
+
+  ; Delete MCP server binary
+  Delete "$INSTDIR\myshell-mcp.exe"
 
   ; Delete app associations
   {{#each file_associations as |association| ~}}
