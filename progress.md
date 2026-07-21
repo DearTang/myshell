@@ -1669,3 +1669,28 @@
 | 什么可能导致偏离？ | (1) sftp 覆盖对 ftp/local 连接无意义（已忽略覆盖）；(2) 聚焦匹配按 connectionId+类型，同连接多 tab 时聚焦第一个匹配。 |
 | 下一步最小可验证动作？ | 打包 v2.1.0，用户安装后让 AI 调 open_in_gui tab_type=sftp 看是否开文件浏览 tab。 |
 | 目标是什么？ | AI 能灵活驱动 GUI 开终端/SFTP tab，且智能聚焦避免重复 tab。 |
+
+
+### 阶段 67：v2.1.0 发布（2026-07-22）
+
+**版本：** 2.0.0 → **2.1.0**（minor，含 ✨ 新增 open_in_gui）
+
+**发布内容：** open_in_gui 工具（阶段 65 + 66 累积）——AI 驱动 GUI 开连接 tab，支持 tab_type（auto/terminal/sftp）+ 智能聚焦已有 tab。
+
+**完整发布流水线：**
+1. ✅ 版本 bump：Cargo.toml 2.0.0 → 2.1.0，version:sync 同步 package.json/lock
+2. ✅ CHANGELOG.md + README.md 更新日志节同步
+3. ✅ 预检：npx tsc --noEmit + cargo check 全 PASS
+4. ✅ 构建：scripts/build-release.bat → MyShell_2.1.0_x64-setup.exe（8.99 MB）
+5. ✅ commit + push：6376e1a release: v2.1.0 → origin/main
+6. ✅ Gitee 发布：https://gitee.com/argustang/myshell/releases/tag/v2.1.0（release id=755892，exe 上传完成）。首次发布因 VPN 改变路由导致 Gitee API 端点（180.76.199.x）连接超时，网络恢复后重试成功。
+7. ✅ 清理：RELEASE_NOTES_STAGING.md 待发布条目清空，baseline 更新为 v2.1.0
+
+## 五问重启检查（阶段 67）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | v2.1.0 已发布到 Gitee，commit 已 push，staging 已清空。 |
+| 我要去哪里？ | v2.1.x 维护期——等用户反馈 open_in_gui 实际使用体验，按需 patch；或开始 v2.2 新特性。 |
+| 什么可能导致偏离？ | (1) Gitee API 在 VPN 下不稳定（发布脚本可考虑加代理支持）；(2) open_in_gui 的 sftp 覆盖、聚焦匹配在多 tab 场景可能有边界。 |
+| 下一步最小可验证动作？ | 用户安装 v2.1.0，让 AI 调 open_in_gui（含 tab_type=sftp 和重复调用聚焦）验证日常可用。 |
+| 目标是什么？ | AI ↔ GUI 联动能力稳定交付，用户能用自然语言驱动 MyShell 开终端/文件浏览 tab。 |
