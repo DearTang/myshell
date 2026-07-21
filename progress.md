@@ -1587,3 +1587,37 @@
 | 什么可能导致偏离？ | (1) html2canvas 对 webgl renderer 可能仍空白——有 canvas fallback 兜底；(2) 首次截图前必须配置附件目录，否则会报错（已在 toast 中提示）；(3) xterm DOM 结构在新版本可能变化，导致 canvas fallback 路径找不到 .xterm-screen。 |
 | 下一步最小可验证动作？ | 用户打开 SSH tab 输出些内容（比如 ls / uname -a），点 📷，确认附件目录有新 PNG 且内容正确。 |
 | 目标是什么？ | 一键截取当前终端画面用于分享/留档；AI 能通过 MCP 引导用户完成截图并拿到文件位置。 |
+
+
+### 阶段 64：v2.0.0 发布（2026-07-21）
+
+**版本：** 1.11.2 → **2.0.0**（用户指定，重大版本升级）
+
+**发布内容：** 累积 v1.11.2 之后的全部改动，按用户确认的 CHANGELOG 节发布（无 🐛 修复 节，只保留 ✨新增 / 🛠️优化 / 🔒安全）。
+
+**完整发布流水线：**
+1. ✅ 版本号 bump：Cargo.toml 1.11.2 → 2.0.0，npm run version:sync 同步 package.json/lock
+2. ✅ CHANGELOG.md + README.md 更新日志节同步
+3. ✅ git diff --stat 完整性检查：所有改动文件都已覆盖 staging 条目
+4. ✅ ⚠️ 确认门：用户审阅版本号 + CHANGELOG 全文 → 修改（删 🐛 修复节）→ 再次确认通过
+5. ✅ 预检：npx tsc --noEmit + cargo check 全部 PASS
+6. ✅ 构建：scripts/build-release.bat → MCP + CLI 二进制先编，再 tauri:build → MyShell_2.0.0_x64-setup.exe
+7. ✅ commit + push：5293c88 release: v2.0.0 → origin/main
+8. ✅ Gitee 发布：https://gitee.com/argustang/myshell/releases/tag/v2.0.0（release id=755644，exe 上传完成）
+9. ✅ 清理：RELEASE_NOTES_STAGING.md 待发布条目清空，baseline 更新为 v2.0.0
+
+**核心交付：**
+- **CLI（myshell-cli）**：命令行访问已保存 SSH/SFTP 连接
+- **MCP Server（myshell-mcp）**：10 个工具暴露给 AI agent，NDJSON 协议，高危操作人工确认
+- **三二进制架构**：提取 myshell_core 共享库
+- **终端截图**：CommandBar 📷 按钮，读 xterm buffer 自绘，附件目录管理
+- **架构修复**：NDJSON 协议分帧、MCP 连接超时（后台解锁）、Cargo default-run
+
+## 五问重启检查（阶段 64）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | v2.0.0 已发布到 Gitee，commit 已 push，staging 已清空。 |
+| 我要去哪里？ | v2.0.x 维护期——等用户反馈，按需打 patch；或开始 v2.1 新特性。 |
+| 什么可能导致偏离？ | (1) 用户安装后发现回归 bug → 需要 hotfix patch；(2) MCP 客户端（ZCode/Cursor 等）可能反馈新的兼容性问题。 |
+| 下一步最小可验证动作？ | 用户下载 MyShell_2.0.0_x64-setup.exe 覆盖安装，验证：①旧连接/密码能正常加载；②截图按钮工作；③MCP 在 ZCode/opencode 中连接正常。 |
+| 目标是什么？ | v2.0.0 稳定可用，AI agent 集成能力交付到用户手中。 |
