@@ -20,7 +20,10 @@ import {
   getAttachmentDir,
   setAttachmentDir,
   showInFolder,
+  getCommandRules,
+  setCommandRules,
 } from "../api";
+import type { CommandRules } from "../api";
 import type { BackupInfo, AiToolInfo } from "../api";
 import { useTheme } from "../hooks/useTheme";
 import { useColorScheme } from "../hooks/useColorScheme";
@@ -171,6 +174,12 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   const [attachmentDir, setAttachmentDirState] = useState<string | null>(null);
   const [attachmentDirPicking, setAttachmentDirPicking] = useState(false);
   const [attachmentDirAcknowledged, setAttachmentDirAcknowledged] = useState(false);
+  // ── Command confirmation rules (whitelist/blacklist regex) ──
+  const [rulesBlacklist, setRulesBlacklist] = useState("");
+  const [rulesWhitelist, setRulesWhitelist] = useState("");
+  const [rulesConfirmUnknown, setRulesConfirmUnknown] = useState(false);
+  const [rulesShowInGui, setRulesShowInGui] = useState(true);
+  const [rulesSaving, setRulesSaving] = useState(false);
   useEffect(() => {
     let cancelled = false;
     readGpuDisabled()
@@ -207,6 +216,16 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
     getAttachmentDir()
       .then((dir) => { if (!cancelled) setAttachmentDirState(dir); })
       .catch(() => {});
+    // Load command confirmation rules
+    getCommandRules()
+      .then((r) => {
+        if (cancelled) return;
+        setRulesBlacklist(r.blacklist.join("\n"));
+        setRulesWhitelist(r.whitelist.join("\n"));
+        setRulesConfirmUnknown(r.confirm_unknown);
+        setRulesShowInGui(r.show_in_gui);
+      })
+      .catch(() => {});
     // Load "user has acknowledged the attachment-dir prompt" flag
     try {
       const ack = localStorage.getItem("myshell-attachment-dir-acknowledged");
@@ -230,6 +249,26 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
       console.error("pickAttachmentDir failed:", e);
     } finally {
       setAttachmentDirPicking(false);
+    }
+  }
+
+  /** Parse the textarea contents into a CommandRules and persist it. */
+  async function saveCommandRules() {
+    setRulesSaving(true);
+    try {
+      const parse = (text: string) =>
+        text.split(/[\n,]/).map((s) => s.trim()).filter((s) => s.length > 0);
+      const rules: CommandRules = {
+        blacklist: parse(rulesBlacklist),
+        whitelist: parse(rulesWhitelist),
+        confirm_unknown: rulesConfirmUnknown,
+        show_in_gui: rulesShowInGui,
+      };
+      await setCommandRules(rules);
+    } catch (e) {
+      console.error("saveCommandRules failed:", e);
+    } finally {
+      setRulesSaving(false);
     }
   }
 
@@ -2096,6 +2135,128 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
                       )}
                       <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 6 }}>
                         终端截图文件名为「截图_&lt;连接名&gt;_&lt;时间戳&gt;.png」，自动保存到此目录。
+                      </div>
+                    </div>
+
+                    {/* Command Confirmation Rules — whitelist/blacklist regex
+                        controlling which ssh_exec commands skip the OS dialog. */}
+                    <div style={{ marginBottom: 12 }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                        <div style={{ fontSize: 12, fontWeight: 500 }}>🛡️ 命令确认规则</div>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <button
+                            onClick={() => {
+                              // Reset to defaults (fetch a fresh default by clearing then reloading).
+                              // The simplest way: write the empty object so the backend returns defaults.
+                              setRulesBlacklist("");
+                              setRulesWhitelist("");
+                              setRulesConfirmUnknown(false);
+                            }}
+                            style={{
+                              padding: "4px 10px", borderRadius: 6,
+                              border: "1px solid var(--border)",
+                              background: "var(--bg-input)",
+                              color: "var(--text-secondary)",
+                              fontSize: 11, cursor: "pointer",
+                            }}
+                          >
+                            清空编辑
+                          </button>
+                          <button
+                            onClick={saveCommandRules}
+                            disabled={rulesSaving}
+                            style={{
+                              padding: "4px 10px", borderRadius: 6,
+                              border: "1px solid var(--accent-primary)",
+                              background: "var(--accent-primary)",
+                              color: "white", fontSize: 11,
+                              cursor: rulesSaving ? "wait" : "pointer",
+                              opacity: rulesSaving ? 0.6 : 1,
+                            }}
+                          >
+                            {rulesSaving ? "保存中..." : "保存规则"}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
+                        控制 <code style={{ fontFamily: "monospace" }}>ssh_exec</code> 执行哪些命令时弹人工确认对话框。每行一条正则表达式（大小写不敏感）。
+                      </div>
+
+                      {/* confirm_unknown toggle */}
+                      <label style={{
+                        display: "flex", alignItems: "center", gap: 6,
+                        fontSize: 11, color: "var(--text-secondary)",
+                        marginBottom: 10, cursor: "pointer",
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={rulesConfirmUnknown}
+                          onChange={(e) => setRulesConfirmUnknown(e.target.checked)}
+                        />
+                        <span>未匹配任何规则的命令也需要确认（严格模式，默认关闭）</span>
+                      </label>
+
+                      {/* show_in_gui toggle */}
+                      <label style={{
+                        display: "flex", alignItems: "center", gap: 6,
+                        fontSize: 11, color: "var(--text-secondary)",
+                        marginBottom: 10, cursor: "pointer",
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={rulesShowInGui}
+                          onChange={(e) => setRulesShowInGui(e.target.checked)}
+                        />
+                        <span>ssh_exec 命令在界面终端同步展示（关闭则后台静默执行，默认开启）</span>
+                      </label>
+
+                      {/* Blacklist textarea */}
+                      <div style={{ marginBottom: 8 }}>
+                        <div style={{ fontSize: 11, fontWeight: 500, color: "var(--error)", marginBottom: 4 }}>
+                          ⛔ 黑名单（命中则确认，除非白名单豁免）
+                        </div>
+                        <textarea
+                          value={rulesBlacklist}
+                          onChange={(e) => setRulesBlacklist(e.target.value)}
+                          rows={5}
+                          placeholder="(^|[;&|]\s*)rm\b&#10;(^|[;&|]\s*)kill\b"
+                          style={{
+                            width: "100%", fontSize: 11, fontFamily: "monospace",
+                            background: "var(--bg-input)",
+                            border: "1px solid var(--border)",
+                            borderRadius: 6, padding: "6px 8px",
+                            color: "var(--text-primary)",
+                            resize: "vertical", boxSizing: "border-box",
+                          }}
+                        />
+                      </div>
+
+                      {/* Whitelist textarea */}
+                      <div style={{ marginBottom: 8 }}>
+                        <div style={{ fontSize: 11, fontWeight: 500, color: "var(--success)", marginBottom: 4 }}>
+                          ✅ 白名单豁免（命中则免确认，优先级高于黑名单）
+                        </div>
+                        <textarea
+                          value={rulesWhitelist}
+                          onChange={(e) => setRulesWhitelist(e.target.value)}
+                          rows={3}
+                          placeholder="(^|[;&|]\s*)grep\b"
+                          style={{
+                            width: "100%", fontSize: 11, fontFamily: "monospace",
+                            background: "var(--bg-input)",
+                            border: "1px solid var(--border)",
+                            borderRadius: 6, padding: "6px 8px",
+                            color: "var(--text-primary)",
+                            resize: "vertical", boxSizing: "border-box",
+                          }}
+                        />
+                      </div>
+
+                      <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 4, lineHeight: 1.6 }}>
+                        判定顺序：① 命令替换 / 写重定向 / 管道到 shell → 始终确认（不可配置）；
+                        ② 黑名单命中且白名单未命中 → 确认；③ 黑名单未命中 → 放行（除非开启严格模式）。
+                        空配置文件自动使用内置默认规则。
                       </div>
                     </div>
 

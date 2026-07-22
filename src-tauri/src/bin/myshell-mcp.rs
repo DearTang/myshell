@@ -198,7 +198,7 @@ WORKFLOW:\n\
 2. Pass the name / group-path / host to `ssh_exec` / `sftp_list` / etc. The tool auto-disambiguates by type: ssh_exec prefers ssh connections, sftp_* prefers sftp.\n\
 3. For `ssh_exec`: each invocation is a fresh non-interactive session — no cwd/memory between calls. Use absolute paths or chain commands with && if state matters.\n\
 \n\
-SAFETY: the four dangerous tools (`ssh_exec`, `sftp_upload`, `sftp_remove`, `sftp_rename`) trigger a NATIVE OS confirmation dialog that the USER must click. You cannot bypass it. Before invoking, briefly tell the user a dialog is coming so they don't miss it. If they click Cancel, the tool returns an error — surface it, don't retry silently.\n\
+SAFETY: ssh_exec uses a **configurable whitelist/blacklist** to decide which commands need human confirmation. Read-only commands (ps, ls, cat, grep, df, ...) run WITHOUT a dialog. Dangerous commands (rm, kill, sudo, shutdown, write-redirects, pipe-to-shell, ...) trigger a NATIVE OS confirmation dialog the USER must click — you cannot bypass it. Before calling a dangerous command, briefly tell the user a dialog is coming. If they click Cancel, the tool returns an error — surface it, don't retry silently. The sftp tools (sftp_upload/remove/rename) ALWAYS confirm regardless of rules.\n\
 \n\
 ENCOUNTERING ERRORS: if a tool returns 'Vault 未解锁' or '未找到保存的密码', the user hasn't synced their vault passphrase to the OS keyring via MyShell GUI (Settings → MCP 支持). Tell them this and stop.";
 
@@ -300,7 +300,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "test_connection",
-                "description": "Verify that a saved connection still works (TCP dial + SSH handshake + auth + channel open). No commands run.\n\nWHEN TO USE: The user reports connection issues ('I can't reach prod-db', 'is the staging server up?') or you got an unexpected error from ssh_exec/sftp_list and want to diagnose. Quick, read-only, no confirmation needed.\n\nOUTPUT: Success message including the actual host:port that was contacted, or an error explaining which step failed (unreachable / auth refused / channel blocked).",
+                "description": "Verify that a saved connection still works (TCP dial + SSH handshake + auth + channel open). No commands run.\n\nWHEN TO USE: The user reports connection issues ('I can't reach prod-db', 'is the staging server up?') or you got an unexpected error from ssh_exec/sftp_list and want to diagnose. Quick, read-only, no confirmation needed.\n\nDISAMBIGUATION: If a host is saved as both an SSH and an SFTP connection (same IP/name), this tool probes the SSH one automatically — so passing a bare IP like '135.32.64.30' just works without needing the group path. Only a genuine ambiguity within SSH connections (two SSH entries, same host) returns an error listing the candidates.\n\nOUTPUT: Success message including the actual host:port that was contacted, or an error explaining which step failed (unreachable / auth refused / channel blocked).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -510,10 +510,39 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             let command = args["command"].as_str().ok_or("缺少 command 参数")?;
             let timeout = args["timeout"].as_u64().unwrap_or(30);
 
-            // 高危操作：必须人工确认
-            let detail = format!("在服务器 [{}] 执行命令: {}", conn_name, command);
-            if !confirm_dangerous_operation("ssh_exec（远程命令执行）", &detail) {
-                return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：ssh_exec" }], "isError": true }));
+            // Command confirmation: read the user's whitelist/blacklist rules
+            // (regex) from the config file. Only commands that look dangerous
+            // pop the OS confirmation dialog — read-only commands (ps, ls,
+            // cat, grep, ...) run freely. See command_rules module for the
+            // fail-safe decision order.
+            let rules = load_command_rules();
+
+            // ── show_in_gui path: run the command in a visible GUI tab ──
+            // When enabled (default), the command is sent to a terminal tab in
+            // the MyShell GUI so the user can watch it in real time. The output
+            // is captured from the tab's PTY (via sentinel mechanism) and
+            // returned to the AI — same result as the headless path, but the
+            // user sees everything. Falls back to headless if the GUI isn't
+            // reachable after an auto-start attempt.
+            if rules.show_in_gui {
+                match exec_in_gui_tab(conn_name, command, timeout, &state).await {
+                    Ok(result_json) => return Ok(result_json),
+                    Err(e) => {
+                        // GUI not available or exec failed — fall through to
+                        // headless mode so the tool still works.
+                        log(&format!("show_in_gui 失败，回退到静默模式: {}", e));
+                    }
+                }
+            }
+
+            // ── Confirmation check (headless path) ──
+            if command_rules::command_needs_confirmation(command, &rules) {
+                let detail = format!("在服务器 [{}] 执行命令: {}", conn_name, command);
+                if !confirm_dangerous_operation("ssh_exec（远程命令执行）", &detail) {
+                    return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：ssh_exec" }], "isError": true }));
+                }
+            } else {
+                log(&format!("ssh_exec 免确认（白名单/非危险）: {}", command));
             }
 
             let mut config = state.find_connection(conn_name, Some("ssh"))?;
@@ -680,10 +709,19 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
         "test_connection" => {
             let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
-            // test_connection accepts any type — the user may be diagnosing an
-            // FTP or local connection too. Pass None so we don't artificially
-            // reject matching connections of the "wrong" type.
-            let mut config = state.find_connection(conn_name, None)?;
+            // Prefer an SSH connection for reachability probing: ssh exercises
+            // the full dial + auth + channel path and is the most common probe
+            // target. This also auto-disambiguates hosts saved as BOTH ssh and
+            // sftp (e.g. "135.32.64.30") — the ssh entry wins instead of
+            // erroring with "匹配到 2 条". If no ssh connection matches the
+            // query, fall back to any type so ftp / local / sftp-only hosts
+            // still work. A genuine ambiguity WITHIN the ssh type (two ssh
+            // connections, same host) is still surfaced to the caller.
+            let mut config = match state.find_connection(conn_name, Some("ssh")) {
+                Ok(c) => c,
+                Err(e) if e.contains("未找到") => state.find_connection(conn_name, None)?,
+                Err(e) => return Err(e),
+            };
             state.resolve_secrets(&mut config)?;
 
             let result = match config.conn_type.as_str() {
@@ -790,6 +828,23 @@ fn secrets_attachment_dir() -> Option<String> {
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
 }
 
+/// Read the command confirmation rules from the JSON config file written by
+/// the GUI (`<config_dir>/myshell/mcp-command-rules.json`). Returns the
+/// built-in defaults if the file is missing or unparseable, so the MCP server
+/// always has sane rules even on first run.
+fn load_command_rules() -> command_rules::CommandRules {
+    let mut path = match dirs::config_dir() {
+        Some(d) => d,
+        None => return command_rules::CommandRules::default(),
+    };
+    path.push("myshell");
+    path.push("mcp-command-rules.json");
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => command_rules::CommandRules::default(),
+    }
+}
+
 // ============ GUI IPC client (open_in_gui) ============
 //
 // The GUI writes its IPC listener port to `<config_dir>/myshell/gui-ipc-port`
@@ -840,6 +895,115 @@ fn send_gui_open_command(port: u16, connection_id: &str, tab_type: &str, focus_e
         .map_err(|e| format!("响应解析失败: {} (raw: {})", e, resp_line.trim()))?;
 
     Ok(resp["ok"].as_bool().unwrap_or(false))
+}
+
+// ============ GUI exec_in_tab (show_in_gui mode) ============
+
+/// Ensure the MyShell GUI is running. If the IPC port file exists, assume it's
+/// already up. Otherwise, spawn `myshell.exe` from the same directory as this
+/// MCP binary and poll for the port file to appear (up to 30s).
+fn ensure_gui_running() -> Result<u16, String> {
+    // Already running?
+    if let Some(port) = read_gui_ipc_port() {
+        return Ok(port);
+    }
+
+    // Find myshell.exe — it lives in the same directory as myshell-mcp.exe.
+    let mcp_exe = std::env::current_exe()
+        .map_err(|e| format!("无法定位自身路径: {e}"))?;
+    let gui_exe = mcp_exe
+        .parent()
+        .ok_or("无法定位安装目录")?
+        .join("myshell.exe");
+
+    if !gui_exe.exists() {
+        return Err(format!(
+            "未找到 myshell.exe（期望位置: {}）。请手动打开 MyShell。",
+            gui_exe.display()
+        ));
+    }
+
+    log(&format!("启动 GUI: {}", gui_exe.display()));
+    std::process::Command::new(&gui_exe)
+        .spawn()
+        .map_err(|e| format!("启动 myshell.exe 失败: {e}"))?;
+
+    // Poll for the port file (GUI writes it on startup once the IPC listener
+    // binds). Give it up to 30 seconds — the GUI needs to boot WebView2.
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if let Some(port) = read_gui_ipc_port() {
+            log(&format!("GUI 就绪，IPC port = {}", port));
+            return Ok(port);
+        }
+    }
+    Err("GUI 启动超时（30 秒内未就绪）。请手动打开 MyShell 后重试。".to_string())
+}
+
+/// Send an "exec_in_tab" command to the GUI: run `command` in a visible
+/// terminal tab for `connection_id`, block until the GUI returns the result
+/// (stdout + exit_code), and format it as an MCP tool response.
+///
+/// This is the "show_in_gui" path for ssh_exec. The GUI opens a tab, sends the
+/// command + a sentinel marker to the PTY, captures the output, and sends it
+/// back over the IPC connection.
+async fn exec_in_gui_tab(
+    conn_name: &str,
+    command: &str,
+    timeout: u64,
+    state: &McpState,
+) -> Result<Value, String> {
+    // Resolve the connection to get its id (needed by the GUI to find/open tab).
+    let config = state.find_connection(conn_name, Some("ssh"))?;
+
+    // Ensure the GUI is running (auto-start if needed).
+    let port = ensure_gui_running()?;
+
+    // Send the exec_in_tab command and read the response.
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| format!("TCP 连接 GUI 失败: {e}"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(timeout + 15)))
+        .map_err(|e| format!("设置超时失败: {e}"))?;
+
+    let cmd = serde_json::json!({
+        "action": "exec_in_tab",
+        "connection_id": config.id,
+        "command": command,
+        "timeout": timeout,
+    });
+    writeln!(stream, "{}", cmd).map_err(|e| format!("发送命令失败: {e}"))?;
+    stream.flush().map_err(|e| format!("flush 失败: {e}"))?;
+
+    // Read the response — a JSON object with {ok, stdout?, exit_code?, error?}.
+    let mut reader = BufReader::new(stream);
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).map_err(|e| format!("读取响应失败: {e}"))?;
+
+    let resp: Value = serde_json::from_str(resp_line.trim())
+        .map_err(|e| format!("响应解析失败: {e} (raw: {})", resp_line.trim()))?;
+
+    if resp["ok"].as_bool() == Some(true) {
+        let stdout = resp["stdout"].as_str().unwrap_or("");
+        let exit_code = resp["exit_code"].as_i64().unwrap_or(0);
+        let result = json!({
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": "",
+        });
+        Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }] }))
+    } else {
+        let err_msg = resp["error"].as_str().unwrap_or("未知错误");
+        // If there's partial stdout, include it.
+        let stdout = resp["stdout"].as_str().unwrap_or("");
+        if !stdout.is_empty() {
+            Err(format!("{}（部分输出: {}）", err_msg, stdout))
+        } else {
+            Err(err_msg.to_string())
+        }
+    }
 }
 
 // ============ SFTP helpers (same as CLI) ============

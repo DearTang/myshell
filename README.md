@@ -109,6 +109,17 @@ Vault 解锁：设置 `MYSHELL_PASSPHRASE` 环境变量，或使用 `--passphras
 
 ## 更新日志
 
+### v2.2.0（2026-07-22）
+
+#### ✨ 新增
+- **MCP ssh_exec 界面同步展示**：AI 执行的命令现在实时显示在 GUI 终端 tab，用户可见可干预，输出回传给 AI（sentinel 标记法捕获 PTY 输出边界）。GUI 未运行时 MCP 自动拉起 `myshell.exe`。可在「设置 → MCP 支持 → 命令确认规则」开关。
+
+#### 🛠️ 优化
+- **ssh_exec 命令确认规则（黑名单正则 + 白名单豁免）**：只读命令（`ps`/`ls`/`cat`/`grep` 等）不再弹确认框，只有危险命令（`rm`/`kill`/`sudo`/写重定向/管道到 shell）才弹框；白名单豁免误报（`grep rm` 不误杀）。用户可在设置编辑黑/白名单和严格模式。19 个单元测试覆盖。
+
+#### 🐛 修复
+- **NSIS 升级报「无法打开要写入的文件：myshell-mcp.exe」**：安装/升级/卸载前新增对 `myshell-mcp.exe` / `myshell-cli.exe` 的运行检查（原先只检查主程序），被 AI 客户端常驻拉起时提前提示关闭。顺带修复 `myshell-mcp.exe` 重复打包 + 卸载 `Delete` 加 `/REBOOTOK`。
+
 ### v2.1.0（2026-07-22）
 
 #### ✨ 新增

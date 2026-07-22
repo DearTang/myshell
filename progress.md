@@ -1,4 +1,4 @@
-﻿# 杩涘害鏃ュ織
+# 杩涘害鏃ュ織
 
 ## 浼氳瘽锛?026-06-12 ~ 2026-06-13
 
@@ -1694,3 +1694,79 @@
 | 什么可能导致偏离？ | (1) Gitee API 在 VPN 下不稳定（发布脚本可考虑加代理支持）；(2) open_in_gui 的 sftp 覆盖、聚焦匹配在多 tab 场景可能有边界。 |
 | 下一步最小可验证动作？ | 用户安装 v2.1.0，让 AI 调 open_in_gui（含 tab_type=sftp 和重复调用聚焦）验证日常可用。 |
 | 目标是什么？ | AI ↔ GUI 联动能力稳定交付，用户能用自然语言驱动 MyShell 开终端/文件浏览 tab。 |
+
+
+### 阶段 68：ssh_exec 命令确认规则（黑名单正则 + 白名单豁免，可配置）（2026-07-22）
+
+- **需求：** 原本 ssh_exec 对任何命令都弹人工确认框（ps/ls 也不例外），用户反馈 ps aux 不该算高危。改为：黑名单（危险命令）才确认，白名单（只读命令的误报）豁免，正则匹配，规则可在 GUI 编辑。
+- **设计：黑名单为主 + 白名单豁免 + 正则匹配**：
+  - 判定顺序：① 命令替换 `$(`/`反引号`/写重定向 `> 文件`/管道到 shell → 始终确认（硬底线，不可配置）；② 黑名单正则命中且白名单正则未命中 → 确认；③ 黑名单未命中 → 放行（confirm_unknown=true 时未知也确认）。
+  - 黑名单正则：`(^|[;&|]\s*)rm\b` 等（匹配命令位置，避免 echo rm 误报；约 70 条默认）。
+  - 白名单正则：`(^|[;&|]\s*)grep\b` 等（豁免 grep/ps/ls/cat 等只读命令的误报；约 7 条默认）。
+  - 白名单只在黑名单命中时检查，且按命令位置匹配（`cat a; rm b` 不会被 cat 豁免，因为 rm 在独立链段）。
+- **改动：**
+  - `src-tauri/src/command_rules.rs`（新模块，myshell_core 库）：CommandRules 结构体（blacklist/whitelist/confirm_unknown）+ 默认列表 + `command_needs_confirmation()` + `has_write_redirect()`/`has_command_substitution()` 辅助 + **19 个单元测试**（ps 免确认 / rm 确认 / grep rm 豁免 / cat;rm 仍确认 / >/dev/null 放行 / curl|bash 确认 等）。
+  - `src-tauri/src/lib.rs`：`pub mod command_rules;`
+  - `src-tauri/src/main.rs`：`get_command_rules`/`set_command_rules` 命令（JSON 文件 `mcp-command-rules.json`，仿 attachment_dir 模式）+ 注册。
+  - `src/api.ts`：CommandRules 接口 + getCommandRules/setCommandRules。
+  - `src-tauri/src/bin/myshell-mcp.rs`：`load_command_rules()`（读 JSON，失败用默认）+ ssh_exec 改为条件确认（`command_needs_confirmation()` 判定）+ 更新工具 description + 更新 SERVER_INSTRUCTIONS 的 SAFETY 段。
+  - `src/components/SettingsPanel.tsx`：MCP 节新增"🛡️ 命令确认规则"子区块——confirm_unknown toggle + 黑名单 textarea + 白名单 textarea + 保存按钮 + 判定逻辑说明。
+- **验证：** `cargo test --lib command_rules` 19/19 PASS。`cargo check` + `npx tsc --noEmit` PASS。手测：`ssh_exec "ps aux | grep sftp | grep -v grep"` **不再弹框**（10s 后返回 SSH 连接超时，证明直接执行未阻塞在对话框）。
+
+## 五问重启检查（阶段 68）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 68 complete —— 命令确认规则实现并验证（ps 免确认通过）。 |
+| 我要去哪里？ | 打包发布（含此功能 + test_connection 歧义修复，攒到 v2.2.0 或 v2.1.1）。 |
+| 什么可能导致偏离？ | (1) 用户的命令模式不在默认黑名单（如自定义脚本删数据）→ confirm_unknown=false 时会放行（用户需自行加黑名单或开严格模式）；(2) 正则写错可能误报/漏报（用户可在 GUI 编辑修正）。 |
+| 下一步最小可验证动作？ | 用户装新版，在设置里看到"命令确认规则"区块；让 AI 跑 ps（免确认）/ rm（弹框）。 |
+| 目标是什么？ | ssh_exec 只在真正危险时打扰用户，只读命令顺畅执行；规则透明可配置。 |
+
+
+### 阶段 69：ssh_exec 走 GUI tab 同步展示 + 自动启动 + 配置开关（2026-07-22）
+
+- **需求：** MCP 调 ssh_exec 时自动启动 GUI，命令在 GUI 终端 tab 里同步展示（用户实时可见），输出回传给 AI。做成可配置开关。
+- **架构：双向 IPC（MCP→GUI 发命令，GUI→MCP 回结果）+ Sentinel 标记法捕获 PTY 输出**
+  - show_in_gui=true 时：MCP 通过 IPC 发 exec_in_tab → GUI 开 tab → 发 command + sentinel 到 PTY → 监听 ssh_output 流 → sentinel 出现时截取输出 → IPC 回传 → MCP 返回给 AI
+  - show_in_gui=false 时：走原来的独立连接（headless，不变）
+  - Sentinel 机制解决"PTY 输出无界流没有命令边界"问题：发 `command + "\necho __MCP_DONE_<uuid>__:$?\n"`，正则匹配 sentinel 行获取 exit_code
+  - 自动启动：MCP 读不到端口文件 → spawn myshell.exe（同目录）→ 轮询等端口文件（最多 30s）
+- **改动：**
+  - `command_rules.rs`：CommandRules 加 `show_in_gui: bool`（默认 true）
+  - `main.rs`：IPC listener 加 `exec_in_tab` action（生成 request_id → emit 事件 → oneshot channel 阻塞等前端回传）；新增 `mcp_exec_result` Tauri 命令（前端调它把结果送回等待中的 IPC 线程）；全局 PENDING_EXEC HashMap 关联 request_id ↔ oneshot::Sender
+  - `api.ts`：mcpExecResult 封装；CommandRules 加 show_in_gui
+  - `App.tsx`：mcp-gui-command listener 扩展处理 exec_in_tab（找/开 tab → sshSend 命令+sentinel → onSshOutput 累积 → 正则匹配 sentinel → mcpExecResult 回传）；tabsRef 解决闭包捕获旧 tabs 问题
+  - `myshell-mcp.rs`：ssh_exec 分支加 show_in_gui 路径（exec_in_gui_tab + ensure_gui_running + TCP 客户端读结果）；失败时优雅回退 headless
+  - `SettingsPanel.tsx`：命令确认规则区块加"ssh_exec 界面同步展示"toggle
+- **验证：** `cargo check` PASS，`npx tsc --noEmit` PASS。功能手测待用户验证（需 dev GUI + MCP 联调）。
+
+## 五问重启检查（阶段 69）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 69 complete —— show_in_gui 全链路实现并编译通过。 |
+| 我要去哪里？ | dev GUI + MCP 联调验证：ssh_exec 走 GUI tab 展示 + sentinel 捕获输出。 |
+| 什么可能导致偏离？ | (1) Sentinel 正则匹配可能因 PTY 回显/ANSI 码/多行命令偏差；(2) 新开 tab 后 SSH 连接建立需要时间，polling tabs 可能有延迟；(3) 并发 exec 调用（多个 AI 同时）可能争抢同一 tab。 |
+| 下一步最小可验证动作？ | 用户开 dev GUI，让 AI 跑 `ssh_exec "ps aux"`，看 GUI tab 里命令出现 + AI 收到输出。 |
+| 目标是什么？ | AI 执行的命令在 GUI 实时可见、输出回传，用户全程掌控；关闭开关则静默执行。 |
+
+
+### 阶段 70：NSIS 安装器增加 mcp/cli 运行检查 + 修复重复打包（2026-07-22）
+
+- **问题：** 用户升级到 v2.1.1 时安装报「无法打开要写入的文件：E:\Program Files\MyShell\myshell-mcp.exe」。根因：myshell-mcp.exe 常被各 AI 客户端（Claude Desktop / Cursor / ZCode 等）作为 MCP server 子进程常驻拉起，文件被占用导致 NSIS 无法覆盖写入；而安装器只在写文件时才报错（官方 CheckIfAppIsRunning 宏只检查主程序 myshell.exe）。
+  - 实测当时机器上有 4 个 myshell-mcp.exe 进程在跑。
+- **改动（`src-tauri/nsis/installer.nsi`，自定义 NSIS 模板）:
+  1. Install section 在检查主程序后，追加检查 myshell-mcp.exe + myshell-cli.exe（复用 `CheckIfAppIsRunning` 宏）—— 安装/升级一开始就提示用户关闭，而不是写到一半才弹 Abort/Retry/Ignore。
+  2. Uninstall section 同样追加 mcp + cli 运行检查，避免卸载时 Delete 失败留残文件。
+  3. 卸载 Delete 主程序 + binaries 循环加 `/REBOOTOK`：即便文件仍被占用，也登记为重启删除，卸载不卡。
+  4. 删除手写的冗余 `File "/oname=myshell-mcp.exe" "..\..\myshell-mcp.exe"` 与对应 `Delete "$INSTDIR\myshell-mcp.exe"`：经核 Tauri 按 workspace `[[bin]]` 目标已把 myshell-mcp.exe / myshell-cli.exe 自动注入 `{{#each binaries}}` 列表（生成模板里展开为绝对路径 File 指令），手写行属重复打包，且其相对路径 `..\..\` 解析到不存在的 `src-tauri/myshell-mcp.exe`，是隐患。
+ 5. 同步更新模板头部注释（MyShell 改动清单从 1 项扩到 3 项 + 维护须知）。
+- **验证：** 源模板改动完成。需重新 `npm run tauri:build` 出新安装器才能端到端验证（检查宏触发 + 重复打包消除）。npx tsc / cargo check 不适用（纯 NSIS 模板改动，无 Rust/TS 代码变更）。
+
+## 五问重启检查（阶段 70）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 70 complete —— installer.nsi 加 mcp/cli 运行检查 + 删重复打包，模板头部注释同步。 |
+| 我要去哪里？ | 下次打包出安装器，验证升级时若 mcp 在跑会提示关闭而非写到一半失败。 |
+| 什么可能导致偏离？ | (1) CheckIfAppIsRunning 只按镜像名匹配，若 mcp 被改名运行则查不到（极少见）；(2) /REBOOTOK 只是登记重启删除，用户不重启则文件仍在（可接受，卸载流程不卡）。 |
+| 下一步最小可验证动作？ | 打包后，开着 AI 客户端（mcp 在跑）跑安装器，确认弹出「MyShell (MCP Server) 正在运行」提示而非写入失败。 |
+| 目标是什么？ | 升级/卸载时不再因 mcp 占用卡在「无法打开要写入的文件」，提前提示用户关闭。 |

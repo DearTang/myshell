@@ -24,6 +24,19 @@ impl EventSink for WindowSink {
     }
 }
 
+// ============ MCP exec_in_tab: pending request registry ============
+//
+// When the MCP server asks the GUI to run a command in a visible terminal tab,
+// the IPC listener emits a "mcp-gui-command" event and then BLOCKS waiting for
+// the frontend to call the `mcp_exec_result` Tauri command with the result.
+// We use oneshot channels keyed by request_id to connect the waiting IPC
+// thread to the Tauri command handler.
+use tokio::sync::oneshot;
+type PendingExecMap = std::sync::Mutex<std::collections::HashMap<String, oneshot::Sender<serde_json::Value>>>;
+static PENDING_EXEC: std::sync::LazyLock<PendingExecMap> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(std::collections::HashMap::new())
+});
+
 // ============ Connection Management Commands ============
 
 #[tauri::command]
@@ -1569,6 +1582,68 @@ fn save_screenshot(data_url: String, connection_name: String) -> Result<String, 
     std::fs::write(&filepath, &png_bytes).map_err(|e| format!("写入截图文件失败: {e}"))?;
 
     Ok(filepath.to_string_lossy().to_string())
+}
+
+// ============ MCP command confirmation rules ============
+//
+// User-configurable whitelist + blacklist (regex) that control which `ssh_exec`
+// commands skip the human-confirmation dialog. Stored as JSON in the config
+// dir so both the GUI (these commands) and the MCP server (separate process,
+// reads the same file) stay in sync.
+
+fn command_rules_path() -> Option<std::path::PathBuf> {
+    let mut path = dirs::config_dir()?;
+    path.push("myshell");
+    path.push("mcp-command-rules.json");
+    Some(path)
+}
+
+/// Read the configured command rules. Returns the built-in defaults if the
+/// file doesn't exist yet (first launch) or fails to parse.
+#[tauri::command]
+fn get_command_rules() -> Result<myshell_core::command_rules::CommandRules, String> {
+    let path = command_rules_path().ok_or_else(|| "无法定位配置目录".to_string())?;
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map_err(|e| format!("解析命令规则失败: {e}")),
+        Err(_) => {
+            // File doesn't exist — return defaults (not an error).
+            Ok(myshell_core::command_rules::CommandRules::default())
+        }
+    }
+}
+
+/// Persist the command rules to the JSON config file.
+#[tauri::command]
+fn set_command_rules(rules: myshell_core::command_rules::CommandRules) -> Result<(), String> {
+    let path = command_rules_path().ok_or_else(|| "无法定位配置目录".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(&rules)
+        .map_err(|e| format!("序列化命令规则失败: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("写入命令规则失败: {e}"))?;
+    Ok(())
+}
+
+/// Called by the frontend to deliver the result of an `exec_in_tab` request
+/// back to the waiting IPC listener thread. The listener registered a oneshot
+/// sender under `request_id`; we look it up, send the result, and clean up.
+///
+/// `result` is a JSON object: `{ok: bool, stdout?: string, exit_code?: int, error?: string}`.
+#[tauri::command]
+fn mcp_exec_result(request_id: String, result: serde_json::Value) -> Result<(), String> {
+    let mut pending = PENDING_EXEC.lock().map_err(|e| e.to_string())?;
+    if let Some(tx) = pending.remove(&request_id) {
+        // Send the result to the waiting IPC thread. Ignore send errors — the
+        // thread may have already timed out and dropped the receiver.
+        let _ = tx.send(result);
+        Ok(())
+    } else {
+        // No pending request for this ID — likely a duplicate call or the
+        // request already timed out. Not an error (idempotent).
+        Ok(())
+    }
 }
 
 /// Open a file or folder in the OS file manager. On Windows, selects the file
@@ -3704,6 +3779,9 @@ pub fn run() {
             set_attachment_dir,
             save_screenshot,
             show_in_folder,
+            get_command_rules,
+            set_command_rules,
+            mcp_exec_result,
             write_frontend_log,
             get_connections,
             save_connection,
@@ -3962,6 +4040,88 @@ pub fn run() {
                                     }
                                 }
                             }
+                            "exec_in_tab" => {
+                                // MCP wants to run a command in a visible GUI
+                                // terminal tab and get the output back. Unlike
+                                // open_connection (fire-and-forget), this blocks
+                                // until the frontend reports the result.
+                                let conn_id = cmd["connection_id"].as_str().unwrap_or("").to_string();
+                                let command = cmd["command"].as_str().unwrap_or("").to_string();
+                                let timeout_secs = cmd["timeout"].as_u64().unwrap_or(30);
+                                if conn_id.is_empty() || command.is_empty() {
+                                    let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"missing connection_id or command\"}}");
+                                    continue;
+                                }
+
+                                // Generate a unique request_id for this exec.
+                                let request_id = uuid::Uuid::new_v4().to_string();
+
+                                // Register a oneshot channel so the
+                                // `mcp_exec_result` Tauri command can deliver
+                                // the result back to this waiting thread.
+                                let (tx, rx) = oneshot::channel::<serde_json::Value>();
+                                {
+                                    let mut pending = PENDING_EXEC.lock().unwrap();
+                                    pending.insert(request_id.clone(), tx);
+                                }
+
+                                // Bring window to foreground + emit event.
+                                if let Some(window) = ipc_handle.get_webview_window("main") {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
+                                let payload = serde_json::json!({
+                                    "action": "exec_in_tab",
+                                    "request_id": request_id,
+                                    "connection_id": conn_id,
+                                    "command": command,
+                                    "timeout": timeout_secs,
+                                });
+                                if let Err(e) = ipc_handle.emit("mcp-gui-command", payload) {
+                                    // Clean up the pending entry on emit failure.
+                                    let mut pending = PENDING_EXEC.lock().unwrap();
+                                    pending.remove(&request_id);
+                                    let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"emit failed: {}\"}}", e);
+                                    continue;
+                                }
+
+                                // Block until the frontend calls
+                                // mcp_exec_result(request_id, result) or timeout.
+                                // The IPC listener runs on a std thread, so we
+                                // use a mini tokio runtime to await the oneshot.
+                                let timeout = std::time::Duration::from_secs(timeout_secs + 10);
+                                let result = {
+                                    // The IPC listener is a std thread, so create
+                                    // a throwaway runtime just for this await.
+                                    let rt = match tokio::runtime::Runtime::new() {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            log::error!("[ipc] failed to create runtime: {e}");
+                                            let mut pending = PENDING_EXEC.lock().unwrap();
+                                            pending.remove(&request_id);
+                                            let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"internal: runtime\"}}");
+                                            continue;
+                                        }
+                                    };
+                                    rt.block_on(async move {
+                                        match tokio::time::timeout(timeout, rx).await {
+                                            Ok(Ok(val)) => Some(val),
+                                            _ => None,
+                                        }
+                                    })
+                                };
+                                match result {
+                                    Some(result) => {
+                                        let _ = writeln!(reader.get_mut(), "{}", result);
+                                    }
+                                    None => {
+                                        let mut pending = PENDING_EXEC.lock().unwrap();
+                                        pending.remove(&request_id);
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"exec timeout ({}s)\"}}", timeout_secs);
+                                    }
+                                }
+                            }
+
                             _ => {
                                 let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"unknown action: {}\"}}", action);
                             }

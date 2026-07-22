@@ -5,15 +5,31 @@
 ;   crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi
 ; 被 tauri.conf.json → bundle.windows.nsis.template 引用，接管整份模板。
 ;
-; 相对官方模板的唯一改动（搜索 "MyShell 改动" 可定位）:
-;   reinst_uninstall 块调用旧版卸载器时，原版只追加 _?=$4（非静默），
-;   导致双击新安装包升级时旧版 uninstall.exe 弹出完整卸载向导界面，
-;   用户体验上变成"先卸载一次、再装一次"两轮交互。
-;   本副本追加 /S 让旧版卸载静默执行，将升级交互降到一次"下一步"。
+; 相对官方模板的改动（搜索 "MyShell 改动" 可定位）:
+;
+;   1. reinst_uninstall 块调用旧版卸载器时，原版只追加 _?=$4（非静默），
+;      导致双击新安装包升级时旧版 uninstall.exe 弹出完整卸载向导界面，
+;      用户体验上变成"先卸载一次、再装一次"两轮交互。
+;      本副本追加 /S 让旧版卸载静默执行，将升级交互降到一次"下一步"。
+;
+;   2. 安装/卸载前，除主程序 myshell.exe 外，额外检查 myshell-mcp.exe 与
+;      myshell-cli.exe 是否运行（CheckIfAppIsRunning）。myshell-mcp.exe 常被
+;      AI 客户端（Claude/Cursor/ZCode 等）作为 MCP server 子进程常驻拉起，
+;      升级时不关会占用文件，触发 NSIS "无法打开要写入的文件" 报错。
+;
+;   3. 卸载 Delete 主程序及 binaries 加 /REBOOTOK：进程占用无法立即删除时
+;      登记为重启后删除，卸载不再因此卡住或残留。
+;
+;   4. 移除手写的 `File "..\..\myshell-mcp.exe"` / `Delete ...myshell-mcp.exe`：
+;      myshell-mcp.exe 与 myshell-cli.exe 已由 Tauri 按 workspace [[bin]] 目标
+;      自动注入 binaries 列表（见 binaries 循环段），手写行属重复打包
+;      且其相对路径 `..\..\` 解析到不存在的 src-tauri/myshell-mcp.exe，是隐患。
+;      注意: 注释中切勿出现双花括号——Tauri 用 Handlebars 渲染整份模板，
+;      不区分 NSIS 注释，会把注释里的 each/if 等标签当成真实模板语法解析导致崩溃。
 ;
 ; 维护须知（接管模板的代价）:
 ;   升级 Tauri（如 2.12）后，若官方改动了 installer.nsi，需 re-sync ——
-;   diff 新官方模板与本副本，把 "/S _?=" 改动重新应用到新的 reinst_uninstall 行。
+;   diff 新官方模板与本副本，把上述 1~4 项改动重新应用到新模板对应位置。
 ; =============================================================================
 Unicode true
 ManifestDPIAware true
@@ -656,6 +672,12 @@ Section Install
 
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
+  ; MyShell 改动: mcp/cli 二进制同样会被写入 $INSTDIR，若运行中会占用文件导致
+  ; "无法打开要写入的文件" 报错（mcp 常被 AI 客户端作为子进程常驻拉起），
+  ; 故安装/升级前一并检查并提示关闭。
+  !insertmacro CheckIfAppIsRunning "myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
+  !insertmacro CheckIfAppIsRunning "myshell-cli.exe" "${PRODUCTNAME} (CLI)"
+
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
 
@@ -667,13 +689,11 @@ Section Install
     File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
   {{/each}}
 
-  ; Copy external binaries
+  ; Copy external binaries (myshell-mcp.exe / myshell-cli.exe: Tauri 按 workspace
+  ; [[bin]] 目标自动注入 binaries 列表，展开为绝对路径 File 指令；无需手写)
   {{#each binaries}}
     File "/oname={{this}}" "{{no-escape @key}}"
   {{/each}}
-
-  ; Copy MCP server binary (bundled alongside main exe)
-  File "/oname=myshell-mcp.exe" "..\..\myshell-mcp.exe"
 
   ; Create file associations
   {{#each file_associations as |association| ~}}
@@ -796,22 +816,24 @@ Section Uninstall
 
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
+  ; MyShell 改动: 卸载前同样检查 mcp/cli（mcp 常被 AI 客户端常驻拉起）
+  !insertmacro CheckIfAppIsRunning "myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
+  !insertmacro CheckIfAppIsRunning "myshell-cli.exe" "${PRODUCTNAME} (CLI)"
+
   ; Delete the app directory and its content from disk
   ; Copy main executable
-  Delete "$INSTDIR\${MAINBINARYNAME}.exe"
+  Delete /REBOOTOK "$INSTDIR\${MAINBINARYNAME}.exe"
 
   ; Delete resources
   {{#each resources}}
     Delete "$INSTDIR\\{{this.[1]}}"
   {{/each}}
 
-  ; Delete external binaries
+  ; Delete external binaries (myshell-mcp.exe / myshell-cli.exe)
+  ; /REBOOTOK: 若文件被占用无法立即删除，登记为重启后删除，卸载不会因此卡住
   {{#each binaries}}
-    Delete "$INSTDIR\\{{this}}"
+    Delete /REBOOTOK "$INSTDIR\\{{this}}"
   {{/each}}
-
-  ; Delete MCP server binary
-  Delete "$INSTDIR\myshell-mcp.exe"
 
   ; Delete app associations
   {{#each file_associations as |association| ~}}

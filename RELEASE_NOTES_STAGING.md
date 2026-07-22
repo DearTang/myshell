@@ -15,3 +15,9 @@
 ## 待发布条目（打包后清空）
 
 <!-- 上一个版本 v2.1.0 已发布。新的改动完成后在此追加一行：`- <emoji> <一句话描述>` -->
+
+- 🛠️ ssh_exec 命令确认规则（黑名单正则 + 白名单豁免）：只读命令（ps/ls/cat/grep 等）不再弹人工确认框，只有危险命令（rm/kill/sudo/写重定向/管道到 shell 等）才弹框。规则用正则匹配，黑名单为主、白名单豁免误报（grep rm 不误杀）。默认规则内置，用户可在「设置 → MCP 支持 → 命令确认规则」自行编辑黑/白名单和严格模式开关。19 个单元测试覆盖判定算法。
+
+- ✨ ssh_exec 界面同步展示：MCP 执行的命令在 GUI 终端 tab 里实时显示，用户可见可干预，输出回传给 AI（sentinel 标记法捕获 PTY 输出边界）。GUI 未运行时 MCP 自动拉起 myshell.exe。可在「设置 → MCP 支持 → 命令确认规则」开关——关闭则走原来的后台静默执行。
+
+- 🐛 NSIS 安装器升级报「无法打开要写入的文件：myshell-mcp.exe」：安装/升级/卸载前新增对 myshell-mcp.exe / myshell-cli.exe 的运行检查（原先只检查主程序 myshell.exe），mcp 被各 AI 客户端常驻拉起时会提前提示关闭，不再写到一半才失败。顺带修复 myshell-mcp.exe 重复打包（手写 File 行与 Tauri binaries 循环重复）+ 卸载 Delete 加 /REBOOTOK。

@@ -27,6 +27,7 @@ pub mod elevation;
 pub mod ai;
 pub mod redact;
 pub mod mcp_tools;
+pub mod command_rules;
 
 // ============ Event Sink (emitter abstraction) ============
 

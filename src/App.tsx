@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import type { ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
@@ -28,6 +29,7 @@ import {
   deleteConnection,
   listFolders,
   sshConnect,
+  sshSend,
   sshDisconnect,
   ftpConnect,
   ftpDisconnect,
@@ -36,15 +38,189 @@ import {
   vaultStatus,
   getAppVersion,
   openExternalUrl,
+  onSshOutput,
+  mcpExecResult,
+  getCommandRules,
 } from "./api";
 import type { ConnectionConfig, ConnType, Tab } from "./api";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
 import { useRendererPref } from "./hooks/useRendererPref";
+import { ConfirmDialog } from "./components/ConfirmDialog";
+import type { CommandRules } from "./api";
+
+/**
+ * Client-side mirror of the Rust `command_rules::command_needs_confirmation`.
+ * Checks if a command matches any blacklist regex (and isn't exempted by
+ * whitelist). Used in show_in_gui mode to show a React dialog instead of the
+ * MCP process's raw OS MessageBoxW.
+ *
+ * Returns true if the command needs confirmation, false if it can run freely.
+ * On any regex error, returns true (fail-safe).
+ */
+function checkCommandNeedsConfirmation(command: string, rules: CommandRules): boolean {
+  const cmd = command.trim();
+  if (!cmd) return true;
+
+  // Dangerous patterns (hard floor) — always confirm.
+  if (cmd.includes("$(") || cmd.includes("`")) return true;
+  if (hasWriteRedirect(cmd)) return true;
+
+  try {
+    // Compile regexes (case-insensitive). Invalid patterns are dropped.
+    const compile = (pats: string[]) =>
+      pats.map((p) => { try { return new RegExp(p, "i"); } catch { return null; } }).filter(Boolean) as RegExp[];
+
+    const blacklistRe = compile(rules.blacklist);
+    const whitelistRe = compile(rules.whitelist);
+
+    const blacklisted = blacklistRe.some((re) => re.test(cmd));
+    if (blacklisted) {
+      // Whitelist exemption?
+      if (whitelistRe.some((re) => re.test(cmd))) return false;
+      return true;
+    }
+    return rules.confirm_unknown;
+  } catch {
+    return true; // fail-safe
+  }
+}
+
+/** Check for write-redirect to a real file (not /dev/null or fd-dup). */
+function hasWriteRedirect(cmd: string): boolean {
+  for (let i = 0; i < cmd.length; i++) {
+    if (cmd[i] === ">") {
+      let j = i + 1;
+      if (cmd[j] === ">") j++; // append
+      while (cmd[j] === " " || cmd[j] === "\t") j++;
+      const rest = cmd.slice(j);
+      if (!rest.startsWith("/dev/null") && !rest.startsWith("&")) {
+        return true;
+      }
+      i = j;
+    }
+  }
+  return false;
+}
+
+/**
+ * Highlight dangerous keywords in a command string for the MCP confirmation
+ * dialog. Matches each blacklist regex against the full command; for each
+ * match, wraps the matched substring in a red bold `<span>`. Also highlights
+ * dangerous pattern characters (`$(...)`, backticks, write-redirects `>`).
+ *
+ * The result is a React node array so it renders inline inside a `<div>`.
+ */
+function highlightDangerous(command: string, rules: CommandRules): ReactNode {
+  // Collect all match ranges [start, end) from blacklist regexes + dangerous
+  // literal patterns. We merge overlapping ranges, then slice the command
+  // into highlighted/unhighlighted segments.
+  type Range = [number, number];
+  const ranges: Range[] = [];
+
+  // 1. Dangerous literal patterns (hard floor).
+  for (let i = 0; i < command.length; i++) {
+    if (command.startsWith("$(", i)) ranges.push([i, i + 2]);
+    if (command[i] === "`") ranges.push([i, i + 1]);
+    // Write redirect: `>` or `>>` not followed by /dev/null or &
+    if (command[i] === ">") {
+      let j = i + 1;
+      if (command[j] === ">") j++;
+      while (command[j] === " " || command[j] === "\t") j++;
+      const rest = command.slice(j);
+      if (!rest.startsWith("/dev/null") && !rest.startsWith("&")) {
+        ranges.push([i, j]); // highlight the > or >> part
+      }
+    }
+  }
+
+  // 2. Blacklist regex matches.
+  for (const pat of rules.blacklist) {
+    try {
+      const re = new RegExp(pat, "gi");
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(command)) !== null) {
+        if (m[0].length > 0) {
+          ranges.push([m.index, m.index + m[0].length]);
+        }
+        // Prevent zero-length match infinite loop.
+        if (m.index === re.lastIndex) re.lastIndex++;
+      }
+    } catch {
+      // Invalid regex — skip.
+    }
+  }
+
+  if (ranges.length === 0) return command;
+
+  // Merge overlapping/adjacent ranges.
+  ranges.sort((a, b) => a[0] - b[0]);
+  const merged: Range[] = [ranges[0]];
+  for (let i = 1; i < ranges.length; i++) {
+    const last = merged[merged.length - 1];
+    if (ranges[i][0] <= last[1]) {
+      last[1] = Math.max(last[1], ranges[i][1]);
+    } else {
+      merged.push(ranges[i]);
+    }
+  }
+
+  // Slice into segments.
+  const parts: ReactNode[] = [];
+  let pos = 0;
+  merged.forEach(([start, end], idx) => {
+    if (pos < start) {
+      parts.push(command.slice(pos, start));
+    }
+    parts.push(
+      <span
+        key={`hl-${idx}`}
+        style={{
+          color: "var(--error)",
+          fontWeight: 700,
+          background: "var(--error-muted, rgba(255,80,80,0.12))",
+          borderRadius: 3,
+          padding: "0 2px",
+        }}
+      >
+        {command.slice(start, end)}
+      </span>
+    );
+    pos = end;
+  });
+  if (pos < command.length) {
+    parts.push(command.slice(pos));
+  }
+  return parts;
+}
 
 export default function App() {
   const [connections, setConnections] = useState<ConnectionConfig[]>([]);
   const [folders, setFolders] = useState<string[]>([]);
   const [tabs, setTabs] = useState<Tab[]>([]);
+  // Mirror of `tabs` for use inside async callbacks (setInterval/setTimeout)
+  // that close over a stale `tabs` value. Updated on every render.
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+  // ── MCP exec_in_tab command confirmation ──
+  // When show_in_gui=true and a command needs confirmation, we show a
+  // ConfirmDialog. A Promise resolver stored in a ref connects the async
+  // exec flow to the user's button click.
+  const [mcpConfirm, setMcpConfirm] = useState<{
+    command: string;
+    connectionName: string;
+    rules: CommandRules;
+  } | null>(null);
+  const mcpConfirmResolver = useRef<((ok: boolean) => void) | null>(null);
+
+  /** Show a confirmation dialog for an MCP-triggered command. Returns a
+   * Promise that resolves to true (confirm) or false (cancel). */
+  function showMcpConfirm(command: string, connectionName: string, rules: CommandRules): Promise<boolean> {
+    return new Promise((resolve) => {
+      mcpConfirmResolver.current = resolve;
+      setMcpConfirm({ command, connectionName, rules });
+    });
+  }
+
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [showDialog, setShowDialog] = useState(false);
   const [editConfig, setEditConfig] = useState<ConnectionConfig | null>(null);
@@ -200,44 +376,200 @@ export default function App() {
   }, [vault]);
 
   // ── MCP ↔ GUI bridge: listen for commands from the MCP server ──────────
-  // The MCP server (separate process) can tell the GUI to open a connection
-  // via a localhost TCP IPC channel. The Rust side emits "mcp-gui-command"
-  // with { action, connection_id, tab_type, focus_existing }.
+  // The MCP server (separate process) can tell the GUI to:
+  //   - "open_connection": open/focus a terminal tab (fire-and-forget)
+  //   - "exec_in_tab": run a command in a visible terminal tab and capture
+  //     the output back (blocking — the IPC thread waits for mcpExecResult)
   //
-  // Behavior:
-  //   - focus_existing (default true): if a matching tab is already open,
-  //     just switch to it (no duplicate tab).
-  //   - tab_type: "auto" opens the connection's natural tab; "terminal"
-  //     forces a shell tab; "sftp" forces a file-browser tab (by overriding
-  //     the connection's conn_type to "sftp" before handleConnect).
+  // For exec_in_tab we use a sentinel mechanism: send the command followed by
+  // `echo __MCP_DONE_<uuid>__:$?`, then watch the ssh_output stream until the
+  // sentinel appears. Everything between the command echo and the sentinel is
+  // the command's stdout; the number after the colon is the exit code.
   useEffect(() => {
     const unlisten = listen<{
       action: string;
       connection_id: string;
       tab_type?: string;
       focus_existing?: boolean;
+      request_id?: string;
+      command?: string;
+      timeout?: number;
     }>("mcp-gui-command", (event) => {
-      const { action, connection_id, tab_type = "auto", focus_existing = true } = event.payload;
-      if (action !== "open_connection" || !connection_id) return;
+      const { action, connection_id } = event.payload;
+      if (!connection_id) return;
 
       const config = connections.find((c) => c.id === connection_id);
       if (!config) {
         console.warn(`[mcp-gui] connection not found: ${connection_id}`);
+        // If this is an exec_in_tab, report the error back.
+        if (action === "exec_in_tab" && event.payload.request_id) {
+          mcpExecResult(event.payload.request_id, { ok: false, error: "未找到连接" });
+        }
         return;
       }
 
-      // Which tab type does this request want? "auto" → the connection's
-      // natural type; otherwise the explicit request.
+      // ── exec_in_tab: run command in a visible tab + capture output ──
+      if (action === "exec_in_tab" && event.payload.request_id && event.payload.command) {
+        const requestId = event.payload.request_id;
+        const command = event.payload.command;
+        const timeoutMs = (event.payload.timeout || 30) * 1000;
+
+        // Find or open a terminal tab for this connection (terminal type).
+        const existing = tabsRef.current.find(
+          (t) => t.connectionId === connection_id && t.type === "terminal" && t.status === "connected"
+        );
+
+        const runExec = async (sessionId: string) => {
+          // ── Command confirmation (GUI-side, nicer than OS MessageBoxW) ──
+          // When running in show_in_gui mode, check the command rules HERE
+          // (in the GUI) rather than in the MCP process. This lets us show a
+          // beautiful React dialog instead of a raw Windows MessageBoxW.
+          try {
+            const rules = await getCommandRules();
+            // Simple client-side check: if the command matches a blacklist
+            // regex and no whitelist regex matches, show confirmation.
+            const needsConfirm = checkCommandNeedsConfirmation(command, rules);
+            if (needsConfirm) {
+              const connectionName = config.name || connection_id;
+              const confirmed = await showMcpConfirm(command, connectionName, rules);
+              if (!confirmed) {
+                mcpExecResult(requestId, {
+                  ok: false,
+                  error: "❌ 用户取消了高危操作：ssh_exec",
+                });
+                return;
+              }
+            }
+          } catch (e) {
+            console.warn("[mcp-gui] failed to check command rules:", e);
+            // On error, err on the side of caution — but don't block the
+            // command (the MCP side already checked rules in headless fallback).
+          }
+
+          // Generate a unique sentinel. The shell will echo it with the exit
+          // code appended, marking where the command's output ends.
+          const sentinel = `__MCP_DONE_${Math.random().toString(36).slice(2, 14)}__`;
+
+          // Send: the command, then the sentinel probe.
+          // The `\n` ensures the command is submitted (Enter).
+          await sshSend(sessionId, command + "\n");
+          // Small delay so the command is processed before the sentinel.
+          await new Promise((r) => setTimeout(r, 100));
+          await sshSend(sessionId, `echo ${sentinel}:$?\n`);
+
+          // Subscribe to ssh_output for this session and accumulate bytes.
+          let outputBuf = "";
+          let done = false;
+          let timedOut = false;
+
+          const unlistenOutput = await onSshOutput(sessionId, (data) => {
+            if (done) return;
+            // Decode bytes to string (terminal output is UTF-8 / ASCII).
+            outputBuf += new TextDecoder("utf-8", { fatal: false }).decode(data);
+            // Check for the sentinel line. The shell echoes it as:
+            //   __MCP_DONE_xxxx__:0
+            const re = new RegExp(sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ":(\\d+)");
+            const match = outputBuf.match(re);
+            if (match) {
+              done = true;
+              const exitCode = parseInt(match[1], 10);
+              // Extract stdout: everything between the command echo and the
+              // sentinel. We find the sentinel's position and work backwards.
+              const sentinelIdx = outputBuf.indexOf(sentinel);
+              // The sentinel line itself starts at the beginning of its line —
+              // find the preceding newline. Everything before the command's
+              // own echo (the first line after we sent it) is prior output.
+              // Simplest heuristic: strip everything from the sentinel onwards,
+              // and strip the command echo line (first line).
+              let stdout = outputBuf.slice(0, sentinelIdx);
+              // Remove the last newline before the sentinel (it's the end of
+              // the sentinel echo line's predecessor).
+              stdout = stdout.replace(/\n$/, "");
+              // The command itself was echoed by the PTY as the first line(s).
+              // Try to strip it: find the first newline after the command text.
+              const cmdLineEnd = stdout.indexOf("\n");
+              if (cmdLineEnd >= 0 && cmdLineEnd < command.length + 20) {
+                stdout = stdout.slice(cmdLineEnd + 1);
+              }
+
+              mcpExecResult(requestId, { ok: true, stdout, exit_code: exitCode });
+            }
+          });
+
+          // Timeout safety: if the sentinel never appears (interactive command,
+          // hang, etc.), return what we have + error.
+          setTimeout(() => {
+            if (!done && !timedOut) {
+              timedOut = true;
+              unlistenOutput();
+              mcpExecResult(requestId, {
+                ok: false,
+                error: `命令超时（${event.payload.timeout || 30}秒未完成）`,
+                stdout: outputBuf,
+              });
+            }
+          }, timeoutMs);
+
+          // If done already (fast command), clean up the listener.
+          // We check periodically; a cleaner approach would use a Promise.
+          const cleanupCheck = setInterval(() => {
+            if (done || timedOut) {
+              clearInterval(cleanupCheck);
+              unlistenOutput();
+            }
+          }, 500);
+        };
+
+        if (existing && existing.sessionId) {
+          // Tab already open and connected — use it directly.
+          setActiveTabId(existing.id);
+          runExec(existing.sessionId).catch((e) => {
+            mcpExecResult(requestId, { ok: false, error: `执行失败: ${e}` });
+          });
+        } else {
+          // Need to open a new tab. handleConnect is async (establishes SSH),
+          // but we don't get the sessionId back easily — we need to watch for
+          // the new tab to appear with status "connected", then extract its
+          // sessionId.
+          handleConnect(config);
+          // Watch tabs state for the new connected tab.
+          let attempts = 0;
+          const maxAttempts = Math.floor(timeoutMs / 500);
+          const checkInterval = setInterval(() => {
+            attempts++;
+            const tab = tabsRef.current.find(
+              (t) => t.connectionId === connection_id && t.type === "terminal" && t.status === "connected" && t.sessionId
+            );
+            if (tab && tab.sessionId) {
+              clearInterval(checkInterval);
+              setActiveTabId(tab.id);
+              runExec(tab.sessionId).catch((e) => {
+                mcpExecResult(requestId, { ok: false, error: `执行失败: ${e}` });
+              });
+            } else if (attempts >= maxAttempts) {
+              clearInterval(checkInterval);
+              mcpExecResult(requestId, { ok: false, error: "连接超时，无法建立终端会话" });
+            }
+          }, 500);
+        }
+        return;
+      }
+
+      // ── open_connection: open/focus a tab (fire-and-forget) ──
+      if (action !== "open_connection") return;
+
+      const tab_type = event.payload.tab_type || "auto";
+      const focus_existing = event.payload.focus_existing ?? true;
+
       const wantType: "terminal" | "sftp" | "auto" =
         tab_type === "sftp" ? "sftp" : tab_type === "terminal" ? "terminal" : "auto";
 
-      // Focus an existing matching tab if requested.
       if (focus_existing) {
         const existing = tabs.find((t) => {
           if (t.connectionId !== connection_id) return false;
           if (wantType === "sftp") return t.type === "sftp";
           if (wantType === "terminal") return t.type === "terminal";
-          return true; // auto: any open tab for this connection
+          return true;
         });
         if (existing) {
           setActiveTabId(existing.id);
@@ -245,8 +577,6 @@ export default function App() {
         }
       }
 
-      // Open a new tab. Force SFTP type if requested (only meaningful for
-      // SSH-capable connections; ftp/local ignore the override).
       if (wantType === "sftp" && (config.conn_type === "ssh" || config.conn_type === "sftp" || !config.conn_type)) {
         handleConnect({ ...config, conn_type: "sftp" });
       } else {
@@ -947,6 +1277,60 @@ export default function App() {
           updateInfo={updateInfo}
         />
       )}
+
+      {/* MCP exec_in_tab command confirmation — shown when AI runs a dangerous
+          command in show_in_gui mode. Uses the same ConfirmDialog as other
+          destructive prompts for visual consistency. */}
+      {mcpConfirm && (
+        <ConfirmDialog
+          title="🤖 AI 请求执行高危命令"
+          message={
+            <>
+              <div style={{ marginBottom: 8 }}>
+                AI agent 通过 MCP 请求在服务器{" "}
+                <strong style={{ color: "var(--text-primary)" }}>
+                  [{mcpConfirm.connectionName}]
+                </strong>{" "}
+                上执行以下命令：
+              </div>
+              <div
+                style={{
+                  background: "var(--bg-base)",
+                  border: "1px solid var(--border-default)",
+                  borderRadius: "var(--radius-sm)",
+                  padding: "8px 10px",
+                  fontFamily: "monospace",
+                  fontSize: 12,
+                  color: "var(--text-primary)",
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-all",
+                  maxHeight: 120,
+                  overflow: "auto",
+                }}
+              >
+                {highlightDangerous(mcpConfirm.command, mcpConfirm.rules)}
+              </div>
+              <div style={{ marginTop: 8, color: "var(--text-muted)" }}>
+                点击「确认执行」允许，点击「取消」拒绝。取消后 AI 会收到错误消息。
+              </div>
+            </>
+          }
+          confirmLabel="确认执行"
+          cancelLabel="取消"
+          danger={true}
+          onConfirm={() => {
+            setMcpConfirm(null);
+            mcpConfirmResolver.current?.(true);
+            mcpConfirmResolver.current = null;
+          }}
+          onCancel={() => {
+            setMcpConfirm(null);
+            mcpConfirmResolver.current?.(false);
+            mcpConfirmResolver.current = null;
+          }}
+        />
+      )}
+
       {broadcastDupPrompt && (
         <BroadcastDupDialog
           connectionName={broadcastDupPrompt.connectionName}
