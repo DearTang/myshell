@@ -1336,18 +1336,3 @@ export async function mcpWriteConfig(toolId: string): Promise<boolean> {
 export async function mcpRemoveConfig(toolId: string): Promise<void> {
   await invoke("mcp_remove_config", { toolId });
 }
-
-/** Save vault passphrase to OS keyring for MCP server. */
-export async function mcpSavePassphrase(passphrase: string): Promise<void> {
-  await invoke("mcp_save_passphrase", { passphrase });
-}
-
-/** Check if MCP passphrase exists in keyring. */
-export async function mcpHasPassphrase(): Promise<boolean> {
-  return await invoke("mcp_has_passphrase");
-}
-
-/** Delete stored MCP passphrase from keyring. */
-export async function mcpDeletePassphrase(): Promise<void> {
-  await invoke("mcp_delete_passphrase");
-}

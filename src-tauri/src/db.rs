@@ -524,6 +524,59 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
     Ok(configs)
 }
 
+/// Like `get_all_connections` but returns only plaintext columns
+/// (id, name, conn_type, group_path). Encrypted fields (host, username,
+/// passwords, keys) are left empty. This lets the MCP server resolve a
+/// connection name/IP → id WITHOUT needing the DEK — the security model is
+/// that MCP never holds decryption capability; all credential use happens
+/// inside the GUI process where the user has unlocked the vault.
+///
+/// `host` is also returned empty because it is encrypted (`host_enc`).
+/// Name-based lookup still works (name is plaintext). IP-based lookup is
+/// NOT possible with this function (IPs are in the encrypted host column).
+pub fn get_all_connections_plaintext(conn: &Connection) -> Result<Vec<ConnectionConfig>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, conn_type, group_path FROM connections WHERE deleted_at IS NULL ORDER BY name",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,       // id
+            row.get::<_, String>(1)?,       // name
+            row.get::<_, String>(2)?,       // conn_type
+            row.get::<_, String>(3)?,       // group_path
+        ))
+    })?;
+    let mut configs = Vec::new();
+    for row in rows {
+        let (id, name, conn_type, group_path) = row?;
+        configs.push(ConnectionConfig {
+            id,
+            name,
+            host: String::new(),    // encrypted — not available without DEK
+            port: 0,
+            username: String::new(), // encrypted
+            auth_method: String::new(),
+            password: None,
+            private_key_pem: None,
+            conn_type,
+            group_path,
+            ftp_tls: String::new(),
+            ftp_passive: false,
+            proxy_type: String::new(),
+            proxy_host: None,
+            proxy_port: None,
+            proxy_username: None,
+            shell_path: None,
+            shell_args: None,
+            init_command: None,
+            proxy_password: None,
+            created_at: String::new(),
+            terminal_font: None,
+        });
+    }
+    Ok(configs)
+}
+
 pub fn save_connection(conn: &Connection, key: &[u8; 32], config: &ConnectionConfig) -> Result<()> {
     let host_enc = crypto::encrypt_with_key(key, config.host.as_bytes())
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;

@@ -127,8 +127,6 @@ enum SftpAction {
 enum VaultAction {
     /// Show vault status (initialized / unlocked)
     Status,
-    /// Save master passphrase to OS keyring (for MCP server use)
-    SavePassphrase,
 }
 
 // ============ Event sink for CLI ============
@@ -301,7 +299,6 @@ async fn main() {
                 }
                 Ok(())
             }
-            VaultAction::SavePassphrase => cmd_save_passphrase(&state).await,
         },
     };
 
@@ -312,24 +309,6 @@ async fn main() {
 }
 
 // ============ Command implementations ============
-
-async fn cmd_save_passphrase(state: &AppState) -> Result<(), String> {
-    // Prompt for passphrase (no echo)
-    eprint!("输入 vault 主密码: ");
-    let passphrase = rpassword::read_password().map_err(|e| format!("读取密码失败: {}", e))?;
-
-    if passphrase.is_empty() {
-        return Err("密码不能为空".to_string());
-    }
-
-    // Verify by attempting unlock
-    unlock(state, &passphrase)?;
-
-    // Save to OS keyring (DPAPI-encrypted on Windows)
-    secrets::set_mcp_passphrase(&passphrase)?;
-    println!("✓ 密码已保存到 Windows 凭证管理器（DPAPI 加密），MCP server 现在可以自动解锁 vault。");
-    Ok(())
-}
 
 async fn cmd_list(state: &AppState, json: bool) -> Result<(), String> {
     let key = require_dek(state)?;

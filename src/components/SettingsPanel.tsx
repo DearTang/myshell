@@ -14,9 +14,6 @@ import {
   mcpDetectTools,
   mcpWriteConfig,
   mcpRemoveConfig,
-  mcpSavePassphrase,
-  mcpHasPassphrase,
-  mcpDeletePassphrase,
   getAttachmentDir,
   setAttachmentDir,
   showInFolder,
@@ -164,10 +161,6 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
 
   // ── MCP server state ──
   const [mcpEnabled, setMcpEnabled] = useState(false);
-  const [mcpPassphrase, setMcpPassphrase] = useState("");
-  const [mcpPassphraseStored, setMcpPassphraseStored] = useState(false);
-  const [mcpSaving, setMcpSaving] = useState(false);
-  const [mcpEditingPassphrase, setMcpEditingPassphrase] = useState(false);
   const [mcpTools, setMcpTools] = useState<AiToolInfo[]>([]);
   const [mcpConfiguring, setMcpConfiguring] = useState(false);
   // ── Attachment directory (where screenshots are auto-saved) ──
@@ -175,11 +168,16 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   const [attachmentDirPicking, setAttachmentDirPicking] = useState(false);
   const [attachmentDirAcknowledged, setAttachmentDirAcknowledged] = useState(false);
   // ── Command confirmation rules (whitelist/blacklist regex) ──
-  const [rulesBlacklist, setRulesBlacklist] = useState("");
-  const [rulesWhitelist, setRulesWhitelist] = useState("");
+  const [rulesBlacklist, setRulesBlacklist] = useState<string[]>([]);
+  const [rulesWhitelist, setRulesWhitelist] = useState<string[]>([]);
   const [rulesConfirmUnknown, setRulesConfirmUnknown] = useState(false);
   const [rulesShowInGui, setRulesShowInGui] = useState(true);
   const [rulesSaving, setRulesSaving] = useState(false);
+  // Search + add-input state for the list-style rule editor.
+  const [blacklistSearch, setBlacklistSearch] = useState("");
+  const [blacklistInput, setBlacklistInput] = useState("");
+  const [whitelistSearch, setWhitelistSearch] = useState("");
+  const [whitelistInput, setWhitelistInput] = useState("");
   useEffect(() => {
     let cancelled = false;
     readGpuDisabled()
@@ -198,10 +196,6 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   useEffect(() => {
     if (activeCategory !== "mcp") return;
     let cancelled = false;
-    // Check if passphrase exists in keyring
-    mcpHasPassphrase()
-      .then((v) => { if (!cancelled) setMcpPassphraseStored(v); })
-      .catch(() => {});
     // Detect installed tools
     mcpDetectTools()
       .then((tools) => {
@@ -220,8 +214,8 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
     getCommandRules()
       .then((r) => {
         if (cancelled) return;
-        setRulesBlacklist(r.blacklist.join("\n"));
-        setRulesWhitelist(r.whitelist.join("\n"));
+        setRulesBlacklist(r.blacklist);
+        setRulesWhitelist(r.whitelist);
         setRulesConfirmUnknown(r.confirm_unknown);
         setRulesShowInGui(r.show_in_gui);
       })
@@ -256,11 +250,9 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   async function saveCommandRules() {
     setRulesSaving(true);
     try {
-      const parse = (text: string) =>
-        text.split(/[\n,]/).map((s) => s.trim()).filter((s) => s.length > 0);
       const rules: CommandRules = {
-        blacklist: parse(rulesBlacklist),
-        whitelist: parse(rulesWhitelist),
+        blacklist: rulesBlacklist,
+        whitelist: rulesWhitelist,
         confirm_unknown: rulesConfirmUnknown,
         show_in_gui: rulesShowInGui,
       };
@@ -493,14 +485,6 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
     setPasswordSuccess(false);
     try {
       await changeMasterPassword(oldPass, newPass);
-      // Sync new passphrase to keyring for MCP server (if previously set)
-      if (mcpPassphraseStored && newPass) {
-        try {
-          await mcpSavePassphrase(newPass);
-        } catch {
-          // Non-fatal: user can re-set in MCP section
-        }
-      }
       setPasswordSuccess(true);
       setOldPass("");
       setNewPass("");
@@ -1897,163 +1881,6 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
 
                 {mcpEnabled && (
                   <>
-                    {/* Passphrase management */}
-                    <div style={{
-                      marginBottom: 12,
-                      padding: 12,
-                      borderRadius: 8,
-                      background: "var(--bg-secondary)",
-                      border: "1px solid var(--border)",
-                    }}>
-                      <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 8 }}>
-                        🔐 Vault 密码同步
-                      </div>
-                      <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
-                        {mcpPassphraseStored
-                          ? "✓ 已配置安全凭证，MCP server 可自动解锁 vault"
-                          : "请输入 vault 主密码，将加密保存到 Windows 凭证管理器"}
-                      </div>
-                      {!mcpPassphraseStored && (
-                        <div style={{ display: "flex", gap: 8 }}>
-                          <div style={{ flex: 1 }}>
-                          <Input
-                            type="password"
-                            placeholder="输入 vault 主密码"
-                            value={mcpPassphrase}
-                            onChange={(v) => setMcpPassphrase(v)}
-                          />
-                          </div>
-                          <button
-                            style={{
-                              padding: "6px 14px",
-                              borderRadius: 6,
-                              border: "1px solid var(--accent)",
-                              background: "var(--accent)",
-                              color: "#fff",
-                              fontSize: 12,
-                              cursor: mcpSaving ? "default" : "pointer",
-                              opacity: mcpSaving ? 0.6 : 1,
-                            }}
-                            disabled={mcpSaving || !mcpPassphrase}
-                            onClick={async () => {
-                              if (!mcpPassphrase) return;
-                              setMcpSaving(true);
-                              try {
-                                await mcpSavePassphrase(mcpPassphrase);
-                                setMcpPassphrase("");
-                                setMcpPassphraseStored(true);
-                                showToast("ok", "密码已安全保存到 Windows 凭证管理器");
-                              } catch (e: any) {
-                                showToast("err", `保存失败: ${e}`);
-                              } finally {
-                                setMcpSaving(false);
-                              }
-                            }}
-                          >
-                            {mcpSaving ? "保存中…" : "保存"}
-                          </button>
-                        </div>
-                      )}
-                      {mcpPassphraseStored && (
-                        <div style={{ display: "flex", gap: 8 }}>
-                          <button
-                            style={{
-                              padding: "6px 14px",
-                              borderRadius: 6,
-                              border: "1px solid var(--border)",
-                              background: "transparent",
-                              color: "var(--text)",
-                              fontSize: 12,
-                              cursor: "pointer",
-                            }}
-                            onClick={() => setMcpEditingPassphrase(true)}
-                          >
-                            修改密码
-                          </button>
-                          <button
-                            style={{
-                              padding: "6px 14px",
-                              borderRadius: 6,
-                              border: "1px solid var(--error)",
-                              background: "transparent",
-                              color: "var(--error)",
-                              fontSize: 12,
-                              cursor: "pointer",
-                            }}
-                            onClick={async () => {
-                              try {
-                                await mcpDeletePassphrase();
-                                setMcpPassphraseStored(false);
-                                showToast("ok", "已删除安全凭证");
-                              } catch (e: any) {
-                                showToast("err", `删除失败: ${e}`);
-                              }
-                            }}
-                          >
-                            删除
-                          </button>
-                        </div>
-                      )}
-                      {/* Edit passphrase dialog */}
-                      {mcpEditingPassphrase && (
-                        <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
-                          <div style={{ flex: 1 }}>
-                          <Input
-                            type="password"
-                            placeholder="输入新的 vault 主密码"
-                            value={mcpPassphrase}
-                            onChange={(v) => setMcpPassphrase(v)}
-                          />
-                          </div>
-                          <button
-                            style={{
-                              padding: "6px 14px",
-                              borderRadius: 6,
-                              border: "1px solid var(--accent)",
-                              background: "var(--accent)",
-                              color: "#fff",
-                              fontSize: 12,
-                              cursor: mcpSaving ? "default" : "pointer",
-                              opacity: mcpSaving ? 0.6 : 1,
-                            }}
-                            disabled={mcpSaving || !mcpPassphrase}
-                            onClick={async () => {
-                              if (!mcpPassphrase) return;
-                              setMcpSaving(true);
-                              try {
-                                await mcpSavePassphrase(mcpPassphrase);
-                                setMcpPassphrase("");
-                                setMcpEditingPassphrase(false);
-                                showToast("ok", "密码已更新");
-                              } catch (e: any) {
-                                showToast("err", `更新失败: ${e}`);
-                              } finally {
-                                setMcpSaving(false);
-                              }
-                            }}
-                          >
-                            {mcpSaving ? "保存中…" : "确认"}
-                          </button>
-                          <button
-                            style={{
-                              padding: "6px 14px",
-                              borderRadius: 6,
-                              border: "1px solid var(--border)",
-                              background: "transparent",
-                              color: "var(--text)",
-                              fontSize: 12,
-                              cursor: "pointer",
-                            }}
-                            onClick={() => {
-                              setMcpEditingPassphrase(false);
-                              setMcpPassphrase("");
-                            }}
-                          >
-                            取消
-                          </button>
-                        </div>
-                      )}
-                    </div>
 
                     {/* Attachment Directory — where screenshots are auto-saved.
                         First time the user opens MCP settings without this
@@ -2148,8 +1975,8 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
                             onClick={() => {
                               // Reset to defaults (fetch a fresh default by clearing then reloading).
                               // The simplest way: write the empty object so the backend returns defaults.
-                              setRulesBlacklist("");
-                              setRulesWhitelist("");
+                              setRulesBlacklist([]);
+                              setRulesWhitelist([]);
                               setRulesConfirmUnknown(false);
                             }}
                             style={{
@@ -2211,46 +2038,188 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
                         <span>ssh_exec 命令在界面终端同步展示（关闭则后台静默执行，默认开启）</span>
                       </label>
 
-                      {/* Blacklist textarea */}
+                      {/* Blacklist — searchable sorted list */}
                       <div style={{ marginBottom: 8 }}>
-                        <div style={{ fontSize: 11, fontWeight: 500, color: "var(--error)", marginBottom: 4 }}>
+                        <div style={{ fontSize: 12, fontWeight: 500, color: "var(--error)", marginBottom: 4 }}>
                           ⛔ 黑名单（命中则确认，除非白名单豁免）
                         </div>
-                        <textarea
-                          value={rulesBlacklist}
-                          onChange={(e) => setRulesBlacklist(e.target.value)}
-                          rows={5}
-                          placeholder="(^|[;&|]\s*)rm\b&#10;(^|[;&|]\s*)kill\b"
-                          style={{
-                            width: "100%", fontSize: 11, fontFamily: "monospace",
-                            background: "var(--bg-input)",
-                            border: "1px solid var(--border)",
-                            borderRadius: 6, padding: "6px 8px",
-                            color: "var(--text-primary)",
-                            resize: "vertical", boxSizing: "border-box",
-                          }}
-                        />
+                        <div style={{ display: "flex", gap: 4, marginBottom: 4 }}>
+                          <input
+                            type="text"
+                            value={blacklistInput}
+                            onChange={(e) => setBlacklistInput(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && blacklistInput.trim()) {
+                                const v = blacklistInput.trim();
+                                if (!rulesBlacklist.includes(v)) {
+                                  setRulesBlacklist([...rulesBlacklist, v].sort());
+                                }
+                                setBlacklistInput("");
+                              }
+                            }}
+                            placeholder="输入正则后回车添加…"
+                            style={{
+                              flex: 1, fontSize: 13, fontFamily: "monospace",
+                              background: "var(--bg-input)",
+                              border: "1px solid var(--border)",
+                              borderRadius: 6, padding: "5px 8px",
+                              color: "var(--text-primary)",
+                            }}
+                          />
+                          <button
+                            style={{
+                              padding: "4px 12px", borderRadius: 6, fontSize: 12,
+                              border: "1px solid var(--border)",
+                              background: "var(--bg-input)", color: "var(--text)",
+                              cursor: "pointer", flexShrink: 0,
+                            }}
+                            onClick={() => {
+                              const v = blacklistInput.trim();
+                              if (v && !rulesBlacklist.includes(v)) {
+                                setRulesBlacklist([...rulesBlacklist, v].sort());
+                              }
+                              setBlacklistInput("");
+                            }}
+                          >添加</button>
+                        </div>
+                        {rulesBlacklist.length > 3 && (
+                          <input
+                            type="text"
+                            value={blacklistSearch}
+                            onChange={(e) => setBlacklistSearch(e.target.value)}
+                            placeholder="🔍 搜索…"
+                            style={{
+                              width: "100%", fontSize: 12,
+                              background: "var(--bg-input)",
+                              border: "1px solid var(--border)",
+                              borderRadius: 6, padding: "4px 8px", marginBottom: 4,
+                              color: "var(--text-primary)",
+                            }}
+                          />
+                        )}
+                        <div style={{ maxHeight: 200, overflowY: "auto", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-input)" }}>
+                          {rulesBlacklist
+                            .filter((r) => !blacklistSearch || r.toLowerCase().includes(blacklistSearch.toLowerCase()))
+                            .map((rule, i) => (
+                              <div key={rule} style={{
+                                display: "flex", alignItems: "center", gap: 6,
+                                padding: "4px 8px", borderBottom: i < rulesBlacklist.length - 1 ? "1px solid var(--border)" : "none",
+                              }}>
+                                <span style={{ fontSize: 13, fontFamily: "monospace", color: "var(--error)", flex: 1, wordBreak: "break-all" }}>
+                                  {rule}
+                                </span>
+                                <button
+                                  style={{
+                                    border: "none", background: "transparent",
+                                    color: "var(--text-muted)", cursor: "pointer",
+                                    fontSize: 14, padding: "0 4px", flexShrink: 0,
+                                  }}
+                                  onClick={() => setRulesBlacklist(rulesBlacklist.filter((r) => r !== rule))}
+                                  title="删除"
+                                >✕</button>
+                              </div>
+                            ))}
+                          {rulesBlacklist.length === 0 && (
+                            <div style={{ padding: "8px", fontSize: 12, color: "var(--text-muted)", textAlign: "center" }}>
+                              暂无规则
+                            </div>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>
+                          共 {rulesBlacklist.length} 条，自动按字母排序
+                        </div>
                       </div>
 
-                      {/* Whitelist textarea */}
+                      {/* Whitelist — searchable sorted list */}
                       <div style={{ marginBottom: 8 }}>
-                        <div style={{ fontSize: 11, fontWeight: 500, color: "var(--success)", marginBottom: 4 }}>
+                        <div style={{ fontSize: 12, fontWeight: 500, color: "var(--success)", marginBottom: 4 }}>
                           ✅ 白名单豁免（命中则免确认，优先级高于黑名单）
                         </div>
-                        <textarea
-                          value={rulesWhitelist}
-                          onChange={(e) => setRulesWhitelist(e.target.value)}
-                          rows={3}
-                          placeholder="(^|[;&|]\s*)grep\b"
-                          style={{
-                            width: "100%", fontSize: 11, fontFamily: "monospace",
-                            background: "var(--bg-input)",
-                            border: "1px solid var(--border)",
-                            borderRadius: 6, padding: "6px 8px",
-                            color: "var(--text-primary)",
-                            resize: "vertical", boxSizing: "border-box",
-                          }}
-                        />
+                        <div style={{ display: "flex", gap: 4, marginBottom: 4 }}>
+                          <input
+                            type="text"
+                            value={whitelistInput}
+                            onChange={(e) => setWhitelistInput(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && whitelistInput.trim()) {
+                                const v = whitelistInput.trim();
+                                if (!rulesWhitelist.includes(v)) {
+                                  setRulesWhitelist([...rulesWhitelist, v].sort());
+                                }
+                                setWhitelistInput("");
+                              }
+                            }}
+                            placeholder="输入正则后回车添加…"
+                            style={{
+                              flex: 1, fontSize: 13, fontFamily: "monospace",
+                              background: "var(--bg-input)",
+                              border: "1px solid var(--border)",
+                              borderRadius: 6, padding: "5px 8px",
+                              color: "var(--text-primary)",
+                            }}
+                          />
+                          <button
+                            style={{
+                              padding: "4px 12px", borderRadius: 6, fontSize: 12,
+                              border: "1px solid var(--border)",
+                              background: "var(--bg-input)", color: "var(--text)",
+                              cursor: "pointer", flexShrink: 0,
+                            }}
+                            onClick={() => {
+                              const v = whitelistInput.trim();
+                              if (v && !rulesWhitelist.includes(v)) {
+                                setRulesWhitelist([...rulesWhitelist, v].sort());
+                              }
+                              setWhitelistInput("");
+                            }}
+                          >添加</button>
+                        </div>
+                        {rulesWhitelist.length > 3 && (
+                          <input
+                            type="text"
+                            value={whitelistSearch}
+                            onChange={(e) => setWhitelistSearch(e.target.value)}
+                            placeholder="🔍 搜索…"
+                            style={{
+                              width: "100%", fontSize: 12,
+                              background: "var(--bg-input)",
+                              border: "1px solid var(--border)",
+                              borderRadius: 6, padding: "4px 8px", marginBottom: 4,
+                              color: "var(--text-primary)",
+                            }}
+                          />
+                        )}
+                        <div style={{ maxHeight: 150, overflowY: "auto", border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-input)" }}>
+                          {rulesWhitelist
+                            .filter((r) => !whitelistSearch || r.toLowerCase().includes(whitelistSearch.toLowerCase()))
+                            .map((rule, i) => (
+                              <div key={rule} style={{
+                                display: "flex", alignItems: "center", gap: 6,
+                                padding: "4px 8px", borderBottom: i < rulesWhitelist.length - 1 ? "1px solid var(--border)" : "none",
+                              }}>
+                                <span style={{ fontSize: 13, fontFamily: "monospace", color: "var(--success)", flex: 1, wordBreak: "break-all" }}>
+                                  {rule}
+                                </span>
+                                <button
+                                  style={{
+                                    border: "none", background: "transparent",
+                                    color: "var(--text-muted)", cursor: "pointer",
+                                    fontSize: 14, padding: "0 4px", flexShrink: 0,
+                                  }}
+                                  onClick={() => setRulesWhitelist(rulesWhitelist.filter((r) => r !== rule))}
+                                  title="删除"
+                                >✕</button>
+                              </div>
+                            ))}
+                          {rulesWhitelist.length === 0 && (
+                            <div style={{ padding: "8px", fontSize: 12, color: "var(--text-muted)", textAlign: "center" }}>
+                              暂无规则
+                            </div>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2 }}>
+                          共 {rulesWhitelist.length} 条，自动按字母排序
+                        </div>
                       </div>
 
                       <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 4, lineHeight: 1.6 }}>
@@ -2275,7 +2244,7 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
                             cursor: mcpConfiguring ? "default" : "pointer",
                             opacity: mcpConfiguring ? 0.6 : 1,
                           }}
-                          disabled={mcpConfiguring || !mcpPassphraseStored}
+                          disabled={mcpConfiguring}
                           onClick={async () => {
                             setMcpConfiguring(true);
                             try {
@@ -2300,20 +2269,6 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
                           {mcpConfiguring ? "配置中…" : "一键配置全部"}
                         </button>
                       </div>
-
-                      {!mcpPassphraseStored && (
-                        <div style={{
-                          padding: 10,
-                          borderRadius: 6,
-                          background: "var(--warning-muted)",
-                          border: "1px solid var(--warning)",
-                          fontSize: 11,
-                          color: "var(--warning)",
-                          marginBottom: 8,
-                        }}>
-                          ⚠ 请先配置上方密码，再配置 AI 工具
-                        </div>
-                      )}
 
                       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                         {mcpTools.map((tool) => (

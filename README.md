@@ -94,20 +94,37 @@ myshell-cli test myserver                            # 测试连接
 myshell-cli ssh myserver                             # 交互式终端
 ```
 
-Vault 解锁：设置 `MYSHELL_PASSPHRASE` 环境变量，或使用 `--passphrase` 参数，或交互式提示。
+Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 
 **myshell-mcp** — MCP 协议服务器（stdio 传输）：
 ```json
 // Claude Desktop / Cursor / ZCode 配置
 { "mcpServers": { "myshell": {
-    "command": "myshell-mcp",
-    "env": { "MYSHELL_PASSPHRASE": "your-master-password" }
+    "command": "myshell-mcp"
 }}}
 ```
 
+> **安全模型**：MCP server 不存储 vault 密码，也不持有解密密钥。所有服务器访问必须经过 MyShell GUI——ssh_exec 在 GUI 终端标签页内执行（用户已在 GUI 中解锁 vault），SFTP 工具通过 IPC 向 GUI 请求解密后的连接凭证。GUI 未运行或 vault 未解锁时，MCP 返回错误提示用户打开 GUI。
 暴露 11 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`test_connection`、`screenshot_terminal`、`open_in_gui`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。
 
 ## 更新日志
+
+### v2.3.0（2026-07-22）
+
+#### ✨ 新增
+- **MCP upload_project / download_project**：AI 一键上传/下载整个项目目录（tar 打包 + SSH 管道直传）。
+- **终端 sentinel 噪音过滤**：`__MCP_DONE_` 行在渲染层丢弃，终端零噪音（智能缓冲不影响交互）。
+
+#### 🛠️ 优化
+- **upload_project** SSH 管道直传替代 SFTP 分块，速度 10x+；download_project 支持 sudo tar + UTF-8 中文文件名。
+- **sentinel 简化**：去掉 stty 三行辅助命令，改单行 sentinel + 截断式清洗。
+- **命令确认规则 UI**：黑白名单改列表式——搜索、自动排序、字号放大、逐条删除。
+
+#### 🐛 修复
+- **ssh_exec 空输出**（订阅时序 + 提示符剥离）、**连续开新 tab**（focus_existing）、**stdout 残留辅助命令**（截断清洗）。
+
+#### 🔒 安全
+- **删除 MCP vault 密码 keyring 明文存储**：MCP 不再持有 DEK/passphrase，所有服务器访问强制经 GUI 解锁（ssh_exec 走 GUI tab，SFTP 经 IPC 解密凭证）。删除 GUI Vault 同步 UI + CLI save-passphrase。
 
 ### v2.2.0（2026-07-22）
 
@@ -136,7 +153,7 @@ Vault 解锁：设置 `MYSHELL_PASSPHRASE` 环境变量，或使用 `--passphras
 - **CLI 工具（myshell-cli）**：命令行访问已保存的 SSH/SFTP 连接，让 AI agent 和高级用户可在脚本/终端直接使用。支持 `list / exec / ssh / sftp / test / vault` 等命令，`--json` 输出对自动化友好。
 - **MCP Server（myshell-mcp）**：通过 Model Context Protocol（stdio 传输）将 SSH/SFTP 能力暴露给 AI agent（Claude Desktop / Cursor / ZCode / opencode 等）。10 个工具：连接管理 + 远程命令执行 + SFTP 文件操作 + 连接测试 + 终端截图。
 - **三二进制共享架构**：提取 `myshell_core` 库，GUI / CLI / MCP 三个二进制共享同一核心逻辑、同一 SQLite、同一 vault 和 keyring。
-- **MCP 管理设置页**：「设置 → MCP 支持」集中管理：启用/禁用、vault 密码 DPAPI 加密同步、自动检测已安装 AI 工具并一键写入配置。
+- **MCP 管理设置页**：「设置 → MCP 支持」集中管理：启用/禁用、自动检测已安装 AI 工具并一键写入配置。
 - **MCP 连接智能查找**：连接参数支持 name / group-path / host-IP 三种形式；重名场景（同 IP 多类型）自动按工具类型消歧。
 - **终端截图功能**：CommandBar 新增 📷 按钮，截取纯终端 viewport（不含标签栏/工具栏/输入栏）。读 xterm buffer 自绘，支持完整颜色和文字属性。文件名带毫秒防覆盖。
 - **附件目录设置**：截图自动归档；保存后弹"已保存 + 打开"toast，跨平台调系统文件管理器并选中文件。

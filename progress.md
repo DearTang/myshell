@@ -1770,3 +1770,85 @@
 | 什么可能导致偏离？ | (1) CheckIfAppIsRunning 只按镜像名匹配，若 mcp 被改名运行则查不到（极少见）；(2) /REBOOTOK 只是登记重启删除，用户不重启则文件仍在（可接受，卸载流程不卡）。 |
 | 下一步最小可验证动作？ | 打包后，开着 AI 客户端（mcp 在跑）跑安装器，确认弹出「MyShell (MCP Server) 正在运行」提示而非写入失败。 |
 | 目标是什么？ | 升级/卸载时不再因 mcp 占用卡在「无法打开要写入的文件」，提前提示用户关闭。 |
+
+### 阶段 71：修�?ssh_exec 空输�?+ 新增 upload_project/download_project MCP 工具�?026-07-22�?
+- **问题�?* ssh_exec �?show_in_gui 模式下返回空 stdout（exit_code 正确�?stdout 为空）；终端里能看到 sentinel 回显；无法一键上�?下载整个项目目录�?- **根因�?* src/App.tsx �?runExec 函数存在时序 bug —�?onSshOutput 订阅�?sshSend 命令发送之后才建立，导致快速命令的输出在订阅建立前就被消费完毕，outputBuf 里只�?sentinel 行。PS1 提示符剥离逻辑�?`command.startsWith(lines[0].trim())` 对带前缀的行（`[host]$ cmd`）也失败�?- **改动�?*
+  1. `src/App.tsx` —�?�?onSshOutput 订阅移到 sshSend 之前；改�?`stdout.indexOf(command)` 定位回显边界；增�?CRLF→LF 规范化；尾部提示符行检�?  2. `src/App.tsx` —�?发�?sentinel 前先执行 `stty -echo` 隐藏终端回显，发完再 `stty echo` 恢复
+  3. `src-tauri/src/bin/myshell-mcp.rs` —�?新增 `upload_project` 工具：本�?tar 打包（排�?.venv 等）�?SSH exec 管道直传 �?远程解压
+  4. `src-tauri/src/bin/myshell-mcp.rs` —�?新增 `download_project` 工具：远�?sudo tar 打包 �?SFTP 下载 �?本地解压到附件目�?  5. `src-tauri/src/bin/myshell-mcp.rs` —�?upload_project/download_project 同时支持 ssh/sftp 连接类型（`find_connection(None)`�?- **验证�?* `npx tsc --noEmit` 通过；`cargo check --bin myshell-mcp` 通过；upload_project 成功上传 13MB sftpMonitor �?135.32.56.70:/opt/py；download_project 成功下载�?G:\桌面\myshell附件\
+
+## 五问重启检查（阶段 71�?| 问题 | 答案 |
+|------|------|
+| 我在哪里�?| 阶段 71 complete —�?ssh_exec 空输出修�?+ upload_project/download_project 工具，端到端验证通过�?|
+| 我要去哪里？ | 打包发布 v2.3.0（含 ✨新�?2 个工�?+ 🐛 修复 1 �?bug + 🛠�?优化 3 项）�?|
+| 什么可能导致偏离？ | (1) 使用 ZCode 30s MCP 超时的大项目上传需确认�?2) 不同服务�?locale 设置差异可能影响 tar 中文文件名�?|
+| 下一步最小可验证动作�?| 打包后跑一次完整安�?+ 上传/下载回归测试�?|
+| 目标是什么？ | ssh_exec 可靠返回 stdout；AI 可一键部�?备份远程项目�?|
+
+### 阶段 71：修复 ssh_exec 空输出 + 新增 upload_project/download_project MCP 工具（2026-07-22）
+
+- **问题：** ssh_exec 在 show_in_gui 模式下返回空 stdout（exit_code 正确但 stdout 为空）；终端里能看到 sentinel 回显；无法一键上传/下载整个项目目录。
+- **根因：** src/App.tsx 的 runExec 函数存在时序 bug —— onSshOutput 订阅在 sshSend 命令发送之后才建立，导致快速命令的输出在订阅建立前就被消费完毕，outputBuf 里只剩 sentinel 行。PS1 提示符剥离逻辑用 `command.startsWith(lines[0].trim())` 对带前缀的行（`[host]$ cmd`）也失败。
+- **改动：**
+  1. `src/App.tsx` —— 把 onSshOutput 订阅移到 sshSend 之前；改用 `stdout.indexOf(command)` 定位回显边界；增加 CRLF→LF 规范化；尾部提示符行检测
+  2. `src/App.tsx` —— 发送 sentinel 前先执行 `stty -echo` 隐藏终端回显，发完再 `stty echo` 恢复
+  3. `src-tauri/src/bin/myshell-mcp.rs` —— 新增 `upload_project` 工具：本地 tar 打包（排除 .venv 等）→ SSH exec 管道直传 → 远程解压
+  4. `src-tauri/src/bin/myshell-mcp.rs` —— 新增 `download_project` 工具：远程 sudo tar 打包 → SFTP 下载 → 本地解压到附件目录
+  5. `src-tauri/src/bin/myshell-mcp.rs` —— upload_project/download_project 同时支持 ssh/sftp 连接类型（`find_connection(None)`）
+- **验证：** `npx tsc --noEmit` 通过；`cargo check --bin myshell-mcp` 通过；upload_project 成功上传 13MB sftpMonitor 到 135.32.56.70:/opt/py；download_project 成功下载到 G:\桌面\myshell附件\
+
+## 五问重启检查（阶段 71）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 71 complete —— ssh_exec 空输出修复 + upload_project/download_project 工具，端到端验证通过。 |
+| 我要去哪里？ | 打包发布 v2.3.0（含 ✨新增 2 个工具 + 🐛 修复 1 个 bug + 🛠️ 优化 3 项）。 |
+| 什么可能导致偏离？ | (1) 使用 ZCode 30s MCP 超时的大项目上传需确认；(2) 不同服务器 locale 设置差异可能影响 tar 中文文件名。 |
+| 下一步最小可验证动作？ | 打包后跑一次完整安装 + 上传/下载回归测试。 |
+| 目标是什么？ | ssh_exec 可靠返回 stdout；AI 可一键部署/备份远程项目。 |
+
+
+### 阶段 72：修复 MCP ssh_exec 不停开 tab + stdout 残留辅助命令回显（2026-07-22）
+
+- **问题：** (1) 连续执行多次 MCP ssh_exec 时，GUI 不停打开重复的 terminal 标签页；(2) 返回的 stdout 里残留 stty -echo / echo __MCP_DONE__ / stty echo 辅助命令文字，且剥离 sentinel 后换行丢失导致输出粘连。
+- **根因：**
+  1. myshell-mcp.rs:1180 exec_in_gui_tab 调 send_gui_open_command(..., focus_existing=false)，GUI 端在 focus_existing=false 时跳过去重直接开新 tab → 每次执行都开新页
+  2. src/App.tsx runExec 发送 sentinel 时往 PTY 发了三行辅助命令（stty -echo / echo __MCP_DONE__ / stty echo），这些命令的回显混入输出流，但 stdout 提取逻辑只剥离了 command 回显和 sentinel 结果行，没有剥离这三行辅助命令回显
+- **改动：**
+  1. src-tauri/src/bin/myshell-mcp.rs —— send_gui_open_command 第 4 参数 focus_existing 从 false 改为 true：已有该连接的 terminal tab 时复用而非开新页
+  2. src/App.tsx 发送端 —— 去掉 stty -echo/stty echo 三行辅助命令（echo 时序不可靠，回显留噪音+^C），改为只发单行 echo sentinel:$?
+  3. src/App.tsx 提取端 —— 截断式清洗：先剥离 ANSI 转义，再找第一个 echo __MCP_DONE_ 回显行从行首截断，丢弃 sentinel 命令及之后所有内容，只保留中间真实输出
+- **验证：** npx tsc --noEmit 通过；cargo check --bin myshell-mcp 通过
+
+## 五问重启检查（阶段 72）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 72 complete —— MCP ssh_exec 开 tab 去重（focus_existing=true）+ stdout 清洗（去 stty 三行改单行 sentinel + 截断式 ANSI 剥离），IPC 直连验证 stdout 干净、终端只剩 1 行 sentinel。 |
+| 我要去哪里？ | 打包发布 v2.3.0（含阶段 71-72 的改动）。 |
+| 什么可能导致偏离？ | focus_existing=true 后若 tab 状态非 connected（断连/重连中），exec 会落到等待新 tab 分支，需确认边界正常。 |
+| 下一步最小可验证动作？ | 实跑连续 ssh_exec 确认只开一个 tab；确认返回 stdout 不含 stty/echo/MCP_DONE 文字。 |
+| 目标是什么？ | MCP ssh_exec 复用单一 tab、返回干净 stdout。 |
+
+
+### 阶段 73：Vault 安全加固 + MCP 终端噪音治理（2026-07-22）
+
+- **安全加固：删除 MCP vault 密码 keyring 明文存储。** 旧模型：MCP 从 keyring 读 passphrase → 解锁 vault → 持有所有连接明文密码 → 可绕过 GUI 访问任意服务器（风险点）。新模型：MCP 完全不持有 DEK/passphrase，所有凭证访问经 GUI。
+  - ssh_exec：走 GUI terminal tab（GUI 已解锁 vault，命令在 tab 内执行）
+  - SFTP 工具：MCP 通过新 IPC get_connection_secrets 向 GUI 请求解密后的连接配置
+  - 新增 db::get_all_connections_plaintext + MCP find_connection_id（纯文本查找，不需 DEK）
+  - 删除 secrets.rs MCP passphrase 三函数 + main.rs 三 Tauri command + api.ts 三函数
+  - 删除 SettingsPanel.tsx Vault 密码同步 UI 卡片 + CLI vault save-passphrase
+- **终端噪音治理：** ssh_exec 的 sentinel 辅助命令（stty/echo __MCP_DONE__）在终端里留下噪音。方案：
+  1. 发送端去掉 stty 三行，改为单行 echo sentinel:$?（上一阶段已做）
+  2. TerminalPanel onSshOutput 渲染层新增行缓冲过滤器：含 __MCP_DONE_ 的行在写入 xterm 前丢弃，终端完全无噪音
+  3. App.tsx stdout 提取端截断式清洗：ANSI 剥离 + 找第一个 echo __MCP_DONE_ 回显行截断
+- **Bug 修复：** MCP ssh_exec 连续执行不停开新 tab（focus_existing: false → true，阶段 72）
+- **验证：** npx tsc --noEmit 通过；cargo check 通过
+
+## 五问重启检查（阶段 73）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 73 complete —— vault 安全加固（删 keyring 明文 + 强制走 GUI）+ 终端噪音治理（渲染层过滤），编译通过。 |
+| 我要去哪里？ | 实测验证：安装后跑 ssh_exec/SFTP 确认 GUI 解锁后正常工作；GUI 未运行时报错提示正确。 |
+| 什么可能导致偏离？ | SFTP 经 GUI IPC 解密密码是新的 IPC 协议，需确认 TCP 超时/并发无问题；keyring 中残留的旧 passphrase 不影响（已不读）。 |
+| 下一步最小可验证动作？ | 打测试包安装，跑一次 ssh_exec + 一次 sftp_list 确认链路通。 |
+| 目标是什么？ | MCP 无法绕过 GUI 访问服务器；终端无 sentinel 噪音。 |

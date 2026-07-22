@@ -450,14 +450,10 @@ export default function App() {
           // code appended, marking where the command's output ends.
           const sentinel = `__MCP_DONE_${Math.random().toString(36).slice(2, 14)}__`;
 
-          // Send: the command, then the sentinel probe.
-          // The `\n` ensures the command is submitted (Enter).
-          await sshSend(sessionId, command + "\n");
-          // Small delay so the command is processed before the sentinel.
-          await new Promise((r) => setTimeout(r, 100));
-          await sshSend(sessionId, `echo ${sentinel}:$?\n`);
-
-          // Subscribe to ssh_output for this session and accumulate bytes.
+          // IMPORTANT: subscribe BEFORE sending the command. If we subscribed
+          // after, fast commands' output would already have been emitted (and
+          // rendered by TerminalPanel) before our handler attaches, leaving
+          // outputBuf with only the sentinel line → stdout came back empty.
           let outputBuf = "";
           let done = false;
           let timedOut = false;
@@ -466,35 +462,99 @@ export default function App() {
             if (done) return;
             // Decode bytes to string (terminal output is UTF-8 / ASCII).
             outputBuf += new TextDecoder("utf-8", { fatal: false }).decode(data);
-            // Check for the sentinel line. The shell echoes it as:
-            //   __MCP_DONE_xxxx__:0
-            const re = new RegExp(sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ":(\\d+)");
-            const match = outputBuf.match(re);
-            if (match) {
-              done = true;
-              const exitCode = parseInt(match[1], 10);
-              // Extract stdout: everything between the command echo and the
-              // sentinel. We find the sentinel's position and work backwards.
-              const sentinelIdx = outputBuf.indexOf(sentinel);
-              // The sentinel line itself starts at the beginning of its line —
-              // find the preceding newline. Everything before the command's
-              // own echo (the first line after we sent it) is prior output.
-              // Simplest heuristic: strip everything from the sentinel onwards,
-              // and strip the command echo line (first line).
-              let stdout = outputBuf.slice(0, sentinelIdx);
-              // Remove the last newline before the sentinel (it's the end of
-              // the sentinel echo line's predecessor).
-              stdout = stdout.replace(/\n$/, "");
-              // The command itself was echoed by the PTY as the first line(s).
-              // Try to strip it: find the first newline after the command text.
-              const cmdLineEnd = stdout.indexOf("\n");
-              if (cmdLineEnd >= 0 && cmdLineEnd < command.length + 20) {
-                stdout = stdout.slice(cmdLineEnd + 1);
-              }
 
-              mcpExecResult(requestId, { ok: true, stdout, exit_code: exitCode });
+            // The PTY echoes everything we send. The output stream looks like:
+            //   <command text echoed back>          ← strip (line 1, may wrap)
+            //   <command's actual stdout/stderr>     ← KEEP
+            //   echo __MCP_DONE_xxx__:$?  echoed     ← strip
+            //   __MCP_DONE_xxx__:0                   ← sentinel + exit code
+            //
+            // We detect the sentinel line via regex, then extract the output
+            // between the command echo and the sentinel echo.
+
+            // Check for the sentinel result line: sentinel:N
+            const sentinelRe = new RegExp(
+              sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ":(\\d+)"
+            );
+            const match = outputBuf.match(sentinelRe);
+            if (!match) return;
+            done = true;
+            const exitCode = parseInt(match[1], 10);
+
+	            // The sentinel match gives us the end boundary. Everything before
+	            // it is: [prompt+command echo] [real stdout] [prompt]
+	            let stdout = outputBuf.slice(0, match.index);
+	
+	            // Normalize CRLF → LF early so all subsequent slicing is uniform.
+	            stdout = stdout.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+	
+	            // Drop a trailing prompt line if one remains after stripping the
+	            // sentinel echo (interactive shells print a fresh `[user@host ~]$ `
+	            // before we send the sentinel). A prompt line ends with `$` or `#`
+	            // and contains no real output. Trim trailing empty lines first.
+	            stdout = stdout.replace(/\n+$/, "");
+	            const lastNl = stdout.lastIndexOf("\n");
+	            const lastLine = stdout.slice(lastNl + 1);
+	            if (lastLine && /[#$]\s*$/.test(lastLine)) {
+	              stdout = stdout.slice(0, lastNl);
+	            }
+
+            // Strip the command echo at the beginning. The PTY echoes the
+            // command text we sent (`command + "\n"`), possibly prefixed by a
+            // PS1 prompt like `[user@host ~]$ `. Locate the command text itself
+            // in the buffer — robust to a leading prompt on the same line,
+            // which the old `command.startsWith(lines[0].trim())` check could
+            // not handle (echoed line is `[host]$ whoami`, not `whoami`).
+            let start = stdout.indexOf(command);
+            if (start >= 0) {
+              // Skip past the echoed command text to the end of its line.
+              start += command.length;
+              const lineEnd = stdout.indexOf("\n", start);
+              stdout = lineEnd >= 0 ? stdout.slice(lineEnd + 1) : "";
+            } else {
+              // Fallback: no command echo found (some PTYs/shells don't echo).
+              const lines = stdout.split("\n");
+              if (lines.length > 0 && command.startsWith(lines[0].trim())) {
+                lines.shift();
+              }
+              stdout = lines.join("\n");
             }
+            // Strip the sentinel helper-command echoes. After the user's
+            // command, we sent ONE helper line: `echo __MCP_DONE_xxx__:$?`.
+            // The PTY echoes it back (with a PS1 prompt prefix, ANSI escapes,
+            // etc.). Find the FIRST occurrence of `echo __MCP_DONE_` after the
+            // command output and truncate everything from that line onward —
+            // the real stdout is strictly between the command echo and the
+            // sentinel command echo.
+            //
+            // First strip ANSI escapes so the regex isn't confused by a
+            // leading OSC title (\x1b]0;...\x07) or color codes on the line.
+            const ansiCleaned = stdout.replace(/\x1b\][0-9];.*?\x07/g, "").replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+            const helperIdx = ansiCleaned.search(/echo __MCP_DONE_/);
+            if (helperIdx >= 0) {
+              // Truncate at the start of the line containing the sentinel
+              // command echo, so we don't leave a dangling prompt prefix.
+              const lineStart = ansiCleaned.lastIndexOf("\n", helperIdx);
+              stdout = ansiCleaned.slice(0, lineStart >= 0 ? lineStart : helperIdx);
+            } else {
+              stdout = ansiCleaned;
+            }
+            stdout = stdout.replace(/^\n+/, "").replace(/\n+$/, "");
+
+            mcpExecResult(requestId, { ok: true, stdout, exit_code: exitCode });
           });
+
+	          // Now that the listener is attached, send the command + sentinel.
+	          // Send user's command first (visible in terminal), then one
+	          // sentinel line to capture the exit code. The sentinel line
+	          // (`echo __MCP_DONE_...`) IS visible in the terminal, but
+	          // TerminalPanel's render-layer filter strips any line containing
+	          // `__MCP_DONE_` before writing to xterm, so the user never sees
+	          // it. We do NOT use `stty -echo` tricks — echo timing is
+	          // unreliable across shells/PTYs.
+	          await sshSend(sessionId, command + "\n");
+	          await new Promise((r) => setTimeout(r, 80));
+	          await sshSend(sessionId, `echo ${sentinel}:$?\n`);
 
           // Timeout safety: if the sentinel never appears (interactive command,
           // hang, etc.), return what we have + error.

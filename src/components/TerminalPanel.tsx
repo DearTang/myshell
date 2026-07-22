@@ -465,13 +465,60 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
     let closed = false;
     let firstOutputHandled = false;
 
+    // ── MCP sentinel line filter ──────────────────────────────────────
+    // When the MCP server runs ssh_exec in show_in_gui mode, App.tsx sends
+    // a sentinel line `echo __MCP_DONE_<rand>__:$?` to capture the exit
+    // code. That line + its output would be visible in the terminal as
+    // noise. We filter out any line containing `__MCP_DONE_` before it
+    // reaches xterm.
+    //
+    // CRITICAL: we must NOT buffer incomplete lines that don't look like
+    // they could be a sentinel — otherwise the shell prompt, user
+    // keystrokes, and all interactive output get stuck in the buffer until
+    // a newline arrives, breaking the terminal completely. Only buffer a
+    // partial line if it contains the sentinel prefix "__MCP" (meaning it
+    // might be a sentinel line split across chunks).
+    let sentinelLineBuf = "";
+    const SENTINEL_PREFIX = "__MCP";
+    const SENTINEL_NEEDLE = "__MCP_DONE_";
+    const filterSentinel = (data: Uint8Array): Uint8Array | null => {
+      const chunk = new TextDecoder("utf-8", { fatal: false }).decode(data);
+      // Prepend any previously buffered partial line, then process.
+      sentinelLineBuf += chunk;
+      const outLines: string[] = [];
+      let start = 0;
+      for (;;) {
+        const nl = sentinelLineBuf.indexOf("\n", start);
+        if (nl < 0) break; // incomplete line at the tail
+        const line = sentinelLineBuf.slice(start, nl + 1);
+        if (!line.includes(SENTINEL_NEEDLE)) outLines.push(line);
+        start = nl + 1;
+      }
+      // Tail = incomplete line (no trailing \n).
+      const tail = sentinelLineBuf.slice(start);
+      if (tail.includes(SENTINEL_PREFIX)) {
+        // This partial line looks like it might be a sentinel — buffer it
+        // until we see the rest (next chunk will have the \n).
+        sentinelLineBuf = tail;
+      } else {
+        // Normal content (prompt, keystrokes, output) — output immediately,
+        // don't buffer. Reset the buffer.
+        if (tail) outLines.push(tail);
+        sentinelLineBuf = "";
+      }
+      if (outLines.length === 0) return null; // whole chunk was a buffered sentinel
+      return new TextEncoder().encode(outLines.join(""));
+    };
+
     onSshOutput(sessionIdRef.current, (data) => {
       if (closed) return;
+      const filtered = filterSentinel(data);
+      if (!filtered) return; // entire chunk was sentinel noise — skip
       if (!rendererReady) {
-        pendingData.push(data);
+        pendingData.push(filtered);
         return;
       }
-      term.write(data);
+      term.write(filtered);
       if (!firstOutputHandled) {
         firstOutputHandled = true;
         // CRITICAL — push the real cols to the PTY AFTER the shell settles.

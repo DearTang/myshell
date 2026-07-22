@@ -8,6 +8,30 @@
   格式参考 keepachangelog.com。新增条目尽量简洁，按 ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全 分组。
 -->
 
+## v2.3.0（2026-07-22）
+
+#### ✨ 新增
+
+- **MCP upload_project / download_project 工具**：AI 可一键上传本地项目目录到远程服务器（tar 打包 → SSH 管道直传 → 远程解压），或一键下载远程项目目录到本地（远程 sudo tar → SFTP 下载 → 本地解压）。支持中英文文件名、自动排除 .venv/.git/node_modules 等目录。
+- **终端 sentinel 噪音过滤**：ssh_exec 的 sentinel 标记行（`__MCP_DONE_`）在渲染层（TerminalPanel）被过滤，写入 xterm 前丢弃，终端完全无噪音。采用智能缓冲——只缓冲可能含 sentinel 的不完整行，不影响正常交互。
+
+#### 🛠️ 优化
+
+- **upload_project 传输方式优化**：SSH 管道直传替代 SFTP 分块上传，速度提升 10x+。
+- **download_project 权限处理**：sudo tar 打包 + UTF-8 locale 支持，解决中文文件名乱码和权限不足问题。
+- **sentinel 机制简化**：去掉 stty -echo/echo 三行辅助命令（echo 时序不可靠），改为单行 sentinel。终端从 6 行噪音降到 0 行（配合渲染层过滤）。
+- **命令确认规则 UI 改进**：黑白名单从 textarea 改为列表式——搜索框（规则 >3 条时显示）、录入后自动排序、字号从 11px 放大到 13px、逐条删除。
+
+#### 🐛 修复
+
+- **ssh_exec 空输出**：sentinel 订阅时序错误（订阅在发送之后）+ PS1 提示符剥离失败导致 stdout 为空。
+- **ssh_exec 连续执行不停开新标签页**：`focus_existing` 从 false 改为 true，复用已有 terminal tab。
+- **ssh_exec 返回 stdout 残留辅助命令回显**：截断式清洗（ANSI 剥离 + 找 sentinel 回显行截断），stdout 彻底干净。
+
+#### 🔒 安全
+
+- **删除 MCP vault 密码 keyring 明文存储**：旧模型 MCP 从 keyring 读 passphrase → 解锁 vault → 持有所有连接明文密码 → 可绕过 GUI 访问任意服务器。新模型 MCP **完全不持有 DEK/passphrase**，所有服务器访问必须经过 GUI：ssh_exec 在 GUI 终端 tab 内执行（用户已解锁 vault），SFTP 工具通过新 IPC `get_connection_secrets` 向 GUI 请求解密后的连接凭证。GUI 未运行或 vault 未解锁时 MCP 返回错误提示。删除了 GUI 的"Vault 密码同步"UI 卡片和 CLI 的 `vault save-passphrase` 命令。
+
 ## v2.2.0（2026-07-22）
 
 #### ✨ 新增

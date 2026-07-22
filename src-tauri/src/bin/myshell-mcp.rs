@@ -2,12 +2,14 @@
 // (Claude Desktop, Cursor, ZCode, etc.) via the Model Context Protocol.
 //
 // Transport: stdio (Content-Length framed JSON-RPC 2.0, same as LSP).
-// Auth: reads MYSHELL_PASSPHRASE env var on startup to unlock the vault.
+// Auth: NONE — the MCP server does NOT hold the vault passphrase or DEK.
+// All credential access is delegated to the GUI: ssh_exec runs in a GUI
+// terminal tab, SFTP tools ask the GUI to decrypt connection credentials
+// via IPC. The GUI must be running and the vault must be unlocked.
 //
 // Configuration example (Claude Desktop claude_desktop_config.json):
 //   { "mcpServers": { "myshell": {
-//       "command": "myshell-mcp",
-//       "env": { "MYSHELL_PASSPHRASE": "your-master-password" }
+//       "command": "myshell-mcp"
 //   }}}
 
 use myshell_core::*;
@@ -200,7 +202,7 @@ WORKFLOW:\n\
 \n\
 SAFETY: ssh_exec uses a **configurable whitelist/blacklist** to decide which commands need human confirmation. Read-only commands (ps, ls, cat, grep, df, ...) run WITHOUT a dialog. Dangerous commands (rm, kill, sudo, shutdown, write-redirects, pipe-to-shell, ...) trigger a NATIVE OS confirmation dialog the USER must click — you cannot bypass it. Before calling a dangerous command, briefly tell the user a dialog is coming. If they click Cancel, the tool returns an error — surface it, don't retry silently. The sftp tools (sftp_upload/remove/rename) ALWAYS confirm regardless of rules.\n\
 \n\
-ENCOUNTERING ERRORS: if a tool returns 'Vault 未解锁' or '未找到保存的密码', the user hasn't synced their vault passphrase to the OS keyring via MyShell GUI (Settings → MCP 支持). Tell them this and stop.";
+ENCOUNTERING ERRORS: if a tool returns '保险库未解锁' or 'MyShell GUI 未运行', the user needs to open the MyShell desktop app and enter their master password to unlock the vault. Tell them this and stop — the MCP server cannot access any server without the GUI running and unlocked.";
 
 fn tool_definitions() -> Value {
     json!({
@@ -299,6 +301,32 @@ fn tool_definitions() -> Value {
                 }
             },
             {
+                "name": "upload_project",
+                "description": "打包并上传整个项目目录到远程服务器，自动解压。\n\nWHEN TO USE: 用户要把一个本地项目目录（含子目录）整体部署到远程服务器时 — 例如 '把 ./myapp 部署到 prod-server 的 /opt/myapp'、'上传这个文件夹到服务器并解压'。工具会自动执行：(1) 把本地目录打成 tar.gz 压缩包，(2) 通过 SSH 流式传输到服务器，(3) 在远程解压到指定路径。比逐个 sftp_upload 文件高效得多。\n\nWHEN NOT TO USE:\n- 只上传单个文件 — 用 sftp_upload 更快\n- 服务器未保存在 MyShell — 只能操作已保存的连接\n- 需要增量同步 — 此工具每次都会传整个目录\n\n⚠️ HUMAN CONFIRMATION REQUIRED: 上传可能覆盖远程文件，会弹出原生 OS 确认对话框，用户必须点击 'Yes' 才能继续。\n\nOUTPUT: 成功时返回确认消息（含传输大小和解压路径），失败返回错误。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
+                        "local_dir": { "type": "string", "description": "本地项目目录的绝对路径（如 'F:\\\\dev\\\\myapp'）。目录必须存在且可读。" },
+                        "remote_dir": { "type": "string", "description": "远程目标目录的绝对路径（如 '/opt/myapp'）。工具会在 remote_dir 下自动创建与本地目录同名的子目录并解压。" }
+                    },
+                    "required": ["connection", "local_dir", "remote_dir"]
+                }
+            },
+            {
+                "name": "download_project",
+                "description": "下载远程服务器上的整个项目目录到本地，自动解压。\n\nWHEN TO USE: 用户要把远程服务器上的整个项目目录下载到本地时 — 例如 '把 /opt/myapp 下载到本地'、'备份服务器上的项目'。工具会自动执行：(1) 在服务器上把目录打成 tar.gz 压缩包，(2) 通过 SFTP 下载到本地，(3) 在本地解压到指定路径。比逐个 sftp_download 文件高效得多。\n\nWHEN NOT TO USE:\n- 只下载单个文件 — 用 sftp_download 更快\n- 服务器未保存在 MyShell — 只能操作已保存的连接\n\n⚠️ HUMAN CONFIRMATION REQUIRED: 会弹出原生 OS 确认对话框，用户必须点击 'Yes' 才能继续。\n\nOUTPUT: 成功时返回确认消息（含传输大小和解压路径），失败返回错误。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
+                        "remote_dir": { "type": "string", "description": "远程项目目录的绝对路径（如 '/opt/myapp'）。目录必须存在且可读。" },
+                        "local_dir": { "type": "string", "description": "本地目标目录的绝对路径（如 'F:\\\\dev\\\\myapp_backup'）。工具会在此目录下创建与远程目录同名的子目录并解压。" }
+                    },
+                    "required": ["connection", "remote_dir", "local_dir"]
+                }
+            },
+            {
                 "name": "test_connection",
                 "description": "Verify that a saved connection still works (TCP dial + SSH handshake + auth + channel open). No commands run.\n\nWHEN TO USE: The user reports connection issues ('I can't reach prod-db', 'is the staging server up?') or you got an unexpected error from ssh_exec/sftp_list and want to diagnose. Quick, read-only, no confirmation needed.\n\nDISAMBIGUATION: If a host is saved as both an SSH and an SFTP connection (same IP/name), this tool probes the SSH one automatically — so passing a bare IP like '135.32.64.30' just works without needing the group path. Only a genuine ambiguity within SSH connections (two SSH entries, same host) returns an error listing the candidates.\n\nOUTPUT: Success message including the actual host:port that was contacted, or an error explaining which step failed (unreachable / auth refused / channel blocked).",
                 "inputSchema": {
@@ -348,42 +376,24 @@ struct McpState {
 }
 
 impl McpState {
-    /// Resolve a user-provided connection reference into a `ConnectionConfig`.
-    ///
-    /// `query` may be:
-    ///   - the exact connection `name` ("prod-db")
-    ///   - the group-prefixed path ("/production/prod-db")
-    ///   - a bare host/IP ("135.32.64.30") — resolved via the `host` field,
-    ///     useful when the user said "ssh to <ip>" without remembering the
-    ///     saved name.
-    ///
-    /// `expected_conn_type` is the caller's hint: "ssh" for ssh_exec,
-    /// "sftp" for sftp_*, "ftp" for ftp, etc. It is used to disambiguate
-    /// when multiple saved connections share the same name or host (common
-    /// when the user saved both an SSH and an SFTP entry for the same box).
-    ///
-    /// Matching priority:
-    ///   1. Exact `name` match, filtered by `expected_conn_type` if given
-    ///   2. Exact `group_path/name` match, filtered by `expected_conn_type`
-    ///   3. Exact `host` match, filtered by `expected_conn_type`
-    ///   4. If still ambiguous (e.g. two ssh connections with the same host
-    ///      in different groups), return an error listing the candidates so
-    ///      the AI can ask the user to disambiguate.
-    fn find_connection(&self, query: &str, expected_conn_type: Option<&str>) -> Result<ConnectionConfig, String> {
-        let key = require_dek(&self.app)?;
+    /// Plaintext-only connection lookup: resolves a name/group-path to a
+    /// connection id WITHOUT needing the DEK. Used by the show_in_gui path
+    /// (ssh_exec, open_in_gui) where the actual credential use happens inside
+    /// the GUI process. Host-IP matching is NOT possible here (host is
+    /// encrypted) — only name and group-path matching.
+    fn find_connection_id(&self, query: &str, expected_conn_type: Option<&str>) -> Result<String, String> {
         let db = self.app.db.lock().map_err(|e| e.to_string())?;
-        let connections = db::get_all_connections(&db, &key).map_err(|e| e.to_string())?;
+        let connections = db::get_all_connections_plaintext(&db).map_err(|e| e.to_string())?;
 
-        // Helper: does this connection match the type filter?
         let type_ok = |c: &ConnectionConfig| match expected_conn_type {
             Some(t) => c.conn_type == t,
             None => true,
         };
 
-        // Pass 1: exact name match (optionally type-filtered).
+        // Pass 1: exact name match.
         let by_name: Vec<_> = connections.iter().filter(|c| c.name == query && type_ok(c)).collect();
         if by_name.len() == 1 {
-            return Ok(by_name[0].clone());
+            return Ok(by_name[0].id.clone());
         }
         if by_name.len() > 1 {
             return Err(ambiguous_error(query, expected_conn_type, &by_name));
@@ -395,64 +405,41 @@ impl McpState {
             .filter(|c| format!("{}/{}", c.group_path.trim_end_matches('/'), c.name) == query && type_ok(c))
             .collect();
         if by_path.len() == 1 {
-            return Ok(by_path[0].clone());
+            return Ok(by_path[0].id.clone());
         }
         if by_path.len() > 1 {
             return Err(ambiguous_error(query, expected_conn_type, &by_path));
         }
 
-        // Pass 3: host match (this is the "user typed an IP" path).
-        // A connection's `name` often equals its `host`, so pass 1 may have
-        // matched already — but if not, try the host field directly. When
-        // expected_conn_type is None we STILL try host match, but with higher
-        // ambiguity risk (error will list candidates).
-        let by_host: Vec<_> = connections.iter().filter(|c| c.host == query && type_ok(c)).collect();
-        if by_host.len() == 1 {
-            return Ok(by_host[0].clone());
-        }
-        if by_host.len() > 1 {
-            return Err(ambiguous_error(query, expected_conn_type, &by_host));
-        }
-
-        // Nothing matched (or 0 matches after type filter). If the user had a
-        // type filter, check whether ANY connection matched without the filter
-        // — that lets us give a more helpful error ("found it, but it's an
-        // SFTP connection, not SSH").
+        // Type-mismatch hint.
         if let Some(t) = expected_conn_type {
             let any_match: Vec<_> = connections
                 .iter()
-                .filter(|c| c.name == query || c.host == query
+                .filter(|c| c.name == query
                     || format!("{}/{}", c.group_path.trim_end_matches('/'), c.name) == query)
                 .collect();
             if !any_match.is_empty() {
                 let types: Vec<&str> = any_match.iter().map(|c| c.conn_type.as_str()).collect();
                 return Err(format!(
                     "找到了连接 '{}'，但类型是 {}，而当前操作需要 {} 类型。请确认连接配置或换一个连接。",
-                    query,
-                    types.join("/"),
-                    t
+                    query, types.join("/"), t
                 ));
             }
         }
 
-        Err(format!("未找到连接: {}。调用 list_connections 查看所有可用连接。", query))
+        Err(format!(
+            "未找到连接: {}。注意：按 IP 查找需要先打开 GUI 并解锁保险库（IP 是加密存储的）。调用 list_connections 查看所有可用连接（按名称）。",
+            query
+        ))
     }
 
-    fn resolve_secrets(&self, config: &mut ConnectionConfig) -> Result<(), String> {
-        if config.auth_method != "key" && config.password.is_none() {
-            let key = require_dek(&self.app)?;
-            config.password = secrets::get_password(&config.id, &key)?;
-        }
-        if config.auth_method == "password"
-            && config.password.as_deref().map(str::is_empty).unwrap_or(true)
-        {
-            return Err("未找到保存的密码".to_string());
-        }
-        if config.proxy_type != "none" && config.proxy_password.is_none() {
-            let key = require_dek(&self.app)?;
-            config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
-        }
-        Ok(())
+    /// Resolve a connection name/group-path to a fully decrypted
+    /// ConnectionConfig by asking the GUI to decrypt it. This replaces the
+    /// old find_connection + resolve_secrets combo (which needed the DEK).
+    /// The MCP server no longer holds the DEK — the GUI does (user unlocked).
+    fn resolve_via_gui(&self, query: &str, expected_conn_type: Option<&str>) -> Result<ConnectionConfig, String> {
+        let conn_id = self.find_connection_id(query, expected_conn_type)?;
+        get_config_from_gui(&conn_id)
     }
 }
 
@@ -545,8 +532,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 log(&format!("ssh_exec 免确认（白名单/非危险）: {}", command));
             }
 
-            let mut config = state.find_connection(conn_name, Some("ssh"))?;
-            state.resolve_secrets(&mut config)?;
+            let config = state.resolve_via_gui(conn_name, Some("ssh"))?;
 
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
             let mut channel = handle
@@ -604,8 +590,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
             let path = args["path"].as_str().unwrap_or("~");
 
-            let mut config = state.find_connection(conn_name, Some("sftp"))?;
-            state.resolve_secrets(&mut config)?;
+            let config = state.resolve_via_gui(conn_name, Some("sftp"))?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
             let sftp = open_sftp(&handle).await?;
             let entries = sftp_list_dir(&sftp, path).await?;
@@ -619,8 +604,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             let remote = args["remote_path"].as_str().ok_or("缺少 remote_path 参数")?;
             let local = args["local_path"].as_str().ok_or("缺少 local_path 参数")?;
 
-            let mut config = state.find_connection(conn_name, Some("sftp"))?;
-            state.resolve_secrets(&mut config)?;
+            let config = state.resolve_via_gui(conn_name, Some("sftp"))?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
             let sftp = open_sftp(&handle).await?;
             sftp_download_file(&sftp, remote, local).await?;
@@ -640,8 +624,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：sftp_upload" }], "isError": true }));
             }
 
-            let mut config = state.find_connection(conn_name, Some("sftp"))?;
-            state.resolve_secrets(&mut config)?;
+            let config = state.resolve_via_gui(conn_name, Some("sftp"))?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
             let sftp = open_sftp(&handle).await?;
             sftp_upload_file(&sftp, local, remote).await?;
@@ -654,8 +637,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
             let path = args["path"].as_str().ok_or("缺少 path 参数")?;
 
-            let mut config = state.find_connection(conn_name, Some("sftp"))?;
-            state.resolve_secrets(&mut config)?;
+            let config = state.resolve_via_gui(conn_name, Some("sftp"))?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
             let sftp = open_sftp(&handle).await?;
             sftp.create_dir(path).await.map_err(|e| format!("创建目录失败: {}", e))?;
@@ -674,8 +656,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：sftp_remove" }], "isError": true }));
             }
 
-            let mut config = state.find_connection(conn_name, Some("sftp"))?;
-            state.resolve_secrets(&mut config)?;
+            let config = state.resolve_via_gui(conn_name, Some("sftp"))?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
             let sftp = open_sftp(&handle).await?;
             if sftp.remove_file(path).await.is_err() {
@@ -697,14 +678,196 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：sftp_rename" }], "isError": true }));
             }
 
-            let mut config = state.find_connection(conn_name, Some("sftp"))?;
-            state.resolve_secrets(&mut config)?;
+            let config = state.resolve_via_gui(conn_name, Some("sftp"))?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
             let sftp = open_sftp(&handle).await?;
             sftp.rename(old, new).await.map_err(|e| format!("重命名失败: {}", e))?;
             let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
             Ok(json!({ "content": [{ "type": "text", "text": format!("已重命名 {} → {}", old, new) }] }))
+        }
+
+        "upload_project" => {
+            let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
+            let local_dir = args["local_dir"].as_str().ok_or("缺少 local_dir 参数")?;
+            let remote_dir = args["remote_dir"].as_str().ok_or("缺少 remote_dir 参数")?;
+
+            // 高危操作：上传可能覆盖远程文件
+            let detail = format!(
+                "打包本地目录 [{}] → 服务器 [{}] 路径: {}",
+                local_dir, conn_name, remote_dir
+            );
+            if !confirm_dangerous_operation("upload_project（上传项目目录）", &detail) {
+                return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：upload_project" }], "isError": true }));
+            }
+
+            // 1. 验证本地目录存在
+            let local_path = std::path::Path::new(local_dir);
+            if !local_path.is_dir() {
+                return Err(format!("本地目录不存在: {}", local_dir));
+            }
+            let dir_name = local_path.file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("无法提取目录名")?;
+
+            // 2. 创建 tar.gz（排除常见不必要的目录）
+            log(&format!("[upload_project] 打包 {} → {}.tar.gz", local_dir, dir_name));
+            let tar_output = std::process::Command::new("tar")
+                .args([
+                    "-czf", "-",
+                    "--exclude=.venv", "--exclude=venv", "--exclude=.env",
+                    "--exclude=__pycache__", "--exclude=*.pyc",
+                    "--exclude=.git", "--exclude=.svn",
+                    "--exclude=node_modules", "--exclude=.next", "--exclude=dist", "--exclude=build",
+                    "--exclude=target", "--exclude=.idea", "--exclude=.vscode",
+                    "-C", local_dir, ".",
+                ])
+                .output()
+                .map_err(|e| format!("打包失败: {}（确保系统有 tar 命令）", e))?;
+
+            if !tar_output.status.success() {
+                let stderr = String::from_utf8_lossy(&tar_output.stderr);
+                return Err(format!("tar 打包失败: {}", stderr));
+            }
+
+            let tar_bytes = tar_output.stdout;
+            let tar_size = tar_bytes.len();
+            log(&format!("[upload_project] 打包完成: {} bytes", tar_size));
+
+            // 3. 写入本地临时文件（sftp_upload_file 需要文件路径）
+            let tmp_tar = std::env::temp_dir().join(format!("_ul_project_{}.tar.gz", dir_name));
+            let tmp_tar_str = tmp_tar.to_str().ok_or("临时路径无效")?;
+            std::fs::write(&tmp_tar, &tar_bytes)
+                .map_err(|e| format!("写入临时文件失败: {}", e))?;
+
+            // 4. 用 SFTP 上传到 home 目录（可靠），再 sudo 移动到目标位置
+            let remote_target = format!("{}/{}", remote_dir.trim_end_matches('/'), dir_name);
+
+            // 先获取连接配置（需要 username 构造 home 路径）
+            let config = state.resolve_via_gui(conn_name, None)?;
+            let home_dir = format!("/home/{}", config.username);
+            let remote_tar_name = format!("_ul_project_{}.tar.gz", dir_name);
+            let remote_tar_path = format!("{}/{}", home_dir, remote_tar_name);
+
+            let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
+            let sftp = open_sftp(&handle).await?;
+            log(&format!("[upload_project] SFTP 上传 {} → {}", tmp_tar_str, home_dir));
+            sftp_upload_file(&sftp, tmp_tar_str, &home_dir).await?;
+            let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+
+            // 5. 清理本地临时文件
+            std::fs::remove_file(&tmp_tar).ok();
+
+            // 4. 在服务器上：创建目标目录 + sudo 移动 + 解压 + 清理
+            let ssh_config2 = state.resolve_via_gui(conn_name, Some("ssh"))?;
+            let ssh_handle2 = ssh::dial_and_authenticate(&state.app, &ssh_config2, false).await?;
+            {
+                let channel = ssh_handle2.channel_open_session().await.map_err(|e| format!("打开通道失败: {}", e))?;
+                let extract_cmd = format!(
+                    "sudo mkdir -p '{}' && sudo mv '{}' '{}' && cd '{}' && sudo tar -xzf '{}' && sudo rm -f '{}' && echo 'UPLOAD_OK'",
+                    remote_target, remote_tar_path, remote_target, remote_target, remote_tar_name, remote_tar_name
+                );
+                channel.exec(true, extract_cmd).await.map_err(|e| format!("解压失败: {}", e))?;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let _ = ssh_handle2.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+
+            log(&format!("[upload_project] 完成! {} → {}", local_dir, remote_target));
+
+            Ok(json!({ "content": [{ "type": "text", "text": format!("✅ 项目上传成功！\n本地: {}\n远程: {}\n大小: {} bytes (tar.gz)", local_dir, remote_target, tar_size) }] }))
+        }
+
+        "download_project" => {
+            let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
+            let remote_dir = args["remote_dir"].as_str().ok_or("缺少 remote_dir 参数")?;
+            let local_dir = args["local_dir"].as_str().ok_or("缺少 local_dir 参数")?;
+
+            let detail = format!("从服务器 [{}] 下载目录 {} → 本地 {}", conn_name, remote_dir, local_dir);
+            if !confirm_dangerous_operation("download_project（下载项目目录）", &detail) {
+                return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：download_project" }], "isError": true }));
+            }
+
+            // 1. 验证远程目录存在（通过 SFTP，支持 ssh/sftp 连接）
+            let config = state.resolve_via_gui(conn_name, None)?;
+            let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
+            let sftp = open_sftp(&handle).await?;
+            let remote_path = std::path::Path::new(remote_dir);
+            let dir_name = remote_path.file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("无法提取远程目录名")?;
+
+            // 验证远程目录存在（通过 SFTP canonicalize）
+            let _ = sftp.canonicalize(remote_dir).await
+                .map_err(|e| format!("远程目录不存在: {} ({})", remote_dir, e))?;
+
+            // 2. 在服务器上打包到临时文件（用 Python tarfile 处理中文文件名）
+            let tmp_tar = format!("/tmp/_dl_project_{}.tar.gz", dir_name);
+            let tar_cmd = format!(
+                "python3 -c \"\
+import tarfile, os, sys
+exclude = {{'.venv', 'venv', '__pycache__', '.git', 'node_modules', 'dist', 'build', 'target'}}
+with tarfile.open('{}', 'w:gz') as tf:
+    for root, dirs, files in os.walk('{}'):
+        dirs[:] = [d for d in dirs if d not in exclude and not d.startswith('.')]
+        for f in files:
+            if f.endswith('.pyc'): continue
+            full = os.path.join(root, f)
+            arcname = os.path.relpath(full, '{}')
+            tf.add(full, arcname=arcname)
+print('TAR_OK')
+\" 2>&1",
+                tmp_tar, remote_dir, remote_dir
+            );
+            let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+
+            // 用 ssh_exec 执行打包
+            let ssh_config = state.resolve_via_gui(conn_name, Some("ssh"))?;
+            let ssh_handle = ssh::dial_and_authenticate(&state.app, &ssh_config, false).await?;
+            {
+                let channel = ssh_handle.channel_open_session().await.map_err(|e| format!("打开通道失败: {}", e))?;
+                channel.exec(true, tar_cmd).await.map_err(|e| format!("打包命令执行失败: {}", e))?;
+            }
+            // 等待打包完成
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let _ = ssh_handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+
+            // 3. 用 SFTP 下载 tar.gz 到本地临时文件
+            let local_tar = std::env::temp_dir().join(format!("_dl_project_{}.tar.gz", dir_name));
+            let local_tar_str = local_tar.to_str().ok_or("临时路径无效")?;
+
+            let sftp_config = state.resolve_via_gui(conn_name, None)?;
+            let sftp_handle = ssh::dial_and_authenticate(&state.app, &sftp_config, false).await?;
+            let sftp2 = open_sftp(&sftp_handle).await?;
+            sftp_download_file(&sftp2, &tmp_tar, local_tar_str).await?;
+            let _ = sftp_handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+
+            // 4. 清理服务器上的临时文件
+            let cleanup_config = state.resolve_via_gui(conn_name, Some("ssh"))?;
+            let cleanup_handle = ssh::dial_and_authenticate(&state.app, &cleanup_config, false).await?;
+            {
+                let channel = cleanup_handle.channel_open_session().await.map_err(|e| format!("打开通道失败: {}", e))?;
+                channel.exec(true, format!("sudo rm -f '{}'", tmp_tar)).await.ok();
+            }
+            let _ = cleanup_handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+
+            // 5. 在本地解压
+            let local_path = std::path::Path::new(local_dir);
+            std::fs::create_dir_all(local_path).map_err(|e| format!("创建本地目录失败: {}", e))?;
+            let extract_output = std::process::Command::new("tar")
+                .args(["-xzf", local_tar_str, "-C", local_dir])
+                .output()
+                .map_err(|e| format!("解压失败: {}（确保系统有 tar 命令）", e))?;
+
+            // 清理本地临时文件
+            std::fs::remove_file(&local_tar).ok();
+
+            if !extract_output.status.success() {
+                let stderr = String::from_utf8_lossy(&extract_output.stderr);
+                return Err(format!("解压失败: {}", stderr));
+            }
+
+            let tar_size = std::fs::metadata(local_tar_str).map(|m| m.len()).unwrap_or(0);
+            Ok(json!({ "content": [{ "type": "text", "text": format!("✅ 项目下载成功！\n远程: {}\n本地: {}\n大小: {} bytes (tar.gz)", remote_dir, local_dir, tar_size) }] }))
         }
 
         "test_connection" => {
@@ -717,12 +880,11 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // query, fall back to any type so ftp / local / sftp-only hosts
             // still work. A genuine ambiguity WITHIN the ssh type (two ssh
             // connections, same host) is still surfaced to the caller.
-            let mut config = match state.find_connection(conn_name, Some("ssh")) {
+            let config = match state.resolve_via_gui(conn_name, Some("ssh")) {
                 Ok(c) => c,
-                Err(e) if e.contains("未找到") => state.find_connection(conn_name, None)?,
+                Err(e) if e.contains("未找到") => state.resolve_via_gui(conn_name, None)?,
                 Err(e) => return Err(e),
             };
-            state.resolve_secrets(&mut config)?;
 
             let result = match config.conn_type.as_str() {
                 "ssh" | "sftp" => ssh::test_connection(&state.app, &config).await,
@@ -749,7 +911,13 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // can't. A future IPC-backed variant (MCP writes a trigger file,
             // GUI watches and captures) is tracked as future work.
             let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
-            let config = state.find_connection(conn_name, None)?;
+            // Plaintext lookup only — screenshot tool doesn't need credentials.
+            let db = state.app.db.lock().map_err(|e| e.to_string())?;
+            let conns = db::get_all_connections_plaintext(&db).map_err(|e| e.to_string())?;
+            drop(db);
+            let config = conns.into_iter().find(|c| c.name == conn_name
+                || format!("{}/{}", c.group_path.trim_end_matches('/'), c.name) == conn_name)
+                .ok_or_else(|| format!("未找到连接: {}", conn_name))?;
             let attachment_dir = secrets_attachment_dir();
 
             let attachment_hint = match attachment_dir {
@@ -775,9 +943,14 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
         }
 
         "open_in_gui" => {
-            // Resolve the connection first (confirms it exists + disambiguates).
+            // Resolve the connection id via plaintext lookup — NO DEK needed.
             let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
-            let config = state.find_connection(conn_name, None)?;
+            let conn_id = state.find_connection_id(conn_name, None)?;
+            // Also grab the plaintext record for the success message (name/conn_type).
+            let db = state.app.db.lock().map_err(|e| e.to_string())?;
+            let conns = db::get_all_connections_plaintext(&db).map_err(|e| e.to_string())?;
+            drop(db);
+            let info = conns.iter().find(|c| c.id == conn_id);
 
             // tab_type: "auto" (default) | "terminal" | "sftp".
             let tab_type = match args["tab_type"].as_str().unwrap_or("auto") {
@@ -788,25 +961,27 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             // Discover the GUI's IPC port.
             let port = read_gui_ipc_port().ok_or_else(|| {
-                "MyShell GUI 未运行（找不到 IPC 端口文件）。请先打开 MyShell 桌面应用，然后重试。如果只是想执行命令，可以改用 ssh_exec（无需 GUI）。".to_string()
+                "MyShell GUI 未运行（找不到 IPC 端口文件）。请先打开 MyShell 桌面应用，然后重试。".to_string()
             })?;
 
             // Send the open command over localhost TCP. The GUI focuses an
             // existing matching tab if one is open (focus_existing=true),
             // otherwise opens a new tab of the requested type.
-            let result = send_gui_open_command(port, &config.id, tab_type, true).map_err(|e| {
-                format!("无法与 MyShell GUI 通信（{}）。请确认 MyShell 桌面应用正在运行。如果只是想执行命令，可以改用 ssh_exec。", e)
+            let result = send_gui_open_command(port, &conn_id, tab_type, true).map_err(|e| {
+                format!("无法与 MyShell GUI 通信（{}）。请确认 MyShell 桌面应用正在运行。", e)
             })?;
 
             if result {
+                let conn_type = info.map(|c| c.conn_type.as_str()).unwrap_or("");
+                let display_name = info.map(|c| c.name.as_str()).unwrap_or(conn_name);
                 let kind = match tab_type {
                     "sftp" => "SFTP 文件浏览标签页",
                     "terminal" => "终端标签页",
-                    _ => if config.conn_type == "sftp" { "SFTP 文件浏览标签页" } else { "终端标签页" },
+                    _ => if conn_type == "sftp" { "SFTP 文件浏览标签页" } else { "终端标签页" },
                 };
                 Ok(json!({ "content": [{ "type": "text", "text": format!(
-                    "✅ 已在 MyShell GUI 中打开连接 [{}]（{}@{}）的{}，窗口已聚焦到前台。若该连接已有打开的标签页，则直接切换过去（不重复打开）。用户现在可以直接交互操作。",
-                    config.name, config.username, config.host, kind
+                    "✅ 已在 MyShell GUI 中打开连接 [{}] 的{}，窗口已聚焦到前台。若该连接已有打开的标签页，则直接切换过去（不重复打开）。用户现在可以直接交互操作。",
+                    display_name, kind
                 ) }] }))
             } else {
                 Err("GUI 收到了命令但未能打开连接（可能连接配置有误）。".to_string())
@@ -897,6 +1072,42 @@ fn send_gui_open_command(port: u16, connection_id: &str, tab_type: &str, focus_e
     Ok(resp["ok"].as_bool().unwrap_or(false))
 }
 
+/// Ask the GUI to decrypt a connection's credentials and return the full
+/// decrypted ConnectionConfig. The MCP server no longer holds the DEK or a
+/// stored passphrase — this is the ONLY way to obtain credentials for
+/// headless SFTP operations. Requires the GUI to be running and the vault
+/// to be unlocked (user must have entered the master password in the GUI).
+fn get_config_from_gui(conn_id: &str) -> Result<ConnectionConfig, String> {
+    let port = read_gui_ipc_port().ok_or_else(|| {
+        "MyShell GUI 未运行。请先打开 MyShell 桌面应用并输入主密码解锁保险库，然后重试。".to_string()
+    })?;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| format!("连接 GUI 失败: {e}"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| format!("设置超时失败: {e}"))?;
+    let cmd = serde_json::json!({
+        "action": "get_connection_secrets",
+        "connection_id": conn_id,
+    });
+    writeln!(stream, "{}", cmd).map_err(|e| format!("发送命令失败: {e}"))?;
+    stream.flush().map_err(|e| format!("flush 失败: {e}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).map_err(|e| format!("读取响应失败: {e}"))?;
+    let resp: Value = serde_json::from_str(resp_line.trim())
+        .map_err(|e| format!("响应解析失败: {e} (raw: {})", resp_line.trim()))?;
+    if resp["ok"].as_bool() == Some(true) {
+        let config: ConnectionConfig = serde_json::from_value(resp["config"].clone())
+            .map_err(|e| format!("配置反序列化失败: {e}"))?;
+        Ok(config)
+    } else {
+        let err = resp["error"].as_str().unwrap_or("未知错误");
+        Err(err.to_string())
+    }
+}
+
 // ============ GUI exec_in_tab (show_in_gui mode) ============
 
 /// Ensure the MyShell GUI is running. If the IPC port file exists, assume it's
@@ -953,11 +1164,26 @@ async fn exec_in_gui_tab(
     timeout: u64,
     state: &McpState,
 ) -> Result<Value, String> {
-    // Resolve the connection to get its id (needed by the GUI to find/open tab).
-    let config = state.find_connection(conn_name, Some("ssh"))?;
+    // Resolve the connection id via plaintext lookup — NO DEK needed.
+    // The actual SSH connection + credential use happens inside the GUI
+    // process (the user has unlocked the vault there).
+    let conn_id = state.find_connection_id(conn_name, Some("ssh"))?;
 
     // Ensure the GUI is running (auto-start if needed).
     let port = ensure_gui_running()?;
+
+    // 先确保有一个已连接的标签页：发送 open_connection 让 GUI 打开并连接
+    // 这样后续的 exec_in_tab 就能直接找到已连接的 session，避免在 exec_in_tab 里等待 SSH 握手
+    log(&format!("[exec_in_gui_tab] 确保标签页已连接: {}", conn_name));
+    // focus_existing=true：若 GUI 已有该连接的 terminal tab，复用它而非每次开新 tab。
+    // 否则连续执行多次 ssh_exec 会不停打开重复标签页。
+    let opened = send_gui_open_command(port, &conn_id, "terminal", true)?;
+    if !opened {
+        return Err("打开 GUI 标签页失败".to_string());
+    }
+    // 等待 SSH 连接建立（最多 15 秒）
+    log(&format!("[exec_in_gui_tab] 等待 SSH 连接建立..."));
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     // Send the exec_in_tab command and read the response.
     use std::io::{BufRead, BufReader, Write};
@@ -970,7 +1196,7 @@ async fn exec_in_gui_tab(
 
     let cmd = serde_json::json!({
         "action": "exec_in_tab",
-        "connection_id": config.id,
+        "connection_id": conn_id,
         "command": command,
         "timeout": timeout,
     });
@@ -1079,40 +1305,6 @@ async fn sftp_upload_file(sftp: &russh_sftp::client::SftpSession, local: &str, r
     Ok(())
 }
 
-// ============ Vault unlock (same logic as CLI) ============
-
-/// Unlock vault and return just the DEK (no AppState needed).
-/// Used by the background unlock thread so the main async task can start
-/// the JSON-RPC loop immediately without waiting for PBKDF2 (600k iterations,
-/// ~1s on most CPUs) to finish.
-fn try_unlock_dek(passphrase: &str) -> Result<[u8; 32], String> {
-    let mut lockout = vault::LockoutState::load();
-    if let Some(remaining) = lockout.check_lockout() {
-        return Err(format!("锁定中，请等待 {} 秒", remaining));
-    }
-    let salt = vault::read_salt().ok_or("Vault 未初始化")?;
-    let verifier = vault::read_verifier().ok_or("Vault 未初始化")?;
-    let encrypted_dek_opt = vault::read_encrypted_dek();
-    let (iterations, _) = match vault::read_kdf_meta() {
-        Some(meta) => (meta.iterations, true),
-        None => (crypto::LEGACY_PBKDF2_ITERATIONS, false),
-    };
-    let master_key = crypto::derive_master_key_with_iterations(passphrase, &salt, iterations);
-    if !crypto::check_verifier(&master_key, &verifier) {
-        lockout.record_failure()?;
-        return Err("密码错误".to_string());
-    }
-    let dek: [u8; 32] = match encrypted_dek_opt {
-        Some(blob) => {
-            let bytes = crypto::decrypt_with_key(&master_key, &blob)?;
-            bytes.as_slice().try_into().map_err(|_| "DEK 长度错误")?
-        }
-        None => master_key,
-    };
-    lockout.record_success();
-    Ok(dek)
-}
-
 // ============ Logging to file (stdout is reserved for JSON-RPC only) ============
 
 use std::sync::OnceLock;
@@ -1169,41 +1361,12 @@ async fn main() {
 
     log("AppState initialized");
 
-    // Unlock vault from OS keyring (DPAPI-encrypted, no plaintext in config).
-    // Done in a non-blocking way — vault unlock happens AFTER we start the
-    // JSON-RPC loop, so the server can respond to initialize/tools/list even
-    // before unlock completes. Encrypted-data tools will return an error if
-    // called before unlock finishes.
-    if vault::is_initialized() {
-        // Spawn unlock in background — don't block server startup
-        let dek_clone = Arc::clone(&app.dek);
-        std::thread::spawn(move || {
-            match secrets::get_mcp_passphrase() {
-                Ok(Some(passphrase)) => {
-                    if passphrase.is_empty() {
-                        log("警告: keyring 中密码为空");
-                    } else {
-                        // Re-create a minimal AppState reference for unlock
-                        // We can't move the whole state, so we do unlock inline
-                        // using just the dek slot.
-                        match try_unlock_dek(&passphrase) {
-                            Ok(dek) => {
-                                if let Ok(mut slot) = dek_clone.lock() {
-                                    *slot = Some(dek);
-                                }
-                                log("Vault 解锁成功（后台）");
-                            }
-                            Err(e) => log(&format!("Vault 解锁失败: {}", e)),
-                        }
-                    }
-                }
-                Ok(None) => log("keyring 中未存储 vault 密码"),
-                Err(e) => log(&format!("读取 keyring 失败: {}", e)),
-            }
-        });
-    } else {
-        log("Vault 未初始化，跳过解锁");
-    }
+    // SECURITY: The MCP server no longer reads the vault passphrase from the
+    // OS keyring or auto-unlocks the vault. Instead, all credential access is
+    // delegated to the GUI: ssh_exec runs in a GUI terminal tab (the user has
+    // unlocked the vault there), and SFTP tools ask the GUI to decrypt the
+    // connection config via IPC (get_connection_secrets). The DEK here stays
+    // None permanently — the MCP server cannot access any server on its own.
 
     let state = McpState { app };
     log("MCP server ready — waiting for first message on stdin");

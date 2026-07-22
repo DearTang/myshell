@@ -3539,24 +3539,6 @@ fn sz_write_chunk(
 	    mcp_tools::mcp_remove_config(&tool_id)
 	}
 
-	/// Save vault passphrase to OS keyring for MCP server.
-	#[tauri::command]
-	fn mcp_save_passphrase(passphrase: String) -> Result<(), String> {
-	    secrets::set_mcp_passphrase(&passphrase)
-	}
-
-	/// Check if MCP passphrase exists in keyring.
-	#[tauri::command]
-	fn mcp_has_passphrase() -> bool {
-	    secrets::get_mcp_passphrase().ok().flatten().map(|p| !p.is_empty()).unwrap_or(false)
-	}
-
-	/// Delete stored MCP passphrase from keyring.
-	#[tauri::command]
-	fn mcp_delete_passphrase() -> Result<(), String> {
-	    secrets::delete_mcp_passphrase()
-	}
-
 // ============ Main ============
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3869,9 +3851,6 @@ pub fn run() {
             mcp_detect_tools,
             mcp_write_config,
             mcp_remove_config,
-            mcp_save_passphrase,
-            mcp_has_passphrase,
-            mcp_delete_passphrase,
         ])
         .setup(|app| {
             // Seed built-in AI model presets on first launch (idempotent).
@@ -4118,6 +4097,70 @@ pub fn run() {
                                         let mut pending = PENDING_EXEC.lock().unwrap();
                                         pending.remove(&request_id);
                                         let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"exec timeout ({}s)\"}}", timeout_secs);
+                                    }
+                                }
+                            }
+
+                            // MCP asks the GUI to decrypt a connection's
+                            // credentials (host, username, password, proxy,
+                            // keys) using the vault DEK that the user has
+                            // unlocked in the GUI. The MCP server itself no
+                            // longer holds the DEK or a stored passphrase —
+                            // this is the only way it can obtain credentials
+                            // for headless SFTP operations. Returns the full
+                            // decrypted ConnectionConfig as JSON.
+                            "get_connection_secrets" => {
+                                let conn_id = cmd["connection_id"].as_str().unwrap_or("").to_string();
+                                if conn_id.is_empty() {
+                                    let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"missing connection_id\"}}");
+                                    continue;
+                                }
+                                // Get AppState from the Tauri handle.
+                                let app_state = ipc_handle.state::<AppState>();
+                                // Decrypt using the GUI's DEK.
+                                let dek_guard = match app_state.dek.lock() {
+                                    Ok(g) => g,
+                                    Err(e) => {
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"DEK 锁定: {}\"}}", e);
+                                        continue;
+                                    }
+                                };
+                                let key = match dek_guard.as_ref() {
+                                    Some(k) => k,
+                                    None => {
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"保险库未解锁，请在 MyShell GUI 中输入主密码解锁\"}}");
+                                        continue;
+                                    }
+                                };
+                                let db_guard = app_state.db.lock();
+                                let db_conn = match db_guard {
+                                    Ok(db) => db,
+                                    Err(e) => {
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"数据库锁定: {}\"}}", e);
+                                        continue;
+                                    }
+                                };
+                                match db::get_connection(&db_conn, key, &conn_id) {
+                                    Ok(Some(mut config)) => {
+                                        // Resolve password + proxy password from keyring.
+                                        if config.auth_method != "key" && config.password.is_none() {
+                                            if let Ok(pw) = secrets::get_password(&config.id, key) {
+                                                config.password = pw;
+                                            }
+                                        }
+                                        if config.proxy_type != "none" && config.proxy_password.is_none() {
+                                            if let Ok(pw) = secrets::get_proxy_password(&config.id, key) {
+                                                config.proxy_password = pw;
+                                            }
+                                        }
+                                        let json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":true,\"config\":{}}}", json);
+                                    }
+                                    Ok(None) => {
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"未找到连接: {}\"}}", conn_id);
+                                    }
+                                    Err(e) => {
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"连接查找失败: {}\"}}", e);
                                     }
                                 }
                             }

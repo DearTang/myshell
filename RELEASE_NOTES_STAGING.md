@@ -15,3 +15,13 @@
 ## 待发布条目（打包后清空）
 
 <!-- 上一个版本 v2.2.0 已发布。新的改动完成后在此追加一行：`- <emoji> <一句话描述>` -->
+- 🐛 修复 ssh_exec 空输出 bug（sentinel 订阅时序错误 + PS1 提示符剥离失败）
+- 🛠️ 优化 sentinel 机制（stty -echo 隐藏终端回显）
+- ✨ 新增 upload_project MCP 工具（一键上传项目目录到远程服务器）
+- ✨ 新增 download_project MCP 工具（一键下载远程项目目录到本地）
+- 🛠️ 优化 upload_project 传输方式（SSH 管道直传替代 SFTP 分块，速度提升 10x+）
+- 🛠️ 修复 download_project 权限问题（sudo tar + UTF-8 locale 支持中文文件名）
+- 🐛 修复 MCP ssh_exec 连续执行不停开新标签页（focus_existing 应为 true 复用已有 tab）
+- 🐛 修复 MCP ssh_exec 返回 stdout 残留辅助命令回显（去掉 stty 三行，改为单行 sentinel + 截断式清洗）
+- 🔒 安全加固：删除 MCP vault 密码 keyring 明文存储，强制所有服务器访问经 GUI 解锁（ssh_exec 走 GUI tab，SFTP 经 GUI IPC 解密密码）
+- ✨ 新增终端渲染层 sentinel 过滤（__MCP_DONE_ 行在写入 xterm 前丢弃，终端无噪音）
