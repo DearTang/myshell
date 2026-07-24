@@ -8,6 +8,22 @@
   格式参考 keepachangelog.com。新增条目尽量简洁，按 ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全 分组。
 -->
 
+## v2.4.0（2026-07-24）
+
+#### ✨ 新增
+
+- **MCP `screenshot_terminal` 工具**：AI 可请求 GUI 对指定连接的终端 tab 截图（PNG data URL 回传），用于 AI 视觉检查终端输出。GUI 未运行时自动拉起并聚焦。
+
+#### 🔒 安全
+
+- **`list_connections` 不再泄露 host/port/username**：改用纯文本列查询（`get_all_connections_plaintext`），IP/用户名等加密字段仅在 GUI 解锁后可访问，MCP 永不向 AI 暴露服务器地址与凭据。IP 直连查询改为要求 GUI 在线 + vault 解锁。
+
+#### 🐛 修复
+
+- **sz 多文件下载竞态挂起**：`sz ./*` 首个文件完成后 UI 卡住、后续文件不下载（zmodem.js `_accept()` 发 ZRINIT 早于 resolve 导致 offer 丢失）。改用 offer 队列缓冲早到 offer + session_end 释放等待器。
+- **sz 下载收尾卡死**：全部文件 100% 后 UI 卡几十秒才返回终端（`szWriteChunk` fire-and-forget + 提前 `szClose` 导致文件截断，lrzsz 超时重传）。`accept()` resolve 后 `await Promise.all(pendingWrites)` 排干再关句柄。
+- **sz 启动噪音**：传输开始前终端多出一行 `rz`（lrzsz auto-start 触发串）。在 Normal→Zmodem 切换点剥离 `rz\r\n` 通告。
+
 ## v2.3.0（2026-07-22）
 
 #### ✨ 新增

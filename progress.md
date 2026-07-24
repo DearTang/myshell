@@ -1852,3 +1852,30 @@
 | 什么可能导致偏离？ | SFTP 经 GUI IPC 解密密码是新的 IPC 协议，需确认 TCP 超时/并发无问题；keyring 中残留的旧 passphrase 不影响（已不读）。 |
 | 下一步最小可验证动作？ | 打测试包安装，跑一次 ssh_exec + 一次 sftp_list 确认链路通。 |
 | 目标是什么？ | MCP 无法绕过 GUI 访问服务器；终端无 sentinel 噪音。 |
+
+### 阶段 74：修复 sz ./* 多文件下载三个 Bug（竞态挂起 + 100% 卡死 + rz 噪音）（2026-07-24）
+
+- **Bug 1：首个文件完成后 UI 卡住，后续文件不下载。**
+  - 根因（lost-offer race）：`ZmodemBridge.handleDownload` 用单一 `pendingResolve` 等待下一个 offer。但 zmodem.js 的 receive 端时序特殊：第一个文件的 ZEOF 一到，`_accept()` 内部就立即 `_send_ZRINIT()`（邀请 sender 发下一文件）**然后才** resolve `accept()`。也就是说在 `receiveFile` 还没返回、循环还没走到 `waitForNextOffer()` 之前，第二个文件的 ZFILE 可能已经到达并触发 `offer` 事件——此时 `pendingResolve` 仍是 null，offer 被静默丢弃，循环永远等不到 → 挂起。
+  - `rz`（上传）方向不受影响：我们是 sender，节奏由本地 `for` 循环 + `send_offer()` 串行驱动，无竞态。
+  - 修复（handleDownload）：① offer 队列 + `waitingForOffer` resolver 替代单一 `pendingResolve`，早到 offer 入队、drain 后再挂；② `session.start()` 返回的第一个 offer 与同步触发的 `offer` 事件是同一对象（`this._current_transfer`），dedupe 队列头部重复项；③ `sessionEnded` 标志 + `session_end` 释放等待中的 resolver，会话结束循环必然退出。
+
+- **Bug 2：所有文件下载完（进度 100%）后 UI 卡几十秒才返回终端。**
+  - 根因（fire-and-forget 写入 + 提前关闭句柄）：`receiveFile` 的 `input` 回调对 `szWriteChunk` 是 `.catch()` 不 await，写入 IPC 在后台飞。ZEOF 一到 `accept()` 立刻 resolve，`finally` 里 `await szClose(id)` 把 Rust map 里的句柄删掉——此时队列里还没落地的 `szWriteChunk` 全部报 "Unknown zmodem transfer id" → 文件被截断/末块丢失。lrzsz 看到自己发出的字节没被正确 ZEOF 确认，进入重传/超时窗口（几十秒）后才放弃 → UI 卡在 100% 面板。
+  - 修复（receiveFile）：用 `pendingWrites: Promise<void>[]` 记录每个在途 `szWriteChunk`，`accept()` resolve 后 `await Promise.all(pendingWrites)` 排干再 `szClose`——保证文件精确到字节完整，lrzsz 立即收到正确 ZEOF ack 正常收尾。
+  - Rust 侧 `sz_close` 无需改：它 remove 句柄后 `File` drop 自动 flush，问题只在前端"未排干就关闭"的时序。
+
+- **Bug 3：sz 传输开始前终端多出一行 `rz`。**
+  - 根因（lrzsz auto-start trigger）：lrzsz 的 `sz` 在发 ZMODEM 协议帧之前，会先往 stdout 打印 `rz\r\n`——这是 BBS 时代遗留的约定，让对端的 ZMODEM 感知终端自动拉起本地 `rz` 接收。MyShell 不需要它，但它出现在协议帧之前、Rust 还在 Normal 模式时，被 `append_capped` 当普通终端输出 flush 给了 xterm，于是用户看到一行莫名其妙的 `rz`。
+  - 修复（ssh.rs `handle_incoming_data` Normal→Zmodem 切点）：新增 `strip_zmodem_autostart_noise(buffer)`，在 `find_zmodem_start` 命中、`flush_buffer` 前缀**之前**，从 buffer 尾部剥离 `rz` + 紧邻的 CR/LF。安全边界清晰：只在「确认有协议帧紧随其后」的切点调用，此时尾部的 `rz` 只可能是 lrzsz 触发串，不会误伤真实终端输出。`rz`（上传）方向不打印此串（只有 `sz` 发送方打印），故无副作用。
+
+- **验证：** npx tsc --noEmit 通过；cargo check 通过（仅遗留 dead_code 警告）。
+
+## 五问重启检查（阶段 74）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 74 complete —— sz 多文件下载三个 Bug（竞态 + 100% 卡死 + rz 噪音）修复，TS/Rust 编译均通过。 |
+| 我要去哪里？ | 实测 `sz ./*` 批量下载确认：①所有文件连续完成 ②100% 后秒回终端 ③启动前无多余 `rz` 行；`rz` 上传回归确认未受影响。 |
+| 什么可能导致偏离？ | dedupe 用 `===` 比较 offer 对象引用，依赖 zmodem.js 事件与 start() 返回同一 `_current_transfer` 实例（已核对源码 zsession.js:668-675 成立）。`strip_zmodem_autostart_noise` 只剥尾部 `rz`，若未来 lrzsz 改打印别的触发串需扩展。 |
+| 下一步最小可验证动作？ | 远程 `sz ./*`（3+ 文件）跑一轮，观察启动瞬间终端不再出现裸 `rz` 行。 |
+| 目标是什么？ | sz/rz 多文件批量传输稳定，无中途挂起、无收尾卡死、无启动噪音。 |

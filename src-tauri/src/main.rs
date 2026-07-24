@@ -4165,6 +4165,70 @@ pub fn run() {
                                 }
                             }
 
+                            // MCP asks the GUI to capture a screenshot of a
+                            // terminal tab. Emits an event to the frontend,
+                            // which finds the terminal for this connection,
+                            // captures the xterm buffer to a PNG data URL, and
+                            // calls mcp_exec_result with the data URL. Blocks
+                            // until the frontend responds (same pattern as
+                            // exec_in_tab).
+                            "screenshot_terminal" => {
+                                let conn_id = cmd["connection_id"].as_str().unwrap_or("").to_string();
+                                if conn_id.is_empty() {
+                                    let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"missing connection_id\"}}");
+                                    continue;
+                                }
+                                let request_id = uuid::Uuid::new_v4().to_string();
+                                let (tx, rx) = oneshot::channel::<serde_json::Value>();
+                                {
+                                    let mut pending = PENDING_EXEC.lock().unwrap();
+                                    pending.insert(request_id.clone(), tx);
+                                }
+                                if let Some(window) = ipc_handle.get_webview_window("main") {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
+                                let payload = serde_json::json!({
+                                    "action": "screenshot_terminal",
+                                    "request_id": request_id,
+                                    "connection_id": conn_id,
+                                });
+                                if let Err(e) = ipc_handle.emit("mcp-gui-command", payload) {
+                                    let mut pending = PENDING_EXEC.lock().unwrap();
+                                    pending.remove(&request_id);
+                                    let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"emit failed: {}\"}}", e);
+                                    continue;
+                                }
+                                let timeout = std::time::Duration::from_secs(20);
+                                let result = {
+                                    let rt = match tokio::runtime::Runtime::new() {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            let mut pending = PENDING_EXEC.lock().unwrap();
+                                            pending.remove(&request_id);
+                                            let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"runtime: {}\"}}", e);
+                                            continue;
+                                        }
+                                    };
+                                    rt.block_on(async move {
+                                        match tokio::time::timeout(timeout, rx).await {
+                                            Ok(Ok(val)) => Some(val),
+                                            _ => None,
+                                        }
+                                    })
+                                };
+                                match result {
+                                    Some(result) => {
+                                        let _ = writeln!(reader.get_mut(), "{}", result);
+                                    }
+                                    None => {
+                                        let mut pending = PENDING_EXEC.lock().unwrap();
+                                        pending.remove(&request_id);
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"screenshot timeout (20s)\"}}");
+                                    }
+                                }
+                            }
+
                             _ => {
                                 let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"unknown action: {}\"}}", action);
                             }

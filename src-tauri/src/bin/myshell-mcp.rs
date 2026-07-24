@@ -191,7 +191,7 @@ const SERVER_INSTRUCTIONS: &str = "\
 MyShell MCP — SSH/SFTP gateway to this user's pre-saved server connections.\n\
 \n\
 USE THESE TOOLS WHEN: the user references a remote server by name/nickname/alias/IP ('on prod-db', 'check web1', 'ssh to 135.32.64.30', 'restart nginx on the api box'), or asks to run a command / read a file / upload a file / list files on a remote host they've previously saved in MyShell. \
-The connection details (host, port, credentials) are stored encrypted in MyShell — you never need and never will receive passwords. Pass the connection NAME, group-path, or host/IP — all three forms are accepted.\n\
+The connection details (host, port, credentials) are stored encrypted in MyShell — you never need and never will receive passwords. Pass the connection NAME or group-path. IP-based lookup requires the GUI to be running and the vault unlocked (IPs are encrypted).\n\
 \n\
 DO NOT USE THESE TOOLS WHEN: the user wants to run a command locally on their own machine (use your built-in shell tool instead), or references a server they haven't saved in MyShell (suggest they add it in the MyShell GUI first).\n\
 \n\
@@ -209,7 +209,7 @@ fn tool_definitions() -> Value {
         "tools": [
             {
                 "name": "list_connections",
-                "description": "List all SSH/SFTP/FTP connections saved in this user's MyShell client.\n\nWHEN TO USE: Always call this FIRST when the user mentions a remote server by name, nickname, alias, OR IP address — even if you think you know the name. Call this when the user asks 'what servers do I have', 'show my connections', or wants to know if a specific host is already configured. Knowing the full list helps you pick the right `connection` value for other tools.\n\nWHEN NOT TO USE: Don't use this for connections the user is defining on the fly (e.g. 'ssh to user@1.2.3.4'). MyShell tools only work with pre-saved connections.\n\nOUTPUT: JSON array, each item has `name`, `host`, `port`, `username`, `conn_type` (ssh/sftp/ftp/local), `group_path`. \n\nIMPORTANT: other tools accept the connection `name`, the group-prefixed path ('/production/prod-db'), OR the bare `host`/IP interchangeably — so if the user said '135.32.64.30', you can pass '135.32.64.30' directly to ssh_exec without looking up the name first. But DO call this when (a) you're not sure the host is saved, (b) the user used an ambiguous nickname, or (c) a previous call returned an 'ambiguous match' error and you need to see the candidates. Passwords are never included, for security.",
+                "description": "List all SSH/SFTP/FTP connections saved in this user's MyShell client.\n\nWHEN TO USE: Always call this FIRST when the user mentions a remote server by name, nickname, alias, OR IP address — even if you think you know the name. Call this when the user asks 'what servers do I have', 'show my connections', or wants to know if a specific host is already configured. Knowing the full list helps you pick the right `connection` value for other tools.\n\nWHEN NOT TO USE: Don't use this for connections the user is defining on the fly (e.g. 'ssh to user@1.2.3.4'). MyShell tools only work with pre-saved connections.\n\nOUTPUT: JSON array, each item has `name`, `conn_type` (ssh/sftp/ftp/local), `group_path`. For security, host/port/username are NOT included - they are encrypted and only accessible when the GUI vault is unlocked.\n\nIMPORTANT: other tools accept the connection `name` or the group-prefixed path ('/production/prod-db'). IP-based lookup requires the GUI to be running and the vault unlocked (IPs are encrypted). Passwords are never included, for security.",
                 "inputSchema": { "type": "object", "properties": {}, "required": [] }
             },
             {
@@ -473,17 +473,17 @@ fn ambiguous_error(
 async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, String> {
     match name {
         "list_connections" => {
-            let key = require_dek(&state.app)?;
+            // SECURITY: use plaintext-only lookup - do NOT decrypt host/username.
+            // The MCP server must not expose server IPs or credentials to the AI
+            // without the GUI being unlocked. Only name/conn_type/group_path
+            // (non-sensitive plaintext columns) are returned.
             let db = state.app.db.lock().map_err(|e| e.to_string())?;
-            let connections = db::get_all_connections(&db, &key).map_err(|e| e.to_string())?;
+            let connections = db::get_all_connections_plaintext(&db).map_err(|e| e.to_string())?;
             let items: Vec<Value> = connections
                 .iter()
                 .map(|c| {
                     json!({
                         "name": c.name,
-                        "host": c.host,
-                        "port": c.port,
-                        "username": c.username,
                         "conn_type": c.conn_type,
                         "group_path": c.group_path,
                     })

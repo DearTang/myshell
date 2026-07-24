@@ -109,6 +109,17 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 
 ## 更新日志
 
+### v2.4.0（2026-07-24）
+
+#### ✨ 新增
+- **MCP `screenshot_terminal`**：AI 可请求 GUI 对终端 tab 截图（PNG data URL），用于视觉检查输出；GUI 未运行时自动拉起聚焦。
+
+#### 🔒 安全
+- **`list_connections` 不再泄露 host/port/username**：改用纯文本列查询，IP/用户名仅在 GUI 解锁后可访问；IP 直连查询要求 GUI 在线 + vault 解锁。
+
+#### 🐛 修复
+- **sz 多文件竞态挂起**（offer 丢失 → 队列缓冲）、**sz 收尾卡死**（写入未排干即关句柄 → `Promise.all` drain）、**sz 启动 rz 噪音**（切换点剥离 auto-start 通告）。
+
 ### v2.3.0（2026-07-22）
 
 #### ✨ 新增

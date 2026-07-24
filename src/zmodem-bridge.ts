@@ -161,26 +161,58 @@ export class ZmodemBridge {
   private async handleDownload(session: any): Promise<void> {
     this.patchStatus({ active: true, direction: "download" });
 
-    let pendingResolve: ((o: any) => void) | null = null;
-    const waitForNextOffer = () =>
-      new Promise<any>((resolve) => {
-        pendingResolve = resolve;
-      });
+    // Offers can arrive before the loop is ready to await them: when the
+    // first file's ZEOF lands, zmodem.js's _accept() handler sends ZRINIT
+    // (inviting the next file) *before* offer.accept() resolves. So while
+    // we're still inside receiveFile / awaiting szClose, the second file's
+    // ZFILE can already fire an "offer" event. A single `pendingResolve`
+    // would drop that early offer and the loop would hang forever waiting
+    // for an offer that already came and went. Buffer offers in a queue and
+    // drain via the promise so an early arrival is preserved.
+    const offerQueue: any[] = [];
+    let waitingForOffer: ((o: any) => void) | null = null;
+    let sessionEnded = false;
+
     const onOffer = (offer: any) => {
-      const r = pendingResolve;
-      pendingResolve = null;
-      r?.(offer);
+      if (waitingForOffer) {
+        const resolve = waitingForOffer;
+        waitingForOffer = null;
+        resolve(offer);
+      } else {
+        offerQueue.push(offer);
+      }
     };
     const onSessionEnd = () => {
-      const r = pendingResolve;
-      pendingResolve = null;
-      r?.(null);
+      sessionEnded = true;
+      // Release any pending waiter so the loop exits instead of hanging.
+      const resolve = waitingForOffer;
+      waitingForOffer = null;
+      resolve?.(null);
     };
     session.on("offer", onOffer);
     session.on("session_end", onSessionEnd);
 
+    const waitForNextOffer = (): Promise<any> => {
+      if (offerQueue.length > 0) {
+        return Promise.resolve(offerQueue.shift());
+      }
+      if (sessionEnded) return Promise.resolve(null);
+      return new Promise<any>((resolve) => {
+        waitingForOffer = resolve;
+      });
+    };
+
     try {
+      // session.start() returns the first offer directly (it predates the
+      // "offer" event wiring by one microtask), but the same offer is also
+      // emitted as an event — dedupe by draining the queue first so the
+      // start() offer isn't double-counted.
       let offer: any = await session.start();
+      // If the start() offer raced ahead into the queue, prefer the queue
+      // copy and drop the duplicate.
+      if (offerQueue.length > 0 && offerQueue[0] === offer) {
+        offerQueue.shift();
+      }
       while (offer) {
         const details = offer.get_details();
         const name: string = details.name || "file";
@@ -251,13 +283,26 @@ export class ZmodemBridge {
       this.speedStartBytes = resumeOffset;
     }
 
+    // Track every in-flight szWriteChunk promise. The "input" handler is
+    // invoked synchronously by zmodem.js as ZDATA subpackets arrive, but
+    // each IPC write is async. When offer.accept() resolves on ZEOF we must
+    // NOT close the handle until all queued writes have settled — otherwise
+    // szClose removes the handle from Rust's map mid-flight and the pending
+    // writes error out, leaving the file truncated. lrzsz then sees its
+    // sent byte count never matched by a correct ZEOF ack and stalls for
+    // its full retransmit/timeout window (the "stuck at 100% for 30s" hang).
+    const pendingWrites: Promise<void>[] = [];
+
     offer.on("input", (payload: number[] | Uint8Array) => {
       const bytes =
         payload instanceof Uint8Array ? payload : new Uint8Array(payload);
       const offset = this.status.bytesTransferred;
-      szWriteChunk(id, offset, bytes).catch((e) => {
-        console.error("sz_write_chunk failed:", e);
-      });
+      const p = szWriteChunk(id, offset, bytes)
+        .then(() => undefined)
+        .catch((e) => {
+          console.error("sz_write_chunk failed:", e);
+        });
+      pendingWrites.push(p);
       this.patchStatus({
         bytesTransferred: offset + bytes.length,
       });
@@ -266,6 +311,11 @@ export class ZmodemBridge {
 
     try {
       await offer.accept({ offset: resumeOffset });
+      // ZEOF received and accept() resolved, but some ZDATA subpackets may
+      // still be mid-IPC. Drain them before closing so the file is complete
+      // to the exact byte lrzsz expects — this is what unblocks the sender's
+      // post-transfer teardown instead of letting it time out.
+      await Promise.all(pendingWrites);
     } finally {
       if (this.writeHandleId) {
         await szClose(this.writeHandleId);

@@ -171,6 +171,35 @@ fn find_zmodem_start(buf: &[u8]) -> Option<usize> {
     earliest
 }
 
+/// Strip the lrzsz "auto-start" noise that `sz` prints to stdout immediately
+/// before the protocol frame: the literal `rz` (+ optional CR/LF). This is a
+/// legacy convention — `sz` emits `rz\r\n` so a ZMODEM-aware terminal emulator
+/// on the other end auto-launches its local `rz`. MyShell (like most modern
+/// clients) doesn't need it; it just shows up as a stray "rz" line in the
+/// terminal. Only safe to call at the exact ZMODEM switch point, where we know
+/// a protocol frame immediately follows — so a trailing `rz` here can only be
+/// the lrzsz trigger, never real user output.
+fn strip_zmodem_autostart_noise(buf: &mut Vec<u8>) {
+    // The text is at the tail, possibly preceded by \r and/or \n. Walk back
+    // over trailing CR/LF/whitespace, then expect exactly "rz".
+    let mut end = buf.len();
+    while end > 0 && matches!(buf[end - 1], b'\r' | b'\n' | b' ' | b'\t') {
+        end -= 1;
+    }
+    if end >= 2 && &buf[end - 2..end] == b"rz" {
+        // Keep nothing of the trigger — but preserve any newline that separated
+        // the command echo from the (now-removed) noise so the prompt flow
+        // still reads naturally. Trim the "rz" plus trailing CR/LF only.
+        let mut trim_to = end - 2;
+        // Also drop one preceding CR/LF if present so we don't leave a blank
+        // line where the noise used to be.
+        if trim_to > 0 && matches!(buf[trim_to - 1], b'\r' | b'\n') {
+            trim_to -= 1;
+        }
+        buf.truncate(trim_to);
+    }
+}
+
 /// Best-effort direction hint derived from the first frame's type byte.
 /// Both rz and sz open with ZRINIT, so this is unreliable on the first frame —
 /// the frontend's zmodem.js will figure out the real role from the full
@@ -694,6 +723,14 @@ fn handle_incoming_data(
                 // bytes [idx..] become the first raw ZMODEM frame.
                 let tail: Vec<u8> = buffer[idx..].to_vec();
                 buffer.truncate(idx);
+
+                // Strip lrzsz's "rz\r\n" auto-start trigger from the tail of
+                // the terminal prefix. `sz` prints this so legacy ZMODEM-aware
+                // terminals auto-launch their local rz; we don't need it and it
+                // would otherwise render as a stray "rz" line. Safe here because
+                // a protocol frame immediately follows, so a trailing "rz" can
+                // only be that trigger.
+                strip_zmodem_autostart_noise(buffer);
 
                 // Force-flush the terminal prefix so xterm shows what came before
                 // the protocol switching point.
