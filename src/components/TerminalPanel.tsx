@@ -84,6 +84,11 @@ function forceVisibleCursor(theme: ITheme): { cursor?: string; cursorAccent?: st
 }
 
 interface Props {
+  /** STABLE tab identifier — never changes across reconnects. Used as the
+   * React-effect mount key so the xterm instance survives a sessionId change
+   * (reconnect). Without this, changing sessionId would tear down and rebuild
+   * the whole terminal, losing scrollback history. */
+  tabId: string;
   sessionId: string;
   /** Tab connection type — selects ssh_* vs local_* backend commands.
    * Defaults to "ssh". sftp/ftp tabs never render a TerminalPanel. */
@@ -132,9 +137,17 @@ interface Props {
   /** Tab display name — used as part of the screenshot filename when the
    * user hits the 📷 button in CommandBar. */
   connectionName?: string;
+  /** Terminal text captured from the previous xterm instance before a
+   * reconnect. If present on mount, it's written to the new terminal to
+   * restore scrollback history. The caller is responsible for clearing it
+   * (via onSnapshotConsumed) so it's only restored once. */
+  reconnectSnapshot?: string;
+  /** Called after reconnectSnapshot has been written to the new terminal,
+   * so the parent can clear it from the tab state. */
+  onSnapshotConsumed?: () => void;
 }
 
-export function TerminalPanel({ sessionId, connType, connectionId, fontOverride, rendererBackend, broadcastTargets, active = true, onDisconnected, status, onReconnect, onTerminalReady, onTerminalGone, onOpenQuickCommandsManage, onOpenAi, connectionName }: Props) {
+export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOverride, rendererBackend, broadcastTargets, active = true, onDisconnected, status, onReconnect, onTerminalReady, onTerminalGone, onOpenQuickCommandsManage, onOpenAi, connectionName, reconnectSnapshot, onSnapshotConsumed }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -613,6 +626,17 @@ export function TerminalPanel({ sessionId, connType, connectionId, fontOverride,
 
     termRef.current = term;
     fitRef.current = fitAddon;
+
+    // Restore scrollback from a previous terminal instance after a reconnect.
+    // The snapshot was captured by reconnectOne (reading the old xterm's
+    // buffer) before the sessionId changed. Write it now so the user sees
+    // their history continuity, then mark it consumed.
+    if (reconnectSnapshot) {
+      term.write(reconnectSnapshot);
+      term.write("\r\n\x1b[33m[—— 以上为重连前历史，连接已重建 ——]\x1b[0m\r\n");
+      onSnapshotConsumed?.();
+    }
+
     onTerminalReady?.(sessionId, term);
 
     term.focus();

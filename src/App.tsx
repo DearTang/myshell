@@ -49,6 +49,54 @@ import { ConfirmDialog } from "./components/ConfirmDialog";
 import type { CommandRules } from "./api";
 
 /**
+ * Map a VISIBLE-character index (counting only non-ANSI chars) to the
+ * corresponding byte offset in the ORIGINAL string (which contains ANSI
+ * escape sequences). Used to translate a position found in an ANSI-stripped
+ * copy back to a position in the ANSI-preserving original, so we can
+ * truncate the original at the right point WITHOUT losing color codes.
+ *
+ * Returns `str.length` if `visibleIndex` exceeds the number of visible chars.
+ */
+function stripFromAnsiPosition(str: string, visibleIndex: number): string {
+  let visible = 0;
+  let i = 0;
+  const len = str.length;
+  while (i < len) {
+    if (visible >= visibleIndex) break;
+    const code = str.charCodeAt(i);
+    // CSI: ESC [ ... final-byte(0x40-0x7E)
+    if (code === 0x1b && i + 1 < len && str.charCodeAt(i + 1) === 0x5b) {
+      i += 2;
+      while (i < len) {
+        const c = str.charCodeAt(i);
+        i++;
+        if (c >= 0x40 && c <= 0x7e) break;
+      }
+      continue;
+    }
+    // OSC: ESC ] ... (BEL \x07 or ST \x1b\\)
+    if (code === 0x1b && i + 1 < len && str.charCodeAt(i + 1) === 0x5d) {
+      i += 2;
+      while (i < len) {
+        if (str.charCodeAt(i) === 0x07) { i++; break; }
+        if (str.charCodeAt(i) === 0x1b && i + 1 < len && str.charCodeAt(i + 1) === 0x5c) { i += 2; break; }
+        i++;
+      }
+      continue;
+    }
+    // Other ESC sequences (e.g. \x1b= ): ESC + one byte
+    if (code === 0x1b) {
+      i += 2;
+      continue;
+    }
+    // Normal visible character
+    visible++;
+    i++;
+  }
+  return str.slice(0, i);
+}
+
+/**
  * Client-side mirror of the Rust `command_rules::command_needs_confirmation`.
  * Checks if a command matches any blacklist regex (and isn't exempted by
  * whitelist). Used in show_in_gui mode to show a React dialog instead of the
@@ -264,6 +312,15 @@ export default function App() {
   };
   const getTerminal = (sid?: string): Terminal | undefined =>
     sid ? terminalRegistryRef.current.get(sid) : undefined;
+  /** Clear the reconnectSnapshot from a tab after TerminalPanel has consumed
+   *  it, so it doesn't get written again on a later remount. */
+  const clearReconnectSnapshot = (tabId: string) => {
+    setTabs((prev) =>
+      prev.map((t) =>
+        t.id === tabId ? { ...t, reconnectSnapshot: undefined } : t
+      )
+    );
+  };
   // Preset scope when opening the quick-commands panel: null = global,
   // a connection id = that server's per-server scope. Set by the entry point
   // (Sidebar global button → null, CommandBar "管理" → current connection).
@@ -414,9 +471,14 @@ export default function App() {
         const command = event.payload.command;
         const timeoutMs = (event.payload.timeout || 30) * 1000;
 
-        // Find or open a terminal tab for this connection (terminal type).
-        const existing = tabsRef.current.find(
-          (t) => t.connectionId === connection_id && t.type === "terminal" && t.status === "connected"
+        // Find an existing terminal tab for this connection (regardless of
+        // status). We then branch on the tab's status:
+        //   connected    → run the command immediately (fast path, <1s)
+        //   disconnected → reconnect IN PLACE (reuse the tab, preserve history)
+        //                  then run the command
+        //   absent       → open a fresh tab + connect, then run the command
+        const existingTab = tabsRef.current.find(
+          (t) => t.connectionId === connection_id && t.type === "terminal"
         );
 
         const runExec = async (sessionId: string) => {
@@ -457,47 +519,43 @@ export default function App() {
           let outputBuf = "";
           let done = false;
           let timedOut = false;
+          // Track the last time we received ANY data. Used by the idle-timeout
+          // fallback below — if output stops arriving for a while after the
+          // sentinel *command echo* has been seen, we conclude the command has
+          // finished even if the sentinel *result line* never reached us (it
+          // can get stuck behind PTY/SSH buffering on large outputs).
+          let lastDataAt = Date.now();
+          let sawSentinelEcho = false;
 
-          const unlistenOutput = await onSshOutput(sessionId, (data) => {
-            if (done) return;
-            // Decode bytes to string (terminal output is UTF-8 / ASCII).
-            outputBuf += new TextDecoder("utf-8", { fatal: false }).decode(data);
-
-            // The PTY echoes everything we send. The output stream looks like:
-            //   <command text echoed back>          ← strip (line 1, may wrap)
-            //   <command's actual stdout/stderr>     ← KEEP
-            //   echo __MCP_DONE_xxx__:$?  echoed     ← strip
-            //   __MCP_DONE_xxx__:0                   ← sentinel + exit code
-            //
-            // We detect the sentinel line via regex, then extract the output
-            // between the command echo and the sentinel echo.
-
-            // Check for the sentinel result line: sentinel:N
+          // Helper: finalize output extraction. Shared by the sentinel-match
+          // path and the idle-timeout fallback so both produce identical
+          // stdout cleaning. exitCode is null in the fallback case (unknown).
+          const finalizeOutput = (exitCode: number | null) => {
+            done = true;
+            unlistenOutput();
+            let stdout = outputBuf;
+            // If the sentinel result line is present, truncate at it.
             const sentinelRe = new RegExp(
               sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ":(\\d+)"
             );
-            const match = outputBuf.match(sentinelRe);
-            if (!match) return;
-            done = true;
-            const exitCode = parseInt(match[1], 10);
+            const sentinelMatch = stdout.match(sentinelRe);
+            if (sentinelMatch && sentinelMatch.index !== undefined) {
+              stdout = stdout.slice(0, sentinelMatch.index);
+            }
 
-	            // The sentinel match gives us the end boundary. Everything before
-	            // it is: [prompt+command echo] [real stdout] [prompt]
-	            let stdout = outputBuf.slice(0, match.index);
-	
-	            // Normalize CRLF → LF early so all subsequent slicing is uniform.
-	            stdout = stdout.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-	
-	            // Drop a trailing prompt line if one remains after stripping the
-	            // sentinel echo (interactive shells print a fresh `[user@host ~]$ `
-	            // before we send the sentinel). A prompt line ends with `$` or `#`
-	            // and contains no real output. Trim trailing empty lines first.
-	            stdout = stdout.replace(/\n+$/, "");
-	            const lastNl = stdout.lastIndexOf("\n");
-	            const lastLine = stdout.slice(lastNl + 1);
-	            if (lastLine && /[#$]\s*$/.test(lastLine)) {
-	              stdout = stdout.slice(0, lastNl);
-	            }
+            // Normalize CRLF → LF early so all subsequent slicing is uniform.
+            stdout = stdout.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+            // Drop a trailing prompt line if one remains after stripping the
+            // sentinel echo (interactive shells print a fresh `[user@host ~]$ `
+            // before we send the sentinel). A prompt line ends with `$` or `#`
+            // and contains no real output. Trim trailing empty lines first.
+            stdout = stdout.replace(/\n+$/, "");
+            const lastNl = stdout.lastIndexOf("\n");
+            const lastLine = stdout.slice(lastNl + 1);
+            if (lastLine && /[#$]\s*$/.test(lastLine)) {
+              stdout = stdout.slice(0, lastNl);
+            }
 
             // Strip the command echo at the beginning. The PTY echoes the
             // command text we sent (`command + "\n"`), possibly prefixed by a
@@ -527,40 +585,142 @@ export default function App() {
             // the real stdout is strictly between the command echo and the
             // sentinel command echo.
             //
-            // First strip ANSI escapes so the regex isn't confused by a
-            // leading OSC title (\x1b]0;...\x07) or color codes on the line.
-            const ansiCleaned = stdout.replace(/\x1b\][0-9];.*?\x07/g, "").replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+            // CRITICAL: we use an ANSI-stripped COPY only to LOCATE the
+            // helper line, then truncate the ORIGINAL stdout (which still has
+            // color codes) via stripFromAnsiPosition. The old code replaced
+            // stdout with the ANSI-stripped copy, which discarded all colors —
+            // the root cause of "AI output has no color" complaints.
+            //
+            // The OSC regex is upgraded from [0-9]; (single digit) to \d+;
+            // to handle multi-digit OSC params (e.g. OSC 133 shell-integration
+            // sequences if they appear).
+            const ansiCleaned = stdout
+              .replace(/\x1b\]\d+;.*?(?:\x07|\x1b\\)/g, "")
+              .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
             const helperIdx = ansiCleaned.search(/echo __MCP_DONE_/);
             if (helperIdx >= 0) {
               // Truncate at the start of the line containing the sentinel
               // command echo, so we don't leave a dangling prompt prefix.
               const lineStart = ansiCleaned.lastIndexOf("\n", helperIdx);
-              stdout = ansiCleaned.slice(0, lineStart >= 0 ? lineStart : helperIdx);
-            } else {
-              stdout = ansiCleaned;
+              const cutVisible = lineStart >= 0 ? lineStart : helperIdx;
+              // Map visible-char position back to the ANSI-preserving original.
+              stdout = stripFromAnsiPosition(stdout, cutVisible);
             }
+            // NOTE: we deliberately do NOT strip ANSI from stdout here —
+            // preserving color codes so the AI sees the same colors the user
+            // sees in the terminal (red errors, green success, blue dirs).
             stdout = stdout.replace(/^\n+/, "").replace(/\n+$/, "");
 
-            mcpExecResult(requestId, { ok: true, stdout, exit_code: exitCode });
+            mcpExecResult(requestId, {
+              ok: true,
+              stdout,
+              exit_code: exitCode ?? 0,
+            });
+          };
+
+          const unlistenOutput = await onSshOutput(sessionId, (data) => {
+            if (done) return;
+            lastDataAt = Date.now();
+            // Decode bytes to string (terminal output is UTF-8 / ASCII).
+            outputBuf += new TextDecoder("utf-8", { fatal: false }).decode(data);
+
+            // Cap the buffer at 4MB (aligned with the headless path's MAX
+            // limit). Without this, a chatty command (cat huge.log) can grow
+            // outputBuf unbounded and OOM the renderer. We keep the TAIL
+            // (most recent output) because the sentinel always appears at the
+            // end — truncating the head only loses early stdout, which is
+            // acceptable for pathological output sizes.
+            const MAX_OUTPUT = 4 * 1024 * 1024;
+            if (outputBuf.length > MAX_OUTPUT) {
+              outputBuf = outputBuf.slice(-MAX_OUTPUT);
+            }
+
+            // Detect the sentinel *command echo* (`echo __MCP_DONE_xxx__:$?`).
+            // Once seen, we know the command has been submitted and the result
+            // line should follow shortly. This arms the idle-timeout fallback.
+            if (!sawSentinelEcho && outputBuf.includes(`echo ${sentinel}`)) {
+              sawSentinelEcho = true;
+            }
+
+            // The PTY echoes everything we send. The output stream looks like:
+            //   <command text echoed back>          ← strip (line 1, may wrap)
+            //   <command's actual stdout/stderr>     ← KEEP
+            //   echo __MCP_DONE_xxx__:$?  echoed     ← strip
+            //   __MCP_DONE_xxx__:0                   ← sentinel + exit code
+            //
+            // We detect the sentinel line via regex, then extract the output
+            // between the command echo and the sentinel echo.
+
+            // Check for the sentinel result line: sentinel:N
+            // Scan the TAIL (last 16KB) — the sentinel is always near the end,
+            // but on large/chatty outputs the tail batch can exceed the old
+            // 2KB window (prompt + ANSI codes + buffered chunks). 16KB covers
+            // realistic worst cases without measurable cost vs 2KB.
+            const sentinelRe = new RegExp(
+              sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ":(\\d+)"
+            );
+            const tailSearch = outputBuf.slice(-16 * 1024);
+            const tailMatch = tailSearch.match(sentinelRe);
+            if (!tailMatch) return;
+            // Map the tail match back to a full-buffer index.
+            const matchIndex = outputBuf.length - tailSearch.length + (tailMatch.index ?? 0);
+            const exitCode = parseInt(tailMatch[1], 10);
+            // Truncate the buffer at the sentinel so finalizeOutput's
+            // sentinel-truncation logic fires cleanly.
+            outputBuf = outputBuf.slice(0, matchIndex);
+            finalizeOutput(exitCode);
           });
 
-	          // Now that the listener is attached, send the command + sentinel.
-	          // Send user's command first (visible in terminal), then one
-	          // sentinel line to capture the exit code. The sentinel line
-	          // (`echo __MCP_DONE_...`) IS visible in the terminal, but
-	          // TerminalPanel's render-layer filter strips any line containing
-	          // `__MCP_DONE_` before writing to xterm, so the user never sees
-	          // it. We do NOT use `stty -echo` tricks — echo timing is
-	          // unreliable across shells/PTYs.
-	          await sshSend(sessionId, command + "\n");
-	          await new Promise((r) => setTimeout(r, 80));
-	          await sshSend(sessionId, `echo ${sentinel}:$?\n`);
+          // Now that the listener is attached, send the command + sentinel.
+          // Send user's command first (visible in terminal), then one
+          // sentinel line to capture the exit code. The sentinel line
+          // (`echo __MCP_DONE_...`) IS visible in the terminal, but
+          // TerminalPanel's render-layer filter strips any line containing
+          // `__MCP_DONE_` before writing to xterm, so the user never sees
+          // it. We do NOT use `stty -echo` tricks — echo timing is
+          // unreliable across shells/PTYs.
+          await sshSend(sessionId, command + "\n");
+          await new Promise((r) => setTimeout(r, 80));
+          await sshSend(sessionId, `echo ${sentinel}:$?\n`);
 
-          // Timeout safety: if the sentinel never appears (interactive command,
-          // hang, etc.), return what we have + error.
+          // ── Three-tier completion strategy ──────────────────────────────
+          // Tier 1 (happy path): sentinel result line `__MCP_DONE_xxx__:N`
+          //   arrives → finalizeOutput with the real exit code. Handled in the
+          //   onSshOutput callback above.
+          //
+          // Tier 2 (idle fallback): the sentinel COMMAND echo
+          //   (`echo __MCP_DONE_xxx__:$?`) has been seen, the command itself
+          //   must have finished — but the sentinel RESULT line is stuck
+          //   behind PTY/SSH buffering on large outputs. If no new data
+          //   arrives for IDLE_TIMEOUT_MS, conclude the command is done and
+          //   return what we have (exit code unknown → 0). This is what fixes
+          //   the `docker logs --tail 30` 30s-timeout bug: the command had
+          //   long finished, but the sentinel result never arrived in time.
+          //
+          // Tier 3 (hard timeout): the user-supplied `timeout` elapses with
+          //   continued chatty output (tail -f, interactive command, hang).
+          //   Return an error + partial stdout.
+          const IDLE_TIMEOUT_MS = 5000;
+          const idleCheck = setInterval(() => {
+            if (done || timedOut) {
+              clearInterval(idleCheck);
+              return;
+            }
+            // Only fire the idle fallback AFTER we've seen the sentinel
+            // command echo — otherwise we'd prematurely cut off a command
+            // that's still producing output (slow `find /`, etc.).
+            if (sawSentinelEcho && Date.now() - lastDataAt >= IDLE_TIMEOUT_MS) {
+              clearInterval(idleCheck);
+              finalizeOutput(null);
+            }
+          }, 1000);
+
+          // Hard timeout: if the command genuinely hangs (e.g. waiting for
+          // stdin), return an error + partial stdout.
           setTimeout(() => {
             if (!done && !timedOut) {
               timedOut = true;
+              clearInterval(idleCheck);
               unlistenOutput();
               mcpExecResult(requestId, {
                 ok: false,
@@ -580,23 +740,61 @@ export default function App() {
           }, 500);
         };
 
-        if (existing && existing.sessionId) {
-          // Tab already open and connected — use it directly.
-          setActiveTabId(existing.id);
-          runExec(existing.sessionId).catch((e) => {
+        if (existingTab && existingTab.status === "connected" && existingTab.sessionId) {
+          // ── Fast path: tab already connected — run immediately. ──
+          setActiveTabId(existingTab.id);
+          runExec(existingTab.sessionId).catch((e) => {
             mcpExecResult(requestId, { ok: false, error: `执行失败: ${e}` });
           });
+        } else if (existingTab && (existingTab.status === "disconnected" || existingTab.status === "error")) {
+          // ── Reconnect path: session timed out / died. Reconnect IN PLACE
+          //    (reuse the same tab, preserve terminal history via snapshot)
+          //    then run the command. This avoids opening a duplicate tab on
+          //    every ssh_exec after a server-side TMOUT disconnect. ──
+          setActiveTabId(existingTab.id);
+          reconnectOne(existingTab.id).then(async (ok) => {
+            if (!ok) {
+              mcpExecResult(requestId, {
+                ok: false,
+                error: `会话已断开且重连失败：${existingTab.errorMessage || "请检查网络和保险库是否解锁"}`,
+              });
+              return;
+            }
+            // reconnectOne updated the tab's sessionId; read the fresh value.
+            const reconnected = tabsRef.current.find(
+              (t) => t.id === existingTab.id && t.status === "connected" && t.sessionId
+            );
+            if (reconnected?.sessionId) {
+              runExec(reconnected.sessionId).catch((e) => {
+                mcpExecResult(requestId, { ok: false, error: `执行失败: ${e}` });
+              });
+            } else {
+              mcpExecResult(requestId, { ok: false, error: "重连后未找到会话" });
+            }
+          });
         } else {
-          // Need to open a new tab. handleConnect is async (establishes SSH),
-          // but we don't get the sessionId back easily — we need to watch for
-          // the new tab to appear with status "connected", then extract its
-          // sessionId.
+          // ── Fresh tab path: no tab exists yet. Open one + connect. ──
           handleConnect(config);
           // Watch tabs state for the new connected tab.
           let attempts = 0;
           const maxAttempts = Math.floor(timeoutMs / 500);
           const checkInterval = setInterval(() => {
             attempts++;
+            // Check for error state FIRST — if handleConnect failed (e.g.
+            // vault locked, auth refused), the tab flips to "error" almost
+            // immediately. Without this check we'd poll uselessly until the
+            // full timeout, wasting ~30s before reporting.
+            const errTab = tabsRef.current.find(
+              (t) => t.connectionId === connection_id && t.type === "terminal" && t.status === "error"
+            );
+            if (errTab) {
+              clearInterval(checkInterval);
+              mcpExecResult(requestId, {
+                ok: false,
+                error: `连接失败：${errTab.errorMessage || "请检查保险库是否已解锁"}`,
+              });
+              return;
+            }
             const tab = tabsRef.current.find(
               (t) => t.connectionId === connection_id && t.type === "terminal" && t.status === "connected" && t.sessionId
             );
@@ -768,10 +966,15 @@ export default function App() {
     const connType = config.conn_type ?? "ssh";
     const display = connType === "local" ? config.name : `${config.username}@${config.host}`;
 
-    // Create a temporary tab with "connecting" status
-    const tempTabId = `temp-${Date.now()}`;
-    const tempTab: Tab = {
-      id: tempTabId,
+    // The tab id is a STABLE identifier created once here. It never changes
+    // across reconnects — only `sessionId` changes when the underlying SSH
+    // connection is rebuilt. This keeps the React key (and thus the xterm
+    // instance) stable across reconnects, preserving terminal scrollback
+    // history. The temp- prefix is kept for clarity during the connecting
+    // phase; the id itself stays the same after connect succeeds.
+    const newTabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const newTab: Tab = {
+      id: newTabId,
       name: display,
       type: connType === "ftp" ? "ftp" : connType === "sftp" ? "sftp" : "terminal",
       connType,
@@ -780,75 +983,60 @@ export default function App() {
       config: config,
     };
 
-    setTabs((prev) => [...prev, tempTab]);
-    setActiveTabId(tempTabId);
+    setTabs((prev) => [...prev, newTab]);
+    setActiveTabId(newTabId);
 
     try {
       if (connType === "ftp") {
         const ftpId = await ftpConnect(config);
         setTabs((prev) =>
           prev.map((t) =>
-            t.id === tempTabId
+            t.id === newTabId
               ? {
-                  id: ftpId,
-                  name: display,
+                  ...t,
                   sessionId: ftpId,
-                  type: "ftp",
-                  connType: "ftp",
                   ftpSessionId: ftpId,
-                  connectionId: config.id,
                   status: "connected",
-                  config: config,
+                  errorMessage: undefined,
                 }
               : t
           )
         );
-        setActiveTabId(ftpId);
       } else if (connType === "local") {
         const sessionId = await localConnect(config);
         setTabs((prev) =>
           prev.map((t) =>
-            t.id === tempTabId
+            t.id === newTabId
               ? {
-                  id: sessionId,
-                  name: display,
+                  ...t,
                   sessionId,
-                  type: "terminal",
-                  connType: "local",
-                  connectionId: config.id,
                   status: "connected",
-                  config: config,
+                  errorMessage: undefined,
                 }
               : t
           )
         );
-        setActiveTabId(sessionId);
       } else {
         const sessionId = await sshConnect(config);
         setTabs((prev) =>
           prev.map((t) =>
-            t.id === tempTabId
+            t.id === newTabId
               ? {
-                  id: sessionId,
-                  name: display,
+                  ...t,
                   sessionId,
-                  type: connType === "sftp" ? "sftp" : "terminal",
-                  connType,
-                  connectionId: config.id,
                   status: "connected",
-                  config: config,
+                  errorMessage: undefined,
                 }
               : t
           )
         );
-        setActiveTabId(sessionId);
       }
     } catch (e) {
       const errorMessage = String(e);
       // Update tab to show error state
       setTabs((prev) =>
         prev.map((t) =>
-          t.id === tempTabId
+          t.id === newTabId
             ? {
                 ...t,
                 status: "error",
@@ -867,6 +1055,58 @@ export default function App() {
     const tab = tabs.find((t) => t.id === tabId);
     if (!tab || !tab.config) return false;
 
+    // Capture the old terminal's text buffer before tearing it down, so the
+    // new xterm instance can restore scrollback history after reconnect. We
+    // read it via the terminal registry (onTerminalReady registered the
+    // xterm instance by its old sessionId). Only terminal tabs have a
+    // captured xterm; SFTP/FTP tabs skip this.
+    let snapshot: string | undefined;
+    if (tab.type === "terminal" && tab.sessionId) {
+      const oldTerm = terminalRegistryRef.current.get(tab.sessionId);
+      if (oldTerm) {
+        try {
+          const buf = oldTerm.buffer.active;
+          const lines: string[] = [];
+          for (let i = 0; i < buf.length; i++) {
+            const line = buf.getLine(i);
+            if (line) lines.push(line.translateToString(true));
+          }
+          // Limit to last 5000 lines to avoid pathological memory use.
+          snapshot = lines.slice(-5000).join("\r\n");
+        } catch {
+          // Buffer read failed — proceed without snapshot.
+        }
+      }
+    }
+
+    // Disconnect the old session first (best-effort — it may already be dead).
+    // We do NOT change the tab id: it stays stable so the React key (and the
+    // xterm instance) is preserved across reconnects. Only `sessionId` is
+    // replaced. TerminalPanel detects the sessionId change and rebinds its
+    // output/close subscriptions WITHOUT destroying the xterm terminal.
+    if (tab.sessionId) {
+      try {
+        if (tab.connType === "ftp" && tab.ftpSessionId) {
+          await ftpDisconnect(tab.ftpSessionId);
+        } else if (tab.connType === "local") {
+          await localDisconnect(tab.sessionId);
+        } else {
+          await sshDisconnect(tab.sessionId);
+        }
+      } catch {
+        // Best-effort: the old session may already be gone. Ignore.
+      }
+    }
+
+    // Stash the snapshot on the tab so the new TerminalPanel can restore it.
+    if (snapshot) {
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.id === tabId ? { ...t, reconnectSnapshot: snapshot } : t
+        )
+      );
+    }
+
     // Update status to connecting
     setTabs((prev) =>
       prev.map((t) =>
@@ -879,17 +1119,14 @@ export default function App() {
     try {
       const config = tab.config;
       const connType = config.conn_type ?? "ssh";
-      let newId = tabId;
 
       if (connType === "ftp") {
         const ftpId = await ftpConnect(config);
-        newId = ftpId;
         setTabs((prev) =>
           prev.map((t) =>
             t.id === tabId
               ? {
                   ...t,
-                  id: ftpId,
                   sessionId: ftpId,
                   ftpSessionId: ftpId,
                   status: "connected",
@@ -898,16 +1135,13 @@ export default function App() {
               : t
           )
         );
-        setActiveTabId(ftpId);
       } else if (connType === "local") {
         const sessionId = await localConnect(config);
-        newId = sessionId;
         setTabs((prev) =>
           prev.map((t) =>
             t.id === tabId
               ? {
                   ...t,
-                  id: sessionId,
                   sessionId,
                   status: "connected",
                   errorMessage: undefined,
@@ -915,16 +1149,13 @@ export default function App() {
               : t
           )
         );
-        setActiveTabId(sessionId);
       } else {
         const sessionId = await sshConnect(config);
-        newId = sessionId;
         setTabs((prev) =>
           prev.map((t) =>
             t.id === tabId
               ? {
                   ...t,
-                  id: sessionId,
                   sessionId,
                   status: "connected",
                   errorMessage: undefined,
@@ -932,22 +1163,9 @@ export default function App() {
               : t
           )
         );
-        setActiveTabId(sessionId);
       }
-      // A reconnect mints a fresh session id, so the tab's id changes. The
-      // broadcast group stores tab IDs — if we don't migrate, the old id stays
-      // in broadcastIds while no tab carries it anymore, so the reconnecting
-      // tab silently drops out of the group (and stops receiving broadcast
-      // keystrokes). Swap the old id for the new one to keep membership.
-      if (newId !== tabId) {
-        setBroadcastIds((prev) => {
-          if (!prev.has(tabId)) return prev;
-          const next = new Set(prev);
-          next.delete(tabId);
-          next.add(newId);
-          return next;
-        });
-      }
+      // No broadcast-group id migration needed anymore: tab.id is stable now,
+      // so it never falls out of broadcastIds on reconnect.
       return true;
     } catch (e) {
       const errorMessage = String(e);
@@ -1164,6 +1382,7 @@ export default function App() {
                     <ConnectingState />
                   ) : tab.type === "terminal" ? (
                     <TerminalPanel
+                      tabId={tab.id}
                       sessionId={tab.sessionId!}
                       connectionId={tab.connectionId || ""}
                       connType={tab.connType}
@@ -1177,6 +1396,8 @@ export default function App() {
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}
                       connectionName={tab.name}
+                      reconnectSnapshot={tab.reconnectSnapshot}
+                      onSnapshotConsumed={() => clearReconnectSnapshot(tab.id)}
                       onOpenQuickCommandsManage={() => {
                         setQcInitialConnectionId(tab.connectionId || null);
                         setShowQuickCommands(true);
@@ -1206,6 +1427,7 @@ export default function App() {
                     />
                   ) : (
                     <TerminalPanel
+                      tabId={tab.id}
                       sessionId={tab.sessionId!}
                       connectionId={tab.connectionId || ""}
                       connType={tab.connType}
@@ -1217,6 +1439,8 @@ export default function App() {
                       active={isActive}
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}
+                      reconnectSnapshot={tab.reconnectSnapshot}
+                      onSnapshotConsumed={() => clearReconnectSnapshot(tab.id)}
                       onDisconnected={() => {
                         setTabs((prev) =>
                           prev.map((t) =>

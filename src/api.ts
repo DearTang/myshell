@@ -83,6 +83,11 @@ export interface Tab {
   errorMessage?: string;
   /** Connection config for reconnection */
   config?: ConnectionConfig;
+  /** Terminal text captured from the old xterm instance right before a
+   * reconnect. Written by reconnectOne (reads the old terminal's buffer),
+   * consumed once by TerminalPanel on its next mount to restore scrollback
+   * history. Cleared after consumption. */
+  reconnectSnapshot?: string;
 }
 
 // ============ Connection API ============

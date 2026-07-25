@@ -1172,18 +1172,14 @@ async fn exec_in_gui_tab(
     // Ensure the GUI is running (auto-start if needed).
     let port = ensure_gui_running()?;
 
-    // 先确保有一个已连接的标签页：发送 open_connection 让 GUI 打开并连接
-    // 这样后续的 exec_in_tab 就能直接找到已连接的 session，避免在 exec_in_tab 里等待 SSH 握手
-    log(&format!("[exec_in_gui_tab] 确保标签页已连接: {}", conn_name));
-    // focus_existing=true：若 GUI 已有该连接的 terminal tab，复用它而非每次开新 tab。
-    // 否则连续执行多次 ssh_exec 会不停打开重复标签页。
-    let opened = send_gui_open_command(port, &conn_id, "terminal", true)?;
-    if !opened {
-        return Err("打开 GUI 标签页失败".to_string());
-    }
-    // 等待 SSH 连接建立（最多 15 秒）
-    log(&format!("[exec_in_gui_tab] 等待 SSH 连接建立..."));
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // 直接发送 exec_in_tab。前端的 handler 自己会处理三种情况：
+    //   1. 该连接已有 connected 的 terminal tab → 直接复用（秒级）
+    //   2. 该连接有 tab 但 status 是 disconnected/error → 原地重连（复用同 tab）
+    //   3. 没有 tab → 开新 tab + 连接
+    // 所以这里不再提前 open_connection，也不 sleep —— 那两个操作在会话已存在时
+    // 是纯浪费（旧实现因此每次多耗 5-6 秒），在会话不存在时会和 exec_in_tab
+    // 内部的连接逻辑产生竞态（同服务器被连两次）。
+    log(&format!("[exec_in_gui_tab] exec_in_tab: {} (timeout={}s)", conn_name, timeout));
 
     // Send the exec_in_tab command and read the response.
     use std::io::{BufRead, BufReader, Write};

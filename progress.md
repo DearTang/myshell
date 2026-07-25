@@ -1879,3 +1879,94 @@
 | 什么可能导致偏离？ | dedupe 用 `===` 比较 offer 对象引用，依赖 zmodem.js 事件与 start() 返回同一 `_current_transfer` 实例（已核对源码 zsession.js:668-675 成立）。`strip_zmodem_autostart_noise` 只剥尾部 `rz`，若未来 lrzsz 改打印别的触发串需扩展。 |
 | 下一步最小可验证动作？ | 远程 `sz ./*`（3+ 文件）跑一轮，观察启动瞬间终端不再出现裸 `rz` 行。 |
 | 目标是什么？ | sz/rz 多文件批量传输稳定，无中途挂起、无收尾卡死、无启动噪音。 |
+
+### 阶段 75：MCP ssh_exec 会话复用 + 原地重连 + 输出加固（2026-07-24）
+
+- **问题 1（慢）：MCP ssh_exec 每次无脑 open_connection + 固定 sleep(5s)。**
+  - 根因：`myshell-mcp.rs::exec_in_gui_tab` 在发 exec_in_tab 之前先发 open_connection 让 GUI 开标签页，然后死等 5 秒握手。但前端的 exec_in_tab handler 自己就会处理"找不到 connected tab 就开/连"——这 5 秒 + open_connection 在会话已存在时是纯浪费，还和 exec_in_tab 内部的连接逻辑产生竞态。
+  - 修复：砍掉 `send_gui_open_command` + `tokio::time::sleep(5s)`，直接发 exec_in_tab。会话已存在时从 5-6s 降到 <1s。
+
+- **问题 2（竞态）：open_connection 和 exec_in_tab 各触发一次 SSH 连接。**
+  - 根因：open_connection 的 focus_existing 只查 status===connected 的 tab；5 秒后 SSH 还在 connecting → exec_in_tab 查不到 connected → 又触发一次 handleConnect → 同服务器连两次、开两个 tab。
+  - 修复：问题 1 的改动已消除此竞态（不再提前 open_connection）。
+
+- **问题 3（会话超时不重连）：服务器 TMOUT 踢断后，MCP 发命令开新 tab，旧的残留。**
+  - 根因：exec_in_tab 只查 status==="connected"，找不到就开新 tab；已有的 disconnected tab 残留不清理。
+  - 修复：exec_in_tab 改为三态查找——①connected 直接执行 ②disconnected/error 原地重连（复用 reconnectOne，不开新 tab）③不存在才开新 tab。
+
+- **问题 3b（重连丢终端历史）：原 reconnectOne 改 tab.id（=sessionId），React key 变 → xterm 销毁重建 → 历史丢失。**
+  - 根因：tab.id === sessionId，重连生成新 sessionId → tab.id 变 → key 变 → 组件树重建。
+  - 修复：解耦 tab.id 与 sessionId——handleConnect 用独立生成的稳定 tabId（`tab-{ts}-{rand}`），不再等于 sessionId；reconnectOne 只更新 tab.sessionId 不改 tab.id。重连前从 terminalRegistry 读旧 xterm buffer（≤5000 行）存到 tab.reconnectSnapshot；新 TerminalPanel mount 时写回 + 打一行"[—— 以上为重连前历史 ——]"分隔符。
+
+- **问题 4（颜色丢失）：MCP 命令输出没有颜色，和终端看到的不一致。**
+  - 根因：`App.tsx` runExec 用 ANSI 剥离版（ansiCleaned）定位 sentinel helper 行后，直接用它覆盖了 stdout——所有颜色码丢失。本意只是定位，顺手覆盖是 bug。
+  - 修复：新增 `stripFromAnsiPosition` 辅助函数——用 ansiCleaned 定位 helper 行的可见字符位置，然后映射回带 ANSI 的原始 stdout 做截断。AI 现在能拿到带颜色的输出（和用户终端一致）。
+
+- **问题 5（输出炸弹）：大输出时 outputBuf 无上限 + 全文正则 = O(n²)，浏览器卡死。**
+  - 根因：`outputBuf += decode(data)` 无上限累积；每收到一块数据做一次 `outputBuf.match(sentinelRe)` 全文扫描。
+  - 修复：①outputBuf 加 4MB 上限（对齐 headless 路径），超限时保留尾部；②sentinel 匹配只扫尾部 2KB（sentinel 总在最后），匹配后映射回全缓冲 index。
+
+- **问题 6（保险库锁定静默超时）：保险库锁定时 MCP 命令等 30 秒才报错。**
+  - 根因：exec_in_tab 的 fresh-tab 轮询只查 status==="connected"，handleConnect 失败设 status="error" 但轮询不检测 error。
+  - 修复：轮询里先查 status==="error" 的 tab，命中立刻报错（含 errorMessage，通常提示"请检查保险库是否解锁"），不再等 30s。
+
+- **涉及文件（4 个，Rust 零改动）：**
+  - `src-tauri/src/bin/myshell-mcp.rs`：exec_in_gui_tab 砍 open_connection + sleep
+  - `src/App.tsx`：handleConnect/reconnectOne 解耦 tab.id + 快照；exec_in_tab 三态查找 + error 快速失败；颜色修复 + outputBuf 上限 + 尾部正则；新增 stripFromAnsiPosition
+  - `src/api.ts`：Tab 接口加 reconnectSnapshot 字段
+  - `src/components/TerminalPanel.tsx`：新增 tabId/reconnectSnapshot/onSnapshotConsumed props，mount 时恢复快照
+
+- **验证：** npx tsc --noEmit 通过；cargo check（含 --bin myshell-mcp）通过（仅遗留 dead_code 警告）。
+
+## 五问重启检查（阶段 75）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 75 complete —— MCP ssh_exec 六个问题（慢/竞态/不重连/颜色/炸弹/静默超时）全部修复，TS/Rust 编译均通过。 |
+| 我要去哪里？ | 实测验证 7 个场景：①会话已存在连续 3 条命令每条 <1s ②无重复 tab ③TMOUT 超时后原地重连保留历史 ④ls --color 输出有颜色 ⑤seq 1000000 不卡死 ⑥保险库锁定快速报错 ⑦手动重连按钮保留历史。 |
+| 什么可能导致偏离？ | tab.id 与 sessionId 解耦改动面大（handleConnect/reconnectOne/广播/handleCloseTab 全涉及），虽 tsc 通过但运行时可能有遗漏的 id===sessionId 假设；stripFromAnsiPosition 对复杂 ANSI 序列（256色、嵌套 OSC）的边界 case 需实测。 |
+| 下一步最小可验证动作？ | MCP 连发两条命令到同一服务器，第二条应在 1 秒内返回（验证会话复用 + 速度提升）。 |
+| 目标是什么？ | MCP ssh_exec 做到"和用户在终端里敲命令一样的体验"——快、不重复开 tab、超时自动重连保历史、输出有颜色。 |
+
+### 阶段 76：MCP 任务结束后清理 GUI 标签页（已取消，2026-07-24）
+
+- **需求：** MCP 任务完成后关闭本次会话开过的 GUI terminal tab。
+- **结论：方案讨论后取消，不做自动关闭。** 原因：
+  1. MCP 协议（stdio JSON-RPC）**没有"任务完成"信号**——server 只能感知 `tools/call` 来去和 stdin EOF。
+  2. 实现过的两种方案都有硬伤：
+     - **每次 exec 后关 tab**：破坏阶段 75 的会话复用 <1s 优化（每次都要重新握手 5-6s）。
+     - **进程退出时一次性关**：对常驻型 AI client（Claude Desktop / Cursor）几乎不触发——它们跟 MCP server 同生命周期，只有关闭整个 app 才断开 stdin。tab 会一直留到关 app。
+  3. 空闲超时方案（最后一次 exec 后 N 分钟无调用即关）和显式 close_session 工具方案也讨论过，用户决定**都不做**——保持 tab 开着由用户手动管理。
+- **代码状态：** 已撤销全部相关改动，回到阶段 75 的干净状态。功能上不做任何自动关闭。
+- **涉及文件（撤销后无净变化）：** myshell-mcp.rs / main.rs / App.tsx 三个文件的 close_tabs 相关代码全部移除。
+
+## 五问重启检查（阶段 76）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 76 取消 —— 经过方案讨论，决定不做 MCP 自动关 tab，保持阶段 75 的会话复用体验，tab 由用户手动管理。 |
+| 我要去哪里？ | 打包发布 v2.5.0（仅含阶段 75 的六项 ssh_exec 改造）。 |
+| 什么可能导致偏离？ | 无——纯撤销，回到已验证的阶段 75 状态。 |
+| 下一步最小可验证动作？ | git status 确认三个文件回到阶段 75 状态；tsc + cargo check 通过。 |
+| 目标是什么？ | MCP ssh_exec 保持阶段 75 的体验：快、不重复开 tab、超时自动重连保历史、输出有颜色。tab 关闭交给用户。 |
+
+### 阶段 77：修复 MCP 大输出命令误报超时（docker logs 卡 sentinel）（2026-07-25）
+
+- **问题：** 用户报告 MCP ssh_exec 连 nas.ggbond.fun 失败，但实际 SSH 一直正常（test_connection 317ms 成功）。真正故障是 `sudo docker logs katelyatv-katelyatv-1 --tail 30` 这条命令触发 MCP 工具层 30s 超时——mcp.log 里能看到"部分输出"已经拿到了 docker logs 的完整内容（Cron job 日志），但结尾的 sentinel 结果行 `__MCP_DONE_xxx__:0` 30 秒内没被检测到。
+- **根因 1（扫描窗口太小）：** 阶段 75 把 sentinel 扫描窗口从"全缓冲"缩到"尾部 2KB"以避免 O(n²)。但大输出场景下 PTY 流的最后一块 batch 可能远超 2KB（含 ANSI 颜色码 + prompt + 多行 buffered chunks），sentinel 结果行可能被扫不到。
+- **根因 2（死等 sentinel 字面匹配）：** 原逻辑只有一条路径：要么 sentinel 结果行到达，要么硬超时。没有"命令实际已完成"的中间判断。`docker logs` 这种命令，输出全部送达后，sentinel 结果行因 PTY/SSH 流拥塞可能延迟很久才到——但此时命令早已完成，应该立即返回。
+- **修复（三层完成策略）：**
+  - **Tier 1（happy path）：** sentinel 结果行到达 → finalizeOutput(真实 exit code)。逻辑不变。
+  - **Tier 2（idle fallback，新增）：** 监听器检测到 sentinel **命令回显**（`echo __MCP_DONE_xxx__:$?`）后，说明命令已提交，结果应该紧随其后。若此后 **5 秒无新数据**（输出静止），认为命令已完成（sentinel 结果卡在缓冲），立即 finalizeOutput(null)（exit code 未知→按 0 处理）。
+  - **Tier 3（hard timeout）：** 用户 timeout 到期仍有持续输出（hang、interactive、tail -f）→ 报错 + 部分输出。保持原逻辑。
+- **扫描窗口：** 2KB → 16KB，覆盖大输出 + prompt + ANSI 码的现实场景，性能无感。
+- **重构：** 把原本内联的 stdout 提取逻辑（ANSI 清洗、command echo 剥离、helper echo 剥离、prompt 剥离）抽成 `finalizeOutput(exitCode)` 函数，Tier 1 和 Tier 2 共用，保证两条路径输出处理完全一致。
+- **涉及文件（1 个）：** `src/App.tsx`：runExec 新增 lastDataAt/sawSentinelEcho/finalizeOutput；sentinel 扫描窗口 2KB→16KB；新增 idleCheck 5 秒兜底；重构 stdout 提取。
+- **验证：** npx tsc --noEmit 通过。
+
+## 五问重启检查（阶段 77）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 77 complete —— 修复 MCP 大输出命令误报超时（三层完成策略 + 16KB 扫描窗口 + 公共 finalizeOutput），TS 编译通过。 |
+| 我要去哪里？ | 打测试包，实测 docker logs --tail 30 不再超时。 |
+| 什么可能导致偏离？ | idle fallback 5 秒阈值：若网络抖动恰好造成 >5s 静默但命令还在跑（罕见），会提前返回。可接受——比死等 30s 强，且只发生在已看到 sentinel 命令回显之后。 |
+| 下一步最小可验证动作？ | MCP 执行 `sudo docker logs <容器> --tail 30` 这类大输出命令，应在命令实际完成 + 5s 内返回（不再硬等 30s）。 |
+| 目标是什么？ | MCP ssh_exec 大输出命令稳定返回——sentinel 到了用真实 exit code，sentinel 卡了用 idle 兜底，命令 hang 了用硬超时报错。 |

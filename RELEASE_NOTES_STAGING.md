@@ -15,3 +15,10 @@
 ## 待发布条目（打包后清空）
 
 <!-- 上一个版本 v2.4.0 已发布。新的改动完成后在此追加一行：`- <emoji> <一句话描述>` -->
+- 🛠️优化 MCP ssh_exec 会话已存在时从 5-6 秒降至 <1 秒，砍掉冗余的 open_connection + 固定 sleep
+- 🐛修复 MCP 命令的双连接竞态（open_connection 和 exec_in_tab 各触发一次 SSH 连接）
+- ✨新增 会话超时自动原地重连：服务器 TMOUT 踢断后 MCP 发命令不再开新标签页，而是复用同 tab 并保留终端历史
+- 🐛修复 MCP ssh_exec 输出丢失颜色的问题（原来用 ANSI 剥离版覆盖了带色 stdout）
+- 🛠️优化 MCP 大输出处理：outputBuf 加 4MB 上限 + 尾部正则匹配，避免 O(n²) 卡死
+- 🛠️优化 保险库锁定时 MCP 命令快速报错，不再等 30 秒超时
+- 🐛修复 MCP 大输出命令（如 docker logs）误报超时：sentinel 扫描窗口 2KB→16KB，新增"输出静止 5 秒"兜底（命令已完成但 sentinel 结果卡在 PTY 缓冲时不再死等）
