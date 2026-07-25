@@ -2015,3 +2015,25 @@
 | 什么可能导致偏离？ | 30s 超时是硬编码常量，若 AI client 自己的 tool 超时 < 30s（如 Claude Desktop 默认 60s 够用），可能在 MCP 还在等待时被 client 提前取消。可接受——取消后用户解锁，下次调用秒过。 |
 | 下一步最小可验证动作？ | 锁保险库，让 AI 调 list_connections（应秒过）+ ssh_exec（应等待），在 GUI 输主密码后观察 ssh_exec 继续。 |
 | 目标是什么？ | MCP 工具对未解锁状态友好——给用户 30s 反应窗口，不再立即失败；同时不阻塞纯查询工具。 |
+
+### 阶段 80：修复 MCP ssh_exec 长耗时命令导致会话挂起（2026-07-25）
+
+- **问题：** 用户反馈 MCP ssh_exec 通道在长耗时命令（pip install、sleep 60）下挂起，后续命令全部卡死，最终 AI client 杀掉 MCP 重启。
+- **根因（PTY 架构固有限制 + 三个叠加问题）：**
+  1. **PTY 是交互式 shell，命令顺序排队**。阶段 75 的"会话复用"让所有 ssh_exec 共用同一 PTY。前一条命令（pip install）还在跑时，下一条命令的字符被注入同一 PTY，排在 shell 输入缓冲里，要等 pip 结束 shell 才执行。
+  2. **输出重定向让 idle 检测失效**。`pip install > /tmp/log 2>&1` 让 PTY 零输出，阶段 77 的 idle fallback 要求"看到 sentinel 命令回显 + 5s 无新数据"，但 shell 还在跑 pip，sentinel 命令根本没回显，idle 检测条件不满足，死等硬超时。
+  3. **超时后 PTY 命令没被清理（最致命）**。MCP 超时后给 AI 返回错误，但 PTY 里的 pip 还在跑。下一条命令进来复用同一 session，字符注入到还在跑 pip 的 PTY——命令交错，sentinel 崩溃，恶性循环直到 MCP 被杀重启。
+- **修复（A+B 双管齐下）：**
+  - **A. 超时后发 Ctrl+C**：Tier 3 硬超时分支在返回错误前向 PTY 发 `\x03`，打断残留进程，恢复干净 prompt。
+  - **B. 命令互斥锁**：新增 `mcpExecLocksRef: Set<connectionId>`，exec_in_tab 入口检查——同一连接前一条命令没完成时，立即拒绝新命令并返回明确提示（"用 nohup 后台执行 + 轮询日志"）。锁通过 `finishExec` 包装器在所有 11 个出口统一释放。
+- **涉及文件（1 个）：** `src/App.tsx`：mcpExecLocksRef + finishExec 包装器 + 锁检查 + Ctrl+C 发送 + 7 处 mcpExecResult→finishExec 替换。
+- **验证：** npx tsc --noEmit 通过。
+
+## 五问重启检查（阶段 80）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 80 complete —— 修复 MCP ssh_exec 长耗时命令挂起（命令互斥锁 + 超时发 Ctrl+C），TS 编译通过。 |
+| 我要去哪里？ | 打 v2.5.3 发布，实测：AI 连发两条命令到同一服务器，第二条应立即被拒（锁）；长命令超时后 PTY 应被 Ctrl+C 清干净。 |
+| 什么可能导致偏离？ | 互斥锁改变了 AI 调用模式——AI 必须学会用 nohup 跑长任务。短期内 AI 可能反复试 ssh_exec 然后被拒，需要工具描述引导（本次未改 description，留待后续）。 |
+| 下一步最小可验证动作？ | MCP 连发 `sleep 30; echo done`（timeout=5，应超时发 Ctrl+C）然后立刻发 `whoami`（应成功，证明 PTY 已清干净）。 |
+| 目标是什么？ | MCP ssh_exec 在 AI 滥用（连发、长命令）下不再挂死——锁防止交错，Ctrl+C 防止残留。 |

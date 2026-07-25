@@ -249,6 +249,17 @@ export default function App() {
   // that close over a stale `tabs` value. Updated on every render.
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
+  // ── MCP exec mutex lock ──
+  // Per-connection command lock. An interactive PTY processes commands
+  // sequentially — if a long-running command (pip install, sleep, etc.) is
+  // still running, injecting the next command's bytes into the same PTY
+  // corrupts both commands (the bytes queue behind the running process,
+  // sentinels get crossed, and the session eventually hangs). This set
+  // tracks which connection_ids currently have an MCP exec in flight; a
+  // second exec for the same connection is rejected until the first one
+  // completes (sentinel, idle-timeout, or hard-timeout) or the user is
+  // told to use `nohup ... &` for long tasks.
+  const mcpExecLocksRef = useRef<Set<string>>(new Set());
   // ── MCP exec_in_tab command confirmation ──
   // When show_in_gui=true and a command needs confirmation, we show a
   // ConfirmDialog. A Promise resolver stored in a ref connects the async
@@ -471,6 +482,35 @@ export default function App() {
         const command = event.payload.command;
         const timeoutMs = (event.payload.timeout || 30) * 1000;
 
+        // ── Command mutex lock ──
+        // The interactive PTY executes commands sequentially. If a previous
+        // command is still running (long task, pip install, sleep, etc.),
+        // injecting this command's bytes into the same PTY corrupts both.
+        // Reject the second command and tell the AI to use nohup for long
+        // tasks. This is the root-cause fix for the "session hangs after a
+        // long command" issue — without it, overlapping commands cross their
+        // sentinels and the session becomes unusable.
+        if (mcpExecLocksRef.current.has(connection_id)) {
+          mcpExecResult(requestId, {
+            ok: false,
+            error:
+              "上一条命令仍在该服务器的终端中执行。交互式终端一次只能跑一条命令。" +
+              "如需运行耗时命令，请用 nohup 后台执行（如 `nohup pip install -e . > /tmp/log 2>&1 &`），" +
+              "然后轮询日志文件查看结果。",
+          });
+          return;
+        }
+        mcpExecLocksRef.current.add(connection_id);
+
+        // Release the per-connection exec lock. Called on EVERY completion
+        // path (success, idle-fallback, hard-timeout, connection error,
+        // user-cancel) so the next exec can proceed. Wrapping mcpExecResult
+        // here guarantees we never forget to release on a new exit path.
+        const finishExec = (result: { ok: boolean; stdout?: string; exit_code?: number; error?: string }) => {
+          mcpExecLocksRef.current.delete(connection_id);
+          mcpExecResult(requestId, result);
+        };
+
         // Find an existing terminal tab for this connection (regardless of
         // status). We then branch on the tab's status:
         //   connected    → run the command immediately (fast path, <1s)
@@ -495,7 +535,7 @@ export default function App() {
               const connectionName = config.name || connection_id;
               const confirmed = await showMcpConfirm(command, connectionName, rules);
               if (!confirmed) {
-                mcpExecResult(requestId, {
+                finishExec({
                   ok: false,
                   error: "❌ 用户取消了高危操作：ssh_exec",
                 });
@@ -611,7 +651,7 @@ export default function App() {
             // sees in the terminal (red errors, green success, blue dirs).
             stdout = stdout.replace(/^\n+/, "").replace(/\n+$/, "");
 
-            mcpExecResult(requestId, {
+            finishExec({
               ok: true,
               stdout,
               exit_code: exitCode ?? 0,
@@ -716,15 +756,25 @@ export default function App() {
           }, 1000);
 
           // Hard timeout: if the command genuinely hangs (e.g. waiting for
-          // stdin), return an error + partial stdout.
+          // stdin, or a long task the AI didn't background), return an error
+          // + partial stdout. CRITICAL: send Ctrl+C (\x03) to the PTY
+          // afterward so the running process is interrupted and the prompt
+          // returns — otherwise the next exec on this session inherits a
+          // still-running command and the session hangs. The bytes are sent
+          // BEFORE we report the timeout so the interrupt takes effect even
+          // as we return.
           setTimeout(() => {
             if (!done && !timedOut) {
               timedOut = true;
               clearInterval(idleCheck);
               unlistenOutput();
-              mcpExecResult(requestId, {
+              // Interrupt any still-running process in the PTY so the session
+              // is left in a clean prompt state. Best-effort: ignore errors
+              // (the session may already be gone).
+              sshSend(sessionId, "\x03").catch(() => {});
+              finishExec({
                 ok: false,
-                error: `命令超时（${event.payload.timeout || 30}秒未完成）`,
+                error: `命令超时（${event.payload.timeout || 30}秒未完成）。已自动发送 Ctrl+C 中断残留进程；如需长时间运行的命令，请用 nohup 后台执行并轮询日志。`,
                 stdout: outputBuf,
               });
             }
@@ -744,7 +794,7 @@ export default function App() {
           // ── Fast path: tab already connected — run immediately. ──
           setActiveTabId(existingTab.id);
           runExec(existingTab.sessionId).catch((e) => {
-            mcpExecResult(requestId, { ok: false, error: `执行失败: ${e}` });
+            finishExec({ ok: false, error: `执行失败: ${e}` });
           });
         } else if (existingTab && (existingTab.status === "disconnected" || existingTab.status === "error")) {
           // ── Reconnect path: session timed out / died. Reconnect IN PLACE
@@ -754,7 +804,7 @@ export default function App() {
           setActiveTabId(existingTab.id);
           reconnectOne(existingTab.id).then(async (ok) => {
             if (!ok) {
-              mcpExecResult(requestId, {
+              finishExec({
                 ok: false,
                 error: `会话已断开且重连失败：${existingTab.errorMessage || "请检查网络和保险库是否解锁"}`,
               });
@@ -766,10 +816,10 @@ export default function App() {
             );
             if (reconnected?.sessionId) {
               runExec(reconnected.sessionId).catch((e) => {
-                mcpExecResult(requestId, { ok: false, error: `执行失败: ${e}` });
+                finishExec({ ok: false, error: `执行失败: ${e}` });
               });
             } else {
-              mcpExecResult(requestId, { ok: false, error: "重连后未找到会话" });
+              finishExec({ ok: false, error: "重连后未找到会话" });
             }
           });
         } else {
@@ -789,7 +839,7 @@ export default function App() {
             );
             if (errTab) {
               clearInterval(checkInterval);
-              mcpExecResult(requestId, {
+              finishExec({
                 ok: false,
                 error: `连接失败：${errTab.errorMessage || "请检查保险库是否已解锁"}`,
               });
@@ -802,11 +852,11 @@ export default function App() {
               clearInterval(checkInterval);
               setActiveTabId(tab.id);
               runExec(tab.sessionId).catch((e) => {
-                mcpExecResult(requestId, { ok: false, error: `执行失败: ${e}` });
+                finishExec({ ok: false, error: `执行失败: ${e}` });
               });
             } else if (attempts >= maxAttempts) {
               clearInterval(checkInterval);
-              mcpExecResult(requestId, { ok: false, error: "连接超时，无法建立终端会话" });
+              finishExec({ ok: false, error: "连接超时，无法建立终端会话" });
             }
           }, 500);
         }
