@@ -22,6 +22,14 @@ pub enum SessionCommand {
 pub struct SshSession {
     pub handle: Arc<Handle<SshClient>>,
     pub command_tx: mpsc::UnboundedSender<SessionCommand>,
+    /// Original connection config (incl. credentials). Kept in memory so that
+    /// `exec_once` can transparently reconnect (dial + auth + replace handle)
+    /// when the underlying SSH transport dies mid-session — without this, a
+    /// dead-connection error during AI health inspection / one-shot exec
+    /// surfaces to the user as "please reconnect manually". The config is
+    /// already in memory for the lifetime of the session (connect() received
+    /// it); storing the Arc here doesn't extend exposure.
+    pub config: Arc<ConnectionConfig>,
 }
 
 /// Carries the DB handle so `check_server_key` can look up known_hosts.
@@ -498,6 +506,7 @@ pub async fn connect(
     let session = SshSession {
         handle: Arc::new(handle),
         command_tx,
+        config: Arc::new(config),
     };
 
     // Store session (handle is moved into SshSession above, so use it from there)
@@ -933,6 +942,69 @@ pub async fn zmodem_abort(
     Ok(())
 }
 
+/// Heuristic: does this russh error string indicate the underlying SSH
+/// transport is dead (so a reconnect is worth trying)? russh surfaces these
+/// as stringified errors — we match on substrings because the error types
+/// aren't all public.
+fn is_connection_dead(err: &str) -> bool {
+    err.contains("ConnectFailed")
+        || err.contains("disconnect")
+        || err.contains("Connection reset")
+        || err.contains("broken pipe")
+        || err.contains("channel open")
+        || err.contains("Session not found")
+}
+
+/// Open a new session channel on the existing handle. Extracted so exec_once
+/// can retry it after a reconnect without duplicating the handle-lookup logic.
+async fn open_exec_channel(
+    state: &AppState,
+    session_id: &str,
+) -> Result<russh::Channel<russh::client::Msg>, String> {
+    let handle = {
+        let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(session_id)
+            .map(|s| Arc::clone(&s.handle))
+            .ok_or_else(|| "Session not found".to_string())?
+    };
+    handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("Open exec channel failed: {}", e))
+}
+
+/// Re-establish the SSH connection for an existing session: dial + auth using
+/// the stored config, then replace the handle in the sessions map. The
+/// interactive PTY channel on the OLD handle is abandoned (its reader task
+/// will observe the disconnect and emit ssh_closed — the frontend already
+/// handles that by marking the tab disconnected, and our fresh handle keeps
+/// exec_once working). Does NOT touch command_tx — the reader task for the
+/// old channel winds down on its own.
+async fn reconnect_session(state: &AppState, session_id: &str) -> Result<(), String> {
+    let config = {
+        let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+        let s = sessions
+            .get(session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        Arc::clone(&s.config)
+    };
+    log::info!("[ssh:{}] reconnecting for exec_once (dial+auth)", session_id);
+    let new_handle = dial_and_authenticate(state, &config, false).await?;
+    // Replace the handle in the map. The old handle's Arc may still be held by
+    // the reader task — that's fine, it'll drop when the reader exits.
+    let mut sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+    if let Some(session) = sessions.get_mut(session_id) {
+        session.handle = Arc::new(new_handle);
+        log::info!("[ssh:{}] reconnect succeeded, handle replaced", session_id);
+        Ok(())
+    } else {
+        // Session was removed concurrently — nothing to update, but the dial
+        // already succeeded so we just drop the new handle.
+        Err("Session removed during reconnect".to_string())
+    }
+}
+
 /// Open a fresh exec channel on the existing SSH session, run `command`, and
 /// collect stdout. Used for one-shot probes like server-info gathering. The
 /// interactive PTY channel is untouched — russh multiplexes channels over the
@@ -942,21 +1014,34 @@ pub async fn exec_once(
     session_id: &str,
     command: &str,
 ) -> Result<String, String> {
-    let handle = {
-        let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
-        sessions
-            .get(session_id)
-            .map(|s| Arc::clone(&s.handle))
-            .ok_or_else(|| "Session not found".to_string())?
-    };
-
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|e| {
+    // First attempt with the current handle. On a connection-dead error
+    // (ConnectFailed / channel open fail), transparently reconnect once:
+    // dial + auth with the session's stored config, replace the handle in the
+    // sessions map, then retry the channel open + exec. This makes one-shot
+    // probes (AI health inspection, server-info) resilient to idle-disconnect
+    // without forcing the user to manually reconnect the tab.
+    let mut channel = match open_exec_channel(state, session_id).await {
+        Ok(ch) => ch,
+        Err(first_err) if is_connection_dead(&first_err) => {
+            log::warn!(
+                "[ssh:{}] exec channel open failed ({}), attempting one-time reconnect",
+                session_id, first_err
+            );
+            // Reconnect: dial + auth + replace handle. Reuses the stored config.
+            reconnect_session(state, session_id).await?;
+            // Retry the channel open with the fresh handle.
+            open_exec_channel(state, session_id)
+                .await
+                .map_err(|e| {
+                    log::warn!("[ssh:{}] exec channel open failed after reconnect: {}", session_id, e);
+                    format!("Open exec channel failed: {}", e)
+                })?
+        }
+        Err(e) => {
             log::warn!("[ssh:{}] exec channel open failed: {}", session_id, e);
-            format!("Open exec channel failed: {}", e)
-        })?;
+            return Err(format!("Open exec channel failed: {}", e));
+        }
+    };
     channel
         .exec(true, command)
         .await

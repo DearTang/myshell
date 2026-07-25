@@ -8,6 +8,12 @@
   格式参考 keepachangelog.com。新增条目尽量简洁，按 ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全 分组。
 -->
 
+## v2.5.4（2026-07-25）
+
+#### 🐛 修复
+
+- **AI 面板「服务器信息」巡检在连接失效时报错**：`Open exec channel failed (ConnectFailed)`。底层 SSH transport 已断（服务器 idle 超时/NAT 等），但 `exec_once` 没有重连能力，直接报错让用户手动重连。现改为**自动重连+重试**：检测到连接失效错误时，用 session 存储的原始配置重新 dial+auth，替换 handle 后重试一次。
+
 ## v2.5.3（2026-07-25）
 
 #### 🐛 修复

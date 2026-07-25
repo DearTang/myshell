@@ -2037,3 +2037,26 @@
 | 什么可能导致偏离？ | 互斥锁改变了 AI 调用模式——AI 必须学会用 nohup 跑长任务。短期内 AI 可能反复试 ssh_exec 然后被拒，需要工具描述引导（本次未改 description，留待后续）。 |
 | 下一步最小可验证动作？ | MCP 连发 `sleep 30; echo done`（timeout=5，应超时发 Ctrl+C）然后立刻发 `whoami`（应成功，证明 PTY 已清干净）。 |
 | 目标是什么？ | MCP ssh_exec 在 AI 滥用（连发、长命令）下不再挂死——锁防止交错，Ctrl+C 防止残留。 |
+
+### 阶段 81：AI 面板 exec_once 自动重连（2026-07-25）
+
+- **问题：** GUI 底部「服务器信息」/ AI 巡检报错 `Open exec channel failed: Failed to open channel (ConnectFailed)`。
+- **根因：** `ssh::exec_once`（AI 面板/服务器信息探针走的路径）没有重连能力。底层 SSH transport 已断（服务器 idle 超时、NAT、网络抖动），但 session 还在 `ssh_sessions` map 里，channel 打开就失败。之前只在 `ai.rs` 加了友好提示让用户手动重连 tab。
+- **修复：** 给 `exec_once` 加自动重连+重试：
+  - `SshSession` 新增 `config: Arc<ConnectionConfig>` 字段——connect 时已持有 config，直接存 Arc，零额外解密/拷贝。
+  - 新增 `is_connection_dead(err)` 启发式判断（ConnectFailed / disconnect / channel open / Session not found 等）。
+  - 新增 `open_exec_channel(state, sid)` 抽取 channel 打开逻辑（可重试）。
+  - 新增 `reconnect_session(state, sid)`——用存储的 config 重新 dial+auth，替换 sessions map 里的 handle。
+  - `exec_once` 改为：第一次 channel open 失败且判定为连接失效 → `reconnect_session` → 重试 `open_exec_channel` → 仍失败才报错。
+- **边界说明：** 重连只替换 exec 用的 handle，不碰前端 PTY 的 reader task——旧 reader 会检测到断开发 ssh_closed，前端把 tab 标记 disconnected（正确，连接确实断过）。用户若要在 terminal 继续输入，仍需手动重连 tab（前端 reconnectOne）。本次只保证 AI 巡检/服务器信息探针的可用性。
+- **涉及文件（1 个）：** `src-tauri/src/ssh.rs`：SshSession 加 config 字段；connect 存 config；新增 3 个辅助函数；exec_once 重连逻辑。
+- **验证：** cargo check --bin myshell 通过。
+
+## 五问重启检查（阶段 81）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 81 complete —— AI 面板 exec_once 自动重连+重试，cargo check 通过。 |
+| 我要去哪里？ | 打 v2.5.4 发布，实测：打开一个 SSH tab，等服务器 idle 断开，点 AI 巡检——应自动重连成功而不是报 ConnectFailed。 |
+| 什么可能导致偏离？ | 存 config 到 session 内存里多持有一份密码——可接受（session 生命周期内，connect 本来就有）。reconnect 只修 exec 路径，不修前端 PTY——若用户紧接着在 terminal 输入会发到旧死 handle，需手动重连 tab（已有功能）。 |
+| 下一步最小可验证动作？ | SSH tab idle 断开后，AI 面板点「巡检」——应成功（后台自动重连），不再报 ConnectFailed。 |
+| 目标是什么？ | AI 巡检对连接失效自愈——用户不用先手动重连 tab 才能巡检。 |
