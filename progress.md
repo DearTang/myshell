@@ -1995,3 +1995,23 @@
 | 什么可能导致偏离？ | 老版本用户之前点的"同意"因 CSP 拦截从未送达，localStorage 里 myshell.statsConsent=agreed 已写但 version stamp 没写 → 升级到 v2.5.1 后会静默重试上报（不再弹窗），符合预期。若用户之前点过"拒绝"，statsConsent 未写，v2.5.1 首启会重新弹窗——也符合预期。 |
 | 下一步最小可验证动作？ | 装 v2.5.1，首启点同意，1 分钟内 Umami 后台应出现 app_launch_v2.5.1 事件。 |
 | 目标是什么？ | 匿名统计真正可达——CSP 放行、失败可重试、同意一次后静默不打扰。 |
+
+### 阶段 79：MCP 调用等待保险库解锁（2026-07-25）
+
+- **需求：** 当 AI 调用 myshell-mcp 工具时，如果 GUI 还没输入主密码，每隔 3 秒确认一次是否已解锁，30 秒还没解锁就提示用户。
+- **原行为：** MCP 工具立即失败（"保险库未解锁" 或 "MyShell GUI 未运行"），用户来不及反应。
+- **修复：**
+  - **GUI 侧**：`main.rs` IPC 分发新增 `vault_status` action，返回 `{ok, initialized, unlocked}`——复用已有 `vault::is_initialized()` + `AppState.dek.is_some()` 判断。
+  - **MCP 侧**：新增 `query_gui_vault_status(port)` 通过 localhost IPC 查询；新增 `wait_for_vault_unlocked()` 三分支逻辑：①GUI 未运行→立即报错 ②已解锁→Ok 立即返回 ③已锁定→每 3s 轮询一次、最多 10 次（30s），期间用户解锁了就放行，超时返回"请在 GUI 输入主密码"。
+  - **闸门位置**：`call_tool` 入口（match name 前），只对需要凭据的工具（ssh_exec、sftp_*、test_connection 等）生效；`list_connections` / `screenshot_terminal` / `open_in_gui` 豁免（前者纯文本查询不需解锁，后两者会触发 GUI 自己的解锁流程）。
+- **涉及文件（2 个）：** `src-tauri/src/main.rs`（vault_status IPC action）、`src-tauri/src/bin/myshell-mcp.rs`（query + wait + 闸门）。
+- **验证：** cargo check --bin myshell / --bin myshell-mcp 均通过（仅遗留无关 dead_code warning）。
+
+## 五问重启检查（阶段 79）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 79 complete —— MCP 调用需要凭据的工具时，保险库未解锁则轮询等待 30s，cargo check 通过。 |
+| 我要去哪里？ | 打 v2.5.2 发布，实测：锁保险库 → AI 调 ssh_exec → 应在 GUI 提示用户解锁，解锁后工具继续执行。 |
+| 什么可能导致偏离？ | 30s 超时是硬编码常量，若 AI client 自己的 tool 超时 < 30s（如 Claude Desktop 默认 60s 够用），可能在 MCP 还在等待时被 client 提前取消。可接受——取消后用户解锁，下次调用秒过。 |
+| 下一步最小可验证动作？ | 锁保险库，让 AI 调 list_connections（应秒过）+ ssh_exec（应等待），在 GUI 输主密码后观察 ssh_exec 继续。 |
+| 目标是什么？ | MCP 工具对未解锁状态友好——给用户 30s 反应窗口，不再立即失败；同时不阻塞纯查询工具。 |

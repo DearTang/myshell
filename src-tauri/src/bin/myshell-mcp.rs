@@ -471,6 +471,23 @@ fn ambiguous_error(
 // ============ Tool dispatch ============
 
 async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, String> {
+    // ── Vault-unlock gate ────────────────────────────────────────────────
+    // Tools that touch encrypted credentials (host/password) require the GUI
+    // vault to be unlocked. If it's locked, wait up to 30s for the user to
+    // unlock it (polling every 3s) before giving up. Tools that don't need
+    // credentials are exempt: list_connections (plaintext-only) is always
+    // allowed so the AI can still enumerate servers even when locked.
+    match name {
+        "list_connections" | "screenshot_terminal" | "open_in_gui" => {
+            // These tools either don't need credentials (list_connections) or
+            // trigger the GUI's own unlock flow (screenshot/open_in_gui). Skip
+            // the gate.
+        }
+        _ => {
+            wait_for_vault_unlocked()?;
+        }
+    }
+
     match name {
         "list_connections" => {
             // SECURITY: use plaintext-only lookup - do NOT decrypt host/username.
@@ -1149,6 +1166,108 @@ fn ensure_gui_running() -> Result<u16, String> {
         }
     }
     Err("GUI 启动超时（30 秒内未就绪）。请手动打开 MyShell 后重试。".to_string())
+}
+
+/// Query the GUI's vault state via localhost IPC. Returns:
+///   Some((initialized, unlocked)) — got a valid response
+///   None                           — GUI unreachable or malformed response
+///
+/// `initialized` = a vault salt file exists on disk (user has set up a master
+/// password before). `unlocked` = the DEK is currently loaded in the GUI's
+/// AppState (user has entered the master password this session).
+fn query_gui_vault_status(port: u16) -> Option<(bool, bool)> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
+    let cmd = serde_json::json!({ "action": "vault_status" });
+    writeln!(stream, "{}", cmd).ok()?;
+    stream.flush().ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    // The GUI always sets `ok=true` for vault_status (it can't fail short of
+    // the IPC itself failing, which we handle via None above).
+    let initialized = v["initialized"].as_bool().unwrap_or(false);
+    let unlocked = v["unlocked"].as_bool().unwrap_or(false);
+    Some((initialized, unlocked))
+}
+
+/// Wait for the GUI vault to be unlocked. Called at the top of every tool
+/// handler that needs credentials (ssh_exec, sftp_*, etc.).
+///
+/// Behavior:
+///   1. If the GUI is not running → fail fast with a clear message (the user
+///      needs to open MyShell first).
+///   2. If the vault is already unlocked → return Ok immediately.
+///   3. If the vault is locked → poll every 3 seconds for up to 30 seconds.
+///      Each poll re-checks the GUI's vault state, giving the user a window
+///      to switch to the GUI and enter their master password. If the user
+///      unlocks within 30s, we proceed with the tool call. If not, we return
+///      an error telling them (and the AI) exactly what to do.
+///
+/// The 30-second window is chosen because the AI client typically shows the
+/// tool as "running" during this time — the user sees something is happening
+/// and gets a chance to unlock without the tool giving up too quickly.
+fn wait_for_vault_unlocked() -> Result<(), String> {
+    let port = match read_gui_ipc_port() {
+        Some(p) => p,
+        None => {
+            return Err(
+                "MyShell GUI 未运行。请先打开 MyShell 桌面应用并输入主密码解锁保险库，然后重试。"
+                    .to_string(),
+            );
+        }
+    };
+
+    // First check — fast path (vault already unlocked, no waiting).
+    match query_gui_vault_status(port) {
+        Some((_, true)) => return Ok(()),
+        Some((false, _)) => {
+            return Err(
+                "保险库尚未初始化。请先在 MyShell GUI 中设置主密码（首次启动时会引导设置）。"
+                    .to_string(),
+            );
+        }
+        Some((true, false)) => {
+            log("[vault] locked — waiting up to 30s for user to unlock GUI");
+        }
+        None => {
+            // GUI IPC failed even though the port file exists — GUI may be
+            // starting up. Fall through to the poll loop and give it a chance.
+            log("[vault] IPC query failed — GUI may be starting, will retry");
+        }
+    }
+
+    // Poll every 3 seconds, up to 30 seconds total (10 attempts).
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+    const MAX_ATTEMPTS: u32 = 10;
+    for attempt in 1..=MAX_ATTEMPTS {
+        std::thread::sleep(INTERVAL);
+        match query_gui_vault_status(port) {
+            Some((true, true)) => {
+                log(&format!("[vault] unlocked on attempt {attempt}"));
+                return Ok(());
+            }
+            Some((false, _)) => {
+                return Err(
+                    "保险库尚未初始化。请先在 MyShell GUI 中设置主密码（首次启动时会引导设置）。"
+                        .to_string(),
+                );
+            }
+            Some((true, false)) => {
+                // Still locked — keep waiting. No log spam, just the final outcome.
+            }
+            None => {
+                // IPC transient failure — keep trying.
+            }
+        }
+    }
+
+    Err(
+        "保险库未解锁（已等待 30 秒）。请在 MyShell GUI 中输入主密码解锁保险库，然后重新调用此工具。"
+            .to_string(),
+    )
 }
 
 /// Send an "exec_in_tab" command to the GUI: run `command` in a visible

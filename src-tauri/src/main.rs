@@ -4101,6 +4101,28 @@ pub fn run() {
                                 }
                             }
 
+                            // MCP polls the GUI's vault state. Used by the
+                            // MCP server's wait_for_vault_unlocked gate: when
+                            // a tool is called while the vault is still
+                            // locked, the MCP server waits (polling every 3s
+                            // up to 30s) for the user to unlock the GUI,
+                            // instead of failing immediately. Returns
+                            // {ok, initialized, unlocked}.
+                            "vault_status" => {
+                                let app_state = ipc_handle.state::<AppState>();
+                                let initialized = vault::is_initialized();
+                                let unlocked = app_state
+                                    .dek
+                                    .lock()
+                                    .map(|k| k.is_some())
+                                    .unwrap_or(false);
+                                let _ = writeln!(
+                                    reader.get_mut(),
+                                    "{{\"ok\":true,\"initialized\":{},\"unlocked\":{}}}",
+                                    initialized, unlocked
+                                );
+                            }
+
                             // MCP asks the GUI to decrypt a connection's
                             // credentials (host, username, password, proxy,
                             // keys) using the vault DEK that the user has
