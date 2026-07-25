@@ -2060,3 +2060,27 @@
 | 什么可能导致偏离？ | 存 config 到 session 内存里多持有一份密码——可接受（session 生命周期内，connect 本来就有）。reconnect 只修 exec 路径，不修前端 PTY——若用户紧接着在 terminal 输入会发到旧死 handle，需手动重连 tab（已有功能）。 |
 | 下一步最小可验证动作？ | SSH tab idle 断开后，AI 面板点「巡检」——应成功（后台自动重连），不再报 ConnectFailed。 |
 | 目标是什么？ | AI 巡检对连接失效自愈——用户不用先手动重连 tab 才能巡检。 |
+
+### 阶段 82：修复 MCP 高危命令重复弹窗（2026-07-25）
+
+- **问题：** GUI 高危命令弹窗隔一会儿没点，会弹 Windows 弹窗，用户被迫点两次。
+- **根因：** ssh_exec 的双路径设计：
+  1. show_in_gui 路径先跑，GUI 弹第一个 React 确认框
+  2. 用户没点 → GUI 侧 exec_in_tab 30s 超时 → MCP 收到错误 → **回退到 headless 路径**
+  3. Headless 路径又调 confirm_dangerous_operation → 弹第二个 Windows MessageBoxW
+  两个弹窗叠加，用户得点两次。
+- **修复：** show_in_gui 失败回退 headless 时，加判断：
+  - 如果 GUI **真正不可用**（错误含"未找到 myshell.exe"/"GUI 启动超时"/"无法定位"）→ 允许 headless 回退（含其 OS 弹窗）——因为 GUI 弹窗根本没机会显示
+  - 如果 GUI **在线但 exec 失败**（用户没点确认/取消/session 错误）+ 命令需要确认 → **直接返回错误，不回退 headless**——避免第二个弹窗
+  - 如果命令不需要确认（白名单）→ 照常回退 headless（不会弹窗）
+- **涉及文件（1 个）：** `src-tauri/src/bin/myshell-mcp.rs`：ssh_exec handler 的 show_in_gui 失败分支加 gui_unreachable 判断 + 条件 return。
+- **验证：** cargo check --bin myshell-mcp 通过。
+
+## 五问重启检查（阶段 82）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 82 complete —— MCP 高危命令不再重复弹窗（GUI 在线失败不回退 headless 重弹），cargo check 通过。 |
+| 我要去哪里？ | 打 v2.5.5 发布，实测：AI 发高危命令，GUI 弹窗出来后不点，等 30s 超时——应只弹一次，不再弹 Windows 窗。 |
+| 什么可能导致偏离？ | gui_unreachable 的错误字符串匹配是启发式——如果 ensure_gui_running 的错误信息改了文案，匹配会失效。但有三个 OR 条件，容错性尚可。 |
+| 下一步最小可验证动作？ | AI 发 `rm /tmp/test` 这种高危命令，GUI 弹窗出来后不点，等超时——观察是否只弹一次。 |
+| 目标是什么？ | 高危命令只确认一次——GUI 弹窗是首选，没点就报错让 AI 重试，绝不弹第二个 OS 窗。 |

@@ -1,6 +1,6 @@
 [package]
 name = "myshell"
-version = "2.5.4"
+version = "2.5.5"
 edition = "2021"
 description = "A Rust-based SSH/SFTP shell tool"
 # Three binaries share this crate (myshell / myshell-cli / myshell-mcp). `tauri dev`

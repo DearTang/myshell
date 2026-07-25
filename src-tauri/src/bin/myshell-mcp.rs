@@ -526,14 +526,45 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // the MyShell GUI so the user can watch it in real time. The output
             // is captured from the tab's PTY (via sentinel mechanism) and
             // returned to the AI — same result as the headless path, but the
-            // user sees everything. Falls back to headless if the GUI isn't
-            // reachable after an auto-start attempt.
+            // user sees everything.
+            //
+            // GUI-attempted flag: if the GUI path was attempted AND the GUI was
+            // reachable (i.e. the confirmation dialog was shown or could have
+            // been shown), we must NOT fall back to headless + re-confirm for
+            // dangerous commands — that would pop a SECOND confirmation (the OS
+            // MessageBoxW) on top of the GUI's React dialog, forcing the user
+            // to click twice. So when gui_attempted && needs_confirmation, we
+            // return the error directly instead of falling through.
             if rules.show_in_gui {
                 match exec_in_gui_tab(conn_name, command, timeout, &state).await {
                     Ok(result_json) => return Ok(result_json),
                     Err(e) => {
-                        // GUI not available or exec failed — fall through to
-                        // headless mode so the tool still works.
+                        let needs_confirm = command_rules::command_needs_confirmation(command, &rules);
+                        // Detect whether the GUI was actually reachable. If
+                        // ensure_gui_running failed (GUI not installed / won't
+                        // start), the error message mentions myshell.exe or
+                        // startup timeout — in that case the GUI dialog was
+                        // never shown, so headless fallback (with its own OS
+                        // confirm) is legitimate.
+                        let gui_unreachable = e.contains("未找到 myshell.exe")
+                            || e.contains("GUI 启动超时")
+                            || e.contains("无法定位");
+                        let gui_attempted = !gui_unreachable;
+
+                        if gui_attempted && needs_confirm {
+                            // GUI was reachable but the exec failed (user didn't
+                            // confirm in time, cancelled, or a session error).
+                            // Don't fall through to headless — that would pop a
+                            // second confirmation dialog. Surface the error.
+                            log(&format!(
+                                "show_in_gui 失败且命令需确认，不再回退 headless（避免重复弹窗）: {}",
+                                e
+                            ));
+                            return Err(e);
+                        }
+                        // Either the GUI was unreachable (legitimate fallback)
+                        // or the command doesn't need confirmation (headless
+                        // won't pop anything). Fall through.
                         log(&format!("show_in_gui 失败，回退到静默模式: {}", e));
                     }
                 }
