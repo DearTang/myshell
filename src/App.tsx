@@ -1545,7 +1545,12 @@ export default function App() {
           version={statsPrompt.version}
           onAgree={() => {
             setStatsConsent(true);
-            markVersionHandled(statsPrompt.version);
+            // NOTE: do NOT markVersionHandled here. reportVersion marks the
+            // version stamp only AFTER a successful fetch — so if the send
+            // fails (network/CSP), the next launch re-enters checkReportNeeded,
+            // sees hasConsent=true (just set), and silently retries WITHOUT
+            // re-prompting the user. Marking here would deadlock: user agreed
+            // but the event was never delivered, and we'd never retry.
             void reportVersion(statsPrompt.version, navigator.platform);
             setStatsPrompt(null);
           }}

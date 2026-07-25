@@ -9,9 +9,10 @@
  *       { device_id, app_version, os }
  *     No hosts, usernames, IPs, or connection data are ever sent.
  *   - Consent model: the user is asked once. If they agree, the preference is
- *     remembered and future versions report silently. If they decline, the
- *     preference is NOT remembered — so each new version asks again (a version
- *     bump is a meaningful new event worth re-asking about).
+ *     remembered and future versions report silently (no re-prompting on
+ *     upgrades). If they decline, the preference is NOT remembered — so each
+ *     new version asks again. If a send fails after the user agreed, the
+ *     next launch retries silently (no re-prompt) until it succeeds.
  *
  * Umami Cloud endpoint: POST https://cloud.umami.is/api/send
  *   body: { type: "event", payload: { website, name, data: {...} } }
@@ -151,19 +152,23 @@ export function setStatsConsent(agreed: boolean): void {
  * Determine whether we need to report the current version, and whether we
  * need to ask for consent first. Call this on app startup (after vault unlock).
  *
- * The consent dialog is shown on every new version's first launch — the user
- * explicitly asked to be re-prompted each time a version upgrade completes,
- * rather than silently remembering a one-time "agree". So hasConsent is always
- * false here; `setStatsConsent` is still recorded on agree in case we revert.
+ * Consent model (ask-once):
+ *   - First ever launch (no consent recorded): prompt the user.
+ *   - User previously agreed: report SILENTLY for all future versions, no
+ *     re-prompting on upgrades. Also covers retry-after-failure: if a prior
+ *     send failed (network/CSP), the version stamp wasn't written, so the
+ *     next launch returns {shouldReport:true, hasConsent:true} and retries
+ *     silently.
+ *   - User declined: consent is NOT remembered, so each new version
+ *     re-prompts (a version bump is a meaningful new event worth re-asking).
  *
- * "Already handled" (`isVersionReported`) means the user was already prompted
- * for THIS version (and chose agree OR decline via `markVersionHandled`), so
- * we do not re-prompt. Only a version bump clears the stamp and re-triggers
- * the dialog.
+ * "Already handled" (`isVersionReported`) means THIS version was already
+ * successfully reported (or explicitly declined), so we do nothing.
  *
  * Returns:
- *   - { shouldReport: true, hasConsent: false }  → ask consent, then report
- *   - { shouldReport: false }                     → already handled, do nothing
+ *   - { shouldReport: true,  hasConsent: true  } → agreed before, report silently
+ *   - { shouldReport: true,  hasConsent: false } → no prior consent, prompt user
+ *   - { shouldReport: false, hasConsent: false } → already handled, do nothing
  */
 export function checkReportNeeded(version: string): {
   shouldReport: boolean;
@@ -172,6 +177,10 @@ export function checkReportNeeded(version: string): {
   if (isVersionReported(version)) {
     return { shouldReport: false, hasConsent: false };
   }
-  // Always prompt — never report silently, even if the user agreed before.
-  return { shouldReport: true, hasConsent: false };
+  // Version not yet reported. If the user previously agreed (hasConsent),
+  // retry SILENTLY — this covers the case where a prior send failed (network
+  // error, CSP block) after the user clicked "agree": we don't re-prompt,
+  // just try again. Only prompt when there's no prior consent.
+  const hasConsent = hasStatsConsent();
+  return { shouldReport: true, hasConsent };
 }

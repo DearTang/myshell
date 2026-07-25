@@ -1970,3 +1970,28 @@
 | 什么可能导致偏离？ | idle fallback 5 秒阈值：若网络抖动恰好造成 >5s 静默但命令还在跑（罕见），会提前返回。可接受——比死等 30s 强，且只发生在已看到 sentinel 命令回显之后。 |
 | 下一步最小可验证动作？ | MCP 执行 `sudo docker logs <容器> --tail 30` 这类大输出命令，应在命令实际完成 + 5s 内返回（不再硬等 30s）。 |
 | 目标是什么？ | MCP ssh_exec 大输出命令稳定返回——sentinel 到了用真实 exit code，sentinel 卡了用 idle 兜底，命令 hang 了用硬超时报错。 |
+
+### 阶段 78：修复匿名统计上报被 CSP 拦截 + 重试死锁（2026-07-25）
+
+- **问题：** 用户反馈 https://cloud.umami.is/analytics 收不到统计信息。
+- **根因 1（CSP 拦截，主因）：** `tauri.conf.json` 的 CSP `connect-src` 只允许 `'self' ipc: http://ipc.localhost`，没有放行 `https://cloud.umami.is`。WebView2 严格遵守 CSP，直接拦截 `fetch("https://cloud.umami.is/api/send")`，连网络请求都发不出去。用 curl 测 endpoint 是通的（200 + `{"beep":"boop"}`），但 curl 不受 CSP 管辖——误导排查。
+- **根因 2（重试死锁）：** App.tsx onAgree 回调里先调 `markVersionHandled(version)`（写 version stamp），再 `void reportVersion(...)`。若 fetch 失败，stamp 已写 → `isVersionReported` 返回 true → 永远不再触发上报。用户点了同意但事件从未送达，且无法自救。
+- **根因 3（策略放大了 2 的影响）：** `checkReportNeeded` 原设计"每次版本升级都重新弹同意框"（hasConsent 恒返回 false）。即使修复根因 2，用户同意后失败，下次启动还会再弹窗——体验差。
+- **修复：**
+  - **CSP 白名单**：`connect-src` 加 `https://cloud.umami.is`（tauri.conf.json）。
+  - **重试逻辑**：onAgree 不再立即 markVersionHandled，改由 reportVersion 在 fetch 成功后自己标记（usageStats.ts:121-125 已有此逻辑）。失败时不写 stamp → 下次启动 checkReportNeeded 返回 shouldReport=true → 重试。
+  - **同意策略改为 ask-once**：checkReportNeeded 真正读 hasStatsConsent——同意过的用户版本升级时静默上报（含失败重试），不再弹窗；拒绝过的用户每个新版本重新问。
+- **涉及文件（3 个）：**
+  - `src-tauri/tauri.conf.json`：CSP connect-src 加 cloud.umami.is
+  - `src/App.tsx`：onAgree 移除立即 markVersionHandled
+  - `src/lib/usageStats.ts`：checkReportNeeded 读真实 hasConsent；注释对齐 ask-once 策略
+- **验证：** npx tsc --noEmit 通过；endpoint 直连 200。
+
+## 五问重启检查（阶段 78）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 78 complete —— 修复 CSP 拦截 + 重试死锁 + 同意策略，TS 编译通过。 |
+| 我要去哪里？ | 打 v2.5.1 发布，用户升级后点同意，Umami 后台应开始收到 app_launch_v2.5.1 事件。 |
+| 什么可能导致偏离？ | 老版本用户之前点的"同意"因 CSP 拦截从未送达，localStorage 里 myshell.statsConsent=agreed 已写但 version stamp 没写 → 升级到 v2.5.1 后会静默重试上报（不再弹窗），符合预期。若用户之前点过"拒绝"，statsConsent 未写，v2.5.1 首启会重新弹窗——也符合预期。 |
+| 下一步最小可验证动作？ | 装 v2.5.1，首启点同意，1 分钟内 Umami 后台应出现 app_launch_v2.5.1 事件。 |
+| 目标是什么？ | 匿名统计真正可达——CSP 放行、失败可重试、同意一次后静默不打扰。 |
