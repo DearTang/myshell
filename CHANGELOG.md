@@ -13,6 +13,7 @@
 #### 🐛 修复
 
 - **MCP 高危命令重复弹窗**：show_in_gui 路径的 GUI 确认框用户没及时点击导致 exec 超时后，会回退到 headless 路径又弹一次 Windows MessageBoxW，用户被迫点两次。现改为：GUI 在线但 exec 失败时，高危命令直接返回错误，不再回退 headless 重新确认。只有 GUI 真正不可用（未安装/启动失败）才允许 headless 回退。
+- **应用内检查更新检测不到新版本**：Gitee 的 `/releases/latest` 接口不可靠（一直返回 v1.11.2 而非真实的 v2.5.5），导致旧版用户始终看不到新版本提示。改用列表接口 `/releases` 并在客户端用版本比较选出真正的最新版，完全绕开 Gitee 不可靠的 latest 标记。
 
 ## v2.5.4（2026-07-25）
 

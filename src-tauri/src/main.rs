@@ -664,11 +664,19 @@ fn get_previous_version() -> Option<String> {
 // the webview would be blocked. Rust's reqwest is unaffected by CSP and also
 // sidesteps CORS. reqwest is already a dependency (used by ai.rs).
 
-/// Gitee "latest release" endpoint for this repo. Returns a JSON object with
-/// `tag_name`, `assets[]`, `body`, `created_at`, `html_url`, etc. Public, no
-/// auth needed (subject to Gitee's unauthenticated rate limits).
-const GITEE_LATEST_RELEASE: &str =
-    "https://gitee.com/api/v5/repos/argustang/myshell/releases/latest";
+/// Gitee releases list endpoint for this repo. Returns a JSON array of all
+/// releases (newest-first by creation time), each with `tag_name`, `assets[]`,
+/// `body`, `created_at`, `html_url`, etc. Public, no auth needed (subject to
+/// Gitee's unauthenticated rate limits).
+///
+/// We intentionally do NOT use `/releases/latest`: Gitee's "latest" marker is
+/// unreliable for API-published releases — it kept pointing at v1.11.2 (created
+/// 2026-07-17) long after v2.x was published, so the in-app update check never
+/// saw anything newer. Fetching the full list and picking the max version
+/// client-side (via `is_newer`) is immune to that marker drifting. per_page=100
+/// is well above the ~30 releases published to date.
+const GITEE_RELEASES_LIST: &str =
+    "https://gitee.com/api/v5/repos/argustang/myshell/releases?per_page=100&page=1";
 
 /// Release-notes body is capped before returning to the frontend so a giant
 /// changelog can't balloon the webview memory.
@@ -776,7 +784,7 @@ async fn check_for_updates() -> UpdateInfo {
         Err(e) => return update_info_error(&current_version, format!("客户端构建失败: {e}")),
     };
 
-    let resp = match client.get(GITEE_LATEST_RELEASE).send().await {
+    let resp = match client.get(GITEE_RELEASES_LIST).send().await {
         Ok(r) => r,
         Err(e) => return update_info_error(&current_version, format!("网络请求失败: {e}")),
     };
@@ -793,18 +801,55 @@ async fn check_for_updates() -> UpdateInfo {
         Err(e) => return update_info_error(&current_version, format!("解析响应失败: {e}")),
     };
 
+    // The list endpoint returns an array of releases. Pick the one with the
+    // highest semver tag (via `is_newer`) rather than relying on Gitee's
+    // creation-order or "latest" marker — both have been observed wrong.
+    let releases = match json.as_array() {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => {
+            return update_info_error(&current_version, "未找到任何发布版本".to_string())
+        }
+    };
+    let latest_json = releases
+        .iter()
+        .max_by(|a, b| {
+            let av = a
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .or_else(|| a.get("name").and_then(|v| v.as_str()))
+                .unwrap_or("0");
+            let bv = b
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .or_else(|| b.get("name").and_then(|v| v.as_str()))
+                .unwrap_or("0");
+            if is_newer(av, bv) {
+                std::cmp::Ordering::Greater
+            } else if is_newer(bv, av) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .expect("non-empty array checked above");
+
     // tag_name is the canonical version source on a Gitee release. Fall back
     // to the deprecated `name` field only if tag is absent.
-    let tag = json
+    let tag = latest_json
         .get("tag_name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| json.get("name").and_then(|v| v.as_str()).map(str::to_string));
+        .or_else(|| {
+            latest_json
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
     let Some(latest_version) = tag else {
         return update_info_error(&current_version, "未找到版本信息".to_string());
     };
 
-    let release_url = json
+    let release_url = latest_json
         .get("html_url")
         .and_then(|v| v.as_str())
         .unwrap_or("https://gitee.com/argustang/myshell/releases")
@@ -826,7 +871,7 @@ async fn check_for_updates() -> UpdateInfo {
         // the release page (browser mode).
         ""
     };
-    let download_url = json
+    let download_url = latest_json
         .get("assets")
         .and_then(|v| v.as_array())
         .and_then(|arr| {
@@ -862,13 +907,13 @@ async fn check_for_updates() -> UpdateInfo {
     }
     .to_string();
 
-    let published_at = json
+    let published_at = latest_json
         .get("created_at")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
-    let notes_raw = json
+    let notes_raw = latest_json
         .get("body")
         .and_then(|v| v.as_str())
         .unwrap_or("")

@@ -2084,3 +2084,29 @@
 | 什么可能导致偏离？ | gui_unreachable 的错误字符串匹配是启发式——如果 ensure_gui_running 的错误信息改了文案，匹配会失效。但有三个 OR 条件，容错性尚可。 |
 | 下一步最小可验证动作？ | AI 发 `rm /tmp/test` 这种高危命令，GUI 弹窗出来后不点，等超时——观察是否只弹一次。 |
 | 目标是什么？ | 高危命令只确认一次——GUI 弹窗是首选，没点就报错让 AI 重试，绝不弹第二个 OS 窗。 |
+
+### 阶段 83：修复应用内检测不到更新（Gitee /releases/latest 指向错误版本）（2026-07-26）
+
+- **问题：** 应用内"检查更新"始终检测不到新版本（v1.11.2 用户看不到 v2.x）。
+- **根因：** Gitee 的 `/releases/latest` 接口不可靠——它持续返回 v1.11.2（2026-07-17 创建），而不是真正的最新版 v2.5.5。Gitee 的 "latest" 标记机制对通过 API 发布的 release 不可靠（v2.x 系列经 publish-gitee-release.mjs 发布，没拿到 latest 标记）。代码本身逻辑（平台筛 .exe/.deb、strategy auto/browser）都对，只是输入数据错了。
+- **验证证据：**
+  - `/releases/latest` → 返回 v1.11.2（错误）
+  - `/releases?per_page=100` → 返回 27 个 release，按创建时间降序，v2.5.5 真实存在
+- **修复：** `src-tauri/src/main.rs` `check_for_updates` 改用列表接口 `/releases?per_page=100&page=1`，客户端用已有的 `is_newer()` 在所有返回的 release 中选 `tag_name` 版本号最大的那个。完全不依赖 Gitee 的 latest 标记。
+- **涉及文件（1 个）：**
+  - `src-tauri/src/main.rs`：
+    - 常量 `GITEE_LATEST_RELEASE` → `GITEE_RELEASES_LIST`（URL 改为列表接口）
+    - `check_for_updates`：解析逻辑从"解析单个对象"改为"解析数组 + max_by(is_newer) 选最大版本"，后续字段（assets/created_at/body/html_url）从选中的 `latest_json` 取
+- **验证：**
+  - cargo check 通过（两个 dead_code warning 是预先存在的，与本次无关）
+  - 端到端验证：列表接口返回 27 个 release，复刻的版本比较逻辑正确选出 v2.5.5；对 v1.11.2 → has_update=true，对 v2.5.5 → has_update=false
+- **关联问题（不修）：** MCP/CLI 在 Linux 的可用性已确认——deb 包内含 `usr/bin/myshell` + `usr/bin/myshell-mcp` + `usr/bin/myshell-cli` 三个二进制，装到 /usr/bin/ 即在 PATH 中，共享 `~/.config/myshell/connections.db`，开箱可用。
+
+## 五问重启检查（阶段 83）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 83 complete —— 应用内更新检测改用 Gitee 列表接口 + 客户端选最大版本，绕过 Gitee latest 标记不可靠问题，cargo check 通过，端到端验证选出 v2.5.5。 |
+| 我要去哪里？ | 打包发布让旧版用户（v1.11.2 / 早期 v2.x）能通过应用内检查拿到 v2.5.5+。 |
+| 什么可能导致偏离？ | per_page=100 上限：若以后 release 数 >100 且最大版本在第 101 条之后会漏——目前才 27 个，短期无忧；长期可加分页遍历。 |
+| 下一步最小可验证动作？ | 旧版应用启动 → 检查更新 → 应弹窗提示 v2.5.5 + 下载按钮（Windows auto / Linux browser）。 |
+| 目标是什么？ | 任何已发布旧版都能在应用内检测到真实最新版并被引导升级，不再卡在 v1.11.2。 |
