@@ -23,6 +23,7 @@
 - 连接配置持久化存储（SQLite + OS Keyring）
 - 代理支持（SOCKS5、HTTP）
 - **连接高级选项**（SSH/SFTP）：地址族（自动 / 强制 IPv4 / 强制 IPv6，绕开 IPv6 黑洞）、每连接连接超时、SSH Keepalive 间隔
+- **主机密钥变更自助恢复**（SSH/SFTP）：服务器重装/换密钥导致主机指纹变化时，报错明确列出新旧指纹（而非含糊的 "Unknown server key"），连接右键「重置主机密钥信任」即可重新信任（保留 MITM 防护，不自动接受）
 
 ### 终端功能
 - 基于 xterm.js 的高性能终端模拟
@@ -109,6 +110,11 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 暴露 11 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`test_connection`、`screenshot_terminal`、`open_in_gui`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。
 
 ## 更新日志
+
+### v2.6.1（2026-07-27）
+
+#### 🐛 修复
+- **服务器主机密钥变更后无法连接**：服务器重装/换密钥后连接报含糊的 "Unknown server key" 且无法恢复。现报错明确列出新旧指纹，连接 ⋯ 菜单新增「重置主机密钥信任」（仅 SSH/SFTP），重置后重新信任；保留 MITM 防护，不自动接受。
 
 ### v2.6.0（2026-07-26）
 

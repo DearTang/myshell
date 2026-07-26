@@ -2136,3 +2136,23 @@
 | 什么可能导致偏离？ | `dial_tcp` 用 `lookup_host` 自行解析取代了 russh 内部解析——若某些主机名解析行为与 russh 原路径有差异（极少见），直连可能受影响；auto 模式保留全部地址、行为应等价。 |
 | 下一步最小可验证动作？ | 起 `cargo tauri dev`，编辑一个 SSH 连接，确认「高级选项」组出现、保存后重开回显正确、强制 IPv6 对 IPv4 主机报错。 |
 | 目标是什么？ | 让用户能绕开 IPv6 黑洞、按连接调超时/保活——选项默认值与原硬编码一致，不改既有连接行为。 |
+
+### 阶段 85：主机密钥变更后无法连接——明确报错 + 右键重置信任（2026-07-27）
+
+- **问题：** 用户服务器重装/重新生成密钥后，连接报含糊的 `SSH connect failed: Unknown server key`，且**无任何入口可恢复**——首次信任（TOFU）本身正常（日志反证：同端口新主机 192.168.3.30 首连成功），真正原因是 host key mismatch 被防中间人逻辑正确拒绝，但 russh 把 `check_server_key` 返回 false 统一显示成 "Unknown server key"，用户既看不懂也无法重新信任（db 无 delete、无命令、无 UI）。
+- **根因定位：** 读运行时日志（`%AppData%/myshell/logs/`）确认 `[ssh] host key mismatch ... stored=SHA256:BWhBt3… got=SHA256:lUqnZI…`，即服务器主机密钥指纹变了。
+- **方案（用户选定 A：明确报错 + 右键重置，保留 MITM 防护）：**
+  1. `check_server_key` 检测到不匹配时，把（stored_fp, got_fp）写入 handler 上一个共享 `Arc<Mutex<Option<(String,String)>>>`。
+  2. `dial_and_authenticate` 把拨号+握手包进 async 块统一产出 Result，失败时读该槽位：若是不匹配，用明确的中文错误替换 russh 的 "Unknown server key"（列出新旧指纹 + 指引右键重置）。russh 会消费 handler 且失败不归还，故用共享槽位旁路。
+  3. 新增「重置主机密钥信任」能力：`db::delete_known_host(host, port)` → `reset_known_host` command（注册进 generate_handler!）→ `api.ts resetKnownHost` → Sidebar 连接 ⋯ 菜单项（仅 ssh/sftp 显示，ConfirmDialog 二次确认）。重置后下次连接重新走 TOFU。
+- **涉及文件（5 个）：** `ssh.rs`（SshClient 加槽位 + check_server_key 记录 + dial async 块 + 错误细化）、`db.rs`（delete_known_host）、`main.rs`（reset_known_host command + 注册）、`api.ts`（resetKnownHost）、`Sidebar.tsx`（state + handler + ConnRow prop + 菜单项 + ConfirmDialog）。
+- **验证：** `cargo check` Finished（仅既有 dead_code 警告）+ `npx tsc --noEmit` exit 0。
+
+## 五问重启检查（阶段 85）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 85 complete —— 主机密钥变更不再卡死：报错明确列出新旧指纹，右键「重置主机密钥信任」可恢复，cargo check + tsc 通过。 |
+| 我要去哪里？ | 实测：对 nas.ggbond.fun:22228 连接应看到明确的"主机密钥已变更"错误（非 Unknown server key）；右键重置后再连应成功（重新 TOFU）。 |
+| 什么可能导致偏离？ | 错误细化依赖共享槽位在 connect 失败时被正确读取——若 russh 在 check_server_key 之外的环节先报错，槽位为空则回退原始错误（无害）。重置仅删 known_hosts 单行，不动凭据，可逆。 |
+| 下一步最小可验证动作？ | 起 dev，连 nas.ggbond.fun → 看新错误文案；⋯ → 重置主机密钥信任 → 确认 → 重连成功。 |
+| 目标是什么？ | 服务器合法换密钥后用户能自助恢复连接，同时不牺牲主机密钥变更的 MITM 防护（不自动接受）。 |

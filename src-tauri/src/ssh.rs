@@ -40,6 +40,12 @@ pub struct SshClient {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub host: String,
     pub port: u16,
+    /// Records a host-key mismatch detected during `check_server_key` so the
+    /// connect flow can surface a specific, actionable error instead of
+    /// russh's opaque "Unknown server key". Holds (stored_fp, presented_fp).
+    /// Shared with `dial_and_authenticate` (which keeps a clone) because russh
+    /// consumes the handler on connect and doesn't hand it back on failure.
+    pub host_key_mismatch: Arc<Mutex<Option<(String, String)>>>,
 }
 
 impl client::Handler for SshClient {
@@ -83,6 +89,12 @@ impl client::Handler for SshClient {
                             "[ssh] host key mismatch for {}:{}: stored={} got={}",
                             crate::redact::host(&self.host), self.port, known_fp, fingerprint
                         );
+                        // Stash both fingerprints so dial_and_authenticate can
+                        // turn russh's opaque "Unknown server key" into a
+                        // specific "host key changed — reset trust" error.
+                        if let Ok(mut slot) = self.host_key_mismatch.lock() {
+                            *slot = Some((known_fp.clone(), fingerprint.clone()));
+                        }
                         false
                     }
                 }
@@ -386,10 +398,15 @@ pub async fn dial_and_authenticate(
     ssh_config.keepalive_max = 3;
     let ssh_config = Arc::new(ssh_config);
 
+    // Shared slot for a host-key mismatch detected mid-handshake. The handler
+    // fills it; we keep a clone to read after connect fails (russh consumes
+    // the handler and doesn't return it on error).
+    let host_key_mismatch: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
     let handler = SshClient {
         db: Arc::clone(&state.db),
         host: config.host.clone(),
         port: config.port,
+        host_key_mismatch: Arc::clone(&host_key_mismatch),
     };
 
     // Branch on proxy config: if proxy_type is set, dial the proxy first
@@ -401,42 +418,63 @@ pub async fn dial_and_authenticate(
     // dead server fails fast instead of letting the UI spin forever. The
     // direct path resolves + dials itself (via `dial_tcp`) so it can honor
     // the address-family preference, then hands the stream to connect_stream.
-    let mut handle = match proxy::ProxyConfig::from_config(config)? {
-        Some(proxy_cfg) => {
-            log::info!(
-                "[ssh] dialing via {} proxy {}:{} → {}:{}",
-                config.proxy_type,
-                crate::redact::host(proxy_cfg.host()),
-                proxy_cfg.port(),
-                crate::redact::host(&config.host),
-                config.port
-            );
-            let stream = proxy::connect_via_proxy(&proxy_cfg, &config.host, config.port).await?;
-            with_connect_timeout(
-                client::connect_stream(ssh_config, stream, handler),
-                connect_timeout,
-                "通过代理连接",
-                |e| format!("SSH connect via proxy failed: {}", e),
-            )
-            .await?
+    //
+    // The whole dial+handshake runs in an async block so a failure surfaces
+    // as a single Result we can post-process: if `check_server_key` recorded
+    // a host-key mismatch, we replace russh's opaque "Unknown server key"
+    // with a specific, actionable error (pointing at the reset-trust action).
+    let connect_result: Result<Handle<SshClient>, String> = async {
+        match proxy::ProxyConfig::from_config(config)? {
+            Some(proxy_cfg) => {
+                log::info!(
+                    "[ssh] dialing via {} proxy {}:{} → {}:{}",
+                    config.proxy_type,
+                    crate::redact::host(proxy_cfg.host()),
+                    proxy_cfg.port(),
+                    crate::redact::host(&config.host),
+                    config.port
+                );
+                let stream =
+                    proxy::connect_via_proxy(&proxy_cfg, &config.host, config.port).await?;
+                with_connect_timeout(
+                    client::connect_stream(ssh_config, stream, handler),
+                    connect_timeout,
+                    "通过代理连接",
+                    |e| format!("SSH connect via proxy failed: {}", e),
+                )
+                .await
+            }
+            None => {
+                let stream = dial_tcp(
+                    &config.host,
+                    config.port,
+                    &config.address_family,
+                    connect_timeout,
+                )
+                .await?;
+                with_connect_timeout(
+                    client::connect_stream(ssh_config, stream, handler),
+                    connect_timeout,
+                    "连接",
+                    |e| format!("SSH connect failed: {}", e),
+                )
+                .await
+            }
         }
-        None => {
-            let stream = dial_tcp(
-                &config.host,
-                config.port,
-                &config.address_family,
-                connect_timeout,
-            )
-            .await?;
-            with_connect_timeout(
-                client::connect_stream(ssh_config, stream, handler),
-                connect_timeout,
-                "连接",
-                |e| format!("SSH connect failed: {}", e),
-            )
-            .await?
+    }
+    .await;
+
+    let mut handle = connect_result.map_err(|e| {
+        if let Ok(slot) = host_key_mismatch.lock() {
+            if let Some((stored, got)) = slot.as_ref() {
+                return format!(
+                    "服务器主机密钥已变更，与本地信任记录不符（通常是服务器重装或重新生成了密钥所致）。\n· 本地记录: {}\n· 当前服务器: {}\n如确认是服务器侧变更，请右键该连接选择「重置主机密钥信任」后重连。",
+                    stored, got
+                );
+            }
         }
-    };
+        e
+    })?;
 
     // Authenticate
     let auth_result = match config.auth_method.as_str() {

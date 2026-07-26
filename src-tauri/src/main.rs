@@ -112,6 +112,24 @@ fn delete_connection(state: State<AppState>, id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Forget the stored host key for (host, port) so the next connect re-runs
+/// trust-on-first-use. Recovery path for a legitimate server-side host-key
+/// change (OS reinstall / regenerated host keys) that the MITM defense would
+/// otherwise reject forever as "Unknown server key". Scoped to host+port
+/// exactly like the known_hosts store, so resetting one connection doesn't
+/// touch another host's trust anchor.
+#[tauri::command]
+fn reset_known_host(state: State<AppState>, host: String, port: u16) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::delete_known_host(&db, &host, port).map_err(|e| e.to_string())?;
+    log::info!(
+        "[reset_known_host] cleared stored host key for {} (port {})",
+        redact::host(&host),
+        port
+    );
+    Ok(())
+}
+
 /// Clone a connection: same config, new UUID + incremented name suffix.
 /// Name collisions are resolved by scanning `name`, `name(1)`, `name(2)`, …
 /// until a free slot is found. The keyring entry is also duplicated so the
@@ -3813,6 +3831,7 @@ pub fn run() {
             get_connections,
             save_connection,
             delete_connection,
+            reset_known_host,
             copy_connection,
             export_connections,
             import_connections,

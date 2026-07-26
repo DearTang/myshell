@@ -191,6 +191,14 @@ export async function deleteConnection(id: string): Promise<void> {
   await invoke("delete_connection", { id });
 }
 
+/** Forget the stored host key for (host, port) so the next connect re-runs
+ * trust-on-first-use. Recovery for a legitimate server-side host-key change
+ * (reinstall / regenerated host keys) that would otherwise be rejected
+ * forever as "Unknown server key". */
+export async function resetKnownHost(host: string, port: number): Promise<void> {
+  await invoke("reset_known_host", { host, port });
+}
+
 export async function copyConnection(id: string): Promise<ConnectionConfig> {
   return await invoke("copy_connection", { srcId: id });
 }

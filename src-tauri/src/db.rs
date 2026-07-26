@@ -459,6 +459,19 @@ pub fn set_known_host(
     Ok(())
 }
 
+/// Forget the stored host key for (host, port). The next connect re-runs
+/// trust-on-first-use and accepts whatever key the server then presents.
+/// Used by the "重置主机密钥信任" action to recover after a legitimate
+/// server-side host-key change (reinstall / regenerated host keys) that
+/// would otherwise be rejected forever as a potential MITM.
+pub fn delete_known_host(conn: &Connection, host: &str, port: u16) -> Result<()> {
+    conn.execute(
+        "DELETE FROM known_hosts WHERE host = ?1 AND port = ?2",
+        params![host, port],
+    )?;
+    Ok(())
+}
+
 // ============ Connections CRUD ============
 //
 // All read/write paths take `key: &[u8; 32]` and encrypt/decrypt at the
