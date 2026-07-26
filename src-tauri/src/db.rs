@@ -42,7 +42,10 @@ pub fn init_db() -> Result<Connection> {
             shell_args TEXT,
             init_command TEXT,
             created_at TEXT NOT NULL,
-            terminal_font TEXT
+            terminal_font TEXT,
+            address_family TEXT NOT NULL DEFAULT 'auto',
+            connect_timeout_secs INTEGER,
+            keepalive_interval_secs INTEGER
         );
         CREATE TABLE IF NOT EXISTS known_hosts (
             host TEXT NOT NULL,
@@ -257,6 +260,21 @@ pub fn migrate_legacy_schema(conn: &Connection) -> Result<()> {
     if !column_exists(&tx, "connections", "deleted_at") {
         tx.execute("ALTER TABLE connections ADD COLUMN deleted_at TEXT", [])?;
     }
+    // Advanced connection options (SSH/SFTP). address_family defaults to 'auto'
+    // (NOT NULL, mirrors proxy_type); the two timeouts are nullable (NULL = use
+    // the built-in 10s connect / 15s keepalive defaults). Idempotent.
+    if !column_exists(&tx, "connections", "address_family") {
+        tx.execute(
+            "ALTER TABLE connections ADD COLUMN address_family TEXT NOT NULL DEFAULT 'auto'",
+            [],
+        )?;
+    }
+    if !column_exists(&tx, "connections", "connect_timeout_secs") {
+        tx.execute("ALTER TABLE connections ADD COLUMN connect_timeout_secs INTEGER", [])?;
+    }
+    if !column_exists(&tx, "connections", "keepalive_interval_secs") {
+        tx.execute("ALTER TABLE connections ADD COLUMN keepalive_interval_secs INTEGER", [])?;
+    }
 
     tx.execute(
         "CREATE TABLE IF NOT EXISTS folders (path TEXT PRIMARY KEY, created_at TEXT NOT NULL)",
@@ -452,7 +470,8 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
     let mut stmt = conn.prepare(
         "SELECT id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
                 private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
-                proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font
+                proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font,
+                address_family, connect_timeout_secs, keepalive_interval_secs
          FROM connections WHERE deleted_at IS NULL ORDER BY group_path, name"
     )?;
 
@@ -481,6 +500,9 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
             row.get::<_, Option<String>>(18)?,              // init_command
             row.get::<_, String>(19)?,                      // created_at
             row.get::<_, Option<String>>(20)?,              // terminal_font
+            row.get::<_, String>(21)?,                      // address_family
+            row.get::<_, Option<i64>>(22)?,                 // connect_timeout_secs
+            row.get::<_, Option<i64>>(23)?,                 // keepalive_interval_secs
         ))
     })?;
 
@@ -489,13 +511,16 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
         let (id, name, host_enc, port_i, user_enc, auth_method, pem_enc,
              conn_type, group_path, ftp_tls, ftp_passive,
              proxy_type, proxy_host_enc, proxy_port_i, proxy_username,
-             shell_path, shell_args, init_command, created_at, terminal_font) = row?;
+             shell_path, shell_args, init_command, created_at, terminal_font,
+             address_family, connect_timeout_i, keepalive_interval_i) = row?;
         let host = decrypt_field(key, host_enc)?.unwrap_or_default();
         let username = decrypt_field(key, user_enc)?.unwrap_or_default();
         let private_key_pem = decrypt_field(key, pem_enc)?;
         let proxy_host = decrypt_field(key, proxy_host_enc)?;
         let port: u16 = port_i.try_into().unwrap_or(0);
         let proxy_port = proxy_port_i.and_then(|p| p.try_into().ok());
+        let connect_timeout_secs = connect_timeout_i.and_then(|v| v.try_into().ok());
+        let keepalive_interval_secs = keepalive_interval_i.and_then(|v| v.try_into().ok());
         configs.push(ConnectionConfig {
             id,
             name,
@@ -519,6 +544,9 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
             proxy_password: None, // resolved from keyring by caller
             created_at,
             terminal_font,
+            address_family,
+            connect_timeout_secs,
+            keepalive_interval_secs,
         });
     }
     Ok(configs)
@@ -572,6 +600,9 @@ pub fn get_all_connections_plaintext(conn: &Connection) -> Result<Vec<Connection
             proxy_password: None,
             created_at: String::new(),
             terminal_font: None,
+            address_family: String::new(),
+            connect_timeout_secs: None,
+            keepalive_interval_secs: None,
         });
     }
     Ok(configs)
@@ -603,8 +634,9 @@ pub fn save_connection(conn: &Connection, key: &[u8; 32], config: &ConnectionCon
         "INSERT OR REPLACE INTO connections
             (id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
              private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
-             proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+             proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font,
+             address_family, connect_timeout_secs, keepalive_interval_secs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             config.id,
             config.name,
@@ -626,6 +658,9 @@ pub fn save_connection(conn: &Connection, key: &[u8; 32], config: &ConnectionCon
             config.init_command,
             config.created_at,
             config.terminal_font,
+            config.address_family,
+            config.connect_timeout_secs.map(|v| v as i64),
+            config.keepalive_interval_secs.map(|v| v as i64),
         ],
     )?;
     Ok(())
@@ -635,7 +670,8 @@ pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Opt
     let mut stmt = conn.prepare(
         "SELECT id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
                 private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
-                proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font
+                proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font,
+                address_family, connect_timeout_secs, keepalive_interval_secs
          FROM connections WHERE id = ?1 AND deleted_at IS NULL"
     )?;
     let mut rows = stmt.query_map(params![id], |row| {
@@ -660,19 +696,25 @@ pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Opt
             row.get::<_, Option<String>>(18)?,               // init_command
             row.get::<_, String>(19)?,                       // created_at
             row.get::<_, Option<String>>(20)?,               // terminal_font
+            row.get::<_, String>(21)?,                       // address_family
+            row.get::<_, Option<i64>>(22)?,                  // connect_timeout_secs
+            row.get::<_, Option<i64>>(23)?,                  // keepalive_interval_secs
         ))
     })?;
     match rows.next() {
         Some(Ok((id, name, host_enc, port_i, user_enc, auth_method, pem_enc,
                  conn_type, group_path, ftp_tls, ftp_passive,
                  proxy_type, proxy_host_enc, proxy_port_i, proxy_username,
-                 shell_path, shell_args, init_command, created_at, terminal_font))) => {
+                 shell_path, shell_args, init_command, created_at, terminal_font,
+                 address_family, connect_timeout_i, keepalive_interval_i))) => {
             let host = decrypt_field(key, host_enc)?.unwrap_or_default();
             let username = decrypt_field(key, user_enc)?.unwrap_or_default();
             let private_key_pem = decrypt_field(key, pem_enc)?;
             let proxy_host = decrypt_field(key, proxy_host_enc)?;
             let port: u16 = port_i.try_into().unwrap_or(0);
             let proxy_port = proxy_port_i.and_then(|p| p.try_into().ok());
+            let connect_timeout_secs = connect_timeout_i.and_then(|v| v.try_into().ok());
+            let keepalive_interval_secs = keepalive_interval_i.and_then(|v| v.try_into().ok());
             Ok(Some(ConnectionConfig {
                 id,
                 name,
@@ -696,6 +738,9 @@ pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Opt
                 proxy_password: None,
                 created_at,
                 terminal_font,
+                address_family,
+                connect_timeout_secs,
+                keepalive_interval_secs,
             }))
         }
         Some(Err(e)) => Err(e),
@@ -786,7 +831,8 @@ pub fn get_deleted_connections(
     let mut stmt = conn.prepare(
         "SELECT id, name, host_enc, port, username_enc, auth_method, private_key_pem_enc,
                 private_key_path_enc, conn_type, group_path, ftp_tls, ftp_passive,
-                proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font, deleted_at
+                proxy_type, proxy_host_enc, proxy_port, proxy_username, shell_path, shell_args, init_command, created_at, terminal_font,
+                address_family, connect_timeout_secs, keepalive_interval_secs, deleted_at
          FROM connections WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -811,7 +857,10 @@ pub fn get_deleted_connections(
             row.get::<_, Option<String>>(18)?,
             row.get::<_, String>(19)?,
             row.get::<_, Option<String>>(20)?,
-            row.get::<_, String>(21)?, // deleted_at
+            row.get::<_, String>(21)?,                       // address_family
+            row.get::<_, Option<i64>>(22)?,                  // connect_timeout_secs
+            row.get::<_, Option<i64>>(23)?,                  // keepalive_interval_secs
+            row.get::<_, String>(24)?,                       // deleted_at
         ))
     })?;
     let mut out = Vec::new();
@@ -820,6 +869,7 @@ pub fn get_deleted_connections(
              conn_type, group_path, ftp_tls, ftp_passive,
              proxy_type, proxy_host_enc, proxy_port_i, proxy_username,
              shell_path, shell_args, init_command, created_at, terminal_font,
+             address_family, connect_timeout_i, keepalive_interval_i,
              deleted_at) = row?;
         let host = decrypt_field(key, host_enc)?.unwrap_or_default();
         let username = decrypt_field(key, user_enc)?.unwrap_or_default();
@@ -827,6 +877,8 @@ pub fn get_deleted_connections(
         let proxy_host = decrypt_field(key, proxy_host_enc)?;
         let port: u16 = port_i.try_into().unwrap_or(0);
         let proxy_port = proxy_port_i.and_then(|p| p.try_into().ok());
+        let connect_timeout_secs = connect_timeout_i.and_then(|v| v.try_into().ok());
+        let keepalive_interval_secs = keepalive_interval_i.and_then(|v| v.try_into().ok());
         let config = ConnectionConfig {
             id,
             name,
@@ -850,6 +902,9 @@ pub fn get_deleted_connections(
             proxy_password: None,
             created_at,
             terminal_font,
+            address_family,
+            connect_timeout_secs,
+            keepalive_interval_secs,
         };
         out.push((config, deleted_at));
     }

@@ -50,6 +50,13 @@ export interface ConnectionConfig {
    * takes precedence over the global terminal font for this connection's
    * tabs. Empty/undefined = use the global setting. Plain column. */
   terminal_font?: string;
+  /** TCP dial address-family preference: "auto" (default) | "ipv4" | "ipv6".
+   * Honored for SSH/SFTP only. "auto" = let the OS try both. Plain column. */
+  address_family?: string;
+  /** Per-connection connect timeout in seconds. undefined = 10s default. */
+  connect_timeout_secs?: number;
+  /** SSH keepalive interval in seconds. undefined = 15s default. */
+  keepalive_interval_secs?: number;
   created_at: string;
 }
 

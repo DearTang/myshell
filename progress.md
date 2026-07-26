@@ -2102,6 +2102,23 @@
   - 端到端验证：列表接口返回 27 个 release，复刻的版本比较逻辑正确选出 v2.5.5；对 v1.11.2 → has_update=true，对 v2.5.5 → has_update=false
 - **关联问题（不修）：** MCP/CLI 在 Linux 的可用性已确认——deb 包内含 `usr/bin/myshell` + `usr/bin/myshell-mcp` + `usr/bin/myshell-cli` 三个二进制，装到 /usr/bin/ 即在 PATH 中，共享 `~/.config/myshell/connections.db`，开箱可用。
 
+### 阶段 84：连接高级选项——地址族 / 连接超时 / Keepalive（2026-07-26）
+
+- **需求：** 主机有 AAAA 记录但 IPv6 黑洞时，SSH 连接会卡到回退 IPv4 才成功；且连接超时（10s）、keepalive（15s）此前是写死的全局值，无法按连接调整。
+- **方案：** 给每个连接新增 3 个可选配置（仅 SSH/SFTP 生效，SFTP 复用 SSH 会话自动覆盖）：
+  1. `address_family`：`auto`（默认）/ `ipv4` / `ipv6`
+  2. `connect_timeout_secs`：`Option<u32>`，None = 10s
+  3. `keepalive_interval_secs`：`Option<u32>`，None = 15s（keepalive_max 固定 3）
+- **核心改动：** `dial_and_authenticate`（ssh.rs）是唯一拨号咽喉（connect / test_connection / 断线重连共用）。直连分支原来用 `client::connect`（russh 内部解析、无地址族控制），改为新增的 `dial_tcp` 辅助函数：`tokio::net::lookup_host` 解析 → 按 family 过滤 → `TcpStream::connect`（带每连接超时）→ 交给 `client::connect_stream`（复用代理路径已有的模式）。`with_connect_timeout` 重构为接受 `timeout: Duration` 参数。代理分支不变（代理目标由代理服务器解析）。
+- **涉及文件（5 个）：**
+  - `src-tauri/src/lib.rs`：ConnectionConfig 加 3 字段 + `default_address_family()`。
+  - `src-tauri/src/db.rs`：CREATE TABLE + 幂等迁移 + INSERT/SELECT/row map/4 处结构体字面量（新列索引 21/22/23，get_deleted 的 deleted_at 顺移到 24）。
+  - `src-tauri/src/ssh.rs`：`dial_tcp` + 每连接超时 + 每连接 keepalive；导入 SocketAddr/TcpStream。
+  - `src/api.ts`：ConnectionConfig 接口镜像 3 字段。
+  - `src/components/ConnectionDialog.tsx`：3 个 state + validate 范围校验（1-3600）+ buildConfig + 「高级选项」FieldGroup（仅 ssh/sftp 显示）。
+- **范围外：** FTP 地址族/超时（suppaftp 内部解析，UI 已隐藏该组）、代理目标地址族、cipher/KEX、压缩、TERM。
+- **验证：** `cargo check`（exit 0）+ `npx tsc --noEmit`（无错误）均通过。
+
 ## 五问重启检查（阶段 83）
 | 问题 | 答案 |
 |------|------|
@@ -2110,3 +2127,12 @@
 | 什么可能导致偏离？ | per_page=100 上限：若以后 release 数 >100 且最大版本在第 101 条之后会漏——目前才 27 个，短期无忧；长期可加分页遍历。 |
 | 下一步最小可验证动作？ | 旧版应用启动 → 检查更新 → 应弹窗提示 v2.5.5 + 下载按钮（Windows auto / Linux browser）。 |
 | 目标是什么？ | 任何已发布旧版都能在应用内检测到真实最新版并被引导升级，不再卡在 v1.11.2。 |
+
+## 五问重启检查（阶段 84）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 84 complete —— 连接新增地址族/连接超时/Keepalive 三个高级选项，Rust + TS 双侧类型检查通过。 |
+| 我要去哪里？ | 实测：建 SSH 连接设「强制 IPv4」+ 超时 5 + keepalive 30 应连接成功；纯 IPv4 主机设「强制 IPv6」应报“无可用 IPv6 地址”。 |
+| 什么可能导致偏离？ | `dial_tcp` 用 `lookup_host` 自行解析取代了 russh 内部解析——若某些主机名解析行为与 russh 原路径有差异（极少见），直连可能受影响；auto 模式保留全部地址、行为应等价。 |
+| 下一步最小可验证动作？ | 起 `cargo tauri dev`，编辑一个 SSH 连接，确认「高级选项」组出现、保存后重开回显正确、强制 IPv6 对 IPv4 主机报错。 |
+| 目标是什么？ | 让用户能绕开 IPv6 黑洞、按连接调超时/保活——选项默认值与原硬编码一致，不改既有连接行为。 |

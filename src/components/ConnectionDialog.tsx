@@ -81,6 +81,15 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
   const [shellArgs, setShellArgs] = useState(config?.shell_args || "");
   const [initCommand, setInitCommand] = useState(config?.init_command || "");
   const [terminalFont, setTerminalFont] = useState(config?.terminal_font || "");
+  // Advanced SSH/SFTP options. Empty string = "use backend default" (auto /
+  // 10s / 15s) — buildConfig maps "" to undefined so the column stays NULL.
+  const [addressFamily, setAddressFamily] = useState(config?.address_family || "auto");
+  const [connectTimeout, setConnectTimeout] = useState(
+    config?.connect_timeout_secs != null ? String(config.connect_timeout_secs) : ""
+  );
+  const [keepaliveInterval, setKeepaliveInterval] = useState(
+    config?.keepalive_interval_secs != null ? String(config.keepalive_interval_secs) : ""
+  );
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
@@ -193,6 +202,23 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
         errs.proxyPort = "代理端口必须为 1-65535 之间的整数";
       }
     }
+
+    // Advanced options (SSH/SFTP only). Empty = use backend default; when
+    // filled, must be a sane positive integer (cap at 1 hour).
+    if (connType === "ssh" || connType === "sftp") {
+      if (connectTimeout.trim()) {
+        const ct = parseInt(connectTimeout, 10);
+        if (!Number.isInteger(ct) || ct < 1 || ct > 3600) {
+          errs.connectTimeout = "连接超时须为 1-3600 之间的整数（秒）";
+        }
+      }
+      if (keepaliveInterval.trim()) {
+        const ki = parseInt(keepaliveInterval, 10);
+        if (!Number.isInteger(ki) || ki < 1 || ki > 3600) {
+          errs.keepaliveInterval = "Keepalive 间隔须为 1-3600 之间的整数（秒）";
+        }
+      }
+    }
     return errs;
   }
 
@@ -260,6 +286,11 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
           : undefined,
       proxy_password: proxyType !== "none" && proxyPassword ? proxyPassword : undefined,
       terminal_font: terminalFont.trim() || undefined,
+      address_family: addressFamily,
+      connect_timeout_secs: connectTimeout.trim() ? parseInt(connectTimeout, 10) : undefined,
+      keepalive_interval_secs: keepaliveInterval.trim()
+        ? parseInt(keepaliveInterval, 10)
+        : undefined,
       created_at: config?.created_at || new Date().toISOString(),
     };
   }
@@ -693,6 +724,56 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
               </>
             )}
           </FieldGroup>
+          )}
+
+          {(connType === "ssh" || connType === "sftp") && (
+            <FieldGroup label="高级选项">
+              <FormField label="地址族">
+                <Select
+                  value={addressFamily}
+                  onChange={setAddressFamily}
+                  options={[
+                    { value: "auto", label: "自动（IPv4 / IPv6）" },
+                    { value: "ipv4", label: "强制 IPv4" },
+                    { value: "ipv6", label: "强制 IPv6" },
+                  ]}
+                />
+              </FormField>
+              <div style={{ display: "flex", gap: 12 }}>
+                <div style={{ flex: 1 }}>
+                  <FormField label="连接超时（秒，留空=10）">
+                    <Input
+                      value={connectTimeout}
+                      onChange={(v) => {
+                        setConnectTimeout(v);
+                        clearFieldError("connectTimeout");
+                      }}
+                      placeholder="10"
+                      errorKey="connectTimeout"
+                      error={fieldErrors.connectTimeout}
+                      shakeNonce={shakeNonce}
+                      registerField={registerField}
+                    />
+                  </FormField>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <FormField label="Keepalive 间隔（秒，留空=15）">
+                    <Input
+                      value={keepaliveInterval}
+                      onChange={(v) => {
+                        setKeepaliveInterval(v);
+                        clearFieldError("keepaliveInterval");
+                      }}
+                      placeholder="15"
+                      errorKey="keepaliveInterval"
+                      error={fieldErrors.keepaliveInterval}
+                      shakeNonce={shakeNonce}
+                      registerField={registerField}
+                    />
+                  </FormField>
+                </div>
+              </div>
+            </FieldGroup>
           )}
 
           <FieldGroup label="分组">

@@ -122,6 +122,21 @@ pub struct ConnectionConfig {
     /// tabs. Plain column — not a secret.
     #[serde(default)]
     pub terminal_font: Option<String>,
+    /// TCP dial address-family preference: "auto" (default — let the OS try
+    /// both v4/v6) | "ipv4" | "ipv6". Honored by ssh.rs's `dial_tcp` for
+    /// SSH/SFTP only. Plain column — not a secret (same treatment as
+    /// proxy_type). Fixes hosts with a dead AAAA record black-holing the
+    /// connect attempt before it falls back to IPv4.
+    #[serde(default = "default_address_family")]
+    pub address_family: String,
+    /// Per-connection TCP + SSH-handshake connect timeout in seconds. None =
+    /// use the 10s default. Nullable column.
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u32>,
+    /// SSH keepalive interval in seconds. None = use the 15s default
+    /// (keepalive_max stays fixed at 3). Nullable column.
+    #[serde(default)]
+    pub keepalive_interval_secs: Option<u32>,
     pub created_at: String,
 }
 
@@ -139,6 +154,10 @@ fn default_ftp_passive() -> bool {
 
 fn default_proxy_type() -> String {
     "none".to_string()
+}
+
+fn default_address_family() -> String {
+    "auto".to_string()
 }
 
 // ============ SFTP File Entry ============

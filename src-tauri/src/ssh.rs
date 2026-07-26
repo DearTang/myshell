@@ -2,8 +2,10 @@ use crate::{AppState, ConnectionConfig, EventSink, EventSinkExt};
 use crate::proxy;
 use russh::client::{self, Handle, Msg};
 use russh::{Channel, ChannelMsg, Disconnect};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
@@ -277,26 +279,68 @@ fn is_zmodem_end(buf: &[u8]) -> bool {
 /// `false` and opens its own channel afterwards instead.
 /// Connection phase timeout (TCP dial + SSH handshake). If the server is
 /// unresponsive (dead host, firewall dropping SYN, suspended VM), the initial
-/// `client::connect()` can block indefinitely waiting for TCP retransmits.
-/// This caps the wait at 10 seconds so the user gets a clear error quickly.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default connect timeout when a connection doesn't override it via
+/// `connect_timeout_secs`. `client::connect()` can block indefinitely waiting
+/// for TCP retransmits, so we always cap the wait so the user gets a clear
+/// error quickly instead of a hung UI.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Wraps a connection future with `CONNECT_TIMEOUT`. On timeout, returns a
-/// localized error so the user sees "连接超时" instead of hanging forever.
+/// Wraps a connection future with a timeout. On timeout, returns a localized
+/// error so the user sees "连接超时" instead of hanging forever. The timeout
+/// is per-connection (`config.connect_timeout_secs`, resolved by the caller).
 async fn with_connect_timeout<F, T, E>(
     fut: F,
+    timeout: Duration,
     ctx: &str,
     map_err: impl FnOnce(E) -> String,
 ) -> Result<T, String>
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    match tokio::time::timeout(CONNECT_TIMEOUT, fut).await {
+    match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(handle)) => Ok(handle),
         Ok(Err(e)) => Err(map_err(e)),
         Err(_) => Err(format!(
             "{}超时（{:?} 无响应），请检查服务器地址和网络",
-            ctx, CONNECT_TIMEOUT
+            ctx, timeout
+        )),
+    }
+}
+
+/// Resolve `host:port` and dial a TCP stream, honoring the per-connection
+/// address-family preference. `family` is "ipv4" / "ipv6" / anything-else
+/// (= auto: try whatever the OS returns, in order). We resolve ourselves
+/// (instead of letting `client::connect` do it) so we can filter the address
+/// family — this is what fixes hosts with a dead AAAA record black-holing the
+/// connect before it falls back to IPv4. The dial is capped by `timeout`.
+async fn dial_tcp(
+    host: &str,
+    port: u16,
+    family: &str,
+    timeout: Duration,
+) -> Result<TcpStream, String> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DNS 解析失败 ({}): {}", host, e))?
+        .filter(|a| match family {
+            "ipv4" => a.is_ipv4(),
+            "ipv6" => a.is_ipv6(),
+            _ => true,
+        })
+        .collect();
+    if addrs.is_empty() {
+        return Err(match family {
+            "ipv4" => format!("{} 无可用 IPv4 地址", host),
+            "ipv6" => format!("{} 无可用 IPv6 地址", host),
+            _ => format!("{} 无可用地址", host),
+        });
+    }
+    match tokio::time::timeout(timeout, TcpStream::connect(addrs.as_slice())).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err(format!("TCP 连接失败 ({}:{}): {}", host, port, e)),
+        Err(_) => Err(format!(
+            "连接超时（{:?} 无响应），请检查服务器地址和网络",
+            timeout
         )),
     }
 }
@@ -328,8 +372,17 @@ pub async fn dial_and_authenticate(
     // server (NAT timeout, suspended VM, dead WiFi) stops responding and
     // is detected within ~45s, close to the old 30s intent but without
     // the false-positive on long-running commands.
+    // Per-connection connect timeout (None = 10s default).
+    let connect_timeout = config
+        .connect_timeout_secs
+        .map(|s| Duration::from_secs(s as u64))
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+
     let mut ssh_config = client::Config::default();
-    ssh_config.keepalive_interval = Some(Duration::from_secs(15));
+    // Keepalive interval is per-connection (None = 15s default); max stays 3.
+    ssh_config.keepalive_interval = Some(Duration::from_secs(
+        config.keepalive_interval_secs.unwrap_or(15) as u64,
+    ));
     ssh_config.keepalive_max = 3;
     let ssh_config = Arc::new(ssh_config);
 
@@ -344,8 +397,10 @@ pub async fn dial_and_authenticate(
     // reuses this same session (sftp.rs) so the proxy choice covers SFTP
     // automatically without a separate code path.
     //
-    // Both paths are wrapped with `CONNECT_TIMEOUT` so a dead server fails
-    // fast instead of letting the UI spin forever.
+    // Both paths are wrapped with the per-connection `connect_timeout` so a
+    // dead server fails fast instead of letting the UI spin forever. The
+    // direct path resolves + dials itself (via `dial_tcp`) so it can honor
+    // the address-family preference, then hands the stream to connect_stream.
     let mut handle = match proxy::ProxyConfig::from_config(config)? {
         Some(proxy_cfg) => {
             log::info!(
@@ -359,14 +414,23 @@ pub async fn dial_and_authenticate(
             let stream = proxy::connect_via_proxy(&proxy_cfg, &config.host, config.port).await?;
             with_connect_timeout(
                 client::connect_stream(ssh_config, stream, handler),
+                connect_timeout,
                 "通过代理连接",
                 |e| format!("SSH connect via proxy failed: {}", e),
             )
             .await?
         }
         None => {
+            let stream = dial_tcp(
+                &config.host,
+                config.port,
+                &config.address_family,
+                connect_timeout,
+            )
+            .await?;
             with_connect_timeout(
-                client::connect(ssh_config, (config.host.as_str(), config.port), handler),
+                client::connect_stream(ssh_config, stream, handler),
+                connect_timeout,
                 "连接",
                 |e| format!("SSH connect failed: {}", e),
             )
