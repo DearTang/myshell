@@ -7,7 +7,6 @@ import {
   renameFolder,
   copyConnection,
   renameConnection,
-  resetKnownHost,
 } from "../api";
 import { useTheme } from "../hooks/useTheme";
 import { useConnectionDrag } from "../hooks/useConnectionDrag";
@@ -261,9 +260,6 @@ export function Sidebar({
     | (ConfirmState<{ path: string }> & { connCount: number; subFolderCount: number })
     | null
   >(null);
-  // Reset stored host key (recover from a legitimate server-side host-key
-  // change). Not destructive to credentials — only forgets the trust anchor.
-  const [resetHostKeyConfirm, setResetHostKeyConfirm] = useState<ConfirmState<ConnectionConfig> | null>(null);
 
   // Long-press-drag-to-folder. While dragState is active the list switches to
   // a compact folders-only view so the user doesn't have to scroll past dozens
@@ -373,32 +369,6 @@ export function Sidebar({
     if (!deleteConnConfirm) return;
     onDelete(deleteConnConfirm.payload.id);
     setDeleteConnConfirm(null);
-  }
-
-  /** Ask to forget the stored host key for a connection (SSH/SFTP only). The
-   * next connect then re-runs trust-on-first-use. Recovery for a server whose
-   * host key legitimately changed (reinstall / regenerated host keys). */
-  function handleResetHostKey(conn: ConnectionConfig) {
-    setResetHostKeyConfirm({
-      title: "重置主机密钥信任",
-      message: `确定清除「${conn.name}」(${conn.host}:${conn.port}) 已保存的主机密钥指纹？\n下次连接会重新信任服务器当前的主机密钥。仅在服务器重装或更换了密钥时使用。`,
-      confirmLabel: "重置并重连信任",
-      danger: false,
-      payload: conn,
-    });
-  }
-
-  /** Run the host-key reset after the user confirmed. */
-  async function confirmResetHostKey() {
-    if (!resetHostKeyConfirm) return;
-    const conn = resetHostKeyConfirm.payload;
-    setResetHostKeyConfirm(null);
-    try {
-      await resetKnownHost(conn.host, conn.port);
-      window.alert(`已清除「${conn.name}」的主机密钥记录，下次连接将重新信任。`);
-    } catch (e) {
-      window.alert(`重置失败: ${e}`);
-    }
   }
 
   async function handleDeleteFolder(path: string) {
@@ -525,7 +495,6 @@ export function Sidebar({
           onEdit={() => onEdit(c)}
           onCopy={() => handleCopy(c.id)}
           onDelete={() => handleDeleteConnection(c)}
-          onResetHostKey={() => handleResetHostKey(c)}
           onRename={() => handleRenameConnection(c.id, c.name)}
         />
       );
@@ -549,7 +518,6 @@ export function Sidebar({
         onEdit={() => onEdit(conn)}
         onCopy={() => handleCopy(conn.id)}
         onDelete={() => handleDeleteConnection(conn)}
-        onResetHostKey={() => handleResetHostKey(conn)}
         onRename={() => handleRenameConnection(conn.id, conn.name)}
       />
     ));
@@ -932,16 +900,6 @@ export function Sidebar({
           onCancel={() => setDeleteConnConfirm(null)}
         />
       )}
-      {resetHostKeyConfirm && (
-        <ConfirmDialog
-          title={resetHostKeyConfirm.title}
-          message={resetHostKeyConfirm.message}
-          confirmLabel={resetHostKeyConfirm.confirmLabel}
-          danger={resetHostKeyConfirm.danger}
-          onConfirm={confirmResetHostKey}
-          onCancel={() => setResetHostKeyConfirm(null)}
-        />
-      )}
       {deleteFolderConfirm && (
         <ConfirmDialog
           title={deleteFolderConfirm.title}
@@ -1069,7 +1027,6 @@ const ConnRow = memo(function ConnRow({
   onEdit,
   onCopy,
   onDelete,
-  onResetHostKey,
   onRename,
 }: {
   conn: ConnectionConfig;
@@ -1082,7 +1039,6 @@ const ConnRow = memo(function ConnRow({
   onEdit: () => void;
   onCopy: () => void;
   onDelete: () => void;
-  onResetHostKey: () => void;
   onRename: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -1213,9 +1169,6 @@ const ConnRow = memo(function ConnRow({
             <MenuItem icon="✏️" label="编辑" onClick={() => { onEdit(); setOpen(false); }} />
             <MenuItem icon="🏷️" label="重命名" onClick={() => { onRename(); setOpen(false); }} />
             <MenuItem icon="📋" label="复制" onClick={() => { onCopy(); setOpen(false); }} />
-            {(connType === "ssh" || connType === "sftp") && (
-              <MenuItem icon="🔑" label="重置主机密钥信任" onClick={() => { onResetHostKey(); setOpen(false); }} />
-            )}
             <MenuItem icon="🗑️" label="删除" danger onClick={() => { onDelete(); setOpen(false); }} />
           </div>
         </>

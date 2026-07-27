@@ -2156,3 +2156,24 @@
 | 什么可能导致偏离？ | 错误细化依赖共享槽位在 connect 失败时被正确读取——若 russh 在 check_server_key 之外的环节先报错，槽位为空则回退原始错误（无害）。重置仅删 known_hosts 单行，不动凭据，可逆。 |
 | 下一步最小可验证动作？ | 起 dev，连 nas.ggbond.fun → 看新错误文案；⋯ → 重置主机密钥信任 → 确认 → 重连成功。 |
 | 目标是什么？ | 服务器合法换密钥后用户能自助恢复连接，同时不牺牲主机密钥变更的 MITM 防护（不自动接受）。 |
+
+### 阶段 85：主机密钥变更后无法连接——明确报错 + 内联重置重连（2026-07-27）
+
+- **问题：** 服务器重装/重新生成密钥后，连接报含糊的 `SSH connect failed: Unknown server key` 且**无任何入口可恢复**。首次信任（TOFU）本身正常（日志反证：同端口新主机 192.168.3.30 首连成功），真正原因是 host key mismatch 被防中间人逻辑正确拒绝，但 russh 统一显示成 "Unknown server key"，用户既看不懂也无法重新信任。
+- **根因定位：** 读运行时日志（`%AppData%/myshell/logs/`）确认 `[ssh] host key mismatch ... stored=SHA256:... got=SHA256:...`，即服务器主机密钥指纹变了。
+- **方案（选定：明确报错 + 内联「重置密钥并重连」，保留 MITM 防护）：**
+  1. `check_server_key` 不匹配时把（stored_fp, got_fp）写入 handler 上的共享槽位。
+  2. `dial_and_authenticate` 把拨号+握手包进 async 块统一产出 Result，失败时读槽位：若是不匹配，用明确的中文错误替换 russh 的 "Unknown server key"（列出新旧指纹）。
+  3. 新增「重置主机密钥信任」能力：`db::delete_known_host` → `reset_known_host` command → `api.ts resetKnownHost`。
+  4. **连接错误屏内联**：App.tsx 识别「主机密钥已变更」→ ErrorState 的「重新连接」按钮变成「重置密钥并重连」→ 点一下自动清旧记录 + 重连（重新走首次信任）。**不**走右键菜单（初版做过右键选项，后按用户要求删除，改为内联一键）。
+- **涉及文件（5 个）：** `ssh.rs`（SshClient 加槽位 + check_server_key 记录 + dial async 块 + 错误细化）、`db.rs`（delete_known_host）、`main.rs`（reset_known_host command + 注册）、`api.ts`（resetKnownHost + Tab.hostKeyMismatch）、`App.tsx`（错误识别 + handleResetHostKeyAndReconnect + ErrorState 按钮切换）+ `Sidebar.tsx`（删除初版的右键菜单项）。
+- **验证：** `cargo check` Finished（仅既有 dead_code 警告）+ `npx tsc --noEmit` exit 0。
+
+## 五问重启检查（阶段 85）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 85 complete —— 主机密钥变更不再卡死：报错明确列出新旧指纹，错误屏「重置密钥并重连」一键恢复，cargo check + tsc 通过。 |
+| 我要去哪里？ | 实测：对 nas.ggbond.fun:22228 连接应看到明确的"主机密钥已变更"错误（非 Unknown server key）；点「重置密钥并重连」后应成功（重新 TOFU）。 |
+| 什么可能导致偏离？ | 错误细化依赖共享槽位在 connect 失败时被正确读取——若 russh 在 check_server_key 之外的环节先报错，槽位为空则回退原始错误（无害）。重置仅删 known_hosts 单行，不动凭据，可逆。 |
+| 下一步最小可验证动作？ | 起 dev，连 nas.ggbond.fun → 看新错误文案；点「重置密钥并重连」→ 应自动清除旧记录并重新信任成功。 |
+| 目标是什么？ | 服务器合法换密钥后用户能一键自助恢复连接，同时不牺牲主机密钥变更的 MITM 防护（不自动接受）。 |

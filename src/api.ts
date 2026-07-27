@@ -88,6 +88,10 @@ export interface Tab {
   status?: "connecting" | "connected" | "disconnected" | "error";
   /** Error message when status is "error" */
   errorMessage?: string;
+  /** True when the last connect failed because the server's host key changed
+   * (stored fingerprint != presented). Drives an inline "reset key & reconnect"
+   * action on the error screen instead of the old opaque "Unknown server key". */
+  hostKeyMismatch?: boolean;
   /** Connection config for reconnection */
   config?: ConnectionConfig;
   /** Terminal text captured from the old xterm instance right before a

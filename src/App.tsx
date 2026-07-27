@@ -27,6 +27,7 @@ import type { Terminal } from "@xterm/xterm";
 import {
   getConnections,
   deleteConnection,
+  resetKnownHost,
   listFolders,
   sshConnect,
   sshSend,
@@ -1083,6 +1084,10 @@ export default function App() {
       }
     } catch (e) {
       const errorMessage = String(e);
+      // Host-key mismatch (server reinstall / regenerated keys) surfaces as a
+      // specific message from ssh.rs — flag it so the error screen can offer
+      // an inline "reset key & reconnect" instead of the old opaque error.
+      const hostKeyMismatch = errorMessage.includes("主机密钥已变更");
       // Update tab to show error state
       setTabs((prev) =>
         prev.map((t) =>
@@ -1091,6 +1096,7 @@ export default function App() {
                 ...t,
                 status: "error",
                 errorMessage: errorMessage,
+                hostKeyMismatch,
               }
             : t
         )
@@ -1222,7 +1228,12 @@ export default function App() {
       setTabs((prev) =>
         prev.map((t) =>
           t.id === tabId
-            ? { ...t, status: "error", errorMessage }
+            ? {
+                ...t,
+                status: "error",
+                errorMessage,
+                hostKeyMismatch: errorMessage.includes("主机密钥已变更"),
+              }
             : t
         )
       );
@@ -1248,6 +1259,21 @@ export default function App() {
       // Reconnect in parallel — they're independent sessions.
       await Promise.all(downSiblings.map((t) => reconnectOne(t.id)));
     }
+  }
+
+  /** Host-key mismatch recovery: forget the stored fingerprint for this host,
+   * then reconnect (which re-runs trust-on-first-use and accepts the new key).
+   * Triggered by the error screen's reconnect button when hostKeyMismatch. */
+  async function handleResetHostKeyAndReconnect(tabId: string) {
+    const tab = tabs.find((t) => t.id === tabId);
+    if (!tab?.config) return;
+    try {
+      await resetKnownHost(tab.config.host, tab.config.port);
+    } catch (e) {
+      window.alert(`重置主机密钥失败: ${e}`);
+      return;
+    }
+    await handleReconnect(tabId);
   }
 
   /** Batch-close every tab that's currently offline (disconnected or error).
@@ -1427,6 +1453,8 @@ export default function App() {
                       message={tab.errorMessage || "连接失败"}
                       onReconnect={() => handleReconnect(tab.id)}
                       onClose={() => handleCloseTab(tab.id)}
+                      hostKeyMismatch={tab.hostKeyMismatch}
+                      onResetHostKeyAndReconnect={() => handleResetHostKeyAndReconnect(tab.id)}
                     />
                   ) : tab.status === "connecting" ? (
                     <ConnectingState />
@@ -1747,10 +1775,16 @@ function ErrorState({
   message,
   onReconnect,
   onClose,
+  hostKeyMismatch,
+  onResetHostKeyAndReconnect,
 }: {
   message: string;
   onReconnect: () => void;
   onClose: () => void;
+  /** True when the connect failed because the server's host key changed.
+   * Swaps the reconnect button to a "reset key & reconnect" action. */
+  hostKeyMismatch?: boolean;
+  onResetHostKeyAndReconnect?: () => void;
 }) {
   return (
     <div
@@ -1827,7 +1861,7 @@ function ErrorState({
           关闭
         </button>
         <button
-          onClick={onReconnect}
+          onClick={hostKeyMismatch ? onResetHostKeyAndReconnect : onReconnect}
           style={{
             padding: "10px 24px",
             background: "var(--accent-primary)",
@@ -1847,7 +1881,7 @@ function ErrorState({
             e.currentTarget.style.background = "var(--accent-primary)";
           }}
         >
-          重新连接
+          {hostKeyMismatch ? "重置密钥并重连" : "重新连接"}
         </button>
       </div>
     </div>
