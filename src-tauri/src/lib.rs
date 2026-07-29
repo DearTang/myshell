@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 // ============ Modules ============
 
 pub mod ssh;
+pub mod zmodem_rx;
 pub mod sftp;
 pub mod db;
 pub mod secrets;
@@ -137,6 +138,11 @@ pub struct ConnectionConfig {
     /// (keepalive_max stays fixed at 3). Nullable column.
     #[serde(default)]
     pub keepalive_interval_secs: Option<u32>,
+    /// Application-level keepalive: open a disposable exec channel every N
+    /// seconds and run `true`. Generates real TCP payload to defeat NAT/
+    /// firewall idle timeouts and shell-level TMOUT. None/0 = disabled.
+    #[serde(default)]
+    pub app_keepalive_secs: Option<u32>,
     pub created_at: String,
 }
 
@@ -229,6 +235,10 @@ pub struct AppState {
     /// database columns and keyring entries. Derived once at setup and
     /// stored encrypted by the login password. `None` until unlocked.
     pub dek: Arc<Mutex<Option<[u8; 32]>>>,
+    /// Cancellation flags for in-flight SFTP transfers, keyed by request_id.
+    /// The frontend sets the flag via `sftp_cancel_transfer`; the download/upload
+    /// loop checks it between 32 KB chunks and breaks early when true.
+    pub transfer_cancels: Arc<Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
 /// Track open file handles for streaming ZMODEM file IO. Each transfer is

@@ -57,6 +57,8 @@ export interface ConnectionConfig {
   connect_timeout_secs?: number;
   /** SSH keepalive interval in seconds. undefined = 15s default. */
   keepalive_interval_secs?: number;
+  /** App-level keepalive (exec `true` every N secs). undefined/0 = disabled. */
+  app_keepalive_secs?: number;
   created_at: string;
 }
 
@@ -578,6 +580,11 @@ export function onSftpTransferDone(
   });
 }
 
+/** Cancel an in-flight SFTP transfer. The backend breaks at the next 32 KB chunk boundary. */
+export async function sftpCancelTransfer(requestId: string): Promise<void> {
+  await invoke("sftp_cancel_transfer", { requestId });
+}
+
 // ============ FTP API ============
 
 export async function ftpConnect(config: ConnectionConfig): Promise<string> {
@@ -953,6 +960,11 @@ export async function sshSendZmodemAbort(sessionId: string): Promise<void> {
   await invoke("ssh_send_zmodem_abort", { sessionId });
 }
 
+/** Signal Rust that the ZMODEM session is definitively over (authoritative). */
+export async function sshZmodemFinish(sessionId: string): Promise<void> {
+  await invoke("ssh_zmodem_finish", { sessionId });
+}
+
 export interface ZmodemReadOpenResult {
   id: string;
   size: number;
@@ -1119,6 +1131,71 @@ export function onZmodemEnd(
   return listen<string>("zmodem_end", (event) => {
     if (event.payload === sessionId) handler();
   });
+}
+
+// ── Native ZMODEM download (Rust-side receiver) ──────────────────────────
+// For downloads (remote `sz`), the Rust backend parses the protocol and writes
+// files directly — no JS data path. The frontend only handles the save-dir
+// prompt and progress display via these events.
+
+export interface ZmodemOfferPayload {
+  sessionId: string;
+  fileName: string;
+  fileSize: number;
+}
+
+export interface ZmodemProgressPayload {
+  sessionId: string;
+  bytesTransferred: number;
+  bytesTotal: number;
+}
+
+export interface ZmodemFileCompletePayload {
+  sessionId: string;
+  fileName: string;
+  bytesWritten: number;
+}
+
+/** A file is being offered by the remote `sz` — prompt the user for a dir. */
+export function onZmodemOffer(
+  sessionId: string,
+  handler: (p: ZmodemOfferPayload) => void
+): Promise<UnlistenFn> {
+  return listen<ZmodemOfferPayload>("zmodem_offer", (event) => {
+    if (event.payload.sessionId === sessionId) handler(event.payload);
+  });
+}
+
+/** Live byte progress for the current native download. */
+export function onZmodemProgress(
+  sessionId: string,
+  handler: (p: ZmodemProgressPayload) => void
+): Promise<UnlistenFn> {
+  return listen<ZmodemProgressPayload>("zmodem_progress", (event) => {
+    if (event.payload.sessionId === sessionId) handler(event.payload);
+  });
+}
+
+/** A single file finished downloading. */
+export function onZmodemFileComplete(
+  sessionId: string,
+  handler: (p: ZmodemFileCompletePayload) => void
+): Promise<UnlistenFn> {
+  return listen<ZmodemFileCompletePayload>("zmodem_file_complete", (event) => {
+    if (event.payload.sessionId === sessionId) handler(event.payload);
+  });
+}
+
+/**
+ * Respond to a `zmodem_offer`: pass the full save path to accept, or `null`
+ * to skip this file. The Rust receiver then sends ZRPOS (or ZSKIP) and starts
+ * streaming the file straight to disk.
+ */
+export async function zmodemAcceptOffer(
+  sessionId: string,
+  path: string | null
+): Promise<void> {
+  await invoke("zmodem_accept_offer", { sessionId, path });
 }
 
 // ============ Update check ============

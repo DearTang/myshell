@@ -16,11 +16,16 @@ import {
   onZmodemStart,
   onZmodemRaw,
   onZmodemEnd,
+  onZmodemOffer,
+  onZmodemProgress,
+  onZmodemFileComplete,
+  zmodemAcceptOffer,
   addCommandHistory,
   saveScreenshot,
   getAttachmentDir,
   showInFolder,
 } from "../api";
+import { open } from "@tauri-apps/plugin-dialog";
 import { captureTerminalToDataUrl } from "../utils/screenshot";
 import type { ConnType } from "../api";
 import { ZmodemBridge, type ZmodemStatus } from "../zmodem-bridge";
@@ -161,6 +166,12 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
   const bridgeRef = useRef<ZmodemBridge | null>(null);
   const isZmodemRef = useRef(false);
   const abortTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Native ZMODEM download state (Rust-side receiver). For downloads the data
+  // path is entirely Rust; the frontend only prompts for a dir and shows
+  // progress. Uploads still use the zmodem.js bridge.
+  const nativeDownloadRef = useRef(false);
+  const nativeDirRef = useRef<string | null>(null);
+  const nativeCancelledRef = useRef(false);
   // Timers for the first-output cols re-sync (see onSshOutput below). Held in
   // a ref so the [sessionId] cleanup can clear them if the panel tears down
   // before the last delayed sync fires.
@@ -203,6 +214,7 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
     bytesTotal: 0,
     speedBps: 0,
     error: null,
+    startTime: 0,
   });
 
   // Screenshot status banner — shown transiently after the user clicks 📷.
@@ -475,6 +487,9 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
     let unlistenZmodemStart: UnlistenFn | null = null;
     let unlistenZmodemRaw: UnlistenFn | null = null;
     let unlistenZmodemEnd: UnlistenFn | null = null;
+    let unlistenZmodemOffer: UnlistenFn | null = null;
+    let unlistenZmodemProgress: UnlistenFn | null = null;
+    let unlistenZmodemFileComplete: UnlistenFn | null = null;
     let closed = false;
     let firstOutputHandled = false;
 
@@ -588,8 +603,35 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
 
     // ZMODEM — Rust has already filtered terminal output from protocol bytes,
     // so zmodem_raw only fires when a session is actually starting.
-    onZmodemStart(sessionIdRef.current, (_direction) => {
+    //
+    // Downloads (remote `sz`) use the native Rust receiver: data never crosses
+    // IPC, the frontend only prompts for a save dir and renders progress.
+    // Uploads (remote `rz`) keep the zmodem.js bridge path.
+    const joinZmodemPath = (dir: string, name: string): string => {
+      const safeName = name.split(/[\\/]/).pop() || name;
+      const sep = dir.includes("/") && !dir.includes("\\") ? "/" : "\\";
+      const trimmed = dir.endsWith(sep) ? dir.slice(0, -1) : dir;
+      return `${trimmed}${sep}${safeName}`;
+    };
+    const promptNativeDir = async (): Promise<string | null> => {
+      if (nativeCancelledRef.current) return null;
+      if (nativeDirRef.current !== null) return nativeDirRef.current;
+      const dir = await open({ directory: true });
+      if (typeof dir === "string" && dir.length > 0) {
+        nativeDirRef.current = dir;
+        return dir;
+      }
+      nativeCancelledRef.current = true;
+      return null;
+    };
+
+    onZmodemStart(sessionIdRef.current, (direction) => {
       isZmodemRef.current = true;
+      nativeDownloadRef.current = direction === "download";
+      if (direction === "download") {
+        nativeDirRef.current = null;
+        nativeCancelledRef.current = false;
+      }
       term.write("\r\n\x1b[36m[ZMODEM 传输开始 — 终端输入已屏蔽]\x1b[0m\r\n");
     })
       .then((un) => {
@@ -599,7 +641,9 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
       .catch((e) => console.error("Failed to subscribe to zmodem_start:", e));
 
     onZmodemRaw(sessionIdRef.current, (data) => {
-      bridge.feed(data);
+      // Native downloads are handled entirely in Rust; only uploads feed the
+      // zmodem.js bridge.
+      if (!nativeDownloadRef.current) bridge.feed(data);
     })
       .then((un) => {
         if (closed) un();
@@ -607,8 +651,77 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
       })
       .catch((e) => console.error("Failed to subscribe to zmodem_raw:", e));
 
+    // Native download: a file is offered — prompt for dir (once), accept/skip.
+    onZmodemOffer(sessionIdRef.current, (p) => {
+      void (async () => {
+        const dir = await promptNativeDir();
+        const path = dir !== null ? joinZmodemPath(dir, p.fileName) : null;
+        if (path !== null) {
+          setZmodemStatus({
+            active: true,
+            direction: "download",
+            currentFile: p.fileName,
+            bytesTransferred: 0,
+            bytesTotal: p.fileSize,
+            speedBps: 0,
+            error: null,
+            startTime: Date.now(),
+          });
+        }
+        zmodemAcceptOffer(sessionIdRef.current, path).catch((e) =>
+          console.error("zmodemAcceptOffer failed:", e)
+        );
+      })();
+    })
+      .then((un) => {
+        if (closed) un();
+        else unlistenZmodemOffer = un;
+      })
+      .catch((e) => console.error("Failed to subscribe to zmodem_offer:", e));
+
+    // Native download: live byte progress.
+    onZmodemProgress(sessionIdRef.current, (p) => {
+      setZmodemStatus((prev) => {
+        if (!prev.active) return prev;
+        const elapsed = (Date.now() - prev.startTime) / 1000;
+        const speed = elapsed > 0 ? p.bytesTransferred / elapsed : 0;
+        return {
+          ...prev,
+          bytesTransferred: p.bytesTransferred,
+          bytesTotal: p.bytesTotal,
+          speedBps: speed,
+        };
+      });
+    })
+      .then((un) => {
+        if (closed) un();
+        else unlistenZmodemProgress = un;
+      })
+      .catch((e) => console.error("Failed to subscribe to zmodem_progress:", e));
+
+    // Native download: single file finished — update progress to 100%.
+    onZmodemFileComplete(sessionIdRef.current, (p) => {
+      setZmodemStatus((prev) => {
+        if (!prev.active) return prev;
+        return {
+          ...prev,
+          bytesTransferred: p.bytesWritten,
+          bytesTotal: p.bytesWritten,
+          currentFile: p.fileName,
+        };
+      });
+    })
+      .then((un) => {
+        if (closed) un();
+        else unlistenZmodemFileComplete = un;
+      })
+      .catch((e) => console.error("Failed to subscribe to zmodem_file_complete:", e));
+
     onZmodemEnd(sessionIdRef.current, () => {
       isZmodemRef.current = false;
+      nativeDownloadRef.current = false;
+      nativeDirRef.current = null;
+      nativeCancelledRef.current = false;
       bridge.reset();
       // Cancel any pending force-reset — the Rust backend reported an
       // orderly ZFIN/CAN sequence so the bridge is clean.
@@ -672,6 +785,9 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
       unlistenZmodemStart?.();
       unlistenZmodemRaw?.();
       unlistenZmodemEnd?.();
+      unlistenZmodemOffer?.();
+      unlistenZmodemProgress?.();
+      unlistenZmodemFileComplete?.();
       unsubscribeStatus();
       resizeObserver.disconnect();
       term.dispose();
@@ -927,18 +1043,18 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
           status={zmodemStatus}
           onCancel={() => {
             bridgeRef.current?.abort();
-            // 5s safety net: if the backend doesn't emit zmodem_end (Rust state
-            // machine stuck, network dropped mid-ZFIN), force the bridge back to
-            // a clean state so the user can resume typing.
+            // Safety net: zmodem_finish normally triggers zmodem_end within
+            // one IPC round-trip. If it somehow doesn't arrive (session dead,
+            // IPC failure), force-reset after 2s so the terminal is usable.
             if (abortTimeoutRef.current) clearTimeout(abortTimeoutRef.current);
             abortTimeoutRef.current = setTimeout(() => {
               bridgeRef.current?.reset();
               isZmodemRef.current = false;
               termRef.current?.write(
-                "\r\n\x1b[33m[abort 超时 5s — 强制重置]\x1b[0m\r\n"
+                "\r\n\x1b[33m[abort 超时 — 强制重置]\x1b[0m\r\n"
               );
               abortTimeoutRef.current = null;
-            }, 5000);
+            }, 2000);
           }}
         />
       </div>

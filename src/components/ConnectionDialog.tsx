@@ -90,6 +90,14 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
   const [keepaliveInterval, setKeepaliveInterval] = useState(
     config?.keepalive_interval_secs != null ? String(config.keepalive_interval_secs) : ""
   );
+  const [appKeepalive, setAppKeepalive] = useState(
+    config?.app_keepalive_secs != null && config.app_keepalive_secs > 0
+  );
+  const [appKeepaliveSecs, setAppKeepaliveSecs] = useState(
+    config?.app_keepalive_secs != null && config.app_keepalive_secs > 0
+      ? String(config.app_keepalive_secs)
+      : "60"
+  );
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
@@ -290,6 +298,9 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
       connect_timeout_secs: connectTimeout.trim() ? parseInt(connectTimeout, 10) : undefined,
       keepalive_interval_secs: keepaliveInterval.trim()
         ? parseInt(keepaliveInterval, 10)
+        : undefined,
+      app_keepalive_secs: appKeepalive
+        ? Math.max(10, parseInt(appKeepaliveSecs, 10) || 60)
         : undefined,
       created_at: config?.created_at || new Date().toISOString(),
     };
@@ -772,6 +783,37 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
                     />
                   </FormField>
                 </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12, color: "var(--text-secondary)" }}>
+                  <input
+                    type="checkbox"
+                    checked={appKeepalive}
+                    onChange={(e) => setAppKeepalive(e.target.checked)}
+                    style={{ accentColor: "var(--accent-primary)" }}
+                  />
+                  应用级保活（防 NAT/防火墙断连）
+                </label>
+                {appKeepalive && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>每</span>
+                    <input
+                      value={appKeepaliveSecs}
+                      onChange={(e) => setAppKeepaliveSecs(e.target.value)}
+                      style={{
+                        width: 48,
+                        background: "var(--bg-input)",
+                        border: "1px solid var(--border-default)",
+                        borderRadius: "var(--radius-sm)",
+                        color: "var(--text-primary)",
+                        padding: "2px 6px",
+                        fontSize: 12,
+                        textAlign: "center",
+                      }}
+                    />
+                    <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>秒</span>
+                  </div>
+                )}
               </div>
             </FieldGroup>
           )}

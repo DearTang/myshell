@@ -2470,6 +2470,27 @@ async fn ssh_send_zmodem_abort(
     ssh::zmodem_abort(&state, &session_id).await
 }
 
+/// Frontend signals the ZMODEM session is over (zmodem.js parsed ZFIN or user
+/// aborted). Switches the reader task back to Normal mode authoritatively.
+#[tauri::command]
+async fn ssh_zmodem_finish(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    ssh::zmodem_finish(&state, &session_id).await
+}
+
+/// Native ZMODEM download: frontend chose a save path for the offered file
+/// (`path` = full path) or passes `null` to skip this file.
+#[tauri::command]
+async fn zmodem_accept_offer(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: Option<String>,
+) -> Result<(), String> {
+    ssh::zmodem_accept_offer(&state, &session_id, path).await
+}
+
 // ============ Local Terminal Commands ============
 //
 // Local terminal sessions (conn_type='local') spawn a shell under a PTY. They
@@ -3202,15 +3223,20 @@ async fn sftp_upload(
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
     let sink = WindowSink(window);
-    sftp::upload(
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.transfer_cancels.lock().unwrap().insert(request_id.clone(), cancel.clone());
+    let result = sftp::upload(
         &state,
         &session_id,
         local_paths,
         &remote_dest_dir,
         &request_id,
         &sink,
+        cancel,
     )
-    .await
+    .await;
+    state.transfer_cancels.lock().unwrap().remove(&request_id);
+    result
 }
 
 /// Batch-download remote files into a local dir. Same event contract as
@@ -3225,15 +3251,38 @@ async fn sftp_download(
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
     let sink = WindowSink(window);
-    sftp::download(
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.transfer_cancels.lock().unwrap().insert(request_id.clone(), cancel.clone());
+    let result = sftp::download(
         &state,
         &session_id,
         remote_paths,
         &local_dest_dir,
         &request_id,
         &sink,
+        cancel,
     )
-    .await
+    .await;
+    state.transfer_cancels.lock().unwrap().remove(&request_id);
+    result
+}
+
+/// Cancel an in-flight SFTP transfer by request_id. Sets the atomic flag that
+/// the download/upload chunk loop checks between 32 KB reads.
+#[tauri::command]
+async fn sftp_cancel_transfer(
+    request_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let cancels = state.transfer_cancels.lock().unwrap();
+    match cancels.get(&request_id) {
+        Some(flag) => {
+            flag.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        None => Err("传输不存在或已结束".to_string()),
+    }
 }
 
 // ============ FTP Commands ============
@@ -3792,6 +3841,7 @@ pub fn run() {
         local_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         zmodem_files: Mutex::new(HashMap::new()),
         dek: Arc::new(Mutex::new(None)),
+        transfer_cancels: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = tauri::Builder::default()
@@ -3862,6 +3912,8 @@ pub fn run() {
             ssh_disconnect,
             ssh_send_zmodem,
             ssh_send_zmodem_abort,
+            ssh_zmodem_finish,
+            zmodem_accept_offer,
             local_connect,
             local_send,
             local_resize,
@@ -3876,6 +3928,7 @@ pub fn run() {
             sftp_rename,
             sftp_upload,
             sftp_download,
+            sftp_cancel_transfer,
             ftp_connect,
             ftp_list_dir,
             ftp_mkdir,

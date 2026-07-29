@@ -2177,3 +2177,62 @@
 | 什么可能导致偏离？ | 错误细化依赖共享槽位在 connect 失败时被正确读取——若 russh 在 check_server_key 之外的环节先报错，槽位为空则回退原始错误（无害）。重置仅删 known_hosts 单行，不动凭据，可逆。 |
 | 下一步最小可验证动作？ | 起 dev，连 nas.ggbond.fun → 看新错误文案；点「重置密钥并重连」→ 应自动清除旧记录并重新信任成功。 |
 | 目标是什么？ | 服务器合法换密钥后用户能一键自助恢复连接，同时不牺牲主机密钥变更的 MITM 防护（不自动接受）。 |
+
+### 阶段 86：ZMODEM 大文件下载卡死修复 + 进度面板增强（2026-07-28）
+
+- **问题：** `sz` 下载 323 MB 文件时，约 130 MB 后传输完全卡死（速度归零、无报错）。进度面板信息也太单薄——缺少开始时间和预估完成时间。
+- **根因：** `receiveFile` 对 zmodem.js 每个 8 KB ZDATA 子包都发一次 `szWriteChunk` IPC。323 MB ≈ 40 000 次 IPC 调用；到 130 MB 时 `pendingWrites` 数组已积累 ~16 000 个未决 Promise，Tauri WebView↔Rust 消息通道饱和，JS 事件循环被微任务淹没，管道死锁。
+- **修复（写入缓冲）：** 在 JS 侧引入写缓冲区——累积到 256 KB 或每 100 ms 才合并成一次 `szWriteChunk` IPC 刷盘。IPC 调用量降低 ~32×（40 000 → ~1 260），彻底消除消息队列饱和。
+- **进度面板增强：**
+  - 新增「开始时间」（HH:MM:SS）
+  - 新增「已用时间」+「预计剩余」（基于当前均速）
+  - 刷新间隔从 500 ms 改为 1 s（减少无谓重绘）
+  - 速度计算修正为 `(bytesTransferred - speedStartBytes) / elapsed`（续传时不再把已有字节计入速度）
+- **涉及文件（3 个）：** `src/zmodem-bridge.ts`（缓冲写入 + startTime 字段 + 速度采样 1 s）、`src/components/ZmodemProgressOverlay.tsx`（四行布局 + 时间信息）、`src/components/TerminalPanel.tsx`（初始状态补 startTime）。
+- **验证：** `npx tsc --noEmit` exit 0。
+
+## 五问重启检查（阶段 86）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 86 complete —— ZMODEM 下载缓冲写入修复 + 进度面板增加开始/剩余时间，tsc 通过。 |
+| 我要去哪里？ | 实测：`sz fault_complaint.tar.gz`（323 MB）应能完整下载不卡死；进度条显示开始时间、已用时间、预计剩余。 |
+| 什么可能导致偏离？ | 缓冲 flush 的 100 ms 定时器若在 ZEOF 后未清理可能写已关闭的 handle——finally 块已 clearTimeout + szClose 保护。 |
+| 下一步最小可验证动作？ | cargo tauri dev → 连远程 → `sz` 大文件 → 观察进度面板四行信息 + 传输不中断。 |
+| 目标是什么？ | 大文件 ZMODEM 传输稳定完成，用户能看到完整的时间/速度/ETA 信息。 |
+
+### 阶段 87：ZMODEM 原生下载文件大小不一致修复（2026-07-29）
+
+- **问题：** 原生 Rust ZMODEM 接收器（`zmodem_rx.rs`）下载大文件时，落盘文件比源文件多出数万字节（218 MB 文件多 45 KB，65 MB 文件多 28 KB），小文件（<30 KB）正常。
+- **根因：** `scan_subpackets` 中，子包 payload 在 CRC 完整性检查**之前**就被写入 `pending_write`。当 SSH Data 块的边界恰好切在子包 CRC 中间时，`skip_zdle_crc` 返回 None → `break` 退出扫描循环，但 payload 已经进了 `pending_write`。由于 `scan_pos` 未前进，下一次 `feed()` 会重新找到同一个子包并**再次**解码写入——导致该子包数据被重复写入文件。大文件子包多，CRC 被切的概率高，累积多出数万字节；小文件子包少，不触发。
+- **修复：** 将 CRC 完整性检查提前到 payload 解码/写入之前。只有 CRC 完整（`skip_zdle_crc` 返回 Some）时才解码 payload 并追加到 `pending_write`；CRC 不完整时直接 break，无任何副作用（pending_write 未触碰、scan_pos 未前进），下次 feed 干净地重新处理。
+- **涉及文件（1 个）：** `src-tauri/src/zmodem_rx.rs`（`scan_subpackets` 方法内 CRC 检查与 payload 写入的顺序调换）。
+- **验证：** `cargo check` Finished + `npx tsc --noEmit` exit 0。
+
+## 五问重启检查（阶段 87）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 87 complete —— 原生 ZMODEM 下载文件多出字节的 bug 已修复（CRC 检查提前），cargo check + tsc 通过。 |
+| 我要去哪里？ | 实测：`sz` 下载 218 MB / 65 MB 文件，对比 md5sum 和文件大小应与源完全一致。 |
+| 什么可能导致偏离？ | 修复仅调换了同一函数内两个操作的顺序，无新逻辑分支；`consume_zcrcw_subpacket`（ZFILE/ZSINIT）本身已正确（用 `?` 提前返回），不受影响。 |
+| 下一步最小可验证动作？ | cargo tauri dev → 连远程 → `sz` 大文件 → `ls -l` 对比字节数 + `md5sum` 校验。 |
+| 目标是什么？ | ZMODEM 下载文件与源文件逐字节一致，无论文件大小。 |
+
+### 阶段 88：ZMODEM 取消垃圾输出修复 + SFTP 传输面板重做（2026-07-29）
+
+- **问题 1：** ZMODEM 传输取消后，lrzsz 的 CAN 突发 + 错误文本 + ZFERR 帧 + OO 全部渲染到终端，打印大量垃圾。原 `oo_eaten` 机制只吃 2 个 `'O'` 字节，第一个字节不是 `'O'` 就放弃抑制。
+- **修复 1：** 将 `oo_eaten: u8` 替换为时间窗口抑制 `suppress_until: Option<Instant>`。ZMODEM 会话结束（正常/取消）后设 500ms 抑制窗口，期间丢弃所有入站 Data。500ms 覆盖 lrzsz 完整 abort 响应（通常 <100ms），shell prompt 在进程退出后才出现（>500ms），不受影响。
+- **问题 2：** SFTP 下载/上传无法取消，无速度/时间/ETA 显示，进度面板信息单薄。
+- **修复 2：**
+  - 后端：AppState 新增 `transfer_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>`；download/upload 的 32KB chunk 循环检查 cancel flag；新增 `sftp_cancel_transfer` command。
+  - 前端：SftpPanel 传输 overlay 重做为仿 ZmodemProgressOverlay 的 4 行布局（方向+文件名+取消按钮 / 进度条 / 字节+百分比+速度 / 开始时间+已用+剩余），1s tick 驱动 elapsed/ETA 实时更新。
+- **涉及文件（8 个）：** `ssh.rs`（suppress_until）、`lib.rs`（AppState 字段）、`sftp.rs`（cancel 检查）、`main.rs`（sftp_cancel_transfer + 注册）、`myshell-cli.rs` / `myshell-mcp.rs`（AppState 初始化）、`api.ts`（sftpCancelTransfer）、`SftpPanel.tsx`（overlay 重做）。
+- **验证：** `cargo check` Finished + `npx tsc --noEmit` exit 0。
+
+## 五问重启检查（阶段 88）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 88 complete —— ZMODEM 取消不再打印垃圾（500ms 抑制窗口）；SFTP 传输面板有取消按钮 + 速度/时间/ETA，cargo check + tsc 通过。 |
+| 我要去哪里？ | 实测：sz 下载中取消 → 终端干净；SFTP 下载大文件 → 面板显示速度/ETA + 取消可用。 |
+| 什么可能导致偏离？ | 抑制窗口 500ms 是经验值——极慢网络下 lrzsz 响应可能超过 500ms 导致少量垃圾泄漏（无害，不影响功能）。SFTP 取消粒度为 32KB chunk，最大延迟 ~1ms。 |
+| 下一步最小可验证动作？ | cargo tauri dev → sz 大文件 → 取消 → 检查终端无垃圾；SFTP 面板下载 → 观察 4 行信息 + 点取消。 |
+| 目标是什么？ | ZMODEM 取消后终端干净；SFTP 传输体验与 ZMODEM 对齐（可取消、有时间信息）。 |

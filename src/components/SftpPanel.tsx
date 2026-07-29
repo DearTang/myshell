@@ -7,6 +7,7 @@ import {
   sftpRename,
   sftpUpload,
   sftpDownload,
+  sftpCancelTransfer,
   onSftpTransferProgress,
   onSftpTransferDone,
   onSshClosed,
@@ -45,6 +46,29 @@ interface TransferState {
   bytesTotal: number;
   errors: string[];
   done: boolean;
+  startTime: number;
+  requestId: string;
+}
+
+function formatClock(epochMs: number): string {
+  if (!epochMs) return "—";
+  const d = new Date(epochMs);
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map((n) => String(n).padStart(2, "0"))
+    .join(":");
+}
+
+function formatDuration(seconds: number): string {
+  if (!isFinite(seconds) || seconds <= 0) return "—";
+  if (seconds < 60) return `${Math.ceil(seconds)}秒`;
+  if (seconds < 3600) {
+    const m = Math.floor(seconds / 60);
+    const s = Math.ceil(seconds % 60);
+    return `${m}分${s}秒`;
+  }
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}小时${m}分`;
 }
 
 export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDisconnected, status, onReconnect }: Props) {
@@ -65,6 +89,13 @@ export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDis
   const [transfer, setTransfer] = useState<TransferState | null>(null);
   // Unlisteners for the active transfer's events — cleared on overlay close.
   const transferUnlistenRef = useRef<Array<() => void>>([]);
+  // 1s tick to keep elapsed/ETA live in the transfer overlay.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!transfer || transfer.done) return;
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [transfer?.done, transfer?.startTime]);
 
   const dispatch = {
     list: source === "ftp" ? ftpListDir : sftpListDir,
@@ -243,6 +274,8 @@ export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDis
       bytesTotal: 0,
       errors: [],
       done: false,
+      startTime: Date.now(),
+      requestId,
     });
     // Subscribe BEFORE invoking so the earliest progress events land.
     const unP = await onSftpTransferProgress(requestId, (p: SftpTransferProgressPayload) => {
@@ -713,92 +746,51 @@ export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDis
         )}
       </div>
 
-      {/* Transfer overlay (upload/download progress + per-file errors) */}
-      {transfer && (
+      {/* Transfer overlay — 4-row layout matching ZmodemProgressOverlay */}
+      {transfer && (() => {
+        const elapsed = transfer.startTime > 0 ? (Date.now() - transfer.startTime) / 1000 : 0;
+        const speed = elapsed > 1 ? transfer.bytesDone / elapsed : 0;
+        const remaining = speed > 0 && transfer.bytesTotal > 0
+          ? (transfer.bytesTotal - transfer.bytesDone) / speed
+          : Infinity;
+        return (
         <div
           style={{
             position: "absolute",
-            left: 10,
-            right: 10,
-            bottom: 10,
-            background: "var(--bg-elevated)",
-            border: "1px solid var(--border-emphasis)",
-            borderRadius: 8,
-            padding: 12,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(30, 30, 46, 0.96)",
+            borderTop: "1px solid var(--border-emphasis)",
+            padding: "8px 16px 10px",
             fontSize: 12,
-            boxShadow: "0 8px 32px rgba(0,0,0,0.55)",
+            fontFamily: "'Cascadia Code', Consolas, monospace",
             zIndex: 10,
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
           }}
         >
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-            <strong style={{ color: "var(--text-primary)" }}>
-              {transfer.done
-                ? transfer.phase === "upload"
-                  ? "上传完成"
-                  : "下载完成"
-                : transfer.phase === "upload"
-                ? "上传中…"
-                : "下载中…"}
-            </strong>
-            <span style={{ color: "var(--text-secondary)" }}>
-              {transfer.fileCount > 0
-                ? `${Math.min(
-                    transfer.fileIndex + (transfer.done ? 0 : 1),
-                    transfer.fileCount
-                  )}/${transfer.fileCount}`
-                : ""}
-            </span>
-          </div>
-          <div
-            style={{
-              height: 6,
-              background: "var(--bg-surface-active)",
-              borderRadius: 3,
-              overflow: "hidden",
-              marginBottom: 6,
-            }}
-          >
-            <div
-              style={{
-                width: `${pctDone}%`,
-                height: "100%",
-                background: "var(--accent-primary)",
-                transition: "width 0.15s",
-              }}
-            />
-          </div>
-          <div
-            style={{
-              color: transfer.done ? "var(--text-secondary)" : "var(--text-primary)",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-              marginBottom: 4,
-            }}
-          >
-            {transfer.done
-              ? `${formatSize(transfer.bytesDone)} / ${formatSize(transfer.bytesTotal)}`
-              : transfer.currentFile || "准备中…"}
-          </div>
-          {transfer.done && transfer.errors.length > 0 && (
-            <div
-              style={{
-                color: "var(--error)",
-                maxHeight: 56,
-                overflowY: "auto",
-                marginBottom: 6,
-                lineHeight: 1.4,
-              }}
-            >
-              {transfer.errors.slice(0, 3).map((er, i) => (
-                <div key={i}>• {er}</div>
-              ))}
-              {transfer.errors.length > 3 && (
-                <div>…等 {transfer.errors.length} 个错误</div>
+          {/* Row 1: direction + filename + cancel/close */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+              <span style={{ color: "#89b4fa", fontSize: 16, lineHeight: 1 }}>
+                {transfer.phase === "upload" ? "↑" : "↓"}
+              </span>
+              <span style={{ color: "#a6e3a1", fontWeight: 600, whiteSpace: "nowrap" }}>
+                {transfer.done
+                  ? transfer.phase === "upload" ? "上传完成" : "下载完成"
+                  : transfer.phase === "upload" ? "SFTP 上传" : "SFTP 下载"}
+              </span>
+              {transfer.fileCount > 1 && (
+                <span style={{ color: "#6c7086", whiteSpace: "nowrap" }}>
+                  {Math.min(transfer.fileIndex + (transfer.done ? 0 : 1), transfer.fileCount)}/{transfer.fileCount}
+                </span>
               )}
+              <span style={{ color: "#bac2de", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {transfer.currentFile || "准备中…"}
+              </span>
             </div>
-          )}
-          <div style={{ display: "flex", justifyContent: "flex-end" }}>
             {transfer.done ? (
               <button
                 onClick={closeTransfer}
@@ -807,21 +799,75 @@ export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDis
                   color: "var(--text-inverse)",
                   border: "none",
                   borderRadius: 4,
-                  padding: "4px 14px",
+                  padding: "2px 12px",
                   fontSize: 12,
                   cursor: "pointer",
+                  whiteSpace: "nowrap",
                 }}
               >
                 关闭
               </button>
             ) : (
-              <span style={{ color: "var(--text-secondary)" }}>
-                {formatSize(transfer.bytesDone)} / {formatSize(transfer.bytesTotal)}
-              </span>
+              <button
+                onClick={() => sftpCancelTransfer(transfer.requestId).catch(() => {})}
+                style={{
+                  background: "transparent",
+                  color: "#f38ba8",
+                  border: "1px solid #f38ba8",
+                  borderRadius: 4,
+                  padding: "2px 12px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                取消
+              </button>
             )}
           </div>
+
+          {/* Row 2: progress bar */}
+          <div style={{ height: 8, background: "#313244", borderRadius: 4, overflow: "hidden" }}>
+            <div
+              style={{
+                width: `${pctDone}%`,
+                height: "100%",
+                background: "linear-gradient(90deg, #89b4fa, #b4befe)",
+                transition: "width 0.3s ease",
+              }}
+            />
+          </div>
+
+          {/* Row 3: bytes + percent + speed */}
+          <div style={{ display: "flex", justifyContent: "space-between", color: "#a6adc8" }}>
+            <span>
+              {formatSize(transfer.bytesDone)} / {formatSize(transfer.bytesTotal)}
+              {transfer.bytesTotal > 0 && ` (${pctDone}%)`}
+            </span>
+            <span>{speed >= 1 ? `${formatSize(speed)}/s` : "—"}</span>
+          </div>
+
+          {/* Row 4: timing */}
+          <div style={{ display: "flex", justifyContent: "space-between", color: "#6c7086", fontSize: 11 }}>
+            <span>开始 {formatClock(transfer.startTime)}</span>
+            <span>已用 {formatDuration(elapsed)}</span>
+            <span>剩余 {transfer.done ? "—" : formatDuration(remaining)}</span>
+          </div>
+
+          {/* Errors (only when done) */}
+          {transfer.done && transfer.errors.length > 0 && (
+            <div style={{ color: "#f38ba8", maxHeight: 42, overflowY: "auto", lineHeight: 1.4 }}>
+              {transfer.errors.slice(0, 3).map((er, i) => (
+                <div key={i}>• {er}</div>
+              ))}
+              {transfer.errors.length > 3 && (
+                <div>…等 {transfer.errors.length} 个错误</div>
+              )}
+            </div>
+          )}
         </div>
-      )}
+        );
+      })()}
 
       {/* Disconnected overlay — shown when the SSH channel dies.
           Covers the file list so the user can't interact with a dead session. */}

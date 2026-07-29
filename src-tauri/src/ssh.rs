@@ -1,5 +1,18 @@
 use crate::{AppState, ConnectionConfig, EventSink, EventSinkExt};
 use crate::proxy;
+use crate::zmodem_rx::{ZmodemReceiver, RxActions, RxEvent};
+
+/// Jobs for the background ZMODEM disk-write task.
+enum DiskJob {
+    /// Take ownership of a newly opened file for writing.
+    Open(std::fs::File),
+    /// Append decoded payload bytes to the open file.
+    Write(Vec<u8>),
+    /// Flush the open file (e.g. at ZEOF).
+    Flush,
+    /// Flush and release the file handle.
+    Close,
+}
 use russh::client::{self, Handle, Msg};
 use russh::{Channel, ChannelMsg, Disconnect};
 use std::net::SocketAddr;
@@ -18,6 +31,16 @@ pub enum SessionCommand {
     ZmodemBytes(Vec<u8>),
     /// User clicked cancel — send 8× CAN(0x18) to abort the in-flight transfer.
     ZmodemAbort,
+    /// Frontend signals the ZMODEM session is definitively over (zmodem.js
+    /// parsed ZFIN or the user aborted). Switch TermMode back to Normal so
+    /// subsequent SSH data renders as terminal output. This is the AUTHORITATIVE
+    /// end signal — the Rust-side `is_zmodem_end` byte-pattern check is only a
+    /// fallback for 5×CAN (abort) and should NOT detect ZFIN (false-positives
+    /// on binary file data break multi-file transfers).
+    ZmodemFinish,
+    /// Native ZMODEM receiver: frontend chose a save path for the offered
+    /// file. `Some(path)` = accept and write there; `None` = skip this file.
+    ZmodemAcceptOffer { path: Option<String> },
     Disconnect,
 }
 
@@ -134,6 +157,16 @@ impl client::Handler for SshClient {
 
         Ok(accepted)
     }
+
+    /// Dynamically grow the SSH channel receive window target. russh's
+    /// default behavior tops up the window to a fixed target when it drops
+    /// below target/2; on high-RTT links this limits throughput because the
+    /// WINDOW_ADJUST round-trip gates the sender. By returning an
+    /// ever-larger target we keep the advertised window deep enough that the
+    /// sender never stalls waiting for an adjust.
+    fn adjust_window(&mut self, _channel: russh::ChannelId, window: u32) -> u32 {
+        window.max(16 * 1024 * 1024)
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -237,16 +270,17 @@ fn detect_direction(tail: &[u8]) -> &'static str {
     "auto"
 }
 
-/// Detect end-of-ZMODEM signals: a ZFIN frame or a burst of 5+ CAN bytes
-/// (lrzsz abort sequence).
+/// Detect end-of-ZMODEM signals: a burst of 5+ CAN bytes (lrzsz abort).
 ///
-/// ZFIN appears as type byte 0x08, but the wire format depends on framing:
-///   ZHEX   `**\x18B` + ASCII "08" (0x30 0x38) — lrzsz's default for ZFIN
-///   ZBIN   `**\x18A` + raw byte 0x08
-///   ZBIN32 `**\x18C` + raw byte 0x08
-/// PTY echo can strip the leading `**`, so we also check bare-ZDLE forms.
+/// ZFIN detection was REMOVED: naive byte-pattern matching on the raw stream
+/// false-positives on binary file data during multi-file transfers (the
+/// compressed payload of a 323 MB tar.gz easily contains ZFIN-like sequences).
+/// The frontend's zmodem.js properly parses ZFIN with full ZDLE-escaping
+/// awareness and signals the end via `SessionCommand::ZmodemFinish`. This
+/// function remains only as a fallback for the abort case (5×CAN), which is
+/// unambiguous — CAN (0x18) is always ZDLE-escaped in data subpackets, so 5
+/// consecutive raw CANs can only be an intentional abort sequence.
 fn is_zmodem_end(buf: &[u8]) -> bool {
-    // 5+ consecutive CAN bytes — lrzsz abort sequence
     let mut can_run = 0;
     for &b in buf {
         if b == CAN {
@@ -256,22 +290,6 @@ fn is_zmodem_end(buf: &[u8]) -> bool {
             }
         } else {
             can_run = 0;
-        }
-    }
-
-    const ZFIN_NEEDLES: [&[u8]; 6] = [
-        b"**\x18B08", // canonical ZHEX
-        b"**\x18A\x08", // canonical ZBIN
-        b"**\x18C\x08", // canonical ZBIN32
-        b"\x18B08",   // bare ZDLE ZHEX (PTY echo stripped **)
-        b"\x18A\x08", // bare ZDLE ZBIN
-        b"\x18C\x08", // bare ZDLE ZBIN32
-    ];
-    for needle in ZFIN_NEEDLES {
-        if needle.len() <= buf.len()
-            && buf.windows(needle.len()).any(|w| w == needle)
-        {
-            return true;
         }
     }
     false
@@ -348,7 +366,15 @@ async fn dial_tcp(
         });
     }
     match tokio::time::timeout(timeout, TcpStream::connect(addrs.as_slice())).await {
-        Ok(Ok(stream)) => Ok(stream),
+        Ok(Ok(stream)) => {
+            // Disable Nagle so small, latency-sensitive packets — especially
+            // SSH CHANNEL_WINDOW_ADJUST (~13 bytes) — go out immediately.
+            // russh never sets this itself; with Nagle active the window
+            // adjust can be held ~200ms, which collapses the receive window
+            // and throttles bulk downloads to a burst/pause crawl.
+            let _ = stream.set_nodelay(true);
+            Ok(stream)
+        }
         Ok(Err(e)) => Err(format!("TCP 连接失败 ({}:{}): {}", host, port, e)),
         Err(_) => Err(format!(
             "连接超时（{:?} 无响应），请检查服务器地址和网络",
@@ -396,6 +422,32 @@ pub async fn dial_and_authenticate(
         config.keepalive_interval_secs.unwrap_or(15) as u64,
     ));
     ssh_config.keepalive_max = 3;
+    // Prefer AES-GCM ciphers over ChaCha20-Poly1305. russh's Rust ChaCha20
+    // implementation lacks the AVX2/SIMD optimizations that C-based clients
+    // (Xshell, OpenSSH) use, making it CPU-bound on bulk transfers. AES-GCM
+    // leverages AES-NI hardware instructions, which are dramatically faster
+    // on x86_64 and directly translate to higher throughput for both SFTP
+    // and ZMODEM file transfers.
+    ssh_config.preferred.cipher = std::borrow::Cow::Borrowed(&[
+        russh::cipher::AES_256_GCM,
+        russh::cipher::CHACHA20_POLY1305,
+        russh::cipher::AES_256_CTR,
+        russh::cipher::AES_192_CTR,
+        russh::cipher::AES_128_CTR,
+    ]);
+    // Large SSH channel window so a fast sender (e.g. `sz` streaming a file)
+    // can keep the pipe full instead of stalling on window exhaustion. The
+    // russh default (~2 MB) throttles bulk transfers to a few MB/s; a 16 MB
+    // window lets throughput reach the link rate. Memory cost is per-channel
+    // and acceptable for a desktop client.
+    ssh_config.window_size = 16 * 1024 * 1024;
+    // Deepen the per-channel message queue (default 100). russh's connection
+    // task `await`s a bounded send into this queue for every inbound packet;
+    // if it fills (because our reader is momentarily busy, e.g. a disk flush),
+    // the connection task blocks — stopping TCP reads AND window-adjust writes,
+    // which collapses throughput into a burst/pause crawl. A deeper queue
+    // absorbs that jitter so the reader's brief stalls don't cascade.
+    ssh_config.channel_buffer_size = 1024;
     let ssh_config = Arc::new(ssh_config);
 
     // Shared slot for a host-key mismatch detected mid-handshake. The handler
@@ -605,6 +657,9 @@ pub async fn connect(
     // Build command channel for the reader task
     let (command_tx, command_rx) = mpsc::unbounded_channel::<SessionCommand>();
 
+    // Extract before config is moved into Arc.
+    let app_keepalive_secs = config.app_keepalive_secs.unwrap_or(0);
+
     let session = SshSession {
         handle: Arc::new(handle),
         command_tx,
@@ -619,14 +674,18 @@ pub async fn connect(
 
     // Spawn the channel reader task. It owns the Channel and multiplexes
     // incoming SSH data with commands from the frontend. Emits are scoped to
-    // the originating window so a different webview can't read this session's
+    // the originating webview so a different webview can't read this session's
     // output. The reader intentionally does NOT remove the session from the
     // map on exit — see the note in `channel_reader` and the removal in
     // `disconnect()`.
     let reader_sid = sid.clone();
+    let reader_handle = {
+        let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+        sessions.get(&sid).map(|s| s.handle.clone())
+    };
 
     tokio::spawn(async move {
-        channel_reader(sink, reader_sid, channel, command_rx).await;
+        channel_reader(sink, reader_sid, channel, command_rx, reader_handle, app_keepalive_secs).await;
     });
 
     Ok(sid)
@@ -637,6 +696,8 @@ async fn channel_reader(
     session_id: String,
     mut channel: Channel<Msg>,
     mut command_rx: mpsc::UnboundedReceiver<SessionCommand>,
+    handle: Option<Arc<Handle<SshClient>>>,
+    app_keepalive_secs: u32,
 ) {
     let mut buffer: Vec<u8> = Vec::with_capacity(8192);
     let mut last_flush = Instant::now();
@@ -645,12 +706,77 @@ async fn channel_reader(
     flush_interval.tick().await;
     log::info!("[ssh:{}] channel_reader started", session_id);
 
+    // Application-level keepalive: periodically open a disposable exec channel
+    // and run `true`. Generates real TCP payload to defeat NAT/firewall idle
+    // timeouts and shell-level TMOUT. Disabled when app_keepalive_secs == 0.
+    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(
+        if app_keepalive_secs > 0 { app_keepalive_secs as u64 } else { 3600 },
+    ));
+    keepalive_interval.tick().await; // consume immediate first tick
+
     let mut mode = TermMode::Normal;
-    // Count of OO bytes (0x4F) eaten from the start of the post-ZMODEM
-    // stream. ZMODEM sessions end with ZFIN + "OO" (Over and Out). Rust
-    // switches back to Normal on ZFIN, so the trailing OO would otherwise
-    // render as visible glyphs on the terminal.
-    let mut oo_eaten: u8 = 2; // start saturated = "not eating"
+    // Post-ZMODEM suppression window. After a ZMODEM session ends (normally
+    // or via abort), lrzsz emits protocol tail bytes: CAN bursts, error text
+    // ("Transfer incomplete"), ZFERR/ZFIN frames, and "OO". All of this is
+    // noise that would render as terminal garbage. We suppress ALL incoming
+    // data until the deadline passes (500 ms covers lrzsz's full abort
+    // response; the shell prompt appears later once the process exits).
+    let mut suppress_until: Option<Instant> = None;
+
+    // Native ZMODEM receiver — active only for downloads (remote `sz`).
+    // When Some, incoming data is fed to the receiver instead of being
+    // emitted as `zmodem_raw` to the JS bridge. Uploads (remote `rz`) stay
+    // on the JS zmodem.js path (receiver is None).
+    //
+    // The receiver does NO disk I/O itself — it only decodes and collects
+    // payload into pending_write. After each feed(), the reader drains it
+    // onto an unbounded channel; a background task owns the actual file
+    // writes via spawn_blocking. This keeps the reader loop (and thus
+    // russh's connection task, which awaits a bounded send per inbound
+    // packet) free of disk work, so WINDOW_ADJUST flows at line rate.
+    let mut zmodem_rx: Option<ZmodemReceiver> = None;
+    // Channel carrying write jobs to the background disk task.
+    // Each job is either a new file handle (FileOpen) or a data buffer (Write).
+    let (disk_tx, mut disk_rx): (
+        tokio::sync::mpsc::UnboundedSender<DiskJob>,
+        tokio::sync::mpsc::UnboundedReceiver<DiskJob>,
+    ) = mpsc::unbounded_channel();
+    let disk_sink = Arc::clone(&sink);
+    let disk_sid = session_id.clone();
+    tokio::spawn(async move {
+        use std::io::Write;
+        let mut file: Option<std::fs::File> = None;
+        while let Some(job) = disk_rx.recv().await {
+            match job {
+                DiskJob::Open(f) => {
+                    file = Some(f);
+                }
+                DiskJob::Write(buf) => {
+                    if let Some(ref mut f) = file {
+                        // This runs on its OWN task, not the reader loop, so a
+                        // blocking write only stalls THIS task — the reader
+                        // keeps draining russh's queue and emitting
+                        // WINDOW_ADJUST at line rate.
+                        if let Err(e) = f.write_all(&buf) {
+                            log::warn!("[ssh:{}] disk write failed: {}", disk_sid, e);
+                        }
+                    }
+                }
+                DiskJob::Flush => {
+                    if let Some(ref mut f) = file {
+                        let _ = f.flush();
+                    }
+                }
+                DiskJob::Close => {
+                    if let Some(ref mut f) = file {
+                        let _ = f.flush();
+                    }
+                    file = None;
+                }
+            }
+        }
+        let _ = disk_sink;
+    });
 
     // Cancel-safety note: `channel.wait()` is awaited inside `tokio::select!`.
     // We previously attempted to move Data bytes onto a dedicated reader task
@@ -696,6 +822,53 @@ async fn channel_reader(
                     let _ = channel.data(&abort[..]).await;
                     let cleanup: &[u8] = b"\x08\x08\x08\x08\x08\x08\x08\x08";
                     let _ = channel.data(cleanup).await;
+                    // Close the disk task so any pending file is flushed.
+                    let _ = disk_tx.send(DiskJob::Close);
+                    // Immediately switch to Normal + suppress post-abort noise
+                    // (CAN bursts, error text, ZFERR, OO) for 500 ms.
+                    mode = TermMode::Normal;
+                    suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                    sink.emit("zmodem_end", &session_id);
+                    // Drop any native receiver so a subsequent transfer starts clean.
+                    zmodem_rx = None;
+                }
+                Some(SessionCommand::ZmodemFinish) => {
+                    // Frontend (zmodem.js) is the authority on session end.
+                    // Switch back to Normal + suppress trailing protocol noise.
+                    if mode == TermMode::Zmodem {
+                        mode = TermMode::Normal;
+                        suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                        sink.emit("zmodem_end", &session_id);
+                    }
+                    let _ = disk_tx.send(DiskJob::Close);
+                    zmodem_rx = None;
+                }
+                Some(SessionCommand::ZmodemAcceptOffer { path }) => {
+                    // Native receiver: frontend chose a save path (or skipped).
+                    if let Some(rx) = zmodem_rx.as_mut() {
+                        let (actions, file) = rx.accept_offer(&path);
+                        // Hand the file handle to the background disk task.
+                        if let Some(f) = file {
+                            let _ = disk_tx.send(DiskJob::Open(f));
+                        }
+                        let (send, ended, disk) = dispatch_rx_actions(&*sink, &session_id, actions);
+                        if disk.flush {
+                            let _ = disk_tx.send(DiskJob::Flush);
+                        }
+                        if !send.is_empty() {
+                            if let Err(e) = channel.data(&send[..]).await {
+                                log::warn!("[ssh:{}] zmodem accept send failed: {}", session_id, e);
+                            }
+                        }
+                        if ended {
+                            if disk.close {
+                                let _ = disk_tx.send(DiskJob::Close);
+                            }
+                            mode = TermMode::Normal;
+                            suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                            zmodem_rx = None;
+                        }
+                    }
                 }
                 Some(SessionCommand::Disconnect) | None => {
                     let _ = channel.close().await;
@@ -707,31 +880,41 @@ async fn channel_reader(
             msg = channel.wait() => match msg {
                 Some(ChannelMsg::Data { ref data }) => {
                     log::debug!("[ssh:{}] Data {} bytes", session_id, data.len());
-                    // Strip leading OO (Over and Out) bytes that follow a ZMODEM
-                    // session end. These arrive in Normal mode but are protocol
-                    // tail bytes, not user-visible output.
-                    let data: &[u8] = if oo_eaten < 2 {
-                        let mut i = 0;
-                        while i < data.len() && oo_eaten < 2 && data[i] == 0x4F {
-                            i += 1;
-                            oo_eaten += 1;
-                        }
-                        if i > 0 {
-                            &data[i..]
+                    // Post-ZMODEM suppression: after a session ends (abort or
+                    // normal ZFIN), lrzsz emits CAN bursts, error text, ZFERR
+                    // frames, and "OO". Suppress ALL incoming data until the
+                    // deadline passes so none of it renders as terminal garbage.
+                    let data: &[u8] = if let Some(deadline) = suppress_until {
+                        if Instant::now() < deadline {
+                            &[][..] // still suppressing — discard
                         } else {
-                            // First byte isn't 'O' — give up eating (lrzsz might
-                            // omit OO, or shell printed prompt immediately).
-                            oo_eaten = 2;
+                            suppress_until = None;
                             data
                         }
                     } else {
                         data
                     };
                     if !data.is_empty() {
-                        handle_incoming_data(
+                        let to_send = handle_incoming_data(
                             &*sink, &session_id, data, &mut buffer, &mut last_flush,
-                            &mut mode, &mut oo_eaten,
+                            &mut mode, &mut suppress_until, &mut zmodem_rx, &disk_tx,
                         );
+                        // Drain decoded payload from the receiver to the
+                        // background disk task — this is just an unbounded
+                        // channel send, so the reader never blocks on disk I/O.
+                        if let Some(ref mut rx) = zmodem_rx {
+                            let pending = rx.take_pending_write();
+                            if !pending.is_empty() {
+                                let _ = disk_tx.send(DiskJob::Write(pending));
+                            }
+                        }
+                        // Native receiver protocol responses (ZRINIT/ZRPOS/ZACK/
+                        // ZFIN) go straight back to the peer — no JS round-trip.
+                        if !to_send.is_empty() {
+                            if let Err(e) = channel.data(&to_send[..]).await {
+                                log::warn!("[ssh:{}] zmodem rx send failed: {}", session_id, e);
+                            }
+                        }
                     }
                 }
                 Some(ChannelMsg::ExtendedData { ref data, .. }) => {
@@ -780,10 +963,34 @@ async fn channel_reader(
 
             // Periodic flush so terminal output reaches the UI even when the
             // server trickles bytes. Coalesces bursts and mitigates tauri#13234.
+            // In Zmodem mode, flush as zmodem_raw (coalesced protocol bytes).
             _ = flush_interval.tick() => {
                 if !buffer.is_empty() && last_flush.elapsed() >= Duration::from_millis(16) {
-                    flush_buffer(&*sink, &session_id, &mut buffer);
+                    if mode == TermMode::Zmodem {
+                        flush_zmodem_buffer(&*sink, &session_id, &mut buffer);
+                    } else {
+                        flush_buffer(&*sink, &session_id, &mut buffer);
+                    }
                     last_flush = Instant::now();
+                }
+            }
+
+            // Application-level keepalive: open a disposable exec channel,
+            // run `true`, close it. Invisible to the user's interactive shell
+            // but generates real TCP payload that resets NAT/firewall idle
+            // timers and shell TMOUT. Only active when app_keepalive_secs > 0.
+            _ = keepalive_interval.tick(), if app_keepalive_secs > 0 => {
+                if let Some(ref h) = handle {
+                    match h.channel_open_session().await {
+                        Ok(mut ch) => {
+                            let _ = ch.exec(false, "true").await;
+                            let _ = ch.close().await;
+                            log::debug!("[ssh:{}] app keepalive sent", session_id);
+                        }
+                        Err(e) => {
+                            log::warn!("[ssh:{}] app keepalive failed: {}", session_id, e);
+                        }
+                    }
                 }
             }
         }
@@ -804,11 +1011,14 @@ async fn channel_reader(
     log::info!("[ssh:{}] channel_reader exited", session_id);
 }
 
-/// Routes incoming PTY bytes: terminal output in Normal mode, raw ZMODEM frames
-/// in Zmodem mode. The Normal→Zmodem transition happens when we spot the
-/// auto-start sequence anywhere in the accumulated buffer; the Zmodem→Normal
-/// transition fires on ZFIN or 5× CAN. On Zmodem→Normal, `oo_eaten` is reset
-/// to 0 so the caller can strip the trailing OO bytes from the next chunks.
+/// Routes incoming PTY bytes: terminal output in Normal mode, ZMODEM frames in
+/// Zmodem mode. The Normal→Zmodem transition happens when we spot the auto-start
+/// sequence; direction is then probed from the first frame:
+///   - ZRQINIT (remote `sz`) → native Rust receiver (zero-IPC data path)
+///   - otherwise (remote `rz`) → passthrough to the JS zmodem.js bridge
+///
+/// Returns bytes that must be sent back to the SSH peer (protocol responses
+/// from the native receiver). The caller forwards them via `channel.data()`.
 fn handle_incoming_data(
     sink: &dyn EventSink,
     session_id: &str,
@@ -816,8 +1026,10 @@ fn handle_incoming_data(
     buffer: &mut Vec<u8>,
     last_flush: &mut Instant,
     mode: &mut TermMode,
-    oo_eaten: &mut u8,
-) {
+    suppress_until: &mut Option<Instant>,
+    zmodem_rx: &mut Option<ZmodemReceiver>,
+    disk_tx: &tokio::sync::mpsc::UnboundedSender<DiskJob>,
+) -> Vec<u8> {
     match *mode {
         TermMode::Normal => {
             // Append to the shared terminal/ZMODEM-scan buffer. If no needle is
@@ -829,60 +1041,205 @@ fn handle_incoming_data(
             // land anywhere — typically right after a prompt — so we can't only
             // look at the tail.
             if let Some(idx) = find_zmodem_start(buffer) {
-                // Split: bytes [0..idx] stay as terminal output (already emitted
-                // by append_capped's threshold path or queued for the 16ms tick);
-                // bytes [idx..] become the first raw ZMODEM frame.
+                // Split: bytes [0..idx] stay as terminal output; bytes [idx..]
+                // become the first ZMODEM frame.
                 let tail: Vec<u8> = buffer[idx..].to_vec();
                 buffer.truncate(idx);
-
-                // Strip lrzsz's "rz\r\n" auto-start trigger from the tail of
-                // the terminal prefix. `sz` prints this so legacy ZMODEM-aware
-                // terminals auto-launch their local rz; we don't need it and it
-                // would otherwise render as a stray "rz" line. Safe here because
-                // a protocol frame immediately follows, so a trailing "rz" can
-                // only be that trigger.
                 strip_zmodem_autostart_noise(buffer);
-
-                // Force-flush the terminal prefix so xterm shows what came before
-                // the protocol switching point.
                 flush_buffer(sink, session_id, buffer);
 
-                let direction = detect_direction(&tail);
+                // Probe direction with a native receiver.
+                let mut rx = ZmodemReceiver::new();
+                let actions = rx.feed(&tail);
+
+                if let Some(passthrough_bytes) = rx.take_passthrough() {
+                    // Upload (remote `rz`) — hand off to the JS zmodem.js path.
+                    *mode = TermMode::Zmodem;
+                    *zmodem_rx = None;
+                    sink.emit(
+                        "zmodem_start",
+                        &ZmodemStartPayload {
+                            session_id: session_id.to_string(),
+                            direction: "upload",
+                        },
+                    );
+                    sink.emit(
+                        "zmodem_raw",
+                        &SshOutputPayload {
+                            session_id: session_id.to_string(),
+                            data: passthrough_bytes,
+                        },
+                    );
+                    return Vec::new();
+                }
+
+                // Download (remote `sz`) — native receiver active.
                 *mode = TermMode::Zmodem;
-                sink.emit(
-                    "zmodem_start",
-                    &ZmodemStartPayload {
-                        session_id: session_id.to_string(),
-                        direction,
-                    },
-                );
-                sink.emit(
-                    "zmodem_raw",
-                    &SshOutputPayload {
-                        session_id: session_id.to_string(),
-                        data: tail,
-                    },
-                );
+                if rx.take_start_signal() {
+                    sink.emit(
+                        "zmodem_start",
+                        &ZmodemStartPayload {
+                            session_id: session_id.to_string(),
+                            direction: "download",
+                        },
+                    );
+                }
+                let (send, ended, disk) = dispatch_rx_actions(sink, session_id, actions);
+                if disk.flush || disk.close {
+                    let pending = rx.take_pending_write();
+                    if !pending.is_empty() {
+                        let _ = disk_tx.send(DiskJob::Write(pending));
+                    }
+                }
+                if disk.flush {
+                    let _ = disk_tx.send(DiskJob::Flush);
+                }
+                if ended {
+                    if disk.close {
+                        let _ = disk_tx.send(DiskJob::Close);
+                    }
+                    *mode = TermMode::Normal;
+                    *suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                    *zmodem_rx = None;
+                    sink.emit("zmodem_end", &session_id.to_string());
+                } else {
+                    *zmodem_rx = Some(rx);
+                }
+                return send;
             }
+            Vec::new()
         }
         TermMode::Zmodem => {
-            // Forward raw bytes to the frontend zmodem.js parser. Do NOT coalesce
-            // on the 16ms tick — protocol framing is byte-precise and a delayed
-            // flush would corrupt the parser's state machine.
-            sink.emit(
-                "zmodem_raw",
-                &SshOutputPayload {
-                    session_id: session_id.to_string(),
-                    data: data.to_vec(),
-                },
-            );
+            if let Some(rx) = zmodem_rx.as_mut() {
+                // Native download path — data goes straight to disk, no JS IPC.
+                let actions = rx.feed(data);
+                if rx.take_start_signal() {
+                    sink.emit(
+                        "zmodem_start",
+                        &ZmodemStartPayload {
+                            session_id: session_id.to_string(),
+                            direction: "download",
+                        },
+                    );
+                }
+                let (send, ended, disk) = dispatch_rx_actions(sink, session_id, actions);
+                // CRITICAL: drain any pending decoded payload BEFORE sending
+                // Flush/Close. ZEOF triggers disk.flush, but the last
+                // subpacket's bytes are still in pending_write — if we flush
+                // before draining, the file is truncated and the transfer
+                // hangs because sz never sees its ZEOF acknowledged correctly.
+                if disk.flush || disk.close {
+                    let pending = rx.take_pending_write();
+                    if !pending.is_empty() {
+                        let _ = disk_tx.send(DiskJob::Write(pending));
+                    }
+                }
+                if disk.flush {
+                    let _ = disk_tx.send(DiskJob::Flush);
+                }
+                if ended {
+                    if disk.close {
+                        let _ = disk_tx.send(DiskJob::Close);
+                    }
+                    *mode = TermMode::Normal;
+                    *suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                    *zmodem_rx = None;
+                    // Tell the frontend the session is over so the progress
+                    // overlay hides. Without this the UI stays at 100% forever.
+                    sink.emit("zmodem_end", &session_id.to_string());
+                }
+                return send;
+            }
+
+            // Passthrough (upload) path — coalesce and emit zmodem_raw to the
+            // JS bridge. ZMODEM frames are self-delimiting (ZDLE-escaped), so
+            // zmodem.js's consume() parses merged data correctly.
+            buffer.extend_from_slice(data);
+            if buffer.len() >= FLUSH_THRESHOLD {
+                flush_zmodem_buffer(sink, session_id, buffer);
+                *last_flush = Instant::now();
+            }
             if is_zmodem_end(data) {
+                flush_zmodem_buffer(sink, session_id, buffer);
                 *mode = TermMode::Normal;
-                *oo_eaten = 0; // arm the OO-stripping for the next chunks
+                *suppress_until = Some(Instant::now() + Duration::from_millis(500));
                 sink.emit("zmodem_end", &session_id);
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// Emit a native receiver's frontend events and collect the bytes that must be
+/// sent back to the SSH peer. Returns `(send_bytes, session_ended)`.
+/// What the reader should do with the disk task after dispatching events.
+#[derive(Default)]
+struct DiskSignal {
+    flush: bool,
+    close: bool,
+}
+
+fn dispatch_rx_actions(
+    sink: &dyn EventSink,
+    session_id: &str,
+    actions: RxActions,
+) -> (Vec<u8>, bool, DiskSignal) {
+    let mut ended = false;
+    let mut disk = DiskSignal::default();
+    for event in actions.events {
+        match event {
+            RxEvent::Offer { name, size } => {
+                sink.emit_raw(
+                    "zmodem_offer",
+                    serde_json::json!({
+                        "sessionId": session_id,
+                        "fileName": name,
+                        "fileSize": size,
+                    }),
+                );
+            }
+            RxEvent::Progress { written, total } => {
+                sink.emit_raw(
+                    "zmodem_progress",
+                    serde_json::json!({
+                        "sessionId": session_id,
+                        "bytesTransferred": written,
+                        "bytesTotal": total,
+                    }),
+                );
+            }
+            RxEvent::FileComplete { name, written } => {
+                // The file is done — flush the disk task so data lands before
+                // we move to the next file or session end.
+                disk.flush = true;
+                sink.emit_raw(
+                    "zmodem_file_complete",
+                    serde_json::json!({
+                        "sessionId": session_id,
+                        "fileName": name,
+                        "bytesWritten": written,
+                    }),
+                );
+            }
+            RxEvent::SessionEnd => {
+                disk.close = true;
+                ended = true;
+            }
+            RxEvent::Error(msg) => {
+                disk.close = true;
+                log::warn!("[ssh:{}] zmodem rx error: {}", session_id, msg);
+                sink.emit_raw(
+                    "zmodem_error",
+                    serde_json::json!({
+                        "sessionId": session_id,
+                        "message": msg,
+                    }),
+                );
+                ended = true;
             }
         }
     }
+    (actions.send, ended, disk)
 }
 
 fn flush_buffer(sink: &dyn EventSink, session_id: &str, buffer: &mut Vec<u8>) {
@@ -895,6 +1252,21 @@ fn flush_buffer(sink: &dyn EventSink, session_id: &str, buffer: &mut Vec<u8>) {
     };
     log::debug!("[ssh:{}] flush {} bytes → ssh_output", session_id, payload.data.len());
     sink.emit("ssh_output", &payload);
+}
+
+/// Flush the shared buffer as `zmodem_raw` — used while in TermMode::Zmodem.
+/// Same buffer as flush_buffer but emits on the zmodem_raw channel so the
+/// frontend's ZmodemBridge.feed() receives it instead of xterm.js.
+fn flush_zmodem_buffer(sink: &dyn EventSink, session_id: &str, buffer: &mut Vec<u8>) {
+    if buffer.is_empty() {
+        return;
+    }
+    let payload = SshOutputPayload {
+        session_id: session_id.to_string(),
+        data: std::mem::take(buffer),
+    };
+    log::debug!("[ssh:{}] flush {} bytes → zmodem_raw", session_id, payload.data.len());
+    sink.emit("zmodem_raw", &payload);
 }
 
 /// Hard cap on the in-flight output buffer. Prevents a hostile or chatty
@@ -1039,6 +1411,49 @@ pub async fn zmodem_abort(
 
     if let Some(tx) = sender {
         let _ = tx.send(SessionCommand::ZmodemAbort);
+    }
+
+    Ok(())
+}
+
+/// Frontend signals the ZMODEM session is definitively over. Switches the
+/// reader task's TermMode back to Normal so subsequent SSH data renders as
+/// terminal output. Called by the bridge on session_end (zmodem.js parsed
+/// ZFIN) and on user abort — this is the AUTHORITATIVE end signal.
+pub async fn zmodem_finish(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(), String> {
+    let sender = {
+        let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(session_id)
+            .map(|s| s.command_tx.clone())
+    };
+
+    if let Some(tx) = sender {
+        let _ = tx.send(SessionCommand::ZmodemFinish);
+    }
+
+    Ok(())
+}
+
+/// Native ZMODEM receiver: the frontend chose a save path for the offered file
+/// (or `None` to skip). Forwards the decision to the reader task's receiver.
+pub async fn zmodem_accept_offer(
+    state: &AppState,
+    session_id: &str,
+    path: Option<String>,
+) -> Result<(), String> {
+    let sender = {
+        let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(session_id)
+            .map(|s| s.command_tx.clone())
+    };
+
+    if let Some(tx) = sender {
+        let _ = tx.send(SessionCommand::ZmodemAcceptOffer { path });
     }
 
     Ok(())

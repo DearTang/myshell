@@ -3,6 +3,7 @@ use crate::{EventSink, EventSinkExt};
 use russh_sftp::client::SftpSession;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -256,6 +257,7 @@ pub async fn upload(
     remote_dest_dir: &str,
     request_id: &str,
     sink: &dyn EventSink,
+    cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let sftp = get_sftp_session(state, session_id).await?;
     let dest = resolve_path(&sftp, remote_dest_dir).await?;
@@ -279,6 +281,10 @@ pub async fn upload(
 
     let mut bytes_done: u64 = 0;
     for (i, lp) in tasks.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            errors.push("已取消".to_string());
+            break;
+        }
         let name = basename(lp);
         let remote_path = if dest.ends_with('/') {
             format!("{}{}", dest, name)
@@ -292,11 +298,12 @@ pub async fn upload(
         );
         if let Err(e) = upload_one(
             &sftp, sink, request_id, lp, &remote_path, i, file_count, bytes_total,
-            &mut bytes_done, &mut last_emit,
+            &mut bytes_done, &mut last_emit, &cancel,
         )
         .await
         {
             errors.push(e);
+            if cancel.load(Ordering::Relaxed) { break; }
         }
     }
 
@@ -325,6 +332,7 @@ async fn upload_one(
     bytes_total: u64,
     bytes_done: &mut u64,
     last_emit: &mut Instant,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let name = basename(local_path);
     let mut local = tokio::fs::File::open(local_path)
@@ -344,6 +352,9 @@ async fn upload_one(
 
     let mut buf = vec![0u8; TRANSFER_CHUNK];
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消".to_string());
+        }
         let n = local
             .read(&mut buf)
             .await
@@ -387,6 +398,7 @@ pub async fn download(
     local_dest_dir: &str,
     request_id: &str,
     sink: &dyn EventSink,
+    cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let sftp = get_sftp_session(state, session_id).await?;
     // Local destination — created if missing (covers a freshly-typed path).
@@ -411,6 +423,10 @@ pub async fn download(
 
     let mut bytes_done: u64 = 0;
     for (i, rp) in tasks.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            errors.push("已取消".to_string());
+            break;
+        }
         let name = basename(rp);
         let local_path = Path::new(local_dest_dir).join(&name);
 
@@ -429,10 +445,12 @@ pub async fn download(
             bytes_total,
             &mut bytes_done,
             &mut last_emit,
+            &cancel,
         )
         .await
         {
             errors.push(e);
+            if cancel.load(Ordering::Relaxed) { break; }
         }
     }
 
@@ -460,6 +478,7 @@ async fn download_one(
     bytes_total: u64,
     bytes_done: &mut u64,
     last_emit: &mut Instant,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let name = basename(remote_path);
     // open() = READ.
@@ -480,6 +499,9 @@ async fn download_one(
 
     let mut buf = vec![0u8; TRANSFER_CHUNK];
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消".to_string());
+        }
         let n = remote
             .read(&mut buf)
             .await

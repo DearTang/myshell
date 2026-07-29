@@ -264,6 +264,7 @@ async fn main() {
         local_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         zmodem_files: Mutex::new(std::collections::HashMap::new()),
         dek: Arc::new(Mutex::new(None)),
+        transfer_cancels: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     // Unlock vault for all other commands

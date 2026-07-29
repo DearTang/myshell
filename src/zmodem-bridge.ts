@@ -12,9 +12,20 @@ import {
   szClose,
   sshSendZmodem,
   sshSendZmodemAbort,
+  sshZmodemFinish,
 } from "./api";
 
 const CHUNK_SIZE = 8192; // matches zmodem.js MAX_CHUNK_LENGTH
+/** Flush the write buffer to Rust when it reaches this size (2 MB). Larger
+ *  batches amortize IPC overhead — fewer, bigger writes instead of many small
+ *  ones. 2 MB keeps peak memory bounded while cutting IPC count ~8× vs 256 KB. */
+const WRITE_BUFFER_FLUSH_SIZE = 2 * 1024 * 1024;
+/** Maximum time (ms) to hold bytes in the write buffer before flushing. */
+const WRITE_BUFFER_FLUSH_INTERVAL = 100;
+/** Max concurrent szWriteChunk IPC calls. >1 improves throughput (overlaps
+ *  Rust disk IO with JS buffering) but must stay small enough to never exhaust
+ *  Tauri's sync-command thread pool (which also serves ZACK sends). 3 is safe. */
+const MAX_CONCURRENT_WRITES = 3;
 
 export interface ZmodemStatus {
   active: boolean;
@@ -24,6 +35,8 @@ export interface ZmodemStatus {
   bytesTotal: number;
   speedBps: number;
   error: string | null;
+  /** Epoch ms when the current file transfer started (0 = idle). */
+  startTime: number;
 }
 
 export type StatusListener = (status: ZmodemStatus) => void;
@@ -62,6 +75,7 @@ export class ZmodemBridge {
     bytesTotal: 0,
     speedBps: 0,
     error: null,
+    startTime: 0,
   };
 
   // Speed sampling — reset per file
@@ -129,6 +143,8 @@ export class ZmodemBridge {
     });
 
     session.on("session_end", () => {
+      // Authoritatively tell Rust to switch back to Normal mode.
+      sshZmodemFinish(this.sessionId).catch(() => {});
       this.patchStatus({
         active: false,
         direction: null,
@@ -136,6 +152,7 @@ export class ZmodemBridge {
         bytesTransferred: 0,
         bytesTotal: 0,
         speedBps: 0,
+        startTime: 0,
       });
     });
 
@@ -261,13 +278,15 @@ export class ZmodemBridge {
     name: string,
     size: number
   ): Promise<void> {
+    const now = Date.now();
     this.patchStatus({
       currentFile: name,
       bytesTotal: size,
       bytesTransferred: 0,
       speedBps: 0,
+      startTime: now,
     });
-    this.speedStartTime = Date.now();
+    this.speedStartTime = now;
     this.speedStartBytes = 0;
     this.speedLastSample = 0;
 
@@ -283,40 +302,116 @@ export class ZmodemBridge {
       this.speedStartBytes = resumeOffset;
     }
 
-    // Track every in-flight szWriteChunk promise. The "input" handler is
-    // invoked synchronously by zmodem.js as ZDATA subpackets arrive, but
-    // each IPC write is async. When offer.accept() resolves on ZEOF we must
-    // NOT close the handle until all queued writes have settled — otherwise
-    // szClose removes the handle from Rust's map mid-flight and the pending
-    // writes error out, leaving the file truncated. lrzsz then sees its
-    // sent byte count never matched by a correct ZEOF ack and stalls for
-    // its full retransmit/timeout window (the "stuck at 100% for 30s" hang).
-    const pendingWrites: Promise<void>[] = [];
+    // ── Buffered + bounded-concurrency writer ────────────────────────────
+    // zmodem.js fires "input" synchronously for every 8 KB ZDATA subpacket.
+    // We accumulate into a 2 MB buffer, then flush as one IPC write.
+    //
+    // Concurrency model: bounded to MAX_CONCURRENT_WRITES in-flight writes.
+    // Pure serialization (1) underutilizes the link; unbounded concurrency
+    // exhausts Tauri's sync-command thread pool (starving ZACK sends, which
+    // stalls lrzsz). 3 concurrent writes overlaps Rust disk IO with JS
+    // buffering while leaving ample thread-pool headroom for ZACK.
+    //
+    // The "input" handler does ZERO React/UI work — it only pushes bytes
+    // into the buffer. UI state updates happen on an independent 1s tick.
+    let writeBuf: Uint8Array[] = [];
+    let writeBufLen = 0;
+    let writeBufOffset = resumeOffset; // next disk offset for the buffer
+    let totalReceived = resumeOffset; // running byte count (local, no React)
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    let inflightWrites = 0; // number of szWriteChunk currently pending
+    let writeResolveQueue: Array<() => void> = []; // pausers waiting for a slot
+    let lastWriteError: string | null = null;
+
+    // Decoupled UI tick: updates React state every 1s regardless of write
+    // cadence. Previously patchStatus was called inside flushBuffer, so when
+    // disk writes slowed down at ~200 MB the progress bar stuttered too.
+    const uiTimer = setInterval(() => {
+      this.patchStatus({ bytesTransferred: totalReceived });
+      this.sampleSpeed();
+    }, 1000);
+
+    const flushBuffer = () => {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      // NOTE: UI update is NOT here — it runs on the independent 1s tick
+      // (uiTimer) so progress stays smooth even when writes slow down.
+      if (writeBufLen === 0) return;
+      // Coalesce fragments into a single contiguous chunk.
+      const merged = new Uint8Array(writeBufLen);
+      let pos = 0;
+      for (const frag of writeBuf) {
+        merged.set(frag, pos);
+        pos += frag.length;
+      }
+      const offset = writeBufOffset;
+      writeBufOffset += writeBufLen;
+      writeBuf = [];
+      writeBufLen = 0;
+
+      // Bounded concurrency: if at max in-flight, pause until one finishes.
+      const waitForSlot =
+        inflightWrites >= MAX_CONCURRENT_WRITES
+          ? new Promise<void>((resolve) => writeResolveQueue.push(resolve))
+          : Promise.resolve();
+      inflightWrites++;
+
+      waitForSlot.then(() => {
+        szWriteChunk(id, offset, merged)
+          .catch((e) => {
+            lastWriteError = String(e);
+            console.error("sz_write_chunk failed:", e);
+          })
+          .finally(() => {
+            inflightWrites--;
+            const next = writeResolveQueue.shift();
+            if (next) next();
+          });
+      });
+    };
 
     offer.on("input", (payload: number[] | Uint8Array) => {
       const bytes =
         payload instanceof Uint8Array ? payload : new Uint8Array(payload);
-      const offset = this.status.bytesTransferred;
-      const p = szWriteChunk(id, offset, bytes)
-        .then(() => undefined)
-        .catch((e) => {
-          console.error("sz_write_chunk failed:", e);
-        });
-      pendingWrites.push(p);
-      this.patchStatus({
-        bytesTransferred: offset + bytes.length,
-      });
-      this.sampleSpeed();
+      writeBuf.push(bytes);
+      writeBufLen += bytes.length;
+      totalReceived += bytes.length;
+
+      if (writeBufLen >= WRITE_BUFFER_FLUSH_SIZE) {
+        flushBuffer();
+      } else if (!flushTimer) {
+        flushTimer = setTimeout(flushBuffer, WRITE_BUFFER_FLUSH_INTERVAL);
+      }
     });
 
     try {
       await offer.accept({ offset: resumeOffset });
-      // ZEOF received and accept() resolved, but some ZDATA subpackets may
-      // still be mid-IPC. Drain them before closing so the file is complete
-      // to the exact byte lrzsz expects — this is what unblocks the sender's
-      // post-transfer teardown instead of letting it time out.
-      await Promise.all(pendingWrites);
+      // ZEOF received — flush any remaining buffered bytes, then wait for
+      // all in-flight writes to settle before closing the handle.
+      flushBuffer();
+      // Drain: wait until every concurrent write has finished.
+      while (inflightWrites > 0) {
+        await new Promise<void>((resolve) => {
+          // Poll-driven drain: each completed write resolves one waiter via
+          // the queue; for the last ones we just re-check in a microtask.
+          const check = () => {
+            if (inflightWrites === 0) resolve();
+            else setTimeout(check, 5);
+          };
+          check();
+        });
+      }
+      if (lastWriteError) {
+        this.patchStatus({ error: lastWriteError });
+      }
     } finally {
+      clearInterval(uiTimer);
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
       if (this.writeHandleId) {
         await szClose(this.writeHandleId);
         this.writeHandleId = null;
@@ -360,13 +455,15 @@ export class ZmodemBridge {
     const { id, size, mtime } = await rzOpenRead(path);
     this.readHandleId = id;
 
+    const now = Date.now();
     this.patchStatus({
       currentFile: fileName,
       bytesTotal: size,
       bytesTransferred: 0,
       speedBps: 0,
+      startTime: now,
     });
-    this.speedStartTime = Date.now();
+    this.speedStartTime = now;
     this.speedStartBytes = 0;
     this.speedLastSample = 0;
 
@@ -418,12 +515,12 @@ export class ZmodemBridge {
 
   private sampleSpeed(): void {
     const now = Date.now();
-    if (now - this.speedLastSample < 500) return;
+    if (now - this.speedLastSample < 1000) return;
     this.speedLastSample = now;
     const elapsed = (now - this.speedStartTime) / 1000;
     if (elapsed > 0) {
       this.patchStatus({
-        speedBps: this.status.bytesTransferred / elapsed,
+        speedBps: (this.status.bytesTransferred - this.speedStartBytes) / elapsed,
       });
     }
   }
@@ -453,6 +550,10 @@ export class ZmodemBridge {
       sshSendZmodemAbort(this.sessionId).catch(() => {});
     }
 
+    // Authoritatively tell Rust to switch back to Normal mode immediately —
+    // don't wait for lrzsz's CAN response (which can take seconds).
+    sshZmodemFinish(this.sessionId).catch(() => {});
+
     this.patchStatus({
       active: false,
       direction: null,
@@ -460,6 +561,7 @@ export class ZmodemBridge {
       bytesTransferred: 0,
       bytesTotal: 0,
       speedBps: 0,
+      startTime: 0,
     });
   }
 
@@ -492,6 +594,7 @@ export class ZmodemBridge {
       bytesTransferred: 0,
       bytesTotal: 0,
       speedBps: 0,
+      startTime: 0,
     });
   }
 }
