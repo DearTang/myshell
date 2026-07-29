@@ -133,6 +133,11 @@ export async function unlockVault(passphrase: string): Promise<void> {
   await invoke("unlock_vault", { passphrase });
 }
 
+/** Lock the vault (clear DEK from memory). Requires re-entering the master password. */
+export async function lockVault(): Promise<void> {
+  await invoke("lock_vault");
+}
+
 export async function changeMasterPassword(
   oldPassphrase: string,
   newPassphrase: string

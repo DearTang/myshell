@@ -125,6 +125,8 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   const [passwordBusy, setPasswordBusy] = useState(false);
   const [passwordErr, setPasswordErr] = useState<string | null>(null);
   const [passwordSuccess, setPasswordSuccess] = useState(false);
+  // Dummy tick to force re-render when the auto-lock select changes (reads localStorage).
+  const [, setAutoLockTick] = useState(0);
   const [exportBusy, setExportBusy] = useState(false);
   const [importBusy, setImportBusy] = useState(false);
   const [ioErr, setIoErr] = useState<string | null>(null);
@@ -2435,6 +2437,41 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
                 ⚠ 重启将关闭当前所有终端会话；Windows 会弹出 UAC 确认，点击「是」后以管理员启动新实例。
               </div>
             )}
+          </Section>
+
+          <Divider />
+
+          {/* Auto-lock Section */}
+          <Section title="🔒 自动锁定">
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.6 }}>
+              无操作超过指定时间后自动锁定应用，需重新输入密码解锁。「不启用」则首次解锁后不再自动锁定（重启后恢复）。
+            </div>
+            <Field label="空闲锁定时长">
+              <select
+                value={localStorage.getItem("myshell-auto-lock-minutes") ?? "30"}
+                onChange={(e) => {
+                  localStorage.setItem("myshell-auto-lock-minutes", e.target.value);
+                  window.dispatchEvent(new Event("myshell-auto-lock-changed"));
+                  // Force re-render so the select shows the new value.
+                  setAutoLockTick((t) => t + 1);
+                }}
+                style={{
+                  background: "var(--bg-surface)",
+                  color: "var(--text-primary)",
+                  border: "1px solid var(--border)",
+                  borderRadius: "var(--radius)",
+                  padding: "6px 10px",
+                  fontSize: 13,
+                  outline: "none",
+                  cursor: "pointer",
+                }}
+              >
+                <option value="10">10 分钟</option>
+                <option value="30">30 分钟（默认）</option>
+                <option value="60">1 小时</option>
+                <option value="0">不启用</option>
+              </select>
+            </Field>
           </Section>
 
           <Divider />

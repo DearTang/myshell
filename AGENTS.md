@@ -142,11 +142,19 @@ Auto-configuration: The GUI settings panel (MCP → "一键配置全部") auto-d
 When the user sends **`打包`** or **`帮我打包`** (or any message whose core intent is "cut a release"), execute the release pipeline autonomously **except for one mandatory confirmation gate after the changelog is written** (see step 3.5). The user has durably pre-authorized version bumping, building, git commit/push, and Gitee publishing by issuing the command — but they want to review and approve the **version number + update content** before anything is built or pushed. Announce each step as you start it (so it's transparent), then proceed — and STOP at the gate.
 
 ### Prerequisite (one-time, done by the user)
-A Gitee personal access token with the `projects`/release scope must be available, either as:
+Tokens for **both** platforms must be available:
+
+**Gitee** — personal access token with `projects`/release scope:
 - env var `$GITEE_TOKEN`, or
 - a `.gitee-token` file at repo root (gitignored — **never commit it, never paste the value into chat/commit messages**).
 
-If neither is present when you reach the publish step, STOP at that step and tell the user how to create the token (Gitee → 设置 → 私人令牌 → 生成新令牌) and where to put it — do NOT proceed to a broken publish and do NOT invent a token.
+**GitHub** — fine-grained PAT with Contents (read/write) on `DearTang/myshell`:
+- env var `$GITHUB_TOKEN`, or
+- a `.github-token` file at repo root (gitignored).
+
+If either is missing when you reach the publish step, STOP at that step and tell the user how to create the token and where to put it — do NOT proceed to a broken publish and do NOT invent a token.
+
+Git remotes: `origin` = Gitee (`gitee.com/argustang/myshell`), `github` = GitHub (`github.com/DearTang/myshell`).
 
 ### Pipeline (run in order)
 1. **Decide the version bump** (auto). Primary signal = the entry **types** in `RELEASE_NOTES_STAGING.md` (any ✨新增 → **minor**; only 🐛/🛠️/🔒 → **patch**). Read the current `src-tauri/Cargo.toml` version. State the chosen version + one-line rationale before applying.
@@ -155,13 +163,16 @@ If neither is present when you reach the publish step, STOP at that step and tel
 3.5. **⚠️ CONFIRMATION GATE — STOP here.** Present: (a) chosen version + rationale, (b) full text of the new CHANGELOG section. **Do NOT build/commit/push/publish until the user confirms.** If they edit, revise and re-present. On confirm, steps 4–9 run autonomously.
 4. **Pre-check** — `npx tsc --noEmit` and `cargo check` (in `src-tauri/`). Both must pass.
 5. **Build the installer** — `npm run tauri:build` from repo root. Long (~10+ min first time); background it. Output: `src-tauri/target/release/bundle/nsis/MyShell_X.Y.Z_x64-setup.exe`.
-6. **Commit + push** — stage `Cargo.toml`, `package.json`, `package-lock.json`, `CHANGELOG.md`, `README.md`, `progress.md`, `RELEASE_NOTES_STAGING.md` (and feature code), commit `release: vX.Y.Z`, push to upstream. (The Gitee release tags `main` HEAD, so the bump must be on the remote first.) Don't commit `.gitee-token`. The host classifier may gate push-to-default-branch → ask the user to authorize or run `! git push origin main`.
-7. **Publish to Gitee** — `node scripts/publish-gitee-release.mjs <version> <temp-notes-file>` (creates release + uploads `.exe`; built-in retry). Report the URL. Host classifier may gate the public release → hand the user the command to run via `!`.
-8. **Clear the staging buffer** — in `RELEASE_NOTES_STAGING.md`: empty the "待发布条目" section (leave the header/baseline structure) and update `baseline: v<X.Y.Z>` to the just-released version. Commit + push this cleanup (`chore: clear release staging after vX.Y.Z`).
+6. **Commit + push (both remotes)** — stage `Cargo.toml`, `package.json`, `package-lock.json`, `CHANGELOG.md`, `README.md`, `progress.md`, `RELEASE_NOTES_STAGING.md` (and feature code), commit `release: vX.Y.Z`, then push to **both** `origin` (Gitee) and `github`. Don't commit `.gitee-token` / `.github-token`. The host classifier may gate push-to-default-branch → ask the user to authorize or run `! git push origin main && git push github main`.
+7. **Publish releases (both platforms)** — run both scripts (sequentially, either order):
+   - `node scripts/publish-gitee-release.mjs <version> <temp-notes-file>`
+   - `node scripts/publish-github-release.mjs <version> <temp-notes-file>`
+   Report both URLs. If one platform fails, still attempt the other; report the failure.
+8. **Clear the staging buffer** — in `RELEASE_NOTES_STAGING.md`: empty the "待发布条目" section (leave the header/baseline structure) and update `baseline: v<X.Y.Z>` to the just-released version. Commit + push this cleanup to **both** remotes (`chore: clear release staging after vX.Y.Z`).
 9. **Doc-after-feature** — ensure `progress.md` has the stage entry and `README.md` 更新日志 is in sync.
 
 ### Notes / safety
-- If a Gitee release for the tag already exists, the publish step will error on create — that's fine, report it; don't delete-and-recreate silently.
+- If a release for the tag already exists on either platform, the publish step will error on create — that's fine, report it; don't delete-and-recreate silently.
 - This rule authorizes git commit + push + public release **only** as part of this explicit `打包` flow. It does not extend to other tasks.
-- Never read, log, or print the token value; the script reads it directly.
+- Never read, log, or print the token value; the scripts read them directly.
 

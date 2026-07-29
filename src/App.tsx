@@ -37,6 +37,7 @@ import {
   localConnect,
   localDisconnect,
   vaultStatus,
+  lockVault,
   getAppVersion,
   openExternalUrl,
   onSshOutput,
@@ -442,6 +443,68 @@ export default function App() {
 
   useEffect(() => {
     if (vault === "ready") reload();
+  }, [vault]);
+
+  // ── Auto-lock: idle timeout locks the vault ──────────────────────────────
+  // Reads `myshell-auto-lock-minutes` from localStorage (default "30", "0" =
+  // disabled). When vault is "ready" and the setting is > 0, starts a timer
+  // that fires after N minutes of inactivity. Any user interaction (mouse,
+  // keyboard, scroll, touch) resets the timer. On fire: lockVault() + flip
+  // vault state to "checking" so the status effect re-queries → shows unlock.
+  useEffect(() => {
+    if (vault !== "ready") return;
+
+    const getMinutes = () => {
+      const raw = localStorage.getItem("myshell-auto-lock-minutes") ?? "30";
+      const n = parseInt(raw, 10);
+      return isNaN(n) ? 30 : n;
+    };
+
+    let minutes = getMinutes();
+    if (minutes <= 0) return; // disabled
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let lastReset = 0;
+
+    const armTimer = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(async () => {
+        try {
+          await lockVault();
+        } catch { /* best effort */ }
+        setVault("checking");
+      }, minutes * 60 * 1000);
+    };
+
+    const onActivity = () => {
+      const now = Date.now();
+      // Throttle: at most one reset per 5 seconds (avoids mousemove floods).
+      if (now - lastReset < 5000) return;
+      lastReset = now;
+      armTimer();
+    };
+
+    armTimer();
+    const events: Array<keyof WindowEventMap> = ["mousemove", "keydown", "click", "wheel", "touchstart"];
+    events.forEach((ev) => window.addEventListener(ev, onActivity, { capture: true, passive: true }));
+
+    // React to setting changes (SettingsPanel dispatches this event).
+    const onSettingChanged = () => {
+      minutes = getMinutes();
+      if (minutes <= 0) {
+        if (timer) clearTimeout(timer);
+        timer = null;
+      } else {
+        armTimer();
+      }
+    };
+    window.addEventListener("myshell-auto-lock-changed", onSettingChanged);
+
+    return () => {
+      if (timer) clearTimeout(timer);
+      events.forEach((ev) => window.removeEventListener(ev, onActivity, { capture: true }));
+      window.removeEventListener("myshell-auto-lock-changed", onSettingChanged);
+    };
   }, [vault]);
 
   // ── MCP ↔ GUI bridge: listen for commands from the MCP server ──────────

@@ -2236,3 +2236,22 @@
 | 什么可能导致偏离？ | 抑制窗口 500ms 是经验值——极慢网络下 lrzsz 响应可能超过 500ms 导致少量垃圾泄漏（无害，不影响功能）。SFTP 取消粒度为 32KB chunk，最大延迟 ~1ms。 |
 | 下一步最小可验证动作？ | cargo tauri dev → sz 大文件 → 取消 → 检查终端无垃圾；SFTP 面板下载 → 观察 4 行信息 + 点取消。 |
 | 目标是什么？ | ZMODEM 取消后终端干净；SFTP 传输体验与 ZMODEM 对齐（可取消、有时间信息）。 |
+
+### 阶段 89：自动锁定功能（2026-07-29）
+
+- **需求：** 无操作超过设定时长后自动锁定 Vault，需重新输入密码。用户可在设置→安全中配置时长（10分钟/30分钟默认/1小时/不启用）。
+- **实现：**
+  - `api.ts`：新增 `lockVault()` 包装（后端 `lock_vault` 命令早已注册，仅缺前端入口）。
+  - `App.tsx`：vault === "ready" 时启动空闲定时器；全局 capture 监听 mousemove/keydown/click/wheel/touchstart 重置定时器（5s 节流）；到期调用 lockVault() + setVault("checking") 切回解锁屏；监听 `myshell-auto-lock-changed` 事件实时响应设置变更。
+  - `SettingsPanel.tsx`：安全 section 新增「🔒 自动锁定」子节，select 下拉选择时长，值存 localStorage `myshell-auto-lock-minutes`。
+- **涉及文件（3 个）：** `src/api.ts`、`src/App.tsx`、`src/components/SettingsPanel.tsx`。
+- **验证：** `npx tsc --noEmit` exit 0。
+
+## 五问重启检查（阶段 89）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 89 complete —— 自动锁定功能实现（空闲超时 → lockVault → 解锁屏），tsc 通过。 |
+| 我要去哪里？ | 实测：设置 10 分钟 → 不操作 → 10 分钟后应自动跳到解锁屏；选「不启用」→ 不再自动锁定。 |
+| 什么可能导致偏离？ | 定时器依赖 vault === "ready" 激活——若 vault 状态异常卡在 "checking" 则不计时（无害）。5s 节流意味着最多延迟 5s 重置，不影响体验。 |
+| 下一步最小可验证动作？ | npm run tauri:dev → 设置→安全→自动锁定改为 10 分钟 → 等待 → 观察是否自动锁定。 |
+| 目标是什么？ | 用户离开后应用自动保护，防止他人查看已解锁的连接/密码。 |
