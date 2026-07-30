@@ -451,6 +451,14 @@ export default function App() {
   // that fires after N minutes of inactivity. Any user interaction (mouse,
   // keyboard, scroll, touch) resets the timer. On fire: lockVault() + flip
   // vault state to "checking" so the status effect re-queries → shows unlock.
+  //
+  // IMPORTANT: a bare setTimeout is NOT reliable for this. When the window is
+  // minimized / loses focus, the OS webview (WebView2/WebKit) throttles background
+  // timers — the callback silently fails to fire on time, so the vault never
+  // locks. We therefore ALSO track `lastActivityAt` (a wall-clock timestamp)
+  // and re-check it when the window becomes visible/focused again. If the idle
+  // gap already exceeds the threshold at that moment, we lock immediately. This
+  // catches the throttle gap regardless of how the window regains foreground.
   useEffect(() => {
     if (vault !== "ready") return;
 
@@ -463,39 +471,74 @@ export default function App() {
     let minutes = getMinutes();
     if (minutes <= 0) return; // disabled
 
+    const timeoutMs = () => minutes * 60 * 1000;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let lastActivityAt = Date.now();
     let lastReset = 0;
+    let locked = false;
+
+    const doLock = () => {
+      if (locked) return;
+      locked = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      lockVault().catch(() => { /* best effort */ });
+      setVault("checking");
+    };
 
     const armTimer = () => {
       if (timer) clearTimeout(timer);
-      timer = setTimeout(async () => {
-        try {
-          await lockVault();
-        } catch { /* best effort */ }
-        setVault("checking");
-      }, minutes * 60 * 1000);
+      timer = setTimeout(doLock, timeoutMs());
+    };
+
+    // If already past the idle threshold (e.g. timer was throttled while the
+    // window was in the background), lock now instead of re-arming.
+    const checkElapsed = () => {
+      if (locked) return;
+      if (Date.now() - lastActivityAt >= timeoutMs()) {
+        doLock();
+      } else {
+        armTimer();
+      }
     };
 
     const onActivity = () => {
       const now = Date.now();
+      lastActivityAt = now;
       // Throttle: at most one reset per 5 seconds (avoids mousemove floods).
       if (now - lastReset < 5000) return;
       lastReset = now;
-      armTimer();
+      if (timer) armTimer();
+    };
+
+    // Fired when the window/tab becomes visible again. While it was hidden the
+    // setTimeout above may have been throttled past its deadline; this catches
+    // up by comparing wall-clock idle time against the threshold.
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") checkElapsed();
     };
 
     armTimer();
     const events: Array<keyof WindowEventMap> = ["mousemove", "keydown", "click", "wheel", "touchstart"];
     events.forEach((ev) => window.addEventListener(ev, onActivity, { capture: true, passive: true }));
+    window.addEventListener("visibilitychange", onVisibility);
+    // focus/pageshow also cover the case where visibilitychange doesn't fire
+    // (e.g. switching between two windows of the same app on some platforms).
+    window.addEventListener("focus", checkElapsed);
+    window.addEventListener("pageshow", checkElapsed);
 
     // React to setting changes (SettingsPanel dispatches this event).
     const onSettingChanged = () => {
       minutes = getMinutes();
       if (minutes <= 0) {
-        if (timer) clearTimeout(timer);
-        timer = null;
-      } else {
-        armTimer();
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      } else if (!locked) {
+        checkElapsed();
       }
     };
     window.addEventListener("myshell-auto-lock-changed", onSettingChanged);
@@ -503,6 +546,9 @@ export default function App() {
     return () => {
       if (timer) clearTimeout(timer);
       events.forEach((ev) => window.removeEventListener(ev, onActivity, { capture: true }));
+      window.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", checkElapsed);
+      window.removeEventListener("pageshow", checkElapsed);
       window.removeEventListener("myshell-auto-lock-changed", onSettingChanged);
     };
   }, [vault]);

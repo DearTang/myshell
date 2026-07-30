@@ -706,9 +706,29 @@ async fn channel_reader(
     flush_interval.tick().await;
     log::info!("[ssh:{}] channel_reader started", session_id);
 
+    // One-shot shell TMOUT suppression — ONLY when the user enabled app-level
+    // keepalive for this connection. The interactive login shell inherits
+    // `TMOUT` (set in /etc/profile, /etc/profile.d/*) which force-logs-out the
+    // session after N seconds of no *keyboard* input — regardless of whether
+    // the SSH connection itself is alive. The exec keepalive below runs in a
+    // *separate* non-interactive process, so it does NOT reset TMOUT. To defeat
+    // TMOUT we must touch the interactive PTY itself: injecting `export
+    // TMOUT=0` right after the shell starts (before the user can run anything,
+    // so it lands in the login shell, not vim/less). `2>/dev/null` swallows the
+    // error when an admin locked it `readonly TMOUT=...`; in that locked case
+    // there is no safe workaround (any periodic PTY byte injection would
+    // corrupt editors like vim), so we simply leave it be. Leading/trailing
+    // newlines make it a standalone line that won't merge with the prompt.
+    // Gated on app_keepalive_secs so connections without keepalive keep their
+    // server-default TMOUT (keeps this tied to the user's explicit opt-in).
+    if app_keepalive_secs > 0 {
+        let _ = channel.data(&b"\nexport TMOUT=0 2>/dev/null\n"[..]).await;
+    }
+
     // Application-level keepalive: periodically open a disposable exec channel
     // and run `true`. Generates real TCP payload to defeat NAT/firewall idle
-    // timeouts and shell-level TMOUT. Disabled when app_keepalive_secs == 0.
+    // timeouts (network-layer only — does NOT reset shell TMOUT; see the
+    // one-shot injection above for that). Disabled when app_keepalive_secs == 0.
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(
         if app_keepalive_secs > 0 { app_keepalive_secs as u64 } else { 3600 },
     ));
