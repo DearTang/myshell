@@ -90,13 +90,8 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
   const [keepaliveInterval, setKeepaliveInterval] = useState(
     config?.keepalive_interval_secs != null ? String(config.keepalive_interval_secs) : ""
   );
-  const [appKeepalive, setAppKeepalive] = useState(
-    config?.app_keepalive_secs != null && config.app_keepalive_secs > 0
-  );
-  const [appKeepaliveSecs, setAppKeepaliveSecs] = useState(
-    config?.app_keepalive_secs != null && config.app_keepalive_secs > 0
-      ? String(config.app_keepalive_secs)
-      : "60"
+  const [suppressTmout, setSuppressTmout] = useState(
+    config?.suppress_tmout === true
   );
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -299,9 +294,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
       keepalive_interval_secs: keepaliveInterval.trim()
         ? parseInt(keepaliveInterval, 10)
         : undefined,
-      app_keepalive_secs: appKeepalive
-        ? Math.max(10, parseInt(appKeepaliveSecs, 10) || 60)
-        : undefined,
+      suppress_tmout: suppressTmout,
       created_at: config?.created_at || new Date().toISOString(),
     };
   }
@@ -788,33 +781,18 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
                 <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12, color: "var(--text-secondary)" }}>
                   <input
                     type="checkbox"
-                    checked={appKeepalive}
-                    onChange={(e) => setAppKeepalive(e.target.checked)}
+                    checked={suppressTmout}
+                    onChange={(e) => setSuppressTmout(e.target.checked)}
                     style={{ accentColor: "var(--accent-primary)" }}
                   />
-                  应用级保活（防 NAT/防火墙断连）
+                  防止 shell 空闲自动登出（TMOUT）
                 </label>
-                {appKeepalive && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                    <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>每</span>
-                    <input
-                      value={appKeepaliveSecs}
-                      onChange={(e) => setAppKeepaliveSecs(e.target.value)}
-                      style={{
-                        width: 48,
-                        background: "var(--bg-input)",
-                        border: "1px solid var(--border-default)",
-                        borderRadius: "var(--radius-sm)",
-                        color: "var(--text-primary)",
-                        padding: "2px 6px",
-                        fontSize: 12,
-                        textAlign: "center",
-                      }}
-                    />
-                    <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>秒</span>
-                  </div>
-                )}
               </div>
+              {suppressTmout && (
+                <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 4, lineHeight: 1.5 }}>
+                  登录后自动执行 export TMOUT=0，阻止服务器按空闲时间踢人。不额外开通道，受限账号也可用。
+                </div>
+              )}
             </FieldGroup>
           )}
 

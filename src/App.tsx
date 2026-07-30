@@ -1282,7 +1282,15 @@ export default function App() {
     );
 
     try {
-      const config = tab.config;
+      // Use the freshest config from the connections list, not the tab's
+      // cached snapshot. The tab stores the config as it was when opened; if
+      // the user edited the connection since (e.g. enabled TMOUT suppression),
+      // tab.config is stale and a reconnect would skip the new setting.
+      // Fall back to the tab's snapshot if the connection was deleted from the
+      // list. (The tabConfig local preserves the guard's narrowing inside the
+      // find closure, where tab.config's property narrowing wouldn't reach.)
+      const tabConfig = tab.config;
+      const config = connections.find((c) => c.id === tabConfig.id) ?? tabConfig;
       const connType = config.conn_type ?? "ssh";
 
       if (connType === "ftp") {

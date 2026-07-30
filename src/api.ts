@@ -57,8 +57,10 @@ export interface ConnectionConfig {
   connect_timeout_secs?: number;
   /** SSH keepalive interval in seconds. undefined = 15s default. */
   keepalive_interval_secs?: number;
-  /** App-level keepalive (exec `true` every N secs). undefined/0 = disabled. */
-  app_keepalive_secs?: number;
+  /** Suppress shell idle auto-logout (TMOUT) by injecting `export TMOUT=0`
+   * once at shell start. Safe for restricted accounts (no extra channel).
+   * Default false. */
+  suppress_tmout?: boolean;
   created_at: string;
 }
 

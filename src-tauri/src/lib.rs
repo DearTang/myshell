@@ -138,11 +138,12 @@ pub struct ConnectionConfig {
     /// (keepalive_max stays fixed at 3). Nullable column.
     #[serde(default)]
     pub keepalive_interval_secs: Option<u32>,
-    /// Application-level keepalive: open a disposable exec channel every N
-    /// seconds and run `true`. Generates real TCP payload to defeat NAT/
-    /// firewall idle timeouts and shell-level TMOUT. None/0 = disabled.
+    /// Suppress the shell's idle auto-logout (`TMOUT`) by injecting `export
+    /// TMOUT=0` into the interactive PTY once, right after the shell starts.
+    /// This is a one-shot write on the *existing* channel (safe for restricted
+    /// single-session accounts). Default false.
     #[serde(default)]
-    pub app_keepalive_secs: Option<u32>,
+    pub suppress_tmout: bool,
     pub created_at: String,
 }
 

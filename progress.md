@@ -2276,3 +2276,83 @@
 | 什么可能导致偏离？ | `readonly TMOUT` 堡垒机无法覆盖（已 `2>/dev/null` 静默，预期放弃）。自动锁定兜底依赖窗口回到前台才补锁——若窗口始终不回前台（彻底后台），仍要等下次可见，这是 webview 后台节流的根本约束，但已是最优解（纯前台 setTimeout 无法解决）。 |
 | 下一步最小可验证动作？ | dev 已重编译重启 → 连服务器验证 TMOUT 门控 → vim 打字 → 设 10 分钟锁定后最小化窗口验证补锁。 |
 | 目标是什么？ | 保活只作用于勾选连接且防住 TMOUT+NAT、不误伤编辑器；自动锁定在后台节流下仍能可靠触发。 |
+
+### 阶段 91：应用级保活默认 60s 踩点服务器空闲超时——默认降到 30s + UI 提示（2026-07-30）
+
+- **需求：** v2.8.1 后用户反馈某连接（`ias@31-sftp`）仍每 60 秒断一次，`[Connection closed]`，但**没有** TMOUT 的 auto-logout 字样。
+- **诊断（日志取证）：** 日志显示三个会话均在连接后**精确 60 秒**以 `channel.wait returned None` 死亡，且死前**无** `ExitStatus`/`EOF`/`Close`——是**连接层（TCP）被静默掐断**，非 shell 退出，故与 TMOUT 无关。同日志中传 2GB 文件的会话活了十几分钟 → 证明是**空闲超时**（有真实流量即重置），非硬性时长限制。查 DB 得该连接 `app_keepalive_secs=60`：应用心跳首次触发在 t=60s，与服务器 60s 超时**同时发生、超时先下手**（日志实锤：会话死后 9ms 才出现 `exec channel open failed`，心跳来晚）。russh 层 15s keepalive 发的是连接级探测包，该超时只认真实通道流量、不认探测包，故 15s 心跳救不了，只有应用层 exec 心跳算数——而它设成 60s 踩点失败。
+- **实现（方案 A）：** `ConnectionDialog.tsx` 应用级保活默认间隔 60s → **30s**（两处：state 初始默认、buildConfig 的 `|| 60` 兜底），给 60s 常见防火墙超时留出安全余量；并在勾选保活后新增一行提示「间隔须小于服务器空闲超时才能生效；防火墙/NAT 常见为 60 秒，建议 ≤ 30 秒」。
+- **注意：** 默认值改动只影响**新建连接**；已存连接（如该 `ias@31-sftp` 仍存 60）需用户手动编辑改为 30 才生效。
+- **涉及文件（1 个）：** `src/components/ConnectionDialog.tsx`。
+- **验证：** `npx tsc --noEmit` exit 0。
+
+## 五问重启检查（阶段 91）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 91 complete —— 应用保活默认 60s→30s + UI 提示，tsc 通过。 |
+| 我要去哪里？ | 实测：把 `ias@31-sftp` 的应用保活手动改 30s 重连，静置 >60s 确认不再断；新建连接确认默认显示 30。 |
+| 什么可能导致偏离？ | 已存连接仍是旧值 60（默认改动不回填），需手动改。若某服务器空闲超时 <30s（罕见），30s 仍会踩点，需再调小（UI 已提示原理）。 |
+| 下一步最小可验证动作？ | 编辑该连接→保活改 30s→重连→静置 90s 观察是否存活。 |
+| 目标是什么？ | 应用心跳间隔默认就小于常见 60s 空闲超时，开箱即稳，不再踩点断连。 |
+
+### 阶段 92：重连按钮用过期配置——编辑保活后「重连」不生效（2026-07-30）
+
+- **需求：** 用户给 `ias21` 连接开了保活，但点标签页「重连」后 `echo $TMOUT` 仍是 300（注入没生效）；而从侧边栏「重新打开会话」后 `TMOUT=0`（注入生效）。同一连接两种入口表现不一致。
+- **诊断：** 服务器 TMOUT=300、**非 readonly**、`PROMPT_COMMAND` 只设终端标题不碰 TMOUT——本可注入覆盖。差异在代码路径：侧边栏重开走 `openConnection`（`getConnections()` 拉 DB 最新配置，含 `app_keepalive_secs=30`）→ 注入触发；而「重连」走 `reconnectOne`，第 1285 行 `const config = tab.config` 用的是**开标签页那一刻缓存的快照**，用户之后编辑保活它不更新 → `app_keepalive_secs` 仍为空 → 注入被门控跳过。
+- **实现：** `reconnectOne` 改为优先从 `connections` 列表（编辑保存后 `onSave→reload()` 会刷新它）按 id 取最新配置，取不到再回退 `tab.config`（连接被删的兜底，也保证 connections 闭包过期时无回归）。注：`tab.config` 的属性收窄不进 `find` 闭包，用局部 `const tabConfig` 接住以保留 1221 行守卫的收窄。
+- **涉及文件（1 个）：** `src/App.tsx`。
+- **验证：** `npx tsc --noEmit` exit 0。
+
+## 五问重启检查（阶段 92）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 92 complete —— reconnectOne 改用 connections 最新配置，编辑保活后重连也能触发 TMOUT 注入，tsc 通过。 |
+| 我要去哪里？ | 实测：开保活→保存→直接点「重连」（非重开）→ `echo $TMOUT` 应为 0。 |
+| 什么可能导致偏离？ | 若 connections 列表尚未 reload（极端时序），回退 tab.config 退回旧行为（无回归，只是这次重连仍用旧配置，下次正常）。MCP 触发的重连同理走此路径。 |
+| 下一步最小可验证动作？ | 编辑连接开/改保活→保存→点标签页重连→`echo $TMOUT` 验证为 0。 |
+| 目标是什么？ | 编辑连接设置后，无论从侧边栏重开还是标签页重连，都用最新配置，行为一致。 |
+
+### 阶段 93：应用级保活 exec 心跳打死受限账号——TMOUT 注入与 exec 心跳解耦（2026-07-30）
+
+- **需求：** 给 `ias21` 开保活（30s）后，`TMOUT=0` 注入虽生效，但连接**每 30 秒**就 `[Connection closed]`（用户实测约 20s）。
+- **诊断（日志取证）：** 两个会话均在连接后**精确 30 秒**（= 保活间隔）以 `channel.wait returned None` 死亡，无 `ExitStatus`/`EOF`。回看 `135.32.64.31`（保活 60s）也精确死在 60s——**死亡间隔跟着保活间隔走**（30→30s、60→60s），非固定防火墙超时。结论：应用级保活的实现是「每 N 秒新开一条 exec 通道跑 `true`」，而 `ias21`/`ias@31-sftp` 是**受限单会话账号**（堡垒机 `MaxSessions=1`），开第二条通道时服务器**直接断开整条连接**。旁证：开保活前 ias21 会话能活十几分钟（传 2GB 文件无事），仅空闲 5 分钟被 TMOUT 踢；开保活后反而 30 秒就死——保活让它死得更快。
+- **核心矛盾：** 「应用级保活」一个开关同时管两件事，对受限账号作用相反——①TMOUT 注入（在现有 PTY 发 `export TMOUT=0`，不开新通道，安全有用）；②exec 心跳（每 N 秒新开 exec 通道，触发断连，有害）。用户要「TMOUT 开、exec 心跳关」，但二者绑定无法分开。
+- **实现（方案：拆成两个独立开关）：**
+  - 新增 `suppress_tmout: bool` 字段（`lib.rs` + `api.ts`），独立控制 TMOUT 注入；`app_keepalive_secs` 仍独立控制 exec 心跳。
+  - `db.rs`：新增 `suppress_tmout INTEGER NOT NULL DEFAULT 0` 列 + ALTER 迁移；迁移时 `UPDATE ... SET suppress_tmout=1 WHERE app_keepalive_secs>0`（解耦前 TMOUT 注入本就门控在保活上，回填以不丢已有行为）；三个 SELECT（含回收站，`deleted_at` 索引 25→26）+ INSERT 全部补列。
+  - `ssh.rs`：TMOUT 注入门控由 `app_keepalive_secs>0` 改为 `suppress_tmout`；`channel_reader` 增 `suppress_tmout` 形参。
+  - `ConnectionDialog.tsx`：新增「防止 shell 空闲自动登出（TMOUT）」复选框（独立于保活）；应用级保活提示追加受限账号警告。
+- **涉及文件（5 个）：** `src-tauri/src/lib.rs`、`src-tauri/src/db.rs`、`src-tauri/src/ssh.rs`、`src/api.ts`、`src/components/ConnectionDialog.tsx`。
+- **验证：** `cargo check` + `npx tsc --noEmit` 均通过。
+
+## 五问重启检查（阶段 93）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 93 complete —— TMOUT 注入（suppress_tmout）与 exec 心跳（app_keepalive_secs）解耦为两个独立开关，cargo check + tsc 通过。 |
+| 我要去哪里？ | 实测：受限账号 ias21 只勾 TMOUT、不勾保活 → 重连 → `echo $TMOUT`=0 且静置不再 30s 断；需 NAT 保活的账号单独勾保活。 |
+| 什么可能导致偏离？ | 迁移回填使已有保活连接 suppress_tmout=1（保留 TMOUT 注入），但 app_keepalive_secs 仍在——受限账号需用户手动关掉保活复选框。readonly TMOUT 仍无解（预期放弃）。 |
+| 下一步最小可验证动作？ | 编辑 ias21：勾 TMOUT、取消保活 → 保存重连 → 静置 >30s 看是否存活、`echo $TMOUT`=0。 |
+| 目标是什么？ | 受限账号能只防 TMOUT 不被 exec 心跳打死；需 NAT 保活的账号各取所需，两机制互不牵连。 |
+
+### 阶段 94：彻底删除「应用级保活（exec 心跳）」功能（2026-07-30）
+
+- **背景：** 阶段 93 将 TMOUT 注入与 exec 心跳解耦后实测发现：①受限账号（ias21）只勾 TMOUT 即稳定，不再需要 exec 心跳；②裸连（无任何保活）也能长期保持——russh 自带 15s 连接级 keepalive 对普通服务器已足够。exec 心跳（每 N 秒开 exec 通道跑 `true`）对本项目服务器**无用甚至有害**（打死受限单会话账号），徒增复杂度和误用陷阱。
+- **决策：删除「应用级保活」整个功能**，只保留「防止 shell 空闲自动登出（TMOUT）」开关。
+- **实现：**
+  - `ssh.rs`：删除 exec 心跳的 keepalive_interval 定时器、`_ = keepalive_interval.tick()` 分支、`app_keepalive_secs` 形参与提取、channel_reader 多余的 `handle` 形参（删除心跳后变 unused）。
+  - `lib.rs`/`api.ts`：删除 `app_keepalive_secs` 字段。
+  - `db.rs`：三个 SELECT + INSERT 移除 `app_keepalive_secs` 读写；**DB 列 + 迁移保留**（含回填 `UPDATE ... WHERE app_keepalive_secs>0`），避免老库升级风险，列本身不再被代码引用。
+  - `ConnectionDialog.tsx`：删除「应用级保活」复选框、秒数输入框、state、buildConfig 项；只留 TMOUT 复选框。
+  - `App.tsx`：清理注释中对 app_keepalive 的提及。
+- **影响：** 老用户升级后，原开过保活的连接经迁移回填已 `suppress_tmout=1`（TMOUT 防护保留），exec 心跳静默停止（DB 列还在但不再被读）。普通服务器靠 russh 15s keepalive 保持；TMOUT 服务器靠 suppress_tmout 开关。
+- **涉及文件（6 个）：** `src-tauri/src/ssh.rs`、`src-tauri/src/lib.rs`、`src-tauri/src/db.rs`、`src/api.ts`、`src/components/ConnectionDialog.tsx`、`src/App.tsx`。
+- **验证：** `cargo check` + `npx tsc --noEmit` 均通过（仅剩历史 dead_code warning）。
+
+## 五问重启检查（阶段 94）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 94 complete —— 删除应用级保活（exec 心跳）整个功能，只留 TMOUT 开关，cargo check + tsc 通过。 |
+| 我要去哪里？ | 打包 2.9.0 发布。实测后普通账号靠 russh keepalive 保持、TMOUT 服务器靠 suppress_tmout。 |
+| 什么可能导致偏离？ | DB 列 app_keepalive_secs 残留（无害，不被读写）。若某 NAT 环境真需应用层心跳（罕见，因 russh 15s 心跳已覆盖绝大多数），需重新评估——但当前用户场景不需要。 |
+| 下一步最小可验证动作？ | 打包发布 → ias21 勾 TMOUT 长期保持 → 普通账号裸连长期保持。 |
+| 目标是什么？ | 移除有害无用的 exec 心跳，连接保活由 russh keepalive + TMOUT 开关覆盖，UI 简洁不再有误用陷阱。 |
