@@ -38,6 +38,20 @@ interface Props {
   /** How many rows in this panel are offline — gates the button's visibility
    * and feeds its label. */
   disconnectedCount?: number;
+  /** Batch action buttons rendered in the header. Each entry is a self-
+   * contained button (label + callback). Lets the caller add custom bulk
+   * operations (reconnect all, broadcast all, exit all broadcast, etc.)
+   * without changing the panel's internals. */
+  batchActions?: Array<{
+    label: string;
+    title?: string;
+    onClick: () => void;
+  }>;
+  /** Per-row secondary action — a second tail button after the main `onAction`.
+   * Used for the broadcast toggle (📡) in the session list. */
+  rowSecondaryAction?: (tab: Tab) => { label: string; title: string; active: boolean } | undefined;
+  /** Callback for the secondary action click. */
+  onRowSecondaryAction?: (tab: Tab) => void;
 }
 
 /**
@@ -63,6 +77,9 @@ export function SessionDropdownPanel({
   emptyHint,
   onCloseDisconnected,
   disconnectedCount = 0,
+  batchActions,
+  rowSecondaryAction,
+  onRowSecondaryAction,
 }: Props) {
   const panelRef = useRef<HTMLDivElement>(null);
 
@@ -127,7 +144,6 @@ export function SessionDropdownPanel({
           }}
         >
           <span style={{ fontSize: 14 }}>{icon}</span>
-          <span style={{ flex: 1 }}>{title}</span>
           {onCloseDisconnected && disconnectedCount > 0 && (
             <button
               onClick={(e) => {
@@ -160,6 +176,39 @@ export function SessionDropdownPanel({
               清理掉线 × {disconnectedCount}
             </button>
           )}
+          {batchActions?.map((action, i) => (
+            <button
+              key={i}
+              onClick={(e) => {
+                e.stopPropagation();
+                action.onClick();
+              }}
+              title={action.title || action.label}
+              style={{
+                fontSize: 11,
+                fontWeight: 500,
+                color: "var(--text-secondary)",
+                background: "transparent",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-md)",
+                padding: "3px 9px",
+                cursor: "pointer",
+                marginRight: 4,
+                whiteSpace: "nowrap",
+                transition: "all var(--duration-fast) var(--ease-in-out)",
+              }}
+              onMouseEnter={(e) => {
+                e.currentTarget.style.background = "var(--bg-surface-hover)";
+                e.currentTarget.style.borderColor = "var(--border-emphasis)";
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.background = "transparent";
+                e.currentTarget.style.borderColor = "var(--border-default)";
+              }}
+            >
+              {action.label}
+            </button>
+          ))}
           <span
             style={{
               fontSize: 11,
@@ -247,6 +296,31 @@ export function SessionDropdownPanel({
                       boxShadow: tab.status === "connecting" ? `0 0 5px ${dot.color}` : "none",
                     }}
                   />
+                  {/* Secondary per-row action (e.g. broadcast toggle) */}
+                  {rowSecondaryAction && onRowSecondaryAction && (() => {
+                    const sa = rowSecondaryAction(tab);
+                    if (!sa) return null;
+                    return (
+                      <span
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onRowSecondaryAction(tab);
+                        }}
+                        title={sa.title}
+                        style={{
+                          flexShrink: 0,
+                          fontSize: 12,
+                          cursor: "pointer",
+                          padding: "1px 4px",
+                          color: sa.active ? "var(--success)" : "var(--text-muted)",
+                          opacity: sa.active ? 1 : 0.5,
+                          transition: "opacity var(--duration-fast) var(--ease-in-out)",
+                        }}
+                      >
+                        📡
+                      </span>
+                    );
+                  })()}
                   {onAction && (
                     <span
                       onClick={(e) => {

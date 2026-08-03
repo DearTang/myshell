@@ -88,6 +88,7 @@ const categories = [
   { id: "appearance", label: "外观", icon: "🎨" },
   { id: "ai", label: "AI 助手", icon: "🤖" },
   { id: "mcp", label: "MCP 支持", icon: "🔌" },
+  { id: "multiWindow", label: "多窗口", icon: "🪟" },
   { id: "security", label: "安全", icon: "🔒" },
   { id: "data", label: "数据管理", icon: "💾" },
   { id: "quickCommands", label: "快捷命令", icon: "⚡" },
@@ -2565,7 +2566,56 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
           )}
 
           {/* Data Category — 配置导入导出 / 版本备份与回退 */}
-          {activeCategory === "data" && (
+          {activeCategory === "multiWindow" && (
+          <>
+            <Section title="🪟 多窗口网格">
+              <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.6 }}>
+                设置多窗口模式的默认网格行列数。进入多窗口时自动按此布局排列，并最大化窗口。
+              </div>
+              <div style={{ display: "flex", gap: 16, alignItems: "flex-end" }}>
+                <Field label="行数">
+                  <select
+                    value={localStorage.getItem("myshell-multiwindow-rows") ?? "2"}
+                    onChange={(e) => {
+                      localStorage.setItem("myshell-multiwindow-rows", e.target.value);
+                      window.dispatchEvent(new Event("myshell-multiwindow-changed"));
+                      setAutoLockTick((t) => t + 1);
+                    }}
+                    style={{ background: "var(--bg-surface)", color: "var(--text-primary)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "6px 10px", fontSize: 13, outline: "none", cursor: "pointer" }}
+                  >
+                    <option value="1">1 行</option>
+                    <option value="2">2 行（默认）</option>
+                    <option value="3">3 行</option>
+                    <option value="4">4 行</option>
+                  </select>
+                </Field>
+                <Field label="列数">
+                  <select
+                    value={localStorage.getItem("myshell-multiwindow-cols") ?? "3"}
+                    onChange={(e) => {
+                      localStorage.setItem("myshell-multiwindow-cols", e.target.value);
+                      window.dispatchEvent(new Event("myshell-multiwindow-changed"));
+                      setAutoLockTick((t) => t + 1);
+                    }}
+                    style={{ background: "var(--bg-surface)", color: "var(--text-primary)", border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "6px 10px", fontSize: 13, outline: "none", cursor: "pointer" }}
+                  >
+                    <option value="1">1 列</option>
+                    <option value="2">2 列</option>
+                    <option value="3">3 列（默认）</option>
+                    <option value="4">4 列</option>
+                    <option value="5">5 列</option>
+                    <option value="6">6 列</option>
+                  </select>
+                </Field>
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 10, lineHeight: 1.5 }}>
+                默认 2 行 × 3 列，最多同时展示 6 个窗口。超出部分可向下滚动查看。修改后下次进入多窗口生效。
+              </div>
+            </Section>
+          </>
+        )}
+
+        {activeCategory === "data" && (
             <>
           {/* Export/Import Section */}
           <Section title="配置导入导出">

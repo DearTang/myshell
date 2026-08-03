@@ -134,6 +134,8 @@ interface Props {
   /** Open the docked AI assistant panel (the trigger button lives in
    * CommandBar, next to the history button). */
   onOpenAi?: () => void;
+  /** Open the multi-window session picker. */
+  onOpenMultiWindow?: () => void;
   /** Phase 3: registers the xterm instance with the App-level terminal
    * registry so the AI panel can read selection / recent output and paste
    * commands into it. Fired after the terminal opens; torn down on close. */
@@ -152,7 +154,7 @@ interface Props {
   onSnapshotConsumed?: () => void;
 }
 
-export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOverride, rendererBackend, broadcastTargets, active = true, onDisconnected, status, onReconnect, onTerminalReady, onTerminalGone, onOpenQuickCommandsManage, onOpenAi, connectionName, reconnectSnapshot, onSnapshotConsumed }: Props) {
+export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOverride, rendererBackend, broadcastTargets, active = true, onDisconnected, status, onReconnect, onTerminalReady, onTerminalGone, onOpenQuickCommandsManage, onOpenAi, onOpenMultiWindow, connectionName, reconnectSnapshot, onSnapshotConsumed }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -1069,6 +1071,7 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
           onReconnect={onReconnect}
           onOpenQuickCommandsManage={onOpenQuickCommandsManage}
           onOpenAi={onOpenAi}
+          onOpenMultiWindow={onOpenMultiWindow}
           onScreenshot={handleScreenshot}
           onRegisterRefresh={(fn) => {
             refreshHistoryRef.current = fn;

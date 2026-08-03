@@ -30,12 +30,14 @@ interface Props {
   onOpenQuickCommandsManage?: () => void;
   /** Open the docked AI assistant panel. */
   onOpenAi?: () => void;
+  /** Open the multi-window session picker. */
+  onOpenMultiWindow?: () => void;
   /** Capture a PNG screenshot of the terminal viewport (excludes this
    * CommandBar). Saves to the configured attachment directory. */
   onScreenshot?: () => void;
 }
 
-export function CommandBar({ sessionId, connectionId, connType, broadcastTargets = [], onRegisterRefresh, status, onReconnect, onOpenQuickCommandsManage, onOpenAi, onScreenshot }: Props) {
+export function CommandBar({ sessionId, connectionId, connType, broadcastTargets = [], onRegisterRefresh, status, onReconnect, onOpenQuickCommandsManage, onOpenAi, onOpenMultiWindow, onScreenshot }: Props) {
   // Pick the send backend by connection type — local tabs must route to
   // local_send, not ssh_send.
   const sendFn = connType === "local" ? localSend : sshSend;
@@ -55,6 +57,19 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
   // document.querySelector would target whichever tab's CommandBar rendered
   // first, hijacking focus to the wrong tab.
   const containerRef = useRef<HTMLDivElement>(null);
+  // Narrow-screen mode: hide button text labels when the bar is too narrow
+  // (multi-window grid cells, small windows) to prevent input-box squeeze.
+  const [showLabels, setShowLabels] = useState(true);
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      setShowLabels(el.clientWidth > 520);
+    });
+    ro.observe(el);
+    setShowLabels(el.clientWidth > 520);
+    return () => ro.disconnect();
+  }, []);
 
   const reload = useCallback(async () => {
     if (!connectionId) return;
@@ -210,6 +225,8 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
           border: "1px solid var(--border-default)",
           borderRadius: "var(--radius-md)",
           padding: "6px 12px",
+          flexShrink: 0,
+          whiteSpace: "nowrap",
           fontSize: 12,
           cursor: "pointer",
           display: "flex",
@@ -219,7 +236,7 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
         }}
       >
         <span>⌨</span>
-        <span>快捷</span>
+        {showLabels && <span>快捷</span>}
       </button>
 
       {/* Screenshot button — captures the terminal viewport only (this
@@ -238,6 +255,8 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
           border: "1px solid var(--border-default)",
           borderRadius: "var(--radius-md)",
           padding: "6px 12px",
+          flexShrink: 0,
+          whiteSpace: "nowrap",
           fontSize: 12,
           cursor: "pointer",
           display: "flex",
@@ -247,7 +266,7 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
         }}
       >
         <span>📷</span>
-        <span>截图</span>
+        {showLabels && <span>截图</span>}
       </button>
 
       {/* History button */}
@@ -263,6 +282,8 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
           border: "1px solid var(--border-default)",
           borderRadius: "var(--radius-md)",
           padding: "6px 12px",
+          flexShrink: 0,
+          whiteSpace: "nowrap",
           fontSize: 12,
           cursor: "pointer",
           display: "flex",
@@ -272,7 +293,31 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
         }}
       >
         <span>📜</span>
-        <span>历史</span>
+        {showLabels && <span>历史</span>}
+      </button>
+
+            {/* Multi-window picker button */}
+      <button
+        onClick={() => onOpenMultiWindow?.()}
+        title="多窗口"
+        style={{
+          background: "var(--bg-input)",
+          color: "var(--text-secondary)",
+          border: "1px solid var(--border-default)",
+          borderRadius: "var(--radius-md)",
+          padding: "6px 12px",
+          flexShrink: 0,
+          whiteSpace: "nowrap",
+          fontSize: 12,
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          gap: 4,
+          transition: "all var(--duration-fast) var(--ease-in-out)",
+        }}
+      >
+        <span>🪟</span>
+        {showLabels && <span>多窗口</span>}
       </button>
 
       {/* AI assistant button — opens the docked right panel */}
@@ -285,6 +330,8 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
           border: "1px solid var(--border-default)",
           borderRadius: "var(--radius-md)",
           padding: "6px 12px",
+          flexShrink: 0,
+          whiteSpace: "nowrap",
           fontSize: 12,
           cursor: "pointer",
           display: "flex",
@@ -294,7 +341,7 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
         }}
       >
         <span>🤖</span>
-        <span>AI</span>
+        {showLabels && <span>AI</span>}
       </button>
 
       {/* Reconnect button (only when disconnected/error) */}
@@ -308,6 +355,8 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
             border: "1px solid var(--success)",
             borderRadius: 6,
             padding: "6px 12px",
+          flexShrink: 0,
+          whiteSpace: "nowrap",
             fontSize: 12,
             cursor: "pointer",
             display: "flex",
@@ -328,7 +377,7 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
           }}
         >
           <span>⚡</span>
-          <span>重连</span>
+          {showLabels && <span>重连</span>}
         </button>
       )}
 
@@ -405,6 +454,8 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
                     display: "flex",
                     alignItems: "center",
                     padding: "6px 12px",
+          flexShrink: 0,
+          whiteSpace: "nowrap",
                     gap: 8,
                     cursor: "pointer",
                     transition: "background var(--duration-fast) var(--ease-in-out)",

@@ -11,6 +11,12 @@ interface Props {
   onReconnect: (id: string) => void;
   broadcastIds: Set<string>;
   onToggleBroadcast: (id: string) => void;
+  /** Reconnect all disconnected/error tabs at once. */
+  onReconnectAll?: () => void;
+  /** Add all connected SSH terminal tabs to the broadcast group. */
+  onBroadcastAll?: () => void;
+  /** Remove all tabs from the broadcast group. */
+  onExitAllBroadcast?: () => void;
   /** Batch-close every offline (disconnected/error) tab. Powers the
    * "清理掉线" button in the dropdown panels. */
   onCloseDisconnected: () => void;
@@ -32,6 +38,9 @@ export function TabBar({
   onReconnect,
   broadcastIds,
   onToggleBroadcast,
+  onReconnectAll,
+  onBroadcastAll,
+  onExitAllBroadcast,
   onCloseDisconnected,
 }: Props) {
   const broadcastCount = broadcastIds.size;
@@ -301,6 +310,19 @@ export function TabBar({
             actionTitle: "关闭标签页",
             onAction: (tab) => onClose(tab.id),
           }))}
+        batchActions={[
+          ...(onReconnectAll && tabs.some((t) => t.status === "disconnected" || t.status === "error")
+            ? [{ label: "全部重连", title: "重连所有掉线的会话", onClick: onReconnectAll }]
+            : []),
+          ...(onBroadcastAll && tabs.some((t) => t.type === "terminal" && t.connType === "ssh" && t.status === "connected")
+            ? [{ label: "全部广播", title: "将所有已连接的 SSH 会话加入广播组", onClick: onBroadcastAll }]
+            : []),
+        ]}
+        rowSecondaryAction={(tab) => {
+          if (tab.type !== "terminal" || tab.connType !== "ssh" || tab.status !== "connected") return undefined;
+          return { label: "📡", title: broadcastIds.has(tab.id) ? "退出广播" : "加入广播", active: broadcastIds.has(tab.id) };
+        }}
+        onRowSecondaryAction={(tab) => onToggleBroadcast(tab.id)}
         />
       )}
       {openPanel === "broadcast" && anchor && (
@@ -322,6 +344,7 @@ export function TabBar({
             actionTitle: "退出广播组",
             onAction: (tab) => onToggleBroadcast(tab.id),
           }))}
+        batchActions={onExitAllBroadcast ? [{ label: "退出全部广播", title: "移除所有广播组成员", onClick: onExitAllBroadcast }] : []}
         />
       )}
     </div>

@@ -5,6 +5,8 @@ import { Sidebar } from "./components/Sidebar";
 import { TabBar } from "./components/TabBar";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { SftpPanel } from "./components/SftpPanel";
+import { MultiWindowPicker } from "./components/MultiWindowPicker";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ServerInfoPanel } from "./components/ServerInfoPanel";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 import { MasterPasswordGate } from "./components/MasterPasswordGate";
@@ -46,7 +48,7 @@ import {
 } from "./api";
 import type { ConnectionConfig, ConnType, Tab } from "./api";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
-import { useRendererPref } from "./hooks/useRendererPref";
+import { useRendererPref, type RendererBackend } from "./hooks/useRendererPref";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import type { CommandRules } from "./api";
 
@@ -305,6 +307,43 @@ export default function App() {
   // AI assistant panel (global docked-right chat bar). Width persists in
   // localStorage so it survives reloads.
   const [showAiPanel, setShowAiPanel] = useState(false);
+  // Multi-window mode: show multiple SSH terminal sessions in a grid.
+  const [multiWindowMode, setMultiWindowMode] = useState(false);
+  const [multiWindowIds, setMultiWindowIds] = useState<string[]>([]);
+  const [showMultiWindowPicker, setShowMultiWindowPicker] = useState(false);
+  // Track whether the window was already maximized before entering multi-window,
+  // so we only unmaximize on exit if WE maximized it (dont shrink a deliberate
+  // maximize). Async-fetched on enter.
+  const mwWasMaximizedRef = useRef(true);
+  // Overflow confirm: when the picker selects more sessions than the grid
+  // capacity, we show a custom dialog (Tauri webview blocks native confirm()).
+  const [mwOverflowPrompt, setMwOverflowPrompt] = useState<{ ids: string[]; cap: number } | null>(null);
+
+  const enterMultiWindow = async (ids: string[]) => {
+    setMultiWindowIds(ids);
+    setMultiWindowMode(ids.length > 0);
+    setShowMultiWindowPicker(false);
+    if (ids.length > 0) {
+      // Maximize the window. Defer slightly so React has committed the
+      // multi-window render first (the maximize must not race with layout).
+      // Retry once after 200ms in case the first call lands before the
+      // window is fully ready (observed in dev with hot-reloaded IPC).
+      setTimeout(async () => {
+        try {
+          const win = getCurrentWindow();
+          mwWasMaximizedRef.current = await win.isMaximized();
+          if (!mwWasMaximizedRef.current) {
+            await win.maximize();
+            console.log("[multiwindow] maximize() called");
+          } else {
+            console.log("[multiwindow] already maximized");
+          }
+        } catch (e) {
+          console.warn("[multiwindow] maximize failed:", e);
+        }
+      }, 100);
+    }
+  };
   const [aiPanelWidth, setAiPanelWidth] = useState(() => {
     // Clamp stored value to the panel's own [300, 720] bounds (see
     // AiPanel.onResizeStart) so a stale/out-of-range value can't render the
@@ -1358,6 +1397,27 @@ export default function App() {
     }
   }
 
+  /** Reconnect all disconnected/error tabs in parallel. */
+  async function handleReconnectAll() {
+    const down = tabs.filter((t) => t.status === "disconnected" || t.status === "error");
+    await Promise.all(down.map((t) => reconnectOne(t.id)));
+  }
+
+  /** Add all connected SSH terminal tabs to the broadcast group. */
+  function handleBroadcastAll() {
+    const targets = tabs.filter((t) => t.type === "terminal" && t.connType === "ssh" && t.status === "connected");
+    setBroadcastIds((prev) => {
+      const next = new Set(prev);
+      for (const t of targets) next.add(t.id);
+      return next;
+    });
+  }
+
+  /** Remove all tabs from the broadcast group. */
+  function handleExitAllBroadcast() {
+    setBroadcastIds(new Set());
+  }
+
   async function handleReconnect(tabId: string) {
     await reconnectOne(tabId);
     // Broadcast cascade: if the tab we just reconnected is in the broadcast
@@ -1526,6 +1586,9 @@ export default function App() {
           onReconnect={handleReconnect}
           broadcastIds={broadcastIds}
           onToggleBroadcast={toggleBroadcast}
+          onReconnectAll={handleReconnectAll}
+          onBroadcastAll={handleBroadcastAll}
+          onExitAllBroadcast={handleExitAllBroadcast}
           onCloseDisconnected={handleCloseDisconnected}
         />
         <div
@@ -1537,7 +1600,46 @@ export default function App() {
             position: "relative",
           }}
         >
-          {tabs.length === 0 ? (
+          {multiWindowMode ? (
+            <MultiWindowGrid
+              tabs={tabs}
+              multiWindowIds={multiWindowIds}
+              connections={connections}
+              rendererBackend={rendererBackend}
+              getBroadcastTargets={getBroadcastTargets}
+              onTerminalReady={handleTerminalReady}
+              onTerminalGone={handleTerminalGone}
+              onOpenAi={() => setShowAiPanel((prev) => !prev)}
+              onOpenMultiWindow={() => setShowMultiWindowPicker(true)}
+              onReconnect={handleReconnect}
+              onDisconnected={(tabId) => setTabs((prev) => prev.map((t) => t.id === tabId ? { ...t, status: "disconnected" as const } : t))}
+              onClearSnapshot={(tabId) => clearReconnectSnapshot(tabId)}
+              onOpenQuickCommandsManage={(tabId) => { setQcInitialConnectionId(tabId); setShowQuickCommands(true); }}
+              onRemoveWindow={(tabId) => {
+                const next = multiWindowIds.filter(id => id !== tabId);
+                setMultiWindowIds(next);
+                // Auto-exit multi-window when only 0 or 1 window remains:
+                // a single window has no benefit being in grid mode — exit
+                // back to single-tab view (the window stays open as a tab).
+                if (next.length <= 1) {
+                  setMultiWindowMode(false);
+                  setMultiWindowIds([]);
+                  try {
+                    const win = getCurrentWindow();
+                    if (!mwWasMaximizedRef.current) win.unmaximize();
+                  } catch { /* not in tauri */ }
+                }
+              }}
+              onExit={() => {
+            setMultiWindowMode(false);
+            setMultiWindowIds([]);
+            try {
+              const win = getCurrentWindow();
+              if (!mwWasMaximizedRef.current) win.unmaximize();
+            } catch { /* not in tauri */ }
+          }}
+            />
+          ) : tabs.length === 0 ? (
             <WelcomeScreen />
           ) : (
             tabs.map((tab) => {
@@ -1587,6 +1689,7 @@ export default function App() {
                       onTerminalReady={handleTerminalReady}
                       onTerminalGone={handleTerminalGone}
                       onOpenAi={() => setShowAiPanel((prev) => !prev)}
+                      onOpenMultiWindow={() => setShowMultiWindowPicker(true)}
                       active={isActive}
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}
@@ -1631,6 +1734,7 @@ export default function App() {
                       onTerminalReady={handleTerminalReady}
                       onTerminalGone={handleTerminalGone}
                       onOpenAi={() => setShowAiPanel((prev) => !prev)}
+                      onOpenMultiWindow={() => setShowMultiWindowPicker(true)}
                       active={isActive}
                       status={tab.status}
                       onReconnect={() => handleReconnect(tab.id)}
@@ -1838,6 +1942,295 @@ export default function App() {
           }}
         />
       )}
+      {mwOverflowPrompt && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 10001,
+          }}
+        >
+          <div style={{
+            background: "var(--bg-base)",
+            border: "1px solid var(--border-default)",
+            borderRadius: "var(--radius-xl)",
+            padding: 24,
+            maxWidth: 380,
+            textAlign: "center",
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)", marginBottom: 12 }}>
+              ⚠️ 窗口数量超出网格容量
+            </div>
+            <div style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.6, marginBottom: 20 }}>
+              {`当前网格最多展示 ${mwOverflowPrompt.cap} 个窗口，你选了 ${mwOverflowPrompt.ids.length} 个。多出的窗口会排在下方，需滚动查看。是否继续？`}
+            </div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+              <button
+                onClick={() => setMwOverflowPrompt(null)}
+                style={{
+                  padding: "8px 20px",
+                  background: "transparent",
+                  color: "var(--text-secondary)",
+                  border: "1px solid var(--border-default)",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 13,
+                  cursor: "pointer",
+                }}
+              >
+                取消
+              </button>
+              <button
+                onClick={() => {
+                  const { ids } = mwOverflowPrompt;
+                  setMwOverflowPrompt(null);
+                  enterMultiWindow(ids);
+                }}
+                style={{
+                  padding: "8px 24px",
+                  background: "var(--accent-primary)",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "var(--radius-md)",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                继续
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showMultiWindowPicker && (
+        <MultiWindowPicker
+          tabs={tabs}
+          onConfirm={(ids) => {
+            const cap = getMultiWindowCapacity();
+            if (ids.length > cap) {
+              setMwOverflowPrompt({ ids, cap });
+              return;
+            }
+            enterMultiWindow(ids);
+          }}
+          onClose={() => setShowMultiWindowPicker(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Auto-pick grid columns based on window count. */
+/** Read multi-window grid rows/cols from localStorage (defaults: 2 rows x 3 cols). */
+function getMultiWindowGridConfig() {
+  const r = parseInt(localStorage.getItem("myshell-multiwindow-rows") ?? "2", 10);
+  const col = parseInt(localStorage.getItem("myshell-multiwindow-cols") ?? "3", 10);
+  return {
+    rows: isNaN(r) || r < 1 ? 2 : Math.min(r, 6),
+    cols: isNaN(col) || col < 1 ? 3 : Math.min(col, 6),
+  };
+}
+
+function gridCfgRows() { return getMultiWindowGridConfig().rows; }
+function gridCfgCols() { return getMultiWindowGridConfig().cols; }
+
+/** Max visible windows = rows * cols. */
+function getMultiWindowCapacity() {
+  const { rows, cols } = getMultiWindowGridConfig();
+  return rows * cols;
+}
+
+function MultiWindowGrid({
+  tabs, multiWindowIds, connections, rendererBackend, getBroadcastTargets,
+  onTerminalReady, onTerminalGone, onOpenAi, onOpenMultiWindow, onReconnect,
+  onDisconnected, onClearSnapshot, onOpenQuickCommandsManage, onRemoveWindow, onExit,
+}: {
+  tabs: Tab[];
+  multiWindowIds: string[];
+  connections: ConnectionConfig[];
+  rendererBackend: RendererBackend;
+  getBroadcastTargets: (tab: Tab) => string[];
+  onTerminalReady: (sid: string, term: Terminal) => void;
+  onTerminalGone: (sid: string) => void;
+  onOpenAi: () => void;
+  onOpenMultiWindow: () => void;
+  onReconnect: (tabId: string) => void;
+  onDisconnected: (tabId: string) => void;
+  onClearSnapshot: (tabId: string) => void;
+  onOpenQuickCommandsManage: (tabId: string) => void;
+  onRemoveWindow: (tabId: string) => void;
+  onExit: () => void;
+}) {
+  const gridCfg = getMultiWindowGridConfig();
+  const capacity = gridCfg.rows * gridCfg.cols;
+  const overflow = multiWindowIds.length > capacity;
+  const n = multiWindowIds.length;
+
+  // Pick the most balanced grid layout for the current window count, bounded
+  // by the user's configured max rows/cols. We try every possible column count
+  // (1..maxCols) and choose the one with the FEWEST empty cells — so 4 windows
+  // in a 2×3 config → 2×2 (0 empty) instead of 1×3+1 (2 empty). Ties break
+  // toward more columns (wider cells) when it fills fewer rows.
+  let actualRows = 1;
+  let actualCols = Math.min(n, gridCfg.cols);
+  let bestEmpty = Infinity;
+  for (let c = 1; c <= gridCfg.cols; c++) {
+    const r = Math.ceil(n / c);
+    if (r > gridCfg.rows) continue; // would need more rows than configured
+    const empty = r * c - n;
+    // Prefer fewer empty cells; on tie prefer fewer rows (taller cells).
+    if (empty < bestEmpty || (empty === bestEmpty && r < actualRows)) {
+      bestEmpty = empty;
+      actualRows = r;
+      actualCols = c;
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+      {/* Toolbar */}
+      <div style={{
+        height: 36,
+        flexShrink: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        padding: "0 12px",
+        borderBottom: "1px solid var(--border-subtle)",
+        background: "var(--bg-surface)",
+      }}>
+        <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)" }}>
+          🪟 多窗口模式（{multiWindowIds.length} 个会话{overflow ? `，仅展示前 ${capacity} 个，可滚动查看` : ""}）
+        </span>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button
+            onClick={onOpenMultiWindow}
+            title="添加/移除会话"
+            style={{
+              padding: "4px 10px",
+              background: "var(--bg-input)",
+              color: "var(--text-secondary)",
+              border: "1px solid var(--border-default)",
+              borderRadius: "var(--radius-md)",
+              fontSize: 12,
+              cursor: "pointer",
+            }}
+          >
+            编辑会话
+          </button>
+          <button
+            onClick={onExit}
+            style={{
+              padding: "4px 12px",
+              background: "transparent",
+              color: "var(--text-secondary)",
+              border: "1px solid var(--border-default)",
+              borderRadius: "var(--radius-md)",
+              fontSize: 12,
+              cursor: "pointer",
+            }}
+          >
+            退出多窗口
+          </button>
+        </div>
+      </div>
+      {/* Grid */}
+      <div style={{
+        flex: 1,
+        minHeight: 0,
+        overflow: "auto",
+        display: "grid",
+        gridTemplateColumns: `repeat(${actualCols}, minmax(280px, 1fr))`,
+        // Each row gets an equal share of the grid container's height. We use
+        // 1fr (not a fixed px calc based on 100vh) so it always matches the
+        // real container size — regardless of sidebar/AiPanel/maximize state.
+        // minHeight:0 on the container lets flex shrink it so 1fr rows don't
+        // overflow when there are exactly enough windows to fill the grid.
+        gridTemplateRows: `repeat(${actualRows}, 1fr)`,
+        gridAutoRows: `1fr`,
+        gap: 6,
+        padding: 6,
+        background: "var(--bg-darker, var(--bg-base))",
+      }}>
+        {multiWindowIds.map((tabId) => {
+          const tab = tabs.find((t) => t.id === tabId);
+          if (!tab || !tab.sessionId) return null;
+          return (
+            <div
+              key={tab.id}
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                background: "var(--bg-base)",
+                border: "1px solid var(--border-default)",
+                borderRadius: "var(--radius-md)",
+                overflow: "hidden",
+                minWidth: 320,
+                minHeight: 160,
+              }}
+            >
+              {/* Window title bar */}
+              <div style={{
+                height: 28,
+                flexShrink: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "0 8px",
+                background: "var(--bg-surface)",
+                borderBottom: "1px solid var(--border-subtle)",
+              }}>
+                <span style={{ fontSize: 11, color: "var(--text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {tab.name}
+                </span>
+                <button
+                  onClick={() => onRemoveWindow(tab.id)}
+                  title="从多窗口移除"
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    color: "var(--text-muted)",
+                    cursor: "pointer",
+                    fontSize: 14,
+                    padding: "0 4px",
+                    lineHeight: 1,
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+              {/* Terminal */}
+              <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+                <TerminalPanel
+                  tabId={tab.id}
+                  sessionId={tab.sessionId!}
+                  connectionId={tab.connectionId || ""}
+                  connType={tab.connType}
+                  fontOverride={connections.find((cn) => cn.id === (tab.connectionId || ""))?.terminal_font}
+                  rendererBackend={rendererBackend}
+                  broadcastTargets={getBroadcastTargets(tab)}
+                  onTerminalReady={onTerminalReady}
+                  onTerminalGone={onTerminalGone}
+                  onOpenAi={onOpenAi}
+                  onOpenMultiWindow={onOpenMultiWindow}
+                  active={true}
+                  status={tab.status}
+                  onReconnect={() => onReconnect(tab.id)}
+                  connectionName={tab.name}
+                  reconnectSnapshot={tab.reconnectSnapshot}
+                  onSnapshotConsumed={() => onClearSnapshot(tab.id)}
+                  onOpenQuickCommandsManage={() => onOpenQuickCommandsManage(tab.connectionId || "")}
+                  onDisconnected={() => onDisconnected(tab.id)}
+                />
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
