@@ -20,6 +20,8 @@ import {
   onZmodemProgress,
   onZmodemFileComplete,
   zmodemAcceptOffer,
+  zmodemStartUpload,
+  sshSendZmodemAbort,
   addCommandHistory,
   saveScreenshot,
   getAttachmentDir,
@@ -168,9 +170,9 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
   const bridgeRef = useRef<ZmodemBridge | null>(null);
   const isZmodemRef = useRef(false);
   const abortTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Native ZMODEM download state (Rust-side receiver). For downloads the data
-  // path is entirely Rust; the frontend only prompts for a dir and shows
-  // progress. Uploads still use the zmodem.js bridge.
+  // Native ZMODEM state. Both download (sz) and upload (rz) are handled
+  // entirely in Rust — data never crosses IPC. The frontend only prompts
+  // for a save dir (download) or file selection (upload) and renders progress.
   const nativeDownloadRef = useRef(false);
   const nativeDirRef = useRef<string | null>(null);
   const nativeCancelledRef = useRef(false);
@@ -606,9 +608,10 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
     // ZMODEM — Rust has already filtered terminal output from protocol bytes,
     // so zmodem_raw only fires when a session is actually starting.
     //
-    // Downloads (remote `sz`) use the native Rust receiver: data never crosses
-    // IPC, the frontend only prompts for a save dir and renders progress.
-    // Uploads (remote `rz`) keep the zmodem.js bridge path.
+    // Both downloads (remote `sz`) and uploads (remote `rz`) are handled
+    // natively in Rust. The frontend only handles UI (file picker / save dir
+    // + progress). zmodem_raw is kept for the subscription lifecycle but no
+    // longer fed to the JS bridge.
     const joinZmodemPath = (dir: string, name: string): string => {
       const safeName = name.split(/[\\/]/).pop() || name;
       const sep = dir.includes("/") && !dir.includes("\\") ? "/" : "\\";
@@ -633,6 +636,41 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
       if (direction === "download") {
         nativeDirRef.current = null;
         nativeCancelledRef.current = false;
+      } else if (direction === "upload") {
+        // Native upload: prompt for files, then hand off to Rust.
+        void (async () => {
+          try {
+            const selected = await open({ multiple: true });
+            const paths: string[] = !selected
+              ? []
+              : Array.isArray(selected)
+              ? selected
+              : [selected];
+            if (paths.length === 0) {
+              sshSendZmodemAbort(sessionIdRef.current).catch(() => {});
+              return;
+            }
+            await zmodemStartUpload(sessionIdRef.current, paths);
+            // Activate the progress overlay. bytesTotal starts at 0 — the
+            // first zmodem_progress event carries the real file size (the
+            // backend stats the file). onZmodemProgress ignores events while
+            // active is false, so this must be set before bytes flow.
+            const firstName = paths[0].split(/[\\/]/).pop() || "file";
+            setZmodemStatus({
+              active: true,
+              direction: "upload",
+              currentFile: paths.length === 1 ? firstName : `${firstName} 等 ${paths.length} 个文件`,
+              bytesTransferred: 0,
+              bytesTotal: 0,
+              speedBps: 0,
+              error: null,
+              startTime: Date.now(),
+            });
+          } catch (e) {
+            console.error("native upload start failed:", e);
+            sshSendZmodemAbort(sessionIdRef.current).catch(() => {});
+          }
+        })();
       }
       term.write("\r\n\x1b[36m[ZMODEM 传输开始 — 终端输入已屏蔽]\x1b[0m\r\n");
     })
@@ -642,10 +680,9 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
       })
       .catch((e) => console.error("Failed to subscribe to zmodem_start:", e));
 
-    onZmodemRaw(sessionIdRef.current, (data) => {
-      // Native downloads are handled entirely in Rust; only uploads feed the
-      // zmodem.js bridge.
-      if (!nativeDownloadRef.current) bridge.feed(data);
+    onZmodemRaw(sessionIdRef.current, (_data) => {
+      // Native Rust handles both upload and download protocol bytes.
+      // Nothing to feed to the JS bridge.
     })
       .then((un) => {
         if (closed) un();

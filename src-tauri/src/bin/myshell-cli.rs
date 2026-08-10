@@ -262,7 +262,7 @@ async fn main() {
         ssh_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         ftp_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         local_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        zmodem_files: Mutex::new(std::collections::HashMap::new()),
+        zmodem_files: Arc::new(Mutex::new(std::collections::HashMap::new())),
         dek: Arc::new(Mutex::new(None)),
         transfer_cancels: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };

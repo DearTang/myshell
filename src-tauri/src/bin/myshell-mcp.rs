@@ -14,6 +14,7 @@
 
 use myshell_core::*;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
@@ -202,7 +203,16 @@ WORKFLOW:\n\
 \n\
 SAFETY: ssh_exec uses a **configurable whitelist/blacklist** to decide which commands need human confirmation. Read-only commands (ps, ls, cat, grep, df, ...) run WITHOUT a dialog. Dangerous commands (rm, kill, sudo, shutdown, write-redirects, pipe-to-shell, ...) trigger a NATIVE OS confirmation dialog the USER must click — you cannot bypass it. Before calling a dangerous command, briefly tell the user a dialog is coming. If they click Cancel, the tool returns an error — surface it, don't retry silently. The sftp tools (sftp_upload/remove/rename) ALWAYS confirm regardless of rules.\n\
 \n\
-ENCOUNTERING ERRORS: if a tool returns '保险库未解锁' or 'MyShell GUI 未运行', the user needs to open the MyShell desktop app and enter their master password to unlock the vault. Tell them this and stop — the MCP server cannot access any server without the GUI running and unlocked.";
+FILE TRANSFER (strict two-step policy):\n\
+1. ALWAYS try `sftp_download`/`sftp_upload` FIRST for any file upload/download request. It is faster and more reliable.\n\
+2. If the sftp tool FAILS for ANY reason, fall back to `zmodem_download`/`zmodem_upload` (ZMODEM over the remote `sz`/`rz` programs). Common failure reasons: the connection is saved as SSH type (no SFTP), the SFTP subsystem is disabled, restricted/chroot shells, jump hosts (堡垒机), embedded devices, or the remote refuses the SFTP channel. Tell the user: 'sftp 失败，改用 ZMODEM (lrzsz) 方式传输'.\n\
+3. NEVER use `ssh_exec` to transfer file content via base64/echo/heredoc/cat workaround — it is fragile, slow, and breaks on binary/large files. If both sftp and zmodem fail, tell the user and stop; do NOT invent a workaround.\n\
+\n\
+VAULT NOTE: '保险库未解锁' / 'MyShell GUI 未运行' errors affect sftp_*, zmodem_*, and ssh_exec(headless) alike. If you see this error, tell the user to unlock the GUI vault and RETRY the same file-transfer tool — do NOT switch to a different approach. The sftp → zmodem fallback only applies when the failure is about SFTP availability, NOT about the vault.\n\
+\n\
+ZMODEM IS ASYNC: `zmodem_upload`/`zmodem_download` return IMMEDIATELY with a `task_id` (status=`running`); the transfer (including GUI launch, vault-unlock wait, and the confirmation dialog) runs in the background. You MUST then poll `zmodem_status` with the `task_id` every 5-10 seconds until `status` is `done` or `failed`. Do not report success until you see `done`.\n\
+\n\
+ENCOUNTERING ERRORS: if a tool returns '保险库未解锁' or 'MyShell GUI 未运行', the user needs to open the MyShell desktop app and enter their master password to unlock the vault. Tell them this and RETRY the same tool — do not switch approaches (see VAULT NOTE above).";
 
 fn tool_definitions() -> Value {
     json!({
@@ -364,73 +374,269 @@ fn tool_definitions() -> Value {
                     },
                     "required": ["connection"]
                 }
+            },
+            {
+                "name": "zmodem_download",
+                "description": "Download a file from a remote SSH server using the ZMODEM protocol (remote `sz` → local). This is the FALLBACK transfer method — use it when `sftp_download` fails or is unavailable.\n\nWHEN TO USE (strict two-step policy):\n1. First call `sftp_download` for the same file. In most cases it succeeds and is faster.\n2. If `sftp_download` fails for ANY reason (connection is SSH-only with no SFTP saved, SFTP subsystem disabled, restricted/chroot shell, jump host, embedded device, etc.), call THIS tool as the fallback. Tell the user: 'sftp 失败，改用 ZMODEM (lrzsz) 方式传输'.\n3. If the user explicitly asked for ZMODEM/sz, use this tool directly.\n\nNEVER use `ssh_exec` + base64/cat/heredoc to transfer file content — it breaks on binary/large files. If both sftp and zmodem fail, tell the user and stop.\n\nPREREQUISITE: The remote server must have `sz` installed (part of the `lrzsz` package). If it's missing, the task fails after ~20s with a hint to install lrzsz.\n\nASYNC: returns IMMEDIATELY with {task_id, status:\"running\"}; the transfer (including GUI launch + vault-unlock wait if needed) runs in the background. You MUST then poll `zmodem_status(task_id)` every 5-10s until status is `done` or `failed`. No human confirmation dialog (read-only on the remote).\n\nFINAL RESULT: when `zmodem_status` returns status=\"done\", its `result` field has `{files:[{name, local_path, bytes}]}`.\n\nNOTE: the `timeout` param (default 120s) caps the background transfer, not the tool-call window (which is <1s).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
+                        "remote_path": { "type": "string", "description": "Absolute remote file path to download (passed to `sz`). Must be a file, not a directory." },
+                        "local_dir": { "type": "string", "description": "Absolute local directory where the file will be saved. Must exist. The file is named after the remote offer's basename." },
+                        "timeout": { "type": "integer", "description": "Max seconds to wait for the transfer (default 120). The first 20s is an initial handshake timeout before the transfer is considered stalled.", "default": 120 }
+                    },
+                    "required": ["connection", "remote_path", "local_dir"]
+                }
+            },
+            {
+                "name": "zmodem_upload",
+                "description": "Upload a local file to a remote SSH server using the ZMODEM protocol (local → remote `rz`). This is the FALLBACK transfer method — use it when `sftp_upload` fails or is unavailable.\n\nWHEN TO USE (strict two-step policy):\n1. First call `sftp_upload` for the same file. In most cases it succeeds and is faster.\n2. If `sftp_upload` fails for ANY reason (connection is SSH-only with no SFTP saved, SFTP subsystem disabled, restricted/chroot shell, jump host, embedded device, etc.), call THIS tool as the fallback. Tell the user: 'sftp 失败，改用 ZMODEM (lrzsz) 方式传输'.\n3. If the user explicitly asked for ZMODEM/rz, use this tool directly.\n\nNEVER use `ssh_exec` + base64/cat/heredoc/echo to transfer file content — it breaks on binary/large files. If both sftp and zmodem fail, tell the user and stop.\n\nPREREQUISITE: The remote server must have `rz` installed (part of the `lrzsz` package). If missing, the task fails after ~20s.\n\nASYNC: returns IMMEDIATELY with {task_id, status:\"running\"}; the transfer (including GUI launch, vault-unlock wait, and the confirmation dialog) runs in the background. The OS dialog pops AFTER the tool returns — remind the user to click it if the first `zmodem_status` poll shows phase=`Confirming`. You MUST then poll `zmodem_status(task_id)` every 5-10s until status is `done` or `failed`.\n\n⚠️ HUMAN CONFIRMATION REQUIRED: A native OS dialog pops up (writing to the remote server). Won't proceed until the user clicks 'Yes'. This happens AFTER the tool returns, in the background.\n\nFINAL RESULT: when `zmodem_status` returns status=\"done\", its `result` field has `{remote_path, bytes}`.\n\nNOTE: the `timeout` param (default 120s) caps the background transfer, not the tool-call window (which is <1s).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
+                        "local_path": { "type": "string", "description": "Absolute local file path to upload. Must exist and be a regular file." },
+                        "remote_dir": { "type": "string", "description": "Remote target DIRECTORY (absolute). rz receives into this directory; the file keeps its local basename. `cd <remote_dir>` is run before rz, so the directory must exist." },
+                        "timeout": { "type": "integer", "description": "Max seconds to wait for the transfer (default 120).", "default": 120 }
+                    },
+                    "required": ["connection", "local_path", "remote_dir"]
+                }
+            },
+            {
+                "name": "zmodem_status",
+                "description": "Poll the status of a background ZMODEM upload/download task started by `zmodem_upload` or `zmodem_download`.\n\nWHEN TO USE: After calling `zmodem_upload`/`zmodem_download` (which return immediately with a `task_id`), call THIS tool with that `task_id` to check progress. Poll every 5-10 seconds until the response `status` is `done` or `failed`.\n\nOUTPUT: JSON with `task_id`, `status` (running/done/failed), `phase` (Confirming/Connecting/Transferring for running tasks), `progress_pct`, `bytes_done`, `bytes_total`. When `status` is `done`, `result` contains the transfer outcome (files for download, remote_path+bytes for upload). When `failed`, `error` has the message.\n\nIMPORTANT: this is a lightweight read-only poll — no confirmation dialog, fast. Keep calling it (every 5-10s) until you see done/failed. If `phase` is `Confirming`, tell the user a confirmation dialog is waiting for them to click.\n\nERROR '未找到任务': the task was lost (likely the MCP process restarted). The transfer did not complete — tell the user and suggest retrying.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": { "type": "string", "description": "The task_id returned by zmodem_upload/zmodem_download." }
+                    },
+                    "required": ["task_id"]
+                }
             }
         ]
     })
+}
+
+// ============ Async transfer task table ============
+//
+// ZMODEM transfers outlast any single MCP tool-call window: the client (ZCode,
+// Cursor, etc.) imposes a 30s hard timeout on each tools/call, but a transfer
+// needs a human-confirmation dialog + the actual byte streaming. So we run
+// transfers as detached tokio tasks and let the AI poll for completion via
+// `zmodem_status`. Each task writes its progress into this shared table.
+
+/// Lifecycle of an async transfer task.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TaskPhase {
+    /// Waiting for the user to click the OS confirmation dialog (upload only).
+    Confirming,
+    /// Connecting + negotiating ZMODEM (pre-handshake). The first-frame
+    /// timeout (lrzsz installed? path exists?) happens here.
+    Connecting,
+    /// Bytes are flowing.
+    Transferring,
+    /// Finished successfully.
+    Done,
+    /// Failed.
+    Failed,
+}
+
+/// A snapshot of one transfer task, readable by `zmodem_status`.
+#[derive(Clone, Debug)]
+struct TransferTask {
+    phase: TaskPhase,
+    /// "download" or "upload".
+    direction: String,
+    /// Human-readable description for the status tool output.
+    description: String,
+    /// Bytes transferred so far (0 until handshake completes).
+    bytes_done: u64,
+    /// Total bytes (file size), 0 if unknown.
+    bytes_total: u64,
+    /// Set when phase == Done: the result payload (files / remote_path).
+    result: Option<Value>,
+    /// Set when phase == Failed.
+    error: Option<String>,
+    /// When the task was created (for staleness / cleanup decisions).
+    started_at: std::time::Instant,
+}
+
+impl TransferTask {
+    fn new(direction: &str, description: String, bytes_total: u64) -> Self {
+        Self {
+            phase: TaskPhase::Confirming,
+            direction: direction.to_string(),
+            description,
+            bytes_done: 0,
+            bytes_total,
+            result: None,
+            error: None,
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Render the task as the MCP tool result text the AI sees.
+    fn to_status_text(&self, task_id: &str) -> Value {
+        let phase_str = match self.phase {
+            TaskPhase::Confirming => "等待用户确认（请点击弹出的对话框）",
+            TaskPhase::Connecting => "连接中（握手）",
+            TaskPhase::Transferring => "传输中",
+            TaskPhase::Done => "已完成",
+            TaskPhase::Failed => "失败",
+        };
+        let pct = if self.bytes_total > 0 {
+            (self.bytes_done * 100 / self.bytes_total).min(100)
+        } else {
+            0
+        };
+        let text = format!(
+            "ZMODEM {} 任务 [{}]：{}\n状态：{}（{}% / {} 字节）",
+            self.direction, task_id, self.description, phase_str, pct, self.bytes_done
+        );
+        match &self.phase {
+            TaskPhase::Done => json!({
+                "content": [{ "type": "text", "text": text }],
+                "task_id": task_id,
+                "status": "done",
+                "progress_pct": pct,
+                "bytes_done": self.bytes_done,
+                "bytes_total": self.bytes_total,
+                "result": self.result.clone().unwrap_or(json!(null))
+            }),
+            TaskPhase::Failed => json!({
+                "content": [{ "type": "text", "text": format!("{}\n错误：{}", text, self.error.as_deref().unwrap_or("未知")) }],
+                "task_id": task_id,
+                "status": "failed",
+                "error": self.error.clone().unwrap_or_default()
+            }),
+            _ => json!({
+                "content": [{ "type": "text", "text": text }],
+                "task_id": task_id,
+                "status": "running",
+                "phase": format!("{:?}", self.phase),
+                "progress_pct": pct,
+                "bytes_done": self.bytes_done,
+                "bytes_total": self.bytes_total
+            }),
+        }
+    }
 }
 
 // ============ Shared state ============
 
 struct McpState {
     app: AppState,
+    /// Async transfer tasks keyed by id. Written by background tokio tasks (the
+    /// actual transfer drivers), read by the synchronous `zmodem_status` tool.
+    /// Each entry is updated in place as the transfer progresses.
+    tasks: Arc<Mutex<HashMap<String, TransferTask>>>,
+}
+
+/// Resolve a connection name/group-path to its id WITHOUT needing the DEK
+/// (plaintext-only DB lookup). Independent of `McpState` so background tasks
+/// (which only hold an `AppState` clone) can call it.
+fn resolve_connection_id(
+    app: &AppState,
+    query: &str,
+    expected_conn_type: Option<&str>,
+) -> Result<String, String> {
+    let db = app.db.lock().map_err(|e| e.to_string())?;
+    let connections = db::get_all_connections_plaintext(&db).map_err(|e| e.to_string())?;
+
+    let type_ok = |c: &ConnectionConfig| match expected_conn_type {
+        Some(t) => c.conn_type == t,
+        None => true,
+    };
+
+    // Pass 1: exact name match.
+    let by_name: Vec<_> = connections.iter().filter(|c| c.name == query && type_ok(c)).collect();
+    if by_name.len() == 1 {
+        return Ok(by_name[0].id.clone());
+    }
+    if by_name.len() > 1 {
+        return Err(ambiguous_error(query, expected_conn_type, &by_name));
+    }
+
+    // Pass 2: group-prefixed path match.
+    let by_path: Vec<_> = connections
+        .iter()
+        .filter(|c| format!("{}/{}", c.group_path.trim_end_matches('/'), c.name) == query && type_ok(c))
+        .collect();
+    if by_path.len() == 1 {
+        return Ok(by_path[0].id.clone());
+    }
+    if by_path.len() > 1 {
+        return Err(ambiguous_error(query, expected_conn_type, &by_path));
+    }
+
+    // Type-mismatch hint.
+    if let Some(t) = expected_conn_type {
+        let any_match: Vec<_> = connections
+            .iter()
+            .filter(|c| c.name == query
+                || format!("{}/{}", c.group_path.trim_end_matches('/'), c.name) == query)
+            .collect();
+        if !any_match.is_empty() {
+            let types: Vec<&str> = any_match.iter().map(|c| c.conn_type.as_str()).collect();
+            return Err(format!(
+                "找到了连接 '{}'，但类型是 {}，而当前操作需要 {} 类型。请确认连接配置或换一个连接。",
+                query, types.join("/"), t
+            ));
+        }
+    }
+
+    Err(format!(
+        "未找到连接: {}。注意：按 IP 查找需要先打开 GUI 并解锁保险库（IP 是加密存储的）。调用 list_connections 查看所有可用连接（按名称）。",
+        query
+    ))
+}
+
+/// Full credential resolution for background tasks: ensure the GUI is running,
+/// wait for the vault to unlock, then ask the GUI to decrypt the connection.
+/// Each failure is reported as a task error via `fail`.
+async fn resolve_config_for_task(
+    app: &AppState,
+    conn_name: &str,
+    expected_conn_type: Option<&str>,
+    fail: &impl Fn(String),
+) -> Option<ConnectionConfig> {
+    // Ensure the GUI is running (auto-launch if needed).
+    if let Err(e) = ensure_gui_running() {
+        fail(format!(
+            "MyShell GUI 未运行且无法自动启动：{}。请手动打开 MyShell 桌面应用并输入主密码解锁保险库，然后重新调用此工具。",
+            e
+        ));
+        return None;
+    }
+    // Wait for the vault to be unlocked (up to 30s).
+    if let Err(e) = wait_for_vault_unlocked() {
+        fail(e);
+        return None;
+    }
+    // Resolve the connection id (plaintext DB lookup).
+    let conn_id = match resolve_connection_id(app, conn_name, expected_conn_type) {
+        Ok(id) => id,
+        Err(e) => {
+            fail(e);
+            return None;
+        }
+    };
+    // Ask the GUI to decrypt the connection config.
+    match get_config_from_gui(&conn_id) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            fail(format!("解析连接凭证失败: {}", e));
+            None
+        }
+    }
 }
 
 impl McpState {
-    /// Plaintext-only connection lookup: resolves a name/group-path to a
-    /// connection id WITHOUT needing the DEK. Used by the show_in_gui path
-    /// (ssh_exec, open_in_gui) where the actual credential use happens inside
-    /// the GUI process. Host-IP matching is NOT possible here (host is
-    /// encrypted) — only name and group-path matching.
+    /// Plaintext-only connection lookup. Delegates to the standalone
+    /// `resolve_connection_id` (shared with background tasks).
     fn find_connection_id(&self, query: &str, expected_conn_type: Option<&str>) -> Result<String, String> {
-        let db = self.app.db.lock().map_err(|e| e.to_string())?;
-        let connections = db::get_all_connections_plaintext(&db).map_err(|e| e.to_string())?;
-
-        let type_ok = |c: &ConnectionConfig| match expected_conn_type {
-            Some(t) => c.conn_type == t,
-            None => true,
-        };
-
-        // Pass 1: exact name match.
-        let by_name: Vec<_> = connections.iter().filter(|c| c.name == query && type_ok(c)).collect();
-        if by_name.len() == 1 {
-            return Ok(by_name[0].id.clone());
-        }
-        if by_name.len() > 1 {
-            return Err(ambiguous_error(query, expected_conn_type, &by_name));
-        }
-
-        // Pass 2: group-prefixed path match.
-        let by_path: Vec<_> = connections
-            .iter()
-            .filter(|c| format!("{}/{}", c.group_path.trim_end_matches('/'), c.name) == query && type_ok(c))
-            .collect();
-        if by_path.len() == 1 {
-            return Ok(by_path[0].id.clone());
-        }
-        if by_path.len() > 1 {
-            return Err(ambiguous_error(query, expected_conn_type, &by_path));
-        }
-
-        // Type-mismatch hint.
-        if let Some(t) = expected_conn_type {
-            let any_match: Vec<_> = connections
-                .iter()
-                .filter(|c| c.name == query
-                    || format!("{}/{}", c.group_path.trim_end_matches('/'), c.name) == query)
-                .collect();
-            if !any_match.is_empty() {
-                let types: Vec<&str> = any_match.iter().map(|c| c.conn_type.as_str()).collect();
-                return Err(format!(
-                    "找到了连接 '{}'，但类型是 {}，而当前操作需要 {} 类型。请确认连接配置或换一个连接。",
-                    query, types.join("/"), t
-                ));
-            }
-        }
-
-        Err(format!(
-            "未找到连接: {}。注意：按 IP 查找需要先打开 GUI 并解锁保险库（IP 是加密存储的）。调用 list_connections 查看所有可用连接（按名称）。",
-            query
-        ))
+        resolve_connection_id(&self.app, query, expected_conn_type)
     }
 
     /// Resolve a connection name/group-path to a fully decrypted
@@ -478,10 +684,13 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
     // credentials are exempt: list_connections (plaintext-only) is always
     // allowed so the AI can still enumerate servers even when locked.
     match name {
-        "list_connections" | "screenshot_terminal" | "open_in_gui" => {
-            // These tools either don't need credentials (list_connections) or
-            // trigger the GUI's own unlock flow (screenshot/open_in_gui). Skip
-            // the gate.
+        "list_connections" | "screenshot_terminal" | "open_in_gui" | "zmodem_status"
+        | "zmodem_download" | "zmodem_upload" => {
+            // These tools either don't need credentials (list_connections),
+            // trigger the GUI's own unlock flow (screenshot/open_in_gui), or
+            // run asynchronously and handle the vault gate inside their
+            // background task (zmodem_*). Skipping the synchronous gate here
+            // avoids colliding with the client's 30s tool-call timeout.
         }
         _ => {
             wait_for_vault_unlocked()?;
@@ -916,6 +1125,21 @@ print('TAR_OK')
 
             let tar_size = std::fs::metadata(local_tar_str).map(|m| m.len()).unwrap_or(0);
             Ok(json!({ "content": [{ "type": "text", "text": format!("✅ 项目下载成功！\n远程: {}\n本地: {}\n大小: {} bytes (tar.gz)", remote_dir, local_dir, tar_size) }] }))
+        }
+
+        "zmodem_download" => zmodem_download_tool(state, args).await,
+
+        "zmodem_upload" => zmodem_upload_tool(state, args).await,
+
+        "zmodem_status" => {
+            let task_id = args["task_id"].as_str().ok_or("缺少 task_id 参数")?;
+            let task = {
+                let tasks = state.tasks.lock().map_err(|e| e.to_string())?;
+                tasks.get(task_id).cloned().ok_or_else(|| {
+                    format!("未找到任务 {}。任务可能在 MCP 进程重启后丢失，或 task_id 错误。", task_id)
+                })?
+            };
+            Ok(task.to_status_text(task_id))
         }
 
         "test_connection" => {
@@ -1378,6 +1602,647 @@ async fn exec_in_gui_tab(
     }
 }
 
+// ============ ZMODEM (lrzsz) helpers ============
+//
+// These two tools (zmodem_download / zmodem_upload) provide ZMODEM file
+// transfers against the remote `sz` / `rz` programs — useful when the SFTP
+// subsystem isn't available (restricted shells, jump hosts, embedded devices).
+// They open a real interactive SSH session (PTY), invoke `sz`/`rz`, and drive
+// the ZMODEM protocol via the core library's `zmodem_rx` (download) /
+// `zmodem_tx` (upload) state machines.
+//
+// Both reuse the GUI-vault credential flow: the MCP server never holds the DEK;
+// `resolve_via_gui` asks the running GUI to decrypt the connection config.
+
+/// A captured terminal event used to coordinate the ZMODEM state machines with
+/// the SSH channel reader (`ssh::connect`'s background task, which emits events
+/// via the `EventSink`).
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+enum ZmodemEvent {
+    /// Raw bytes produced by the remote (sz/rz) — feed into the state machine.
+    Raw(Vec<u8>),
+    /// `zmodem_start`: the reader detected ZRINIT (upload) or a sz offer
+    /// (download). For uploads this is the cue to hand the local file to the
+    /// reader's NATIVE pump (the fast path the GUI uses).
+    Start { direction: String },
+    /// A file offer from remote `sz` (download): { name, size }.
+    Offer { name: String, size: u64 },
+    /// Progress: { bytes_transferred, bytes_total }. Currently informational
+    /// only — the driver loops don't act on it (throughput comes back via the
+    /// sender's own Progress events for uploads). Kept for future surfacing.
+    #[allow(dead_code)]
+    Progress { transferred: u64, total: u64 },
+    /// A file finished downloading.
+    FileComplete { name: String, bytes: u64 },
+    /// The remote signaled the ZMODEM session has ended.
+    End,
+    /// A protocol error.
+    Error(String),
+    /// Plain terminal output (sz/rz error text, shell noise). Captured so we
+    /// can include it in a diagnostic on failure (e.g. "lrzsz not installed").
+    Terminal(Vec<u8>),
+    /// The underlying SSH session closed.
+    Closed,
+}
+
+/// `EventSink` that funnels every ssh.rs event into an mpsc channel as a
+/// `ZmodemEvent`. Built per-tool-invocation; dropped when the tool returns.
+struct McpZmodemSink {
+    tx: std::sync::Mutex<tokio::sync::mpsc::UnboundedSender<ZmodemEvent>>,
+}
+
+impl McpZmodemSink {
+    fn new(tx: tokio::sync::mpsc::UnboundedSender<ZmodemEvent>) -> Self {
+        Self {
+            tx: std::sync::Mutex::new(tx),
+        }
+    }
+}
+
+impl EventSink for McpZmodemSink {
+    fn emit_raw(&self, event: &str, payload: Value) {
+        // DEBUG: log every event to the MCP log file for upload-path diagnosis.
+        let preview = if event == "zmodem_raw" || event == "ssh_output" {
+            let len = payload["data"].as_array().map(|a| a.len()).unwrap_or(0);
+            format!("<{} bytes>", len)
+        } else {
+            format!("{}", payload)
+        };
+        log(&format!("[McpZmodemSink] event={} {}", event, preview));
+
+        let parsed = match event {
+            "zmodem_raw" => payload["data"]
+                .as_array()
+                .map(|arr| {
+                    let bytes: Vec<u8> = arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect();
+                    ZmodemEvent::Raw(bytes)
+                }),
+            "zmodem_start" => Some(ZmodemEvent::Start {
+                direction: payload["direction"].as_str().unwrap_or("").to_string(),
+            }),
+            "zmodem_offer" => Some(ZmodemEvent::Offer {
+                name: payload["fileName"].as_str().unwrap_or("unknown").to_string(),
+                size: payload["fileSize"].as_u64().unwrap_or(0),
+            }),
+            "zmodem_progress" => Some(ZmodemEvent::Progress {
+                transferred: payload["bytesTransferred"].as_u64().unwrap_or(0),
+                total: payload["bytesTotal"].as_u64().unwrap_or(0),
+            }),
+            "zmodem_file_complete" => Some(ZmodemEvent::FileComplete {
+                name: payload["fileName"].as_str().unwrap_or("").to_string(),
+                bytes: payload["bytesWritten"].as_u64().unwrap_or(0),
+            }),
+            "zmodem_end" => Some(ZmodemEvent::End),
+            "zmodem_error" => Some(ZmodemEvent::Error(
+                payload["message"].as_str().unwrap_or("zmodem error").to_string(),
+            )),
+            "ssh_output" => payload["data"]
+                .as_array()
+                .map(|arr| {
+                    let bytes: Vec<u8> = arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect();
+                    ZmodemEvent::Terminal(bytes)
+                }),
+            "ssh_closed" => Some(ZmodemEvent::Closed),
+            _ => None,
+        };
+        if let Some(ev) = parsed {
+            // best-effort send — if the receiver was dropped (tool returned),
+            // there's nobody to handle the event anyway.
+            let _ = self.tx.lock().map(|tx| tx.send(ev));
+        }
+    }
+}
+
+/// Sanitize an untrusted filename (from a remote `sz` offer) into a safe local
+/// basename. Strips directory components, `..`, drive letters, and characters
+/// illegal on Windows. Returns None if nothing usable remains.
+fn sanitize_remote_basename(name: &str) -> Option<String> {
+    // Take the last path component (handles both / and \).
+    let leaf = name.rsplit(['/', '\\']).next()?.trim();
+    if leaf.is_empty() || leaf == "." || leaf == ".." {
+        return None;
+    }
+    let cleaned: String = leaf
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    // Trim trailing dots/spaces (Windows quirk).
+    let cleaned = cleaned.trim_end_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Join a directory and a basename into an absolute local path, producing a
+/// platform-appropriate separator.
+fn join_local_path(dir: &str, name: &str) -> String {
+    let sep = if dir.contains('\\') && !dir.contains('/') {
+        '\\'
+    } else {
+        std::path::MAIN_SEPARATOR
+    };
+    let dir = dir.trim_end_matches(['/', '\\']);
+    format!("{}{}{}", dir, sep, name)
+}
+
+/// zmodem_download: run `sz <remote_path>` on the server, receive the file via
+/// the native ZMODEM receiver, and write it to `local_dir`.
+///
+/// ASYNC: returns immediately with a task_id. The actual transfer runs in a
+/// background task. Poll progress with `zmodem_status(task_id)`.
+async fn zmodem_download_tool(state: &McpState, args: &Value) -> Result<Value, String> {
+    let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?.to_string();
+    let remote_path = args["remote_path"].as_str().ok_or("缺少 remote_path 参数")?.to_string();
+    let local_dir = args["local_dir"].as_str().ok_or("缺少 local_dir 参数")?.to_string();
+    let timeout = args["timeout"].as_u64().unwrap_or(120);
+
+    // Validate the local destination directory exists (fail fast, before spawn).
+    std::fs::metadata(&local_dir)
+        .map_err(|e| format!("本地目录不存在或不可访问 [{}]: {}", local_dir, e))?;
+
+    // NOTE: GUI/vault/credential checks are deferred to the background task —
+    // doing them here would block the synchronous tool-call path and risk the
+    // client's 30s timeout. The background task reports failures via the task
+    // table, which the AI polls with zmodem_status.
+
+    // Create the task entry.
+    let task_id = format!("zm-dl-{}", chrono_like_ts());
+    let description = format!("下载 {} 的 {} → {}", conn_name, remote_path, local_dir);
+    {
+        let mut tasks = state.tasks.lock().map_err(|e| e.to_string())?;
+        tasks.insert(
+            task_id.clone(),
+            TransferTask::new("download", description.clone(), 0),
+        );
+    }
+
+    // Spawn the background driver.
+    let app = state.app.clone();
+    let tasks_table = Arc::clone(&state.tasks);
+    let tid = task_id.clone();
+    let bg_conn = conn_name.clone();
+    let bg_remote = remote_path.clone();
+    let bg_local = local_dir.clone();
+    tokio::spawn(async move {
+        run_download_task(&app, &tasks_table, &tid, &bg_conn, &bg_remote, &bg_local, timeout).await;
+    });
+
+    // Return immediately with the task handle so the client's 30s window is
+    // never exceeded.
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "⏳ ZMODEM 下载已启动（任务 {}）。正在后台传输：{} → {}\n请用 zmodem_status 查询进度（建议每 5-10 秒轮询一次）。文件名和大小在收到远端 sz 的 offer 后才能确定。",
+                task_id, remote_path, local_dir
+            )
+        }],
+        "task_id": task_id,
+        "status": "running",
+        "poll_with": "zmodem_status"
+    }))
+}
+
+/// Background driver for a zmodem download. Updates the task table in place.
+async fn run_download_task(
+    app: &AppState,
+    tasks: &Arc<Mutex<HashMap<String, TransferTask>>>,
+    task_id: &str,
+    conn_name: &str,
+    remote_path: &str,
+    local_dir: &str,
+    timeout: u64,
+) {
+    let mark = |phase: TaskPhase, bytes_done: u64, bytes_total: u64| {
+        let _ = tasks.lock().map(|mut t| {
+            if let Some(task) = t.get_mut(task_id) {
+                task.phase = phase;
+                task.bytes_done = bytes_done;
+                task.bytes_total = bytes_total;
+            }
+        });
+    };
+    let fail = |msg: String| {
+        let _ = tasks.lock().map(|mut t| {
+            if let Some(task) = t.get_mut(task_id) {
+                task.phase = TaskPhase::Failed;
+                task.error = Some(msg.clone());
+            }
+        });
+        log(&format!("zmodem_download [{}] failed: {}", task_id, msg));
+    };
+
+    mark(TaskPhase::Connecting, 0, 0);
+
+    // Resolve credentials (ensure GUI running + vault unlocked + decrypt).
+    // This can take a while (up to 30s waiting for vault unlock, or launching
+    // the GUI), which is why it runs in the background task, not the tool call.
+    let config = match resolve_config_for_task(app, conn_name, Some("ssh"), &fail).await {
+        Some(c) => c,
+        None => return, // fail() already recorded the error
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ZmodemEvent>();
+    let sink = Arc::new(McpZmodemSink::new(tx));
+
+    let session_id = match ssh::connect(app, sink.clone(), config).await {
+        Ok(id) => id,
+        Err(e) => {
+            fail(format!("SSH 连接失败: {}", e));
+            return;
+        }
+    };
+
+    let escaped = remote_path.replace('\'', "'\"\"'");
+    let cmd = format!("sz '{}'\r", escaped);
+    if let Err(e) = ssh::send_input(app, &session_id, cmd.as_bytes()).await {
+        let _ = ssh::disconnect(app, &session_id).await;
+        fail(format!("发送 sz 命令失败: {}", e));
+        return;
+    }
+
+    let mut saved: Vec<(String, String, u64)> = Vec::new();
+    let mut terminal_noise = Vec::<u8>::new();
+    let mut got_offer = false;
+
+    let result: Result<(), String> = loop {
+        let next = if !got_offer {
+            match tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv()).await {
+                Ok(v) => v,
+                Err(_) => break Err(format!(
+                    "等待 sz 启动超时（20秒未收到文件）。远端可能未安装 lrzsz，或路径不存在。\n终端输出：\n{}",
+                    String::from_utf8_lossy(&terminal_noise)
+                )),
+            }
+        } else {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout), rx.recv()).await {
+                Ok(v) => v,
+                Err(_) => break Err(format!("传输超时（{}秒）", timeout)),
+            }
+        };
+
+        match next {
+            None => break Err("SSH 会话意外关闭".to_string()),
+            Some(ev) => match ev {
+                ZmodemEvent::Offer { name, size } => {
+                    got_offer = true;
+                    mark(TaskPhase::Transferring, 0, size);
+                    let local_name = sanitize_remote_basename(&name).unwrap_or_else(|| {
+                        format!("zmodem_download_{}", chrono_like_ts())
+                    });
+                    let local_path = join_local_path(local_dir, &local_name);
+                    log(&format!(
+                        "zmodem_download [{}]: offer {:?} ({} bytes) → {}",
+                        task_id, name, size, local_path
+                    ));
+                    if let Err(e) =
+                        ssh::zmodem_accept_offer(app, &session_id, Some(local_path.clone())).await
+                    {
+                        break Err(format!("接受文件失败: {}", e));
+                    }
+                }
+                ZmodemEvent::FileComplete { name, bytes } => {
+                    let local_name = sanitize_remote_basename(&name).unwrap_or_default();
+                    let local_path = join_local_path(local_dir, &local_name);
+                    saved.push((name, local_path, bytes));
+                    mark(TaskPhase::Transferring, bytes, 0);
+                }
+                ZmodemEvent::Progress { transferred, total } => {
+                    mark(TaskPhase::Transferring, transferred, total);
+                }
+                ZmodemEvent::End => break Ok(()),
+                ZmodemEvent::Error(m) => break Err(m),
+                ZmodemEvent::Closed => {
+                    if saved.is_empty() {
+                        break Err(format!(
+                            "SSH 会话在传输完成前关闭。\n终端输出：\n{}",
+                            String::from_utf8_lossy(&terminal_noise)
+                        ));
+                    }
+                    break Ok(());
+                }
+                ZmodemEvent::Terminal(bytes) => {
+                    terminal_noise.extend_from_slice(&bytes);
+                    if terminal_noise.len() > 8 * 1024 {
+                        terminal_noise.drain(..terminal_noise.len() - 8 * 1024);
+                    }
+                }
+                ZmodemEvent::Raw(_) | ZmodemEvent::Start { .. } => {}
+            },
+        }
+    };
+
+    if result.is_err() {
+        let _ = ssh::zmodem_abort(app, &session_id).await;
+    }
+    let _ = ssh::disconnect(app, &session_id).await;
+
+    match result {
+        Ok(()) => {
+            let files: Vec<Value> = saved
+                .iter()
+                .map(|(name, path, bytes)| json!({ "name": name, "local_path": path, "bytes": bytes }))
+                .collect();
+            let total: u64 = saved.iter().map(|(_, _, b)| *b).sum();
+            let _ = tasks.lock().map(|mut t| {
+                if let Some(task) = t.get_mut(task_id) {
+                    task.phase = TaskPhase::Done;
+                    task.bytes_done = total;
+                    task.result = Some(json!({ "files": files }));
+                }
+            });
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// zmodem_upload: run `rz -y` on the server, then drive the native ZMODEM
+/// sender to push `local_path` into the remote `remote_dir`.
+async fn zmodem_upload_tool(state: &McpState, args: &Value) -> Result<Value, String> {
+    let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?.to_string();
+    let local_path = args["local_path"].as_str().ok_or("缺少 local_path 参数")?.to_string();
+    let remote_dir = args["remote_dir"].as_str().ok_or("缺少 remote_dir 参数")?.to_string();
+    let timeout = args["timeout"].as_u64().unwrap_or(120);
+
+    // Validate the local file up front (fail fast).
+    let meta = std::fs::metadata(&local_path)
+        .map_err(|e| format!("本地文件不存在或不可访问 [{}]: {}", local_path, e))?;
+    if !meta.is_file() {
+        return Err(format!("本地路径不是普通文件: {}", local_path));
+    }
+    let size = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let basename = std::path::Path::new(&local_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "无法从本地路径提取文件名".to_string())?
+        .to_string();
+
+    // NOTE: GUI/vault/credential checks are deferred to the background task —
+    // doing them here would block the synchronous tool-call path and risk the
+    // client's 30s timeout.
+
+    // Create the task entry (starts in Confirming — the OS dialog is popped
+    // inside the background task so the tool call returns instantly).
+    let task_id = format!("zm-ul-{}", chrono_like_ts());
+    let description = format!("上传 {} → {}:{}/{}", local_path, conn_name, remote_dir, basename);
+    {
+        let mut tasks = state.tasks.lock().map_err(|e| e.to_string())?;
+        tasks.insert(
+            task_id.clone(),
+            TransferTask::new("upload", description.clone(), size),
+        );
+    }
+
+    // Spawn the background driver (confirmation dialog + transfer).
+    let app = state.app.clone();
+    let tasks_table = Arc::clone(&state.tasks);
+    let tid = task_id.clone();
+    let bg_conn = conn_name.clone();
+    let bg_local = local_path.clone();
+    let bg_basename = basename.clone();
+    let bg_remote_dir = remote_dir.clone();
+    tokio::spawn(async move {
+        run_upload_task(
+            &app, &tasks_table, &tid, &bg_conn, &bg_local, &bg_basename,
+            size, mtime, &bg_remote_dir, timeout,
+        ).await;
+    });
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "⏳ ZMODEM 上传已启动（任务 {}）。正在后台准备（如 GUI 未运行会自动启动，保险库未解锁会等待解锁，然后弹出系统确认对话框）。文件：{} ({} 字节) → {}/{}\n请用 zmodem_status 查询进度（建议每 5-10 秒轮询一次）。",
+                task_id, local_path, size, remote_dir, basename
+            )
+        }],
+        "task_id": task_id,
+        "status": "running",
+        "poll_with": "zmodem_status"
+    }))
+}
+
+/// Background driver for a zmodem upload. Pops the confirmation dialog, then
+/// runs the ZMODEM sender. Updates the task table in place.
+async fn run_upload_task(
+    app: &AppState,
+    tasks: &Arc<Mutex<HashMap<String, TransferTask>>>,
+    task_id: &str,
+    conn_name: &str,
+    local_path: &str,
+    basename: &str,
+    size: u64,
+    _mtime: u64,
+    remote_dir: &str,
+    timeout: u64,
+) {
+    let mark = |phase: TaskPhase, bytes_done: u64| {
+        let _ = tasks.lock().map(|mut t| {
+            if let Some(task) = t.get_mut(task_id) {
+                task.phase = phase;
+                task.bytes_done = bytes_done;
+            }
+        });
+    };
+    let fail = |msg: String| {
+        let _ = tasks.lock().map(|mut t| {
+            if let Some(task) = t.get_mut(task_id) {
+                task.phase = TaskPhase::Failed;
+                task.error = Some(msg.clone());
+            }
+        });
+        log(&format!("zmodem_upload [{}] failed: {}", task_id, msg));
+    };
+
+    // The task is in Confirming. Pop the OS dialog here (blocks the background
+    // task, NOT the tool call that already returned).
+    let detail = format!(
+        "ZMODEM 上传本地文件 [{}] ({} 字节) → {}",
+        local_path, size, remote_dir
+    );
+    if !confirm_dangerous_operation("zmodem_upload（ZMODEM 上传）", &detail) {
+        fail("用户取消了高危操作".to_string());
+        return;
+    }
+
+    mark(TaskPhase::Connecting, 0);
+
+    // Resolve credentials (ensure GUI running + vault unlocked + decrypt).
+    // This can take a while (GUI launch / vault-unlock wait), so it runs in the
+    // background task, not the tool call.
+    let config = match resolve_config_for_task(app, conn_name, Some("ssh"), &fail).await {
+        Some(c) => c,
+        None => return, // fail() already recorded the error
+    };
+
+    // Pre-validate the local file is readable. The reader task's native pump
+    // opens its OWN handle for streaming (see ssh.rs ZmodemStartUpload), so we
+    // just fail fast here with a clear message instead of letting ZMODEM stall.
+    if let Err(e) = std::fs::File::open(local_path) {
+        fail(format!("打开本地文件失败: {}", e));
+        return;
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ZmodemEvent>();
+    let sink = Arc::new(McpZmodemSink::new(tx));
+
+    let session_id = match ssh::connect(app, sink.clone(), config).await {
+        Ok(id) => id,
+        Err(e) => {
+            fail(format!("SSH 连接失败: {}", e));
+            return;
+        }
+    };
+
+    // Build the `cd` clause. `~` and `~/...` must NOT be single-quoted — the
+    // shell won't expand `~` inside quotes, so `cd '~'` fails with "No such
+    // file or directory". For paths starting with `~`, emit them unquoted
+    // (tilde expansion is safe; `~` has no shell metacharacters). For all
+    // other paths, single-quote with the standard '\'' escape for embedded
+    // quotes.
+    let cd_target = if remote_dir == "~" || remote_dir.starts_with("~/") {
+        remote_dir.to_string()
+    } else {
+        format!("'{}'", remote_dir.replace('\'', "'\"\"'"))
+    };
+    // Launch `rz` directly — no manual `stty`. lrzsz's rz puts the PTY into
+    // raw/no-echo mode itself before sending ZRINIT (same as when a user runs
+    // Launch rz exactly as a user would in the interactive terminal — NO manual
+    // stty. lrzsz's rz manages termios itself (sets raw on entry, restores on
+    // exit). Forcing stty raw beforehand conflicts with rz's own setup and the
+    // cooked-mode echo leaks into the byte stream.
+    let cmd = format!("cd {} && rz -y\r", cd_target);
+    if let Err(e) = ssh::send_input(app, &session_id, cmd.as_bytes()).await {
+        let _ = ssh::disconnect(app, &session_id).await;
+        fail(format!("发送 rz 命令失败: {}", e));
+        return;
+    }
+
+    // Give rz a moment to start before we respond to its ZRINIT.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let mut bytes_sent: u64 = 0;
+    let mut terminal_noise = Vec::<u8>::new();
+    let mut upload_started = false;
+
+    let result: Result<(), String> = loop {
+        let wait = if !upload_started || bytes_sent == 0 {
+            std::time::Duration::from_secs(20)
+        } else {
+            std::time::Duration::from_secs(timeout.max(30))
+        };
+        let next = match tokio::time::timeout(wait, rx.recv()).await {
+            Ok(v) => v,
+            Err(_) => {
+                break Err(format!(
+                    "等待 rz 响应超时（{}秒）。远端可能未安装 lrzsz，或目录不可写。\n终端输出：\n{}",
+                    wait.as_secs(),
+                    String::from_utf8_lossy(&terminal_noise)
+                ));
+            }
+        };
+
+        match next {
+            None => break Err("SSH 会话意外关闭".to_string()),
+            Some(ev) => match ev {
+                // ZRINIT received: hand the local file to the reader task's
+                // NATIVE pump. It streams file data with 512 KB batched
+                // `channel.data()` calls INLINE in the reader loop — zero
+                // cross-task round-trips per packet, the same fast path the GUI
+                // uses. This replaces the old per-subpacket feed/poll loop that
+                // pushed every 128 KB chunk through the command queue (global
+                // Mutex lock + 128 KB Vec clone + mpsc round-trip per packet),
+                // which capped throughput at roughly 1/10 of the native path.
+                ZmodemEvent::Start { direction }
+                    if direction == "upload" && !upload_started =>
+                {
+                    upload_started = true;
+                    mark(TaskPhase::Transferring, 0);
+                    if let Err(e) =
+                        ssh::zmodem_start_upload(app, &session_id, vec![local_path.to_string()]).await
+                    {
+                        break Err(format!("启动 native 上传失败: {}", e));
+                    }
+                }
+                ZmodemEvent::Progress { transferred, .. } => {
+                    bytes_sent = transferred;
+                    mark(TaskPhase::Transferring, bytes_sent);
+                }
+                ZmodemEvent::FileComplete { bytes, .. } => {
+                    bytes_sent = bytes;
+                    mark(TaskPhase::Transferring, bytes_sent);
+                }
+                ZmodemEvent::End => break Ok(()),
+                ZmodemEvent::Error(m) => break Err(m),
+                ZmodemEvent::Closed => {
+                    break Err(format!(
+                        "SSH 会话在传输完成前关闭。\n终端输出：\n{}",
+                        String::from_utf8_lossy(&terminal_noise)
+                    ));
+                }
+                ZmodemEvent::Terminal(bytes) => {
+                    terminal_noise.extend_from_slice(&bytes);
+                    if terminal_noise.len() > 8 * 1024 {
+                        terminal_noise.drain(..terminal_noise.len() - 8 * 1024);
+                    }
+                }
+                // Native pump owns the stream now; ignore passthrough noise
+                // (legacy zmodem_raw ZRINIT bytes) and stray duplicates.
+                ZmodemEvent::Raw(_)
+                | ZmodemEvent::Offer { .. }
+                | ZmodemEvent::Start { .. } => {}
+            },
+        }
+    };
+
+    if result.is_err() {
+        let _ = ssh::zmodem_abort(app, &session_id).await;
+    }
+    let _ = ssh::zmodem_finish(app, &session_id).await;
+    let _ = ssh::disconnect(app, &session_id).await;
+
+    match result {
+        Ok(()) => {
+            let remote_path = if remote_dir.ends_with('/') {
+                format!("{}{}", remote_dir, basename)
+            } else {
+                format!("{}/{}", remote_dir, basename)
+            };
+            let _ = tasks.lock().map(|mut t| {
+                if let Some(task) = t.get_mut(task_id) {
+                    task.phase = TaskPhase::Done;
+                    task.bytes_done = size;
+                    task.result = Some(json!({ "remote_path": remote_path, "bytes": size }));
+                }
+            });
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Cheap UTC-ish timestamp string for fallback filenames (no chrono dep).
+fn chrono_like_ts() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}", secs)
+}
+
 // ============ SFTP helpers (same as CLI) ============
 
 async fn open_sftp(
@@ -1501,7 +2366,7 @@ async fn main() {
         ssh_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         ftp_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         local_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        zmodem_files: Mutex::new(std::collections::HashMap::new()),
+        zmodem_files: Arc::new(Mutex::new(std::collections::HashMap::new())),
         dek: Arc::new(Mutex::new(None)),
         transfer_cancels: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
@@ -1515,7 +2380,7 @@ async fn main() {
     // connection config via IPC (get_connection_secrets). The DEK here stays
     // None permanently — the MCP server cannot access any server on its own.
 
-    let state = McpState { app };
+    let state = McpState { app, tasks: Arc::new(Mutex::new(std::collections::HashMap::new())) };
     log("MCP server ready — waiting for first message on stdin");
 
     // MCP stdio loop.

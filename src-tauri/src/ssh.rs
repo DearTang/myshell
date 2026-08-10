@@ -1,6 +1,15 @@
 use crate::{AppState, ConnectionConfig, EventSink, EventSinkExt};
 use crate::proxy;
 use crate::zmodem_rx::{ZmodemReceiver, RxActions, RxEvent};
+use crate::zmodem_tx::{ZmodemSender, TxEvent};
+
+/// A queued file for native multi-file ZMODEM upload.
+struct UploadFile {
+    path: String,
+    name: String,
+    size: u64,
+    mtime: u64,
+}
 
 /// Jobs for the background ZMODEM disk-write task.
 enum DiskJob {
@@ -41,6 +50,10 @@ pub enum SessionCommand {
     /// Native ZMODEM receiver: frontend chose a save path for the offered
     /// file. `Some(path)` = accept and write there; `None` = skip this file.
     ZmodemAcceptOffer { path: Option<String> },
+    /// Native ZMODEM sender: frontend selected local files to upload. The
+    /// reader opens the first file, creates a `ZmodemSender`, and begins
+    /// streaming. Remaining paths queue for multi-file batches.
+    ZmodemStartUpload { paths: Vec<String> },
     Disconnect,
 }
 
@@ -192,7 +205,11 @@ enum TermMode {
 }
 
 /// CAN — ZMODEM cancel byte (lrzsz sends 5+ to abort).
+/// Note: CAN shares the value 0x18 with ZDLE, but in an abort context (≥5
+/// consecutive bytes) it is unambiguously a cancel signal.
 const CAN: u8 = 0x18;
+/// ZPAD — ZMODEM frame padding byte ('*'), starts every frame header.
+const ZPAD: u8 = b'*';
 
 /// ZMODEM auto-start needles. The protocol uses three framing variants after
 /// the ZDLE escape byte:
@@ -662,8 +679,8 @@ pub async fn connect(
 
     let session = SshSession {
         handle: Arc::new(handle),
-        command_tx,
         config: Arc::new(config),
+        command_tx,
     };
 
     // Store session (handle is moved into SshSession above, so use it from there)
@@ -679,9 +696,17 @@ pub async fn connect(
     // map on exit — see the note in `channel_reader` and the removal in
     // `disconnect()`.
     let reader_sid = sid.clone();
+    let reader_handle = {
+        let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(&sid)
+            .map(|s| Arc::clone(&s.handle))
+            .ok_or_else(|| "Session not found after insert".to_string())?
+    };
 
     tokio::spawn(async move {
-        channel_reader(sink, reader_sid, channel, command_rx, suppress_tmout).await;
+        channel_reader(sink, reader_sid, channel, reader_handle, command_rx, suppress_tmout)
+            .await;
     });
 
     Ok(sid)
@@ -691,14 +716,93 @@ async fn channel_reader(
     sink: Arc<dyn EventSink>,
     session_id: String,
     mut channel: Channel<Msg>,
+    handle: Arc<Handle<SshClient>>,
     mut command_rx: mpsc::UnboundedReceiver<SessionCommand>,
     suppress_tmout: bool,
 ) {
+    // Capture the channel id once. We use `handle.data(id, ...)` for upload
+    // data instead of `channel.data(...)` so the pump's send doesn't share a
+    // borrow with `channel.wait()` — avoiding a deadlock where channel.data()
+    // blocks waiting for WINDOW_ADJUST while channel.wait() (the only way to
+    // process that WINDOW_ADJUST) is starved by the pump.
+    let channel_id = channel.id();
     let mut buffer: Vec<u8> = Vec::with_capacity(8192);
     let mut last_flush = Instant::now();
     let mut flush_interval = tokio::time::interval(Duration::from_millis(16));
     // First tick completes immediately; consume it so we don't flush an empty buffer.
     flush_interval.tick().await;
+
+    // Spawn a dedicated sender task that drains a bounded mpsc and forwards
+    // each batch to the SSH channel through a `ChannelTx` writer obtained via
+    // `channel.make_writer_ext()`. This writer OWNS clones of the channel's
+    // internal mpsc sender, window-size mutex, and Notify — so calling
+    // `writer.write_all().await` does NOT borrow `channel` and therefore
+    // never blocks `channel.wait()`. Crucially, `write_all` DOES apply the
+    // real SSH send-window backpressure (poll_writable in russh's tx.rs
+    // takes the window mutex and waits on Notify when the window is empty),
+    // so the sender task naturally slows when the server hasn't ACKed.
+    //
+    // WINDOW_ADJUST is handled by russh's background connection task — it
+    // updates the window-size mutex and notify_one()s the Notify, which
+    // wakes any writer that's currently parked. No intervention from this
+    // reader task or the sender task is needed.
+    let writer = channel.make_writer_ext(None);
+    // Channel capacity must stay large enough that the pump's send_data().await
+    // NEVER blocks while inside the ChannelMsg::Data arm — blocking there stalls
+    // the entire select! loop, preventing WINDOW_ADJUST from being processed,
+    // which deadlocks the sender task (write_all awaits window → reader can't
+    // process WINDOW_ADJUST → window never reopens). 64 is safe.
+    let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    // Abort flag shared between the reader loop and the sender task. When a
+    // ZMODEM transfer is aborted (rz sends CAN, user clicks cancel, or an
+    // error occurs), we set this flag so the sender task DROPS all queued
+    // batches instead of writing them to the SSH channel — otherwise the
+    // data already buffered in the mpsc (up to 64 × 512 KB ≈ 32 MB) would
+    // keep flowing to rz's stdin AFTER rz has exited, printing as garbled
+    // terminal output.
+    let upload_aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sender_sid = session_id.clone();
+    let data_sender_task = tokio::spawn({
+        let aborted = Arc::clone(&upload_aborted);
+        async move {
+            use tokio::io::AsyncWriteExt;
+            let mut writer = writer;
+            let mut rx = data_rx;
+            while let Some(batch) = rx.recv().await {
+                // If the transfer was aborted, drain and discard all remaining
+                // batches to prevent post-abort ZMODEM data from reaching the
+                // remote shell as garbled input.
+                if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+                    log::info!("[ssh:{}] [TX] sender task: aborted, dropping {} bytes", sender_sid, batch.len());
+                    while rx.recv().await.is_some() {}
+                    break;
+                }
+                let t0 = Instant::now();
+                if let Err(e) = writer.write_all(&batch[..]).await {
+                    log::warn!("[ssh:{}] data sender task: write_all failed: {}", sender_sid, e);
+                    break;
+                }
+                // NOTE: no flush() — russh 0.50's ChannelTx::poll_flush is a no-op
+                // (returns Ready(Ok(())) unconditionally). write_all already pushes
+                // each ChannelMsg::Data onto the channel's internal mpsc the moment
+                // a permit is available; the background connection task drains it to
+                // the TCP socket. Calling flush() here was pure async state-machine
+                // overhead per batch with zero network effect.
+                log::info!("[ssh:{}] [TX] stream: {} bytes in {:?} = {:.1} MB/s", sender_sid, batch.len(), t0.elapsed(), if t0.elapsed().as_secs_f64() > 0.0 { batch.len() as f64 / t0.elapsed().as_secs_f64() / (1024.0 * 1024.0) } else { 0.0 });
+            }
+            log::info!("[ssh:{}] data sender task exited", sender_sid);
+        }
+    });
+
+    /// Hand a byte batch to the sender task. The mpsc has capacity 64, so
+    /// `send` only awaits when the sender task has fallen behind — which
+    /// means SSH backpressure is already engaged and the few ms wait is the
+    /// pump slowing to line speed. Never blocks on network state.
+    async fn send_data(data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>, data: &[u8]) {
+        if data_tx.send(Vec::from(data)).await.is_err() {
+            // Sender task has exited (connection dropped).
+        }
+    }
     log::info!("[ssh:{}] channel_reader started", session_id);
 
     // One-shot shell TMOUT suppression — gated on the dedicated `suppress_tmout`
@@ -719,7 +823,7 @@ async fn channel_reader(
     // Leading/trailing newlines make it a standalone line, not merged with the
     // prompt.
     if suppress_tmout {
-        let _ = channel.data(&b"\nexport TMOUT=0 2>/dev/null\n"[..]).await;
+        send_data(&data_tx, b"\nexport TMOUT=0 2>/dev/null\n").await;
     }
 
     let mut mode = TermMode::Normal;
@@ -743,6 +847,12 @@ async fn channel_reader(
     // russh's connection task, which awaits a bounded send per inbound
     // packet) free of disk work, so WINDOW_ADJUST flows at line rate.
     let mut zmodem_rx: Option<ZmodemReceiver> = None;
+
+    // Native ZMODEM sender state (uploads). Symmetric to zmodem_rx: when
+    // sender is Some, incoming rz bytes feed the sender and its output goes
+    // straight to channel.data() with zero IPC. Bundled in TxSession to keep
+    // the handle_incoming_data signature manageable.
+    let mut tx_state = TxSession::new();
     // Channel carrying write jobs to the background disk task.
     // Each job is either a new file handle (FileOpen) or a data buffer (Write).
     let (disk_tx, mut disk_rx): (
@@ -801,17 +911,34 @@ async fn channel_reader(
     // variant of Channel in russh or migrate to a fork that exposes the
     // underlying Receiver directly.
 
+    let mut last_upload_error: Option<String> = None;
     loop {
+        // Promote any deferred upload-error cleanup into actual side-effects
+        // BEFORE the select, so all borrows are fresh.
+        if let Some(msg) = last_upload_error.take() {
+            sink.emit("zmodem_error", &serde_json::json!({
+                "sessionId": session_id, "message": msg
+            }));
+            mode = TermMode::Normal;
+            suppress_until = Some(Instant::now() + Duration::from_millis(500));
+            // Signal the sender task to drop all queued batches — prevents
+            // post-abort ZMODEM data from reaching the shell as garbled input.
+            upload_aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+            tx_state.sender = None;
+            tx_state.file = None;
+            tx_state.queue.clear();
+            sink.emit("zmodem_end", &session_id.to_string());
+            // Don't continue — fall through to select!; the new state is
+            // already consistent.
+        }
+
         tokio::select! {
             biased;
 
             // Commands from the frontend take priority so input latency stays low.
             cmd = command_rx.recv() => match cmd {
                 Some(SessionCommand::Input(data)) => {
-                    if let Err(e) = channel.data(&data[..]).await {
-                        log::warn!("[ssh:{}] data send failed: {}", session_id, e);
-                        break;
-                    }
+                    send_data(&data_tx, &data[..]).await;
                 }
                 Some(SessionCommand::Resize { cols, rows }) => {
                     if let Err(e) = channel.window_change(cols, rows, 0, 0).await {
@@ -819,17 +946,19 @@ async fn channel_reader(
                     }
                 }
                 Some(SessionCommand::ZmodemBytes(data)) => {
-                    if let Err(e) = channel.data(&data[..]).await {
-                        log::warn!("[ssh:{}] zmodem send failed: {}", session_id, e);
-                    }
+                    send_data(&data_tx, &data[..]).await;
                 }
                 Some(SessionCommand::ZmodemAbort) => {
+                    // Signal sender task to drop queued batches FIRST, before
+                    // sending the CAN sequence — otherwise buffered upload data
+                    // would interleave with the abort bytes.
+                    upload_aborted.store(true, std::sync::atomic::Ordering::Relaxed);
                     // lrzsz abort sequence: 8× CAN + a few backspaces to clean
                     // the remote's PTY line state.
                     let abort = [CAN; 8];
-                    let _ = channel.data(&abort[..]).await;
+                    send_data(&data_tx, &abort[..]).await;
                     let cleanup: &[u8] = b"\x08\x08\x08\x08\x08\x08\x08\x08";
-                    let _ = channel.data(cleanup).await;
+                    send_data(&data_tx, cleanup).await;
                     // Close the disk task so any pending file is flushed.
                     let _ = disk_tx.send(DiskJob::Close);
                     // Immediately switch to Normal + suppress post-abort noise
@@ -837,12 +966,15 @@ async fn channel_reader(
                     mode = TermMode::Normal;
                     suppress_until = Some(Instant::now() + Duration::from_millis(500));
                     sink.emit("zmodem_end", &session_id);
-                    // Drop any native receiver so a subsequent transfer starts clean.
+                    // Drop any native receiver/sender so a subsequent transfer starts clean.
                     zmodem_rx = None;
+                    tx_state.sender = None;
+                    tx_state.file = None;
+                    tx_state.queue.clear();
                 }
                 Some(SessionCommand::ZmodemFinish) => {
-                    // Frontend (zmodem.js) is the authority on session end.
-                    // Switch back to Normal + suppress trailing protocol noise.
+                    // Frontend is the authority on session end. Switch back to
+                    // Normal + suppress trailing protocol noise.
                     if mode == TermMode::Zmodem {
                         mode = TermMode::Normal;
                         suppress_until = Some(Instant::now() + Duration::from_millis(500));
@@ -850,6 +982,9 @@ async fn channel_reader(
                     }
                     let _ = disk_tx.send(DiskJob::Close);
                     zmodem_rx = None;
+                    tx_state.sender = None;
+                    tx_state.file = None;
+                    tx_state.queue.clear();
                 }
                 Some(SessionCommand::ZmodemAcceptOffer { path }) => {
                     // Native receiver: frontend chose a save path (or skipped).
@@ -864,9 +999,7 @@ async fn channel_reader(
                             let _ = disk_tx.send(DiskJob::Flush);
                         }
                         if !send.is_empty() {
-                            if let Err(e) = channel.data(&send[..]).await {
-                                log::warn!("[ssh:{}] zmodem accept send failed: {}", session_id, e);
-                            }
+                            send_data(&data_tx, &send[..]).await;
                         }
                         if ended {
                             if disk.close {
@@ -875,6 +1008,67 @@ async fn channel_reader(
                             mode = TermMode::Normal;
                             suppress_until = Some(Instant::now() + Duration::from_millis(500));
                             zmodem_rx = None;
+                        }
+                    }
+                }
+                Some(SessionCommand::ZmodemStartUpload { paths }) => {
+                    // Native upload: frontend selected local files. Open the
+                    // first, create a ZmodemSender, queue the rest. Feed any
+                    // buffered ZRINIT bytes to kick off the handshake.
+                    // Reset the abort flag — a fresh transfer starts here.
+                    upload_aborted.store(false, std::sync::atomic::Ordering::Relaxed);
+                    log::info!("[ssh:{}] ZmodemStartUpload: {} paths, pending={} bytes", session_id, paths.len(), tx_state.pending.len());
+                    if paths.is_empty() {
+                        log::warn!("[ssh:{}] zmodem_start_upload with empty paths", session_id);
+                    } else {
+                        tx_state.native = true;
+                        // Build UploadFile entries with metadata.
+                        let mut files: std::collections::VecDeque<UploadFile> = std::collections::VecDeque::new();
+                        for p in &paths {
+                            match std::fs::metadata(p) {
+                                Ok(meta) => {
+                                    if !meta.is_file() { continue; }
+                                    let name = std::path::Path::new(p)
+                                        .file_name().and_then(|n| n.to_str())
+                                        .unwrap_or("file").to_string();
+                                    let mtime = meta.modified().ok()
+                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                        .map(|d| d.as_secs()).unwrap_or(0);
+                                    files.push_back(UploadFile {
+                                        path: p.clone(), name, size: meta.len(), mtime,
+                                    });
+                                }
+                                Err(e) => {
+                                    log::warn!("[ssh:{}] upload file stat failed {}: {}", session_id, p, e);
+                                }
+                            }
+                        }
+                        if let Some(first) = files.pop_front() {
+                            tx_state.queue = files;
+                            log::info!("[ssh:{}] [TX] first file: {:?} ({} bytes)", session_id, first.path, first.size);
+                            match start_upload_file(&first) {
+                                Ok((mut sender, file)) => {
+                                    // Feed any buffered ZRINIT to start the handshake.
+                                    let pending = std::mem::take(&mut tx_state.pending);
+                                    log::info!("[ssh:{}] [TX] start_upload: pending={} bytes, sender state before feed={}", session_id, pending.len(), sender.state_name());
+                                    let actions = if pending.is_empty() {
+                                        sender.feed(&[])
+                                    } else {
+                                        sender.feed(&pending)
+                                    };
+                                    log::info!("[ssh:{}] [TX] start_upload: after feed, sender state={}, send={} bytes, events={}", session_id, sender.state_name(), actions.send.len(), actions.events.len());
+                                    tx_state.sender = Some(sender);
+                                    tx_state.file = Some(file);
+                                    if !actions.send.is_empty() {
+                                        send_data(&data_tx, &actions.send[..]).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    sink.emit("zmodem_error", &serde_json::json!({
+                                        "sessionId": session_id, "message": e
+                                    }));
+                                }
+                            }
                         }
                     }
                 }
@@ -906,6 +1100,7 @@ async fn channel_reader(
                         let to_send = handle_incoming_data(
                             &*sink, &session_id, data, &mut buffer, &mut last_flush,
                             &mut mode, &mut suppress_until, &mut zmodem_rx, &disk_tx,
+                            &mut tx_state, &upload_aborted,
                         );
                         // Drain decoded payload from the receiver to the
                         // background disk task — this is just an unbounded
@@ -919,8 +1114,114 @@ async fn channel_reader(
                         // Native receiver protocol responses (ZRINIT/ZRPOS/ZACK/
                         // ZFIN) go straight back to the peer — no JS round-trip.
                         if !to_send.is_empty() {
-                            if let Err(e) = channel.data(&to_send[..]).await {
-                                log::warn!("[ssh:{}] zmodem rx send failed: {}", session_id, e);
+                            send_data(&data_tx, &to_send[..]).await;
+                        }
+                        // Native upload: stream file data subpackets directly via
+                        // channel.data(). INLINE (not a separate task): a pump task
+                        // starved the PTY input buffer because it flooded rz's stdin
+                        // faster than rz could drain — receiver saw byte loss and
+                        // never stopped sending ZRPOS offset=0. The inline pump is
+                        // naturally throttled by the reader's select! cadence.
+                        //
+                        // Batch subpackets into ~512 KB chunks: bigger than the
+                        // old 128 KB (fewer channel.data() calls → less per-call
+                        // SSH/PTY overhead → higher throughput), but still small
+                        // enough that each await yields back to select! promptly,
+                        // keeping the reader's other arms responsive.
+                        if let Some(sender) = tx_state.sender.as_mut() {
+                            let mut error_msg: Option<String> = None;
+                            if let Some(file) = tx_state.file.as_mut() {
+                                log::info!("[ssh:{}] [TX] pump enter: state={}", session_id, sender.state_name());
+                                const INLINE_BATCH: usize = 512 * 1024;
+                                // Cap batches per select! iteration. Without a
+                                // cap, the pump drains the ENTIRE file in one
+                                // pass (~6 ms for 10 MB), flooding the server's
+                                // PTY kernel buffer before rz can drain — the
+                                // kernel drops bytes, rz sees corrupt data,
+                                // aborts with ZRPOS(0). 8 batches ≈ 4 MB per
+                                // iteration keeps data flowing at network speed
+                                // while yielding back to select! frequently
+                                // enough to process WINDOW_ADJUST and user input.
+                                const MAX_BATCHES_PER_ITER: usize = 8;
+                                let mut batches_this_iter: usize = 0;
+                                let mut batch: Vec<u8> = Vec::with_capacity(INLINE_BATCH);
+                                let mut upload_error = false;
+                                let mut total_sent: usize = 0;
+                                let mut send_time: std::time::Duration = std::time::Duration::ZERO;
+                                loop {
+                                    let poll = sender.poll(file);
+                                    if poll.send.is_empty() {
+                                        break;
+                                    }
+                                    batch.extend_from_slice(&poll.send);
+                                    let mut ended = false;
+                                    let mut err: Option<String> = None;
+                                    dispatch_tx_events_throttled(
+                                        &*sink,
+                                        &session_id,
+                                        &poll.events,
+                                        &mut ended,
+                                        &mut err,
+                                        &mut tx_state.last_progress_emit,
+                                    );
+                                    if let Some(msg) = err {
+                                        // Defer cleanup to after the
+                                        // sender/file borrows end below.
+                                        upload_error = true;
+                                        error_msg = Some(msg);
+                                        break;
+                                    }
+                                    if ended {
+                                        tx_state.file = None;
+                                        break;
+                                    }
+                                    if batch.len() >= INLINE_BATCH {
+                                        let t0 = Instant::now();
+                                        send_data(&data_tx, &batch[..]).await;
+                                        send_time += t0.elapsed();
+                                        total_sent += batch.len();
+                                        batch.clear();
+                                        batches_this_iter += 1;
+                                        if batches_this_iter >= MAX_BATCHES_PER_ITER {
+                                            // Yield back to select! so it can
+                                            // process WINDOW_ADJUST and other
+                                            // messages. The next ChannelMsg::Data
+                                            // from rz (or the 16ms flush tick)
+                                            // will resume the pump.
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !upload_error && !batch.is_empty() {
+                                    let t0 = Instant::now();
+                                    send_data(&data_tx, &batch[..]).await;
+                                    send_time += t0.elapsed();
+                                    total_sent += batch.len();
+                                }
+                                if total_sent > 0 {
+                                    log::info!("[ssh:{}] [TX] stream: {} bytes in {:?} = {:.1} MB/s", session_id, total_sent, send_time, if send_time.as_secs_f64() > 0.0 { total_sent as f64 / send_time.as_secs_f64() / (1024.0 * 1024.0) } else { 0.0 });
+                                }
+
+                                // Track when we entered WaitingZrinit2 (post-
+                                // ZEOF). The reader-side timeout below forces a
+                                // ZFIN if rz never acknowledges, which happens
+                                // when its PTY enters an error state and
+                                // streams garbage instead of a proper reply.
+                                if sender.state_name() == "WaitingZrinit2" {
+                                    if tx_state.waiting_zrinit2_since.is_none() {
+                                        tx_state.waiting_zrinit2_since = Some(Instant::now());
+                                    }
+                                } else {
+                                    tx_state.waiting_zrinit2_since = None;
+                                }
+                            }
+                            // Deferred upload-error cleanup: capture the
+                            // message here (after the inner pump borrows
+                            // have ended) so the outer if-let-sender can
+                            // release its borrow before we mutate
+                            // tx_state.sender in the next-loop cleanup.
+                            if let Some(msg) = error_msg.take() {
+                                last_upload_error = Some(msg);
                             }
                         }
                     }
@@ -973,6 +1274,52 @@ async fn channel_reader(
             // server trickles bytes. Coalesces bursts and mitigates tauri#13234.
             // In Zmodem mode, flush as zmodem_raw (coalesced protocol bytes).
             _ = flush_interval.tick() => {
+                // Resume upload pump if sender is in SendingData. The pump
+                // caps batches per select! iteration (MAX_BATCHES_PER_ITER)
+                // to avoid PTY buffer overflow, so it needs to be re-triggered
+                // by this periodic tick when rz sends no further data.
+                if let Some(sender) = tx_state.sender.as_mut() {
+                    if sender.state_name() == "SendingData" {
+                        if let Some(file) = tx_state.file.as_mut() {
+                            const INLINE_BATCH: usize = 512 * 1024;
+                            const MAX_BATCHES_PER_ITER: usize = 8;
+                            let mut batch: Vec<u8> = Vec::with_capacity(INLINE_BATCH);
+                            let mut batches_this_iter: usize = 0;
+                            loop {
+                                let poll = sender.poll(file);
+                                if poll.send.is_empty() { break; }
+                                batch.extend_from_slice(&poll.send);
+                                let mut ended = false;
+                                let mut err: Option<String> = None;
+                                dispatch_tx_events_throttled(
+                                    &*sink, &session_id, &poll.events,
+                                    &mut ended, &mut err, &mut tx_state.last_progress_emit,
+                                );
+                                if let Some(msg) = err {
+                                    last_upload_error = Some(msg);
+                                    break;
+                                }
+                                if ended { tx_state.file = None; break; }
+                                if batch.len() >= INLINE_BATCH {
+                                    send_data(&data_tx, &batch[..]).await;
+                                    batch.clear();
+                                    batches_this_iter += 1;
+                                    if batches_this_iter >= MAX_BATCHES_PER_ITER { break; }
+                                }
+                            }
+                            if !batch.is_empty() && last_upload_error.is_none() {
+                                send_data(&data_tx, &batch[..]).await;
+                            }
+                            if sender.state_name() == "WaitingZrinit2" {
+                                if tx_state.waiting_zrinit2_since.is_none() {
+                                    tx_state.waiting_zrinit2_since = Some(Instant::now());
+                                }
+                            } else {
+                                tx_state.waiting_zrinit2_since = None;
+                            }
+                        }
+                    }
+                }
                 if !buffer.is_empty() && last_flush.elapsed() >= Duration::from_millis(16) {
                     if mode == TermMode::Zmodem {
                         flush_zmodem_buffer(&*sink, &session_id, &mut buffer);
@@ -981,7 +1328,39 @@ async fn channel_reader(
                     }
                     last_flush = Instant::now();
                 }
-            }
+                // ZMODEM upload timeout: if the sender has been waiting in
+                // WaitingZrinit2 (post-ZEOF) for too long without rz
+                // acknowledging, force end the session. 30s covers large
+                // files whose data is still flushing through the mpsc/sender
+                // task to the network after poll() finished reading the file.
+                if mode == TermMode::Zmodem {
+                    if let Some(since) = tx_state.waiting_zrinit2_since {
+                        if since.elapsed() > Duration::from_secs(30) {
+                            log::warn!("[ssh:{}] zmodem upload timeout (30s in WaitingZrinit2, queue={}), forcing end", session_id, tx_state.queue.len());
+                            // Synthesise ZFIN+OO so the session can close.
+                            let zfin_bytes = if let Some(sender) = tx_state.sender.as_mut() {
+                                Some(sender.force_finish_for_timeout())
+                            } else {
+                                None
+                            };
+                            if let Some(zfin) = zfin_bytes {
+                                send_data(&data_tx, &zfin).await;
+                            }
+                            tx_state.waiting_zrinit2_since = None;
+                            // Clean up and switch back to Normal so the UI
+                            // stops showing the upload progress overlay.
+                            // Suppress for 2s — rz may emit trailing text
+                            // (progress, exit message) after the ZFIN.
+                            mode = TermMode::Normal;
+                            suppress_until = Some(Instant::now() + Duration::from_millis(2000));
+                            tx_state.sender = None;
+                            tx_state.file = None;
+                            tx_state.queue.clear();
+                            sink.emit("zmodem_end", &session_id.to_string());
+                            }
+                        }
+                    }
+                }
         }
     }
 
@@ -998,6 +1377,52 @@ async fn channel_reader(
     // the terminal already shows "[Connection closed]" and SFTP ops on a dead
     // handle return a clean error instead of crashing.
     log::info!("[ssh:{}] channel_reader exited", session_id);
+}
+
+/// Native ZMODEM sender state, bundled so it threads through handle_incoming_data
+/// as a single &mut. Symmetric to the `zmodem_rx: Option<ZmodemReceiver>` slot.
+///
+/// Upload pump is INLINE in the reader's ChannelMsg::Data arm (not a separate
+/// task): a separate pump task starved the PTY input buffer (rz's stdin got
+/// flooded faster than it could drain, losing bytes and causing endless ZRPOS
+/// retransmits). The inline pump naturally throttles — each channel.data() is
+/// gated by the reader returning to select!, matching rz's read cadence.
+struct TxSession {
+    /// Active sender for the current file. None until the frontend calls
+    /// zmodem_start_upload.
+    sender: Option<ZmodemSender>,
+    /// The file currently being sent.
+    file: Option<std::fs::File>,
+    /// Remaining files for multi-file batches.
+    queue: std::collections::VecDeque<UploadFile>,
+    /// rz bytes received before the sender was created (buffered ZRINIT etc.).
+    pending: Vec<u8>,
+    /// True once the frontend has committed to the native upload path.
+    native: bool,
+    /// When the sender entered WaitingZrinit2 (post-ZEOF). Used by the
+    /// reader to force a ZFIN timeout when rz fails to acknowledge (e.g.
+    /// its PTY went into an error state and is streaming garbage instead
+    /// of a ZRINIT/ZFIN reply).
+    waiting_zrinit2_since: Option<std::time::Instant>,
+    /// Last time we emitted a `zmodem_progress` IPC event. Throttles the
+    /// per-subpacket Progress events so a fast upload (one Progress per
+    /// 128 KiB subpacket) doesn't flood the WebView with IPC + React
+    /// re-renders — the single biggest upload-throughput bottleneck.
+    last_progress_emit: Option<std::time::Instant>,
+}
+
+impl TxSession {
+    fn new() -> Self {
+        Self {
+            sender: None,
+            file: None,
+            queue: std::collections::VecDeque::new(),
+            pending: Vec::new(),
+            native: false,
+            waiting_zrinit2_since: None,
+            last_progress_emit: None,
+        }
+    }
 }
 
 /// Routes incoming PTY bytes: terminal output in Normal mode, ZMODEM frames in
@@ -1018,6 +1443,8 @@ fn handle_incoming_data(
     suppress_until: &mut Option<Instant>,
     zmodem_rx: &mut Option<ZmodemReceiver>,
     disk_tx: &tokio::sync::mpsc::UnboundedSender<DiskJob>,
+    tx_state: &mut TxSession,
+    upload_aborted: &std::sync::atomic::AtomicBool,
 ) -> Vec<u8> {
     match *mode {
         TermMode::Normal => {
@@ -1042,7 +1469,11 @@ fn handle_incoming_data(
                 let actions = rx.feed(&tail);
 
                 if let Some(passthrough_bytes) = rx.take_passthrough() {
-                    // Upload (remote `rz`) — hand off to the JS zmodem.js path.
+                    // Upload (remote `rz`). Enter Zmodem mode. Emit zmodem_start
+                    // so the frontend prompts for files and calls
+                    // zmodem_start_upload (native) - OR falls back to the JS
+                    // zmodem.js bridge via zmodem_raw passthrough (legacy).
+                    // Buffer the initial ZRINIT for the native sender.
                     *mode = TermMode::Zmodem;
                     *zmodem_rx = None;
                     sink.emit(
@@ -1052,6 +1483,9 @@ fn handle_incoming_data(
                             direction: "upload",
                         },
                     );
+                    // Stash for the native sender (if the frontend uses it).
+                    tx_state.pending.extend_from_slice(&passthrough_bytes);
+                    // Passthrough fallback for legacy JS bridge.
                     sink.emit(
                         "zmodem_raw",
                         &SshOutputPayload {
@@ -1140,21 +1574,240 @@ fn handle_incoming_data(
                 return send;
             }
 
-            // Passthrough (upload) path — coalesce and emit zmodem_raw to the
-            // JS bridge. ZMODEM frames are self-delimiting (ZDLE-escaped), so
-            // zmodem.js's consume() parses merged data correctly.
+            // Native upload path - sender active, feed rz bytes and stream file data.
+            if let Some(sender) = tx_state.sender.as_mut() {
+                let mut all_send = Vec::new();
+                let mut tx_ended = false;
+                let mut tx_error: Option<String> = None;
+
+                // Multi-file: when the current file's ZEOF is sent, the sender
+                // enters WaitingZrinit2. If rz sends ZRINIT (ready for next file)
+                // and we have queued files, swap in a fresh sender BEFORE feeding
+                // the ZRINIT — otherwise the old sender would send ZFIN and end
+                // the session.
+                if sender.is_waiting_for_next_file() && !tx_state.queue.is_empty() {
+                    if let Some(next) = tx_state.queue.pop_front() {
+                        log::info!("[ssh:{}] [TX] multi-file: starting next file '{}'", session_id, next.name);
+                        match start_upload_next_file(&next) {
+                            Ok((new_sender, new_file)) => {
+                                // Drop old sender (already sent ZEOF). Replace
+                                // with a fresh one in WaitingZrinit state so it
+                                // processes the incoming ZRINIT normally.
+                                *sender = new_sender;
+                                tx_state.file = Some(new_file);
+                            }
+                            Err(e) => {
+                                sink.emit("zmodem_error", &serde_json::json!({
+                                    "sessionId": session_id, "message": e
+                                }));
+                                *mode = TermMode::Normal;
+                                *suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                                upload_aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                                tx_state.sender = None;
+                                tx_state.file = None;
+                                tx_state.queue.clear();
+                                sink.emit("zmodem_end", &session_id.to_string());
+                                return Vec::new();
+                            }
+                        }
+                    }
+                }
+
+                // Feed the incoming rz bytes (ZRPOS/ZACK/ZRINIT/ZFIN/CAN).
+                log::info!("[ssh:{}] [TX] native path: {} bytes, sender state={}, hex: {:02x?}", session_id, data.len(), sender.state_name(), &data[..data.len().min(40)]);
+
+                // Fast-finish optimization: in WaitingZrinit2 (file data fully
+                // sent, waiting for rz to acknowledge), rz often emits non-
+                // protocol output (progress text, file content echo, BEL bytes)
+                // instead of a clean ZRINIT/ZFIN. Waiting 3s for the timeout
+                // lets that garbage leak to the terminal after suppress expires.
+                // If the data contains no ZMODEM frame header (ZPAD/ZDLE), end
+                // immediately — the file was already sent successfully.
+                if sender.is_waiting_for_next_file() && !data.iter().any(|&b| b == ZPAD || b == CAN) {
+                    log::info!("[ssh:{}] [TX] WaitingZrinit2 + non-protocol data — fast finish", session_id);
+                    let zfin = sender.force_finish_for_timeout();
+                    all_send.extend_from_slice(&zfin);
+                    // Do NOT set upload_aborted here — the file data is already
+                    // fully queued/sent and this is a normal (non-error) finish.
+                    // Setting abort would make the sender task DROP in-flight
+                    // data still in the mpsc, corrupting the transfer.
+                    *mode = TermMode::Normal;
+                    *suppress_until = Some(Instant::now() + Duration::from_millis(2000));
+                    tx_state.sender = None;
+                    tx_state.file = None;
+                    tx_state.queue.clear();
+                    sink.emit("zmodem_end", &session_id.to_string());
+                    return all_send;
+                }
+
+                let actions = sender.feed(data);
+                log::info!("[ssh:{}] [TX] feed: send={} events={}", session_id, actions.send.len(), actions.events.len());
+                all_send.extend_from_slice(&actions.send);
+                dispatch_tx_events(sink, session_id, &actions.events, &mut tx_ended, &mut tx_error);
+
+                if let Some(msg) = tx_error {
+                    sink.emit("zmodem_error", &serde_json::json!({
+                        "sessionId": session_id, "message": msg
+                    }));
+                    *mode = TermMode::Normal;
+                    *suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                    upload_aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    tx_state.sender = None;
+                    tx_state.file = None;
+                    tx_state.queue.clear();
+                    sink.emit("zmodem_end", &session_id.to_string());
+                    return Vec::new();
+                }
+
+                if tx_ended {
+                    *mode = TermMode::Normal;
+                    *suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                    // Normal ZFIN completion — do NOT set upload_aborted; the
+                    // sender task may still be flushing the final data batches.
+                    tx_state.sender = None;
+                    tx_state.file = None;
+                    tx_state.queue.clear();
+                    sink.emit("zmodem_end", &session_id.to_string());
+                    return all_send;
+                }
+
+                // File data streaming is handled by the caller (select! loop)
+                // so each subpacket can be sent via channel.data() individually,
+                // letting the SSH transport manage flow control between sends.
+
+                return all_send;
+            }
+
+            // Passthrough (upload) fallback - emit zmodem_raw to the JS bridge.
+            // Used when the frontend has not called zmodem_start_upload (legacy
+            // mode) or for multi-file batches (not yet native).
+            log::info!("[ssh:{}] [TX] passthrough fallback (sender=None): {} bytes, is_end={}", session_id, data.len(), is_zmodem_end(data));
             buffer.extend_from_slice(data);
-            if buffer.len() >= FLUSH_THRESHOLD {
+            if !buffer.is_empty() {
                 flush_zmodem_buffer(sink, session_id, buffer);
                 *last_flush = Instant::now();
             }
             if is_zmodem_end(data) {
-                flush_zmodem_buffer(sink, session_id, buffer);
                 *mode = TermMode::Normal;
                 *suppress_until = Some(Instant::now() + Duration::from_millis(500));
                 sink.emit("zmodem_end", &session_id);
             }
             Vec::new()
+        }
+    }
+}
+
+/// Open a file for native upload and create the ZmodemSender. Returns
+/// (sender, file) ready to stream.
+fn start_upload_file(uf: &UploadFile) -> Result<(ZmodemSender, std::fs::File), String> {
+    let file = std::fs::File::open(&uf.path).map_err(|e| format!("打开文件失败: {}", e))?;
+    Ok((
+        ZmodemSender::new(uf.name.clone(), uf.size, uf.mtime),
+        file,
+    ))
+}
+
+/// Open a **subsequent** file in a multi-file upload batch. Uses
+/// `new_for_next_file` so the fresh sender skips ZSINIT (already negotiated
+/// for the session) and sends ZFILE directly — resending ZSINIT makes rz
+/// abort to the shell.
+fn start_upload_next_file(uf: &UploadFile) -> Result<(ZmodemSender, std::fs::File), String> {
+    let file = std::fs::File::open(&uf.path).map_err(|e| format!("打开文件失败: {}", e))?;
+    Ok((
+        ZmodemSender::new_for_next_file(uf.name.clone(), uf.size, uf.mtime),
+        file,
+    ))
+}
+
+/// Translate TxEvent batch into frontend Tauri events, mirroring
+/// dispatch_rx_actions. Sets `ended` on SessionEnd, `error` on Error.
+fn dispatch_tx_events(
+    sink: &dyn EventSink,
+    session_id: &str,
+    events: &[TxEvent],
+    ended: &mut bool,
+    error: &mut Option<String>,
+) {
+    for ev in events {
+        match ev {
+            TxEvent::Started => {} // zmodem_start already emitted
+            TxEvent::Progress { sent, total } => {
+                sink.emit("zmodem_progress", &serde_json::json!({
+                    "sessionId": session_id,
+                    "bytesTransferred": sent,
+                    "bytesTotal": total
+                }));
+            }
+            TxEvent::FileComplete { name, bytes } => {
+                sink.emit("zmodem_file_complete", &serde_json::json!({
+                    "sessionId": session_id,
+                    "fileName": name,
+                    "bytesWritten": bytes
+                }));
+            }
+            TxEvent::SessionEnd => {
+                *ended = true;
+            }
+            TxEvent::Error(msg) => {
+                *error = Some(msg.clone());
+            }
+        }
+    }
+}
+
+/// Minimum interval between `zmodem_progress` IPC events during uploads.
+/// The ZmodemSender emits one Progress per 128 KiB subpacket; without
+/// throttling a 100 MB file fires ~800 IPC round-trips (JSON serialize +
+/// WebView postMessage + React setState + re-render), all on the reader
+/// thread, which is the single biggest upload-throughput bottleneck.
+/// 100 ms keeps the progress bar smooth while cutting IPC count ~8×+.
+const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Throttled variant of dispatch_tx_events: skips `Progress` events that
+/// arrive within `PROGRESS_THROTTLE` of the last emit, EXCEPT the final
+/// one (`sent == total`) which always passes through so the progress bar
+/// reliably reaches 100%. Non-Progress events are never throttled.
+fn dispatch_tx_events_throttled(
+    sink: &dyn EventSink,
+    session_id: &str,
+    events: &[TxEvent],
+    ended: &mut bool,
+    error: &mut Option<String>,
+    last_emit: &mut Option<std::time::Instant>,
+) {
+    for ev in events {
+        match ev {
+            TxEvent::Started => {}
+            TxEvent::Progress { sent, total } => {
+                let now = std::time::Instant::now();
+                // Force-flush the final progress (sent == total) so the UI
+                // always shows 100% on completion, regardless of throttle.
+                let is_final = *sent >= *total;
+                let due = last_emit
+                    .map(|t| now.duration_since(t) >= PROGRESS_THROTTLE)
+                    .unwrap_or(true);
+                if is_final || due {
+                    sink.emit("zmodem_progress", &serde_json::json!({
+                        "sessionId": session_id,
+                        "bytesTransferred": sent,
+                        "bytesTotal": total
+                    }));
+                    *last_emit = Some(now);
+                }
+            }
+            TxEvent::FileComplete { name, bytes } => {
+                sink.emit("zmodem_file_complete", &serde_json::json!({
+                    "sessionId": session_id,
+                    "fileName": name,
+                    "bytesWritten": bytes
+                }));
+            }
+            TxEvent::SessionEnd => {
+                *ended = true;
+            }
+            TxEvent::Error(msg) => {
+                *error = Some(msg.clone());
+            }
         }
     }
 }
@@ -1443,6 +2096,29 @@ pub async fn zmodem_accept_offer(
 
     if let Some(tx) = sender {
         let _ = tx.send(SessionCommand::ZmodemAcceptOffer { path });
+    }
+
+    Ok(())
+}
+
+/// Native ZMODEM upload: the frontend selected one or more local files. The
+/// reader loop opens the first, creates a ZmodemSender, and streams the file
+/// data directly over the SSH channel (zero IPC). Remaining files queue for
+/// multi-file batches.
+pub async fn zmodem_start_upload(
+    state: &AppState,
+    session_id: &str,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    let sender = {
+        let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+        sessions
+            .get(session_id)
+            .map(|s| s.command_tx.clone())
+    };
+
+    if let Some(tx) = sender {
+        let _ = tx.send(SessionCommand::ZmodemStartUpload { paths });
     }
 
     Ok(())

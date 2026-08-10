@@ -15,7 +15,20 @@ import {
   sshZmodemFinish,
 } from "./api";
 
-const CHUNK_SIZE = 8192; // matches zmodem.js MAX_CHUNK_LENGTH
+// File-read block size. We read 64 KiB per rzReadChunk IPC call (8× fewer read
+// round-trips than reading one 8 KiB subpacket at a time). zmodem.js's
+// transfer.send() still splits this into MAX_CHUNK_LENGTH (8 KiB) wire
+// subpackets — 8 KiB is lrzsz's subpacket ceiling, so the wire format stays
+// compatible; only the (local) read granularity grows.
+const CHUNK_SIZE = 64 * 1024;
+// Outbound IPC batching. zmodem.js invokes set_sender once per 8 KiB subpacket;
+// sending each as its own Tauri invoke caps upload at ~500 KB/s (one IPC
+// round-trip per subpacket). We accumulate subpackets and flush in larger
+// batches — ZMODEM frames are self-delimiting, so concatenating them into one
+// channel write is safe. Flush when the batch is full or after a short timer
+// (so small handshake frames aren't held back).
+const SEND_BATCH_BYTES = 48 * 1024;
+const SEND_FLUSH_MS = 8;
 /** Flush the write buffer to Rust when it reaches this size (2 MB). Larger
  *  batches amortize IPC overhead — fewer, bigger writes instead of many small
  *  ones. 2 MB keeps peak memory bounded while cutting IPC count ~8× vs 256 KB. */
@@ -83,6 +96,11 @@ export class ZmodemBridge {
   private speedStartBytes = 0;
   private speedLastSample = 0;
 
+  // Outbound batching buffer (see SEND_BATCH_BYTES). set_sender appends here;
+  // flushSendBuf() pushes the accumulated bytes in one IPC call.
+  private sendBuf: number[] = [];
+  private sendFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
   constructor(sessionId: string) {
     this.sessionId = sessionId;
   }
@@ -132,14 +150,9 @@ export class ZmodemBridge {
 
   private setupSession(session: any): void {
     session.set_sender((octets: number[]) => {
-      // zmodem.js produced protocol bytes — push them into the SSH channel.
-      sshSendZmodem(this.sessionId, new Uint8Array(octets)).catch((e) => {
-        console.error("sshSendZmodem failed:", e);
-        // Without this, zmodem.js blocks waiting for an ACK that will never
-        // arrive and the UI shows an infinite transfer. abort() is
-        // idempotent and tears down the session + resets status.
-        this.abort();
-      });
+      // zmodem.js produced protocol bytes — batch them and push to the SSH
+      // channel in larger IPC writes (see enqueueSend).
+      this.enqueueSend(octets);
     });
 
     session.on("session_end", () => {
@@ -163,6 +176,38 @@ export class ZmodemBridge {
       // Remote ran `rz` — we're the sender, push files out.
       void this.handleUpload(session);
     }
+  }
+
+  /**
+   * Accumulate outbound ZMODEM bytes and flush them in batches. zmodem.js calls
+   * set_sender once per 8 KiB subpacket; flushing each as its own IPC call is
+   * what capped upload at ~500 KB/s. Batching keeps the wire format identical
+   * (frames are self-delimiting) while cutting IPC round-trips ~6×.
+   */
+  private enqueueSend(octets: number[]): void {
+    for (let i = 0; i < octets.length; i++) this.sendBuf.push(octets[i]);
+    if (this.sendBuf.length >= SEND_BATCH_BYTES) {
+      this.flushSendBuffer();
+    } else if (this.sendFlushTimer === null) {
+      // Small/handshake frame — don't hold it back; flush shortly.
+      this.sendFlushTimer = setTimeout(() => this.flushSendBuffer(), SEND_FLUSH_MS);
+    }
+  }
+
+  private flushSendBuffer(): void {
+    if (this.sendFlushTimer !== null) {
+      clearTimeout(this.sendFlushTimer);
+      this.sendFlushTimer = null;
+    }
+    if (this.sendBuf.length === 0) return;
+    const data = new Uint8Array(this.sendBuf);
+    this.sendBuf = [];
+    sshSendZmodem(this.sessionId, data).catch((e) => {
+      console.error("sshSendZmodem failed:", e);
+      // Without this, zmodem.js blocks waiting for an ACK that will never
+      // arrive and the UI shows an infinite transfer. abort() is idempotent.
+      this.abort();
+    });
   }
 
   /**
@@ -501,10 +546,17 @@ export class ZmodemBridge {
         this.patchStatus({ bytesTransferred: offset });
         this.sampleSpeed();
         // Yield so the UI can repaint and the JS event loop can drain
-        // any incoming acks from zmodem.js's sender.
+        // any incoming acks from zmodem.js's sender. setTimeout(0) is a
+        // MACROTASK yield — required (not Promise.resolve, which is only a
+        // microtask and never runs the Tauri event callbacks that deliver
+        // rz's ZRPOS/ZRINIT). Without this the incoming-event queue starves
+        // and multi-file uploads stall on the first file.
         await new Promise((r) => setTimeout(r, 0));
       }
       await transfer.end(new Uint8Array(0));
+      // transfer.end() enqueued the final ZCRCE/ZEOF bytes into the send
+      // batch; flush now so they aren't held back by the batch timer.
+      this.flushSendBuffer();
     } finally {
       if (this.readHandleId) {
         await rzClose(this.readHandleId);
@@ -529,6 +581,13 @@ export class ZmodemBridge {
   abort(): void {
     if (this.aborted) return;
     this.aborted = true;
+
+    // Drop any buffered outbound bytes; the session is being torn down.
+    if (this.sendFlushTimer !== null) {
+      clearTimeout(this.sendFlushTimer);
+      this.sendFlushTimer = null;
+    }
+    this.sendBuf = [];
 
     if (this.writeHandleId) {
       szClose(this.writeHandleId).catch(() => {});

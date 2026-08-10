@@ -2491,6 +2491,18 @@ async fn zmodem_accept_offer(
     ssh::zmodem_accept_offer(&state, &session_id, path).await
 }
 
+/// Native ZMODEM upload: frontend selected local file(s) to upload. The reader
+/// loop opens the first file, creates a ZmodemSender, and streams data directly
+/// over the SSH channel (zero IPC, symmetric to the native download path).
+#[tauri::command]
+async fn zmodem_start_upload(
+    state: State<'_, AppState>,
+    session_id: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    ssh::zmodem_start_upload(&state, &session_id, paths).await
+}
+
 // ============ Local Terminal Commands ============
 //
 // Local terminal sessions (conn_type='local') spawn a shell under a PTY. They
@@ -2938,9 +2950,14 @@ struct ServerInfo {
     os_pretty: String,
     kernel: String,
     cpu_cores: u32,
+    /// MemTotal from `free -b`.
     mem_total_bytes: u64,
+    /// Used memory = `total − MemAvailable` (the kernel's usable-memory
+    /// estimate; matches htop 3.x / node_exporter). Falls back to procps's
+    /// corrected `used` on legacy systems without an available column.
     mem_used_bytes: u64,
     cpu_usage_pct: f32,
+    /// `mem_used_bytes / mem_total_bytes * 100`. 0 when total is 0.
     mem_usage_pct: f32,
     /// Aggregate bytes across all `/dev/...` partitions. Reported as the
     /// "整体磁盘" number; individual partition sizes are surfaced separately.
@@ -3054,17 +3071,41 @@ fn parse_server_info(raw: &str) -> ServerInfo {
         .and_then(|l| l.trim().parse::<u32>().ok())
         .unwrap_or(0);
 
-    // free -b Mem line: "Mem:  total  used  free  shared  buff  cache  available"
-    let (mem_total, mem_used) = section(raw, "=M=")
+    // free -b Mem line (procps ≥ 3.3.10):
+    // "Mem:  total  used  free  shared  buff/cache  available"
+    // Usage is computed as `total − available`: MemAvailable is the kernel's
+    // own estimate of usable memory (what htop 3.x / node_exporter / k8s
+    // report), whereas procps's derived `used` column overstates pressure on
+    // shmem/tmpfs-heavy boxes. Old `free` output also has 7 tokens on the
+    // Mem: line (… buffers cached), so the available column must be detected
+    // from the header, not the token count.
+    let mem_section = section(raw, "=M=");
+    let has_available = mem_section
+        .lines()
+        .next()
+        .map(|header| header.contains("available"))
+        .unwrap_or(false);
+    let (mem_total, mem_used) = mem_section
         .lines()
         .find(|l| l.starts_with("Mem:"))
         .and_then(|l| {
             let v: Vec<&str> = l.split_whitespace().collect();
-            if v.len() >= 3 {
-                Some((v[1].parse::<u64>().ok()?, v[2].parse::<u64>().ok()?))
+            let total = v.get(1)?.parse::<u64>().ok()?;
+            let used = if has_available && v.len() >= 7 {
+                // Saturate against accounting weirdness (available > total).
+                total.saturating_sub(v.get(6)?.parse::<u64>().ok()?)
             } else {
-                None
-            }
+                // Legacy free (< procps 3.3.10): no available column, and the
+                // Mem: used there counts buffers/cache as consumed. Prefer the
+                // corrected "-/+ buffers/cache:" row when present.
+                mem_section
+                    .lines()
+                    .find(|l| l.starts_with("-/+ buffers/cache:"))
+                    .and_then(|l| l.split_whitespace().nth(2))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| v.get(2).and_then(|s| s.parse::<u64>().ok()))?
+            };
+            Some((total, used))
         })
         .unwrap_or((0, 0));
 
@@ -3168,6 +3209,56 @@ fn pct(used: u64, total: u64) -> f32 {
         0.0
     } else {
         100.0 * used as f32 / total as f32
+    }
+}
+
+#[cfg(test)]
+mod server_info_tests {
+    use super::*;
+
+    /// Modern procps (≥ 3.3.10): header has an `available` column, so
+    /// used = total − available, NOT the procps-derived `used` column.
+    #[test]
+    fn mem_usage_prefers_total_minus_available() {
+        let raw = "=OS=\nDebian GNU/Linux 12 (bookworm)\n\
+                   =K=\n6.1.0-18-amd64\n\
+                   =C=\n8\n\
+                   =M=\n               total        used        free      shared  buff/cache   available\n\
+                   Mem:     16266356000  4194304000  2097152000   268435456  8589934592  11534336000\n\
+                   Swap:     2147483648           0  2147483648\n\
+                   =DT=\n1000202043392 412345678901\n\
+                   =DM=\n/dev/sda1 916G 384G 45% /\n\
+                   =S1=\ncpu  10000 0 5000 80000 1000 0 500 0 0 0\n\
+                   =S2=\ncpu  10100 0 5100 80700 1010 0 510 0 0 0\n";
+        let info = parse_server_info(raw);
+        assert_eq!(info.mem_total_bytes, 16266356000);
+        // total − available, not the 4194304000 `used` column
+        assert_eq!(info.mem_used_bytes, 16266356000 - 11534336000);
+        assert!((info.mem_usage_pct - 29.09).abs() < 0.1);
+    }
+
+    /// Legacy procps (< 3.3.10): 7 tokens on the Mem: line too (last is
+    /// `cached`), but no `available` in the header — fall back to the
+    /// corrected "-/+ buffers/cache:" row, not Mem:'s inflated used.
+    #[test]
+    fn mem_usage_legacy_uses_buffers_cache_row() {
+        let raw = "=M=\n             total       used       free     shared    buffers     cached\n\
+                   Mem:       8192000000 7000000000 1192000000          0  500000000 3500000000\n\
+                   -/+ buffers/cache: 3000000000 5192000000\n\
+                   Swap:      4095996000          0 4095996000\n";
+        let info = parse_server_info(raw);
+        assert_eq!(info.mem_total_bytes, 8192000000);
+        assert_eq!(info.mem_used_bytes, 3000000000);
+        assert!((info.mem_usage_pct - 36.62).abs() < 0.1);
+    }
+
+    /// Missing/garbage sections degrade to zeros instead of panicking.
+    #[test]
+    fn mem_usage_missing_section_is_zero() {
+        let info = parse_server_info("=OS=\nLinux\n=M=\ngarbage\n");
+        assert_eq!(info.mem_total_bytes, 0);
+        assert_eq!(info.mem_used_bytes, 0);
+        assert_eq!(info.mem_usage_pct, 0.0);
     }
 }
 
@@ -3839,7 +3930,7 @@ pub fn run() {
         ssh_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         ftp_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
         local_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        zmodem_files: Mutex::new(HashMap::new()),
+        zmodem_files: Arc::new(Mutex::new(HashMap::new())),
         dek: Arc::new(Mutex::new(None)),
         transfer_cancels: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -3914,6 +4005,7 @@ pub fn run() {
             ssh_send_zmodem_abort,
             ssh_zmodem_finish,
             zmodem_accept_offer,
+            zmodem_start_upload,
             local_connect,
             local_send,
             local_resize,
@@ -4161,11 +4253,15 @@ pub fn run() {
                                     pending.insert(request_id.clone(), tx);
                                 }
 
-                                // Bring window to foreground + emit event.
-                                if let Some(window) = ipc_handle.get_webview_window("main") {
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                }
+                                // Emit to the frontend. We deliberately do NOT
+                                // call window.show()/set_focus() here: exec_in_tab
+                                // usually reuses an already-connected tab, and
+                                // forcing focus on every (often high-frequency)
+                                // ssh_exec call yanks the window to the foreground
+                                // while the user is interacting with it — the main
+                                // cause of the "GUI freezes during MCP use" reports.
+                                // open_connection still focuses the window (it is
+                                // the action that actually opens a new tab).
                                 let payload = serde_json::json!({
                                     "action": "exec_in_tab",
                                     "request_id": request_id,
@@ -4181,41 +4277,70 @@ pub fn run() {
                                     continue;
                                 }
 
-                                // Block until the frontend calls
-                                // mcp_exec_result(request_id, result) or timeout.
-                                // The IPC listener runs on a std thread, so we
-                                // use a mini tokio runtime to await the oneshot.
-                                let timeout = std::time::Duration::from_secs(timeout_secs + 10);
-                                let result = {
-                                    // The IPC listener is a std thread, so create
-                                    // a throwaway runtime just for this await.
-                                    let rt = match tokio::runtime::Runtime::new() {
-                                        Ok(r) => r,
+                                // Detach the blocking wait into its own thread so
+                                // this accept loop can immediately accept the next
+                                // connection. Previously block_on() ran inline and
+                                // a single long/hung exec froze every subsequent
+                                // IPC request (open_connection, vault_status,
+                                // other execs) behind it for up to timeout+10s.
+                                let writer = match reader.get_ref().try_clone() {
+                                    Ok(w) => w,
+                                    Err(e) => {
+                                        // Extremely rare (OS can't dup the socket).
+                                        // Fall back to inline wait so the caller
+                                        // still gets a response instead of a hang.
+                                        log::warn!("[ipc] exec_in_tab cannot clone stream ({}); sync wait", e);
+                                        let timeout = std::time::Duration::from_secs(timeout_secs + 10);
+                                        let result = match tokio::runtime::Runtime::new() {
+                                            Ok(rt) => rt.block_on(async move {
+                                                match tokio::time::timeout(timeout, rx).await {
+                                                    Ok(Ok(val)) => Some(val),
+                                                    _ => None,
+                                                }
+                                            }),
+                                            Err(e) => {
+                                                log::error!("[ipc] exec_in_tab runtime: {e}");
+                                                None
+                                            }
+                                        };
+                                        match result {
+                                            Some(result) => {
+                                                let _ = writeln!(reader.get_mut(), "{}", result);
+                                            }
+                                            None => {
+                                                let mut pending = PENDING_EXEC.lock().unwrap();
+                                                pending.remove(&request_id);
+                                                let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"exec timeout ({}s)\"}}", timeout_secs);
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                };
+                                std::thread::spawn(move || {
+                                    let timeout = std::time::Duration::from_secs(timeout_secs + 10);
+                                    let result = match tokio::runtime::Runtime::new() {
+                                        Ok(rt) => rt.block_on(async move {
+                                            match tokio::time::timeout(timeout, rx).await {
+                                                Ok(Ok(val)) => Some(val),
+                                                _ => None,
+                                            }
+                                        }),
                                         Err(e) => {
-                                            log::error!("[ipc] failed to create runtime: {e}");
-                                            let mut pending = PENDING_EXEC.lock().unwrap();
-                                            pending.remove(&request_id);
-                                            let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"internal: runtime\"}}");
-                                            continue;
+                                            log::error!("[ipc] exec_in_tab runtime: {e}");
+                                            None
                                         }
                                     };
-                                    rt.block_on(async move {
-                                        match tokio::time::timeout(timeout, rx).await {
-                                            Ok(Ok(val)) => Some(val),
-                                            _ => None,
+                                    match result {
+                                        Some(result) => {
+                                            let _ = writeln!(&writer, "{}", result);
                                         }
-                                    })
-                                };
-                                match result {
-                                    Some(result) => {
-                                        let _ = writeln!(reader.get_mut(), "{}", result);
+                                        None => {
+                                            let mut pending = PENDING_EXEC.lock().unwrap();
+                                            pending.remove(&request_id);
+                                            let _ = writeln!(&writer, "{{\"ok\":false,\"error\":\"exec timeout ({}s)\"}}", timeout_secs);
+                                        }
                                     }
-                                    None => {
-                                        let mut pending = PENDING_EXEC.lock().unwrap();
-                                        pending.remove(&request_id);
-                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"exec timeout ({}s)\"}}", timeout_secs);
-                                    }
-                                }
+                                });
                             }
 
                             // MCP polls the GUI's vault state. Used by the
@@ -4338,34 +4463,67 @@ pub fn run() {
                                     let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"emit failed: {}\"}}", e);
                                     continue;
                                 }
-                                let timeout = std::time::Duration::from_secs(20);
-                                let result = {
-                                    let rt = match tokio::runtime::Runtime::new() {
-                                        Ok(r) => r,
+                                // Detach the wait into its own thread, matching the
+                                // exec_in_tab pattern, so a slow screenshot capture
+                                // (e.g. a tab that's still connecting) doesn't stall
+                                // the accept loop and block other IPC requests.
+                                let timeout_secs_sc = 20u64;
+                                let writer = match reader.get_ref().try_clone() {
+                                    Ok(w) => w,
+                                    Err(e) => {
+                                        // Fall back to inline wait (rare).
+                                        log::warn!("[ipc] screenshot cannot clone stream ({}); sync wait", e);
+                                        let timeout = std::time::Duration::from_secs(timeout_secs_sc);
+                                        let result = match tokio::runtime::Runtime::new() {
+                                            Ok(rt) => rt.block_on(async move {
+                                                match tokio::time::timeout(timeout, rx).await {
+                                                    Ok(Ok(val)) => Some(val),
+                                                    _ => None,
+                                                }
+                                            }),
+                                            Err(e) => {
+                                                log::error!("[ipc] screenshot runtime: {e}");
+                                                None
+                                            }
+                                        };
+                                        match result {
+                                            Some(result) => {
+                                                let _ = writeln!(reader.get_mut(), "{}", result);
+                                            }
+                                            None => {
+                                                let mut pending = PENDING_EXEC.lock().unwrap();
+                                                pending.remove(&request_id);
+                                                let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"screenshot timeout ({}s)\"}}", timeout_secs_sc);
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                };
+                                std::thread::spawn(move || {
+                                    let timeout = std::time::Duration::from_secs(timeout_secs_sc);
+                                    let result = match tokio::runtime::Runtime::new() {
+                                        Ok(rt) => rt.block_on(async move {
+                                            match tokio::time::timeout(timeout, rx).await {
+                                                Ok(Ok(val)) => Some(val),
+                                                _ => None,
+                                            }
+                                        }),
                                         Err(e) => {
-                                            let mut pending = PENDING_EXEC.lock().unwrap();
-                                            pending.remove(&request_id);
-                                            let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"runtime: {}\"}}", e);
-                                            continue;
+                                            log::error!("[ipc] screenshot runtime: {e}");
+                                            None
                                         }
                                     };
-                                    rt.block_on(async move {
-                                        match tokio::time::timeout(timeout, rx).await {
-                                            Ok(Ok(val)) => Some(val),
-                                            _ => None,
+                                    match result {
+                                        Some(result) => {
+                                            let _ = writeln!(&writer, "{}", result);
                                         }
-                                    })
-                                };
-                                match result {
-                                    Some(result) => {
-                                        let _ = writeln!(reader.get_mut(), "{}", result);
+                                        None => {
+                                            let mut pending = PENDING_EXEC.lock().unwrap();
+                                            pending.remove(&request_id);
+                                            let _ = writeln!(&writer, "{{\"ok\":false,\"error\":\"screenshot timeout ({}s)\"}}", timeout_secs_sc);
+                                        }
                                     }
-                                    None => {
-                                        let mut pending = PENDING_EXEC.lock().unwrap();
-                                        pending.remove(&request_id);
-                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"screenshot timeout (20s)\"}}");
-                                    }
-                                }
+                                });
                             }
 
                             _ => {

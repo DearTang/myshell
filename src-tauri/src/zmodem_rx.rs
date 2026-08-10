@@ -11,16 +11,16 @@
 use std::io::Write;
 
 // ── ZMODEM constants (byte values) ────────────────────────────────────────
-const ZDLE: u8 = 0x18;
-const ZPAD: u8 = b'*';
-const ZBIN: u8 = b'A'; // binary16 header
-const ZHEX: u8 = b'B'; // hex header
-const ZBIN32: u8 = b'C'; // binary32 header
-const XON: u8 = 0x11;
-const XOFF: u8 = 0x13;
+pub(crate) const ZDLE: u8 = 0x18;
+pub(crate) const ZPAD: u8 = b'*';
+pub(crate) const ZBIN: u8 = b'A'; // binary16 header
+pub(crate) const ZHEX: u8 = b'B'; // hex header
+pub(crate) const ZBIN32: u8 = b'C'; // binary32 header
+pub(crate) const XON: u8 = 0x11;
+pub(crate) const XOFF: u8 = 0x13;
 
 // Frame type numbers (the typenum byte in a header)
-mod frame_type {
+pub(crate) mod frame_type {
     pub const ZRQINIT: u8 = 0;
     pub const ZRINIT: u8 = 1;
     pub const ZSINIT: u8 = 2;
@@ -35,7 +35,7 @@ mod frame_type {
 }
 
 // Subpacket frame-end types (follow a ZDLE)
-mod subpkt_end {
+pub(crate) mod subpkt_end {
     pub const ZCRCE: u8 = 0x68; // h — end of frame, no ack
     pub const ZCRCG: u8 = 0x69; // i — frame continues, no ack (firehose)
     pub const ZCRCQ: u8 = 0x6a; // j — frame continues, ack
@@ -66,7 +66,7 @@ fn zrinit_data() -> [u8; 4] {
 }
 
 /// Pack a file offset as 4 little-endian bytes (ZMODEM ZACK/ZRPOS/ZEOF field).
-fn offset_bytes(off: u64) -> [u8; 4] {
+pub(crate) fn offset_bytes(off: u64) -> [u8; 4] {
     let o = off as u32;
     [
         (o & 0xff) as u8,
@@ -874,7 +874,7 @@ impl ZmodemReceiver {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn hex_val(b: u8) -> Option<u8> {
+pub(crate) fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),
@@ -883,7 +883,7 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-fn hex_char(n: u8) -> u8 {
+pub(crate) fn hex_char(n: u8) -> u8 {
     if n < 10 {
         b'0' + n
     } else {
@@ -892,7 +892,7 @@ fn hex_char(n: u8) -> u8 {
 }
 
 /// ZDLE decode: every 0x18 byte means XOR the next byte with 0x40.
-fn zdle_decode(data: &[u8]) -> Vec<u8> {
+pub(crate) fn zdle_decode(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
@@ -969,7 +969,7 @@ fn updcrc(cp: u8, crc: u16, tab: &[u16; 256]) -> u16 {
     tab[((crc >> 8) & 255) as usize] ^ ((crc & 255) << 8) ^ (cp as u16)
 }
 
-fn crc16_xmodem(bytes: &[u8]) -> u16 {
+pub(crate) fn crc16_xmodem(bytes: &[u8]) -> u16 {
     if bytes.is_empty() {
         return 0;
     }

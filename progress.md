@@ -2356,3 +2356,156 @@
 | 什么可能导致偏离？ | DB 列 app_keepalive_secs 残留（无害，不被读写）。若某 NAT 环境真需应用层心跳（罕见，因 russh 15s 心跳已覆盖绝大多数），需重新评估——但当前用户场景不需要。 |
 | 下一步最小可验证动作？ | 打包发布 → ias21 勾 TMOUT 长期保持 → 普通账号裸连长期保持。 |
 | 目标是什么？ | 移除有害无用的 exec 心跳，连接保活由 russh keepalive + TMOUT 开关覆盖，UI 简洁不再有误用陷阱。 |
+
+### 阶段 95：MCP 新增 lrzsz(ZMODEM) 文件传输支持（zmodem_download / zmodem_upload）（2026-08-04）
+
+- **背景：** MCP 此前只能用 sftp_* 做文件传输，对 SFTP 子系统不可用的服务器（受限/chroot shell、堡垒机、嵌入式设备）无能为力。GUI 早有原生 ZMODEM 支持（zmodem_rx.rs 接收方 + 前端 zmodem.js 上传），但 MCP 是 headless 进程，无法复用前端 zmodem.js 路径。
+- **决策：** 为 MCP 新增两个工具——`zmodem_download`（远端 `sz`→本地，复用核心库已有的原生接收器）、`zmodem_upload`（本地→远端 `rz`，新写 Rust ZMODEM 发送状态机）。双向覆盖 lrzsz 全场景。
+- **实现：**
+  - `zmodem_rx.rs`：把发送方需复用的常量（`ZDLE`/`ZPAD`/`ZBIN`/`ZHEX`/`ZBIN32`/`XON`/`XOFF`）、`frame_type`/`subpkt_end` 模块、`crc16_xmodem`/`offset_bytes`/`hex_char`/`hex_val`/`zdle_decode` 改为 `pub(crate)`，发送方零拷贝复用 CRC 表与编解码。
+  - **新文件 `zmodem_tx.rs`（~520 行）**：纯同步 ZMODEM 发送状态机。状态流 WaitingZrinit→WaitingZrpos→SendingData→WaitingZrinit2→WaitingZfin→Done。协议决策保 lrzsz 兼容：HEX 头、CRC16 子包（即使接收方声明 CANFC32 也用 CRC16，避免实现 CRC32）、ESCCTL 全转义（ZDLE/0x7f/<0x20）、ZCRCG 流式 + ZCRCE 收尾、支持 ZRPOS 重传 seek。`feed()` 解析远端帧、`poll(&mut file)` 推进文件数据。
+  - `lib.rs`：`pub mod zmodem_tx;`。
+  - `myshell-mcp.rs`：
+    - `McpZmodemSink`（实现 `EventSink`）：把 ssh.rs 的 `zmodem_raw`/`zmodem_offer`/`zmodem_end`/`ssh_output`/`ssh_closed` 等事件转成 `ZmodemEvent` enum 塞进 mpsc。
+    - `zmodem_download_tool`：`resolve_via_gui(ssh)` → 校验本地目录 → `ssh::connect`（开 PTY 会话，自动复用 channel_reader 的 ZMODEM 检测+原生接收器）→ `send_input("sz '<path>'\r")` → 事件循环：Offer 时 `sanitize_remote_basename`（剥目录/`..`/Windows 非法字符）→ `zmodem_accept_offer(Some(path))`；End/Error/Closed/超时收尾，错误路径 `zmodem_abort`+`disconnect`。20s 首帧超时（提示装 lrzsz），120s 传输超时。不弹确认框（对齐 sftp_download）。
+    - `zmodem_upload_tool`：`confirm_dangerous_operation` 弹原生确认框（对齐 sftp_upload）→ 读本地文件元数据 → `ssh::connect` → `send_input("cd '<dir>' && rz -y\r")`（`-y` 覆盖不询问）→ 事件循环：Raw 喂 `sender.feed()` 且回写 `actions.send`，随后连续 `sender.poll(&mut file)` 发数据子包直到空。SessionEnd/Error/超时收尾，`zmodem_finish` 退出透传态。
+    - `tool_definitions()` 补两个工具的详细 schema；`SERVER_INSTRUCTIONS` 补一句文件传输优先级（sftp_* 优先，SFTP 不可用才 zmodem_*）。
+  - 安全：远端 offer 文件名 `sanitize_remote_basename` 防路径穿越；`sz`/`rz` 命令路径单引号转义；upload 必弹确认框；所有路径保证 `ssh::disconnect`。
+- **影响：** MCP 从 13 个工具增到 15 个。核心库新增 `zmodem_tx` 模块，`zmodem_rx` 仅放宽可见性（不改逻辑）。GUI/CLI 二进制零改动（cargo check 全目标通过）。
+- **涉及文件（5 个）：** `src-tauri/src/zmodem_tx.rs`（新）、`src-tauri/src/zmodem_rx.rs`、`src-tauri/src/lib.rs`、`src-tauri/src/bin/myshell-mcp.rs`、`AGENTS.md`/`README.md`/`RELEASE_NOTES_STAGING.md`/`progress.md`（文档同步）。
+- **验证：** `cargo check`（全目标，GUI+CLI+MCP）通过，仅剩既有 dead_code warning；`npx tsc --noEmit` 通过（前端未动）。真机 lrzsz 传输验证待用户在带 sz/rz 的服务器上实测（download 可 certutil/fc 校验文件内容）。
+- **已知边界：** 发送方用 CRC16（非 CRC32）——lrzsz `rz` 接受 CRC16 子包无碍，但若未来对接严格要求 CRC32 的接收方需补 CRC32 实现（当前无此需求）。
+
+## 五问重启检查（阶段 95）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 95 complete —— MCP 新增 zmodem_download/zmodem_upload 双向 ZMODEM 传输，新写 zmodem_tx 发送状态机，cargo check 全目标 + tsc 通过。 |
+| 我要去哪里？ | 等用户在带 lrzsz 的服务器上真机验证双向传输正确性（文件内容一致、大文件、ZRPOS 重传），然后随版本一起发布。 |
+| 什么可能导致偏离？ | ①发送方与某些非 lrzsz 接收方（如 zmodem.js 的 rz 实现）的兼容性差异——当前只针对 lrzsz；②远端 rz 若对 ESCCTL 转义有特殊要求可能需调整转义集（lrzsz 无此问题）；③上传用 CRC16，严格要求 CRC32 的接收方会失败（罕见）。 |
+| 下一步最小可验证动作？ | 用户在测试服务器 `apt install lrzsz` 后，用 MCP 跑 zmodem_download 拉一个文件、zmodem_upload 推一个文件，certutil 对比内容。 |
+| 目标是什么？ | MCP 在 SFTP 不可用的受限环境下也能传文件，覆盖堡垒机/嵌入式/受限 shell 场景，补齐 GUI 已有的 lrzsz 能力到 headless MCP 路径。 |
+
+### 阶段 96：底部状态栏内存占用改用 `(total − available) / total` 口径（2026-08-05）
+
+- **背景：** 用户质疑底部栏内存百分比的算法。原实现（`parse_server_info`）解析 `free -b` 的 `used` 列算 `used/total`。该 `used` 是 procps 的推算值（`total − free − buffers − cache`），不是内核直接上报的数：①在 shmem/tmpfs 多的机器（Docker 宿主机）上把共享内存全算成已用，虚高；②与 htop 3.x / node_exporter / Kubernetes 的通行口径不一致，用户对照 htop 会觉得数字对不上；③老 procps（< 3.3.10）的 `free` 没有 available 列，其 `used = total − free` 把 buffers/cache 全算成已用，严重虚高，而原解析只检查 `v.len() >= 3`，这类老系统会直接读进错误值。
+- **决策：** 主口径改为 `(total − MemAvailable) / total`——MemAvailable 是内核自己对"还有多少内存可用"的估计（考虑可回收页与低水位），也是监控行业惯例；`mem_used_bytes` 同步改为 `total − available`，保证前端 chip 显示的 `已用/总量 百分比` 三者自洽。
+- **实现（`main.rs`）：**
+  - `parse_server_info`：检测 `free` 输出表头是否含 `available` 列（**不能按 Mem: 行的 token 数判断**——新旧格式都是 7 个 token，老格式最后一列是 `cached`），有则 `used = total − available`（saturating_sub 防 available > total 的记账异常）；无则回退老格式的 `-/+ buffers/cache:` 修正行（比 Mem: 行自身的 used 准确），再回退 Mem: 的 used 列。
+  - `ServerInfo` 的 `mem_used_bytes` / `mem_usage_pct` 补文档注释，写明口径与回退逻辑。
+  - 新增 `server_info_tests` 测试模块（3 个用例）：现代 free 输出走 total−available、老 free 输出走 buffers/cache 修正行、缺失/垃圾段落退化为 0 不 panic。
+- **涉及文件（1 个）：** `src-tauri/src/main.rs`。前端（ServerInfoPanel.tsx / api.ts）零改动——字段名不变，仅数值口径变化。
+- **验证：** `cargo check` 通过（仅既有 warning）；`cargo test --bin myshell server_info_tests` 3/3 通过。
+- **已知边界：** BusyBox 版 `free` 无 available 列也无 `-/+ buffers/cache:` 行，回退到其 Mem: used 列（口径同旧版，无回归）。
+
+## 五问重启检查（阶段 96）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 96 complete —— 底部栏内存口径从 procps `used/total` 改为内核 `(total − available)/total`，含老 procps 回退路径，cargo check + 3 个单测通过。 |
+| 我要去哪里？ | 随下次打包发布。用户可对照 `htop` 或 `free -h` 的 available 列验证底部栏数值一致。 |
+| 什么可能导致偏离？ | ①老 procps（<3.3.10）系统走 `-/+ buffers/cache:` 回退，口径与现代系统略有差异（已是该环境下的最优解）；②若某发行版 free 表头异常不含 available 但 Mem: 行有 7 列，会误走回退路径——概率极低，且回退值仍是合理近似。 |
+| 下一步最小可验证动作？ | 打开任一 SSH 连接的底部栏，对照该服务器 `free -b` 输出手工算 `(total−available)/total`，确认与底部栏百分比一致。 |
+| 目标是什么？ | 底部栏内存数字与 htop/监控生态口径一致，反映真实内存压力，且兼容老系统不虚高。 |
+
+### 阶段 97：rz 上传提速——专用 pump task 解耦 + 子包/批量加大（2026-08-06）
+
+- **背景：** 用户反馈 GUI 里 `rz -y` 上传非常慢，同样文件 Xshell 快约 10 倍。排查确认 GUI 上传走的是阶段 95 新写的原生 `zmodem_tx.rs` 发送状态机（非 zmodem.js），瓶颈在 ssh.rs 的驱动方式。
+- **根因：**
+  1. **内联 pump 阻塞 reader 的 select!**：文件数据流式循环（`sender.poll()` + `channel.data()`）整个嵌在 `Some(ChannelMsg::Data)` 分支里，整个传输期间 select! 不再轮询——前端命令（取消/结束）、后续入站协议帧全部排队，传输完全由入站数据触发驱动。
+  2. **子包/批量太小**：SUBPACKET_DATA 64 KB、批量门槛 128 KB —— 每 128 KB 一次 `channel.data()` 调用，每次调用内部按 SSH max-packet 分片 + 抢窗口锁，调用开销摊不薄。
+  3. **前端进度条对 native upload 从不激活**（`active` 只在 download offer 时置 true），上传时 overlay 不显示，体感更"卡"。
+- **方案与实现：**
+  - **`ssh.rs` 架构重构——sender+file 移入共享态，pump 独立成 task：**
+    - 新增 `UploadShared { sender, file }`；`TxSession` 改为持有 `Option<Arc<Mutex<UploadShared>>>` + `cancel: Arc<AtomicBool>`（原 `sender`/`file` 直持字段删除），新增 `stop_upload()`。
+    - 新增 `run_upload_pump()`（~110 行）：专用 tokio task，循环 `sender.poll()`（锁内短持，无 await）→ 累积到 **1 MB** 批量 → 经 **bounded mpsc（容量 8，约 8 MB 上限）**推给 reader——有界是刻意的：网络慢于本地磁盘时 `send().await` 背压 pump，在途内存恒定而不是把整个文件堆进队列；**空闲即 flush**（关键正确性：握手帧与 <1 MB 文件的收尾 ZCRCE+ZEOF 不能被 1 MB 门槛扣住）；空闲退避 1→20 ms；退出时发 `SessionCommand::ZmodemFinish` 让 reader 兜底清理（错误路径下前端 overlay 靠它复位；正常 ZFIN 路径幂等无操作）。
+    - reader select! 新增 `upload_batches_rx.recv()` 分支：收到批量 → `channel.data()`。biased 顺序保持 cmd（用户输入）> channel.wait（入站）> batches，传输期间取消/入站帧不再饿死。
+    - `handle_incoming_data` upload 路径改走 `Arc<Mutex<...>>`：锁内完成多文件换 sender + `feed()`，锁外发控制字节；错误/结束路径统一 `stop_upload()` + 清态。
+    - `ZmodemStartUpload` 处理器：创建共享态前 `stop_upload()` 旧 pump（防御）+ 换新 cancel flag，spawn pump task（传入 batches_tx clone、cancel clone、command_tx clone）。
+    - `ZmodemAbort`/`ZmodemFinish` 清理路径同步改为 `stop_upload()` + `upload = None`。
+    - `channel_reader` 签名加 `command_tx` 参数（connect() 处在 move 进 SshSession 前先 clone），供 pump 回投 ZmodemFinish。
+  - **`zmodem_tx.rs`**：`SUBPACKET_DATA` 64 KB → **128 KB**（每 MB 帧数减半，ZDLE/CRC/头开销摊薄；128 KB 在 lrzsz rz 动态解码缓冲舒适区内）。
+  - **`TerminalPanel.tsx`**：upload 分支 `zmodemStartUpload` 成功后置 `zmodemStatus.active=true`（带文件名/多文件计数），进度 overlay 从此在上传时可见（bytesTotal 由首个 zmodem_progress 事件补齐）。
+- **涉及文件（3 个）：** `src-tauri/src/ssh.rs`、`src-tauri/src/zmodem_tx.rs`、`src/components/TerminalPanel.tsx`。
+- **验证：** `cargo build`（全目标 GUI+CLI+MCP）通过，仅既有 warning；`npx tsc --noEmit` 通过。真机提速幅度待用户实测（日志有 `[TX] pump exit: X bytes in Y = Z MB/s` 可直接读数）。
+- **已知边界：** ① pump 空闲退避最高 20 ms，多文件切换时下一文件首个子包最多延迟 20 ms（握手本身就要数个 RTT，可忽略）；② pump 出错时前端只显示传输结束、不显示具体错误文案（`zmodem_error` 前端本就未监听，与改前行为一致）；③ 若实测仍显著慢于 Xshell，下一杠杆是绕开 PTY 的直连 exec channel 传 rz（Xshell 类做法），属更大重构。
+
+## 五问重启检查（阶段 97）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 97 complete —— rz 上传从"内联 pump 阻塞 select!"重构为"共享态 + 专用 pump task + mpsc 批量"，子包 128 KB、批量 1 MB，前端上传进度条激活；cargo build 全目标 + tsc 通过。 |
+| 我要去哪里？ | 用户真机实测 `rz -y` 上传速度（对照日志 `[TX] pump exit` MB/s 与 Xshell）；若仍差距大，评估直连 exec channel 方案。 |
+| 什么可能导致偏离？ | ① reader 与 pump 共抢 UploadShared 锁——均为 µs 级短持、锁内无 await，理论无阻塞风险，但高负载下值得观察；② pump 退出统一回投 ZmodemFinish，正常路径幂等，但若未来 ZmodemFinish 语义变化需同步检查；③ 瓶颈若在服务端 PTY/磁盘而非客户端，本次改动提速有限。 |
+| 下一步最小可验证动作？ | 带 lrzsz 的服务器上 `rz -y` 传一个 ≥100 MB 文件，读日志 `[TX] pump exit: ... MB/s`，对比改前与 Xshell；同时确认传输期间进度条正常走、取消按钮可用。 |
+| 目标是什么？ | rz 上传吞吐接近 Xshell 水平，且传输期间终端控制面（取消/入站帧）不被阻塞。 |
+
+### 阶段 98：rz 上传提速（二）——进度 IPC 事件节流 + 移除无效 flush（2026-08-10）
+
+- **背景：** 阶段 97 的 pump-task 方案后来被回退为 inline pump（独立 task 导致 PTY 输入缓冲溢出 → 字节丢失 → 无限 ZRPOS）。当前 inline pump 架构下，用户再次反馈 `rz -y` 仍慢于 Xshell ~10×。本次聚焦 inline pump 路径上两个零风险、收益明确的瓶颈。
+- **根因（inline pump 路径）：**
+  1. **每 128 KB subpacket 触发 1 次 `zmodem_progress` IPC 事件**——`ZmodemSender::poll()` 每产出一个 subpacket 就 emit 一个 `Progress` 事件，inline pump（`ssh.rs` 的 `Some(ChannelMsg::Data)` 分支）对每个 subpacket 调 `dispatch_tx_events` → `sink.emit("zmodem_progress", ...)`。100 MB 文件 = ~800 次 IPC（JSON 序列化 + WebView postMessage），全部在 reader 线程同步执行；前端每事件触发 React `setState` + `TerminalPanel` + `ZmodemProgressOverlay` 重渲染。这是数据泵被打断的首要原因。
+  2. **sender task 每次 `write_all` 后调用 `flush().await`**——russh 0.50 的 `ChannelTx::poll_flush` 是 no-op（直接返回 `Ready(Ok(()))`），该调用零网络效果但每 batch 走一遍 async 状态机。
+- **方案与实现（低风险两项，不改 pump 架构）：**
+  - **进度事件 100 ms 节流：** `TxSession` 新增 `last_progress_emit: Option<Instant>`；新增 `dispatch_tx_events_throttled()`——仅对 `Progress` 事件做时间节流（距上次 emit ≥100 ms 才发），`sent == total` 的最终进度强制放行（保证进度条必到 100%）；`FileComplete`/`SessionEnd`/`Error`/`Started` 从不节流。inline pump（文件数据流，高频 Progress）改用 throttled 版；`handle_incoming_data` 的控制帧路径（只产 `Started`/`FileComplete`/`SessionEnd`/`Error`，无 Progress）保持原 `dispatch_tx_events`。
+  - **移除 sender task 的 `writer.flush().await`**（保留 `write_all`）——russh 已在每个 permit 可用时推 `ChannelMsg::Data` 到内部 mpsc，background connection task 负责实际 socket 写；flush 无作用。
+  - **不改的部分：** inline pump 架构（pump-task 已证明会 PTY 溢出）、`SUBPACKET_DATA`（128 KB 已是测试最佳值）、`window_size`（16 MB）/`channel_buffer_size`（1024）/`max_packet_size`（32768，russh 默认）均已优化过、CRC16（查表实现）、ZDLE 编码。
+- **涉及文件（1 个）：** `src-tauri/src/ssh.rs`。
+- **验证：** `cargo check` 通过（仅既有 warning）；`npx tsc --noEmit` 通过。提速幅度待用户真机实测（100 MB 文件 IPC 从 ~800 次降到 ~传输秒数×10，减少 8×+）。
+- **已知边界：** ① inline pump 仍只在收到服务器数据时推进（第 3 个潜在瓶颈），若本次提速仍不够，下一步可加定时 tick 驱动 pump；② 100 ms 节流间隔下小文件（<128 KB·1 个 subpacket）的首次 Progress 因 `is_final` 判定直接放行，进度条不受影响。
+
+## 五问重启检查（阶段 98）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 98 complete —— inline pump 路径下两处零风险提速：进度事件 100 ms 节流（减少 ~8× IPC）+ 移除无效 flush()；cargo check + tsc 通过。 |
+| 我要去哪里？ | 用户真机实测 `rz -y` 上传速度，确认提速幅度；若仍慢于 Xshell，评估定时 tick 驱动 pump（第 3 个瓶颈）。 |
+| 什么可能导致偏离？ | ① 100 ms 节流可能让进度条在小文件/快传输时显得"跳跃"，但最终进度强制放行保证到 100%；② 若服务器端 PTY/磁盘是瓶颈，客户端 IPC 优化提速有限；③ inline pump 绑定 channel.wait() 的架构性限制仍在。 |
+| 下一步最小可验证动作？ | 带 lrzsz 服务器 `rz -y` 传 ≥50 MB 文件，对比改前改后速度 + 确认进度条正常到 100% + 传输完成不卡死。 |
+| 目标是什么？ | inline pump 架构不动的前提下，消除 reader 线程上的 IPC 瓶颈，让上传吞吐逼近 SSH PTY 通道的理论上限。 |
+
+### 阶段 99：修复 MCP `ssh_exec` 高频调用导致 GUI 卡死——IPC 监听器串行阻塞 + 抢焦点骚扰（2026-08-10）
+
+- **背景：** 用户反馈本地安装的 MyShell 在操作过程中异常卡死。读 `%APPDATA%\myshell\logs` 排查：MCP 日志（mcp.log）累计 **737 次 `MCP server starting`**、**1187 次 `exec_in_gui_tab`** 调用；最新一次会话 10:07–10:10 三分钟内集中 25 次 exec。GUI 日志（myshell-20675.log）反复出现 `WebView2 error: HRESULT(0x8007139F)`。SSH 后端本身正常（channel_reader started/exited、EOF 均干净），问题完全在 MCP→GUI 的 IPC 编排层。
+- **根因（`src-tauri/src/main.rs` IPC 监听器，单线程串行 accept）：**
+  1. **accept 线程内同步 `block_on`**：`exec_in_tab`（main.rs:4231）与 `screenshot_terminal`（4406）两个分支在 `for stream in listener.incoming()` 的同一线程内 `rt.block_on(timeout(rx))`，等待前端回结果，最多阻塞 `timeout_secs + 10` 秒。阻塞期间监听器无法 accept 下一个连接，后续所有 IPC 请求（`open_connection` / `vault_status` / `get_connection_secrets` / 其他 exec）全部排队冻结。
+  2. **每次 exec 强制抢焦点**：exec_in_tab 分支每次都 `window.show() + set_focus()`。AI 客户端每 5–15 秒调一次 ssh_exec，高频把窗口弹到前台打断用户操作，是体感"卡死/失控"的主因。
+  3. **超时堆积**：命令 hang / 大输出把 sentinel 顶在 PTY 缓冲后面时，前端只能靠 Tier-2（5s 空闲兜底）/ Tier-3（硬超时）返回，期间整条 IPC 通道冻结（一次 timeout=60 的命令会冻结 70s）。
+  4. **WebView2 高频 emit 出错**：`0x8007139F`（"组或资源的状态不是执行请求操作的正确状态"）是渲染线程在高频 `emit("mcp-gui-command")` + 焦点切换下出错，加剧卡顿，与上形成恶性循环。
+- **方案与实现（`src-tauri/src/main.rs`，2 处分支）：**
+  - **exec_in_tab**：删除 `window.show()/set_focus()`（保留 open_connection 的抢焦点，因它才真正开新 tab）；将 `block_on` 等待 + 写回响应 `std::thread::spawn` 到独立线程，accept 线程 emit 后立即 `continue` 回到 accept 循环。`reader.get_ref().try_clone()` 克隆 stream 供子线程写回；clone 失败的极端情况降级为原 inline 同步等待（保证仍有响应、不 hang）。
+  - **screenshot_terminal**：同样把阻塞等待 detach 到独立线程（保留抢焦点——截图需用户看到终端画面）。clone 失败同样降级 inline 等待。
+  - **不动的部分**：`open_connection`（fire-and-forget，本就快）、`vault_status`（纯同步读 DEK）、`get_connection_secrets`（同步 DB+DEK 解密）三个非阻塞分支原样保留——它们不会阻塞 accept 线程。
+- **并发安全性核对：** ① `PENDING_EXEC` 是 `LazyLock<Mutex<HashMap>>`，以 UUID `request_id` 为 key，多线程并发 insert/remove 互不干扰；② `AppState` 各字段（db / ssh_sessions / dek）均为 `Mutex`/`Arc`，线程安全；③ 前端 `mcpExecLocksRef`（App.tsx）已对同一 connection_id 的 exec 做互斥，PTY 层不会出现两条命令交叉污染 sentinel；④ 每条 IPC 连接是一次性的（MCP 每次工具调用新建 TcpStream），`try_clone` 出的 writer 独立 owned，子线程结束后随连接关闭。
+- **涉及文件：** 1 个：`src-tauri/src/main.rs`（IPC 监听器 setup hook 内）。
+- **验证：** `cargo check` 通过（仅既有 warning：`is_openai_protocol`/`started_at`/`setup_file_logging`，均非本次引入）；`npx tsc --noEmit` 通过（本次未改 TS，契约不变）。真机回归建议：AI 客户端连续发 10+ 条 ssh_exec，确认 GUI 不再卡死、窗口不再被反复弹到前台、单条超时命令不再阻塞其他操作。
+- **已知边界：** ① exec_in_tab 不再自动抢焦点——若 tab 尚未打开，首次 exec 会静默开 tab 但不置前；open_connection / screenshot 仍抢焦点，可覆盖大多数"想让用户看到"的场景；② detach 线程在 app 退出时可能仍在等待，但 RunEvent::ExitRequested 会 drain sessions，孤儿线程随进程退出自然回收；③ screenshot clone 失败降级 inline 时仍会短暂阻塞，但属极端罕见路径。
+
+## 五问重启检查（阶段 99）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 99 complete —— IPC 监听器 exec_in_tab/screenshot_terminal 两个分支的阻塞等待 detach 到独立线程 + 去掉 exec 的每次抢焦点；cargo check + tsc 通过。 |
+| 我要去哪里？ | 用户真机回归：AI 连续高频 ssh_exec 下 GUI 不卡死、不抢焦点；单条超时命令不再阻塞其他 IPC 请求。 |
+| 什么可能导致偏离？ | ① 若 AI 客户端串行等待每条 ssh_exec 返回（多数会），detach 只解决"卡死"不解决"总耗时"；② WebView2 `0x8007139F` 若仍出现，需进一步排查高频 emit 节流或升级 tauri/wry；③ try_clone 在某些 Windows 网络栈下偶发失败的降级路径仍会短暂阻塞。 |
+| 下一步最小可验证动作？ | 启动 GUI + MCP，用 AI 对同一服务器连续发 10 条 ssh_exec（含 1 条 timeout=60 的慢命令），观察：GUI 操作是否流畅、窗口是否不再弹前台、慢命令期间其他操作是否可用。 |
+| 目标是什么？ | 消除 MCP 高频 ssh_exec 场景下的 GUI 卡死与焦点骚扰，让 exec_in_tab 路径在"对用户透明"的前提下可靠返回结果。 |
+
+### 阶段 100：ZMODEM(lrzsz) 上传/下载端到端实测验证（2026-08-10）
+
+- **背景：** 阶段 99 修复 IPC 卡死后，用户要求测试 MCP 的 upload/download 功能是否正常（lrzsz 方式）。实测中发现 **2MB 文件上传卡死**（进度 100% 但远端无文件、任务永不结束），随即展开定位。
+- **复现与定位：**
+  - 测试服务器：腾讯云 43.136.77.45（lrzsz 0.12.20）。
+  - 5KB 小文件上传/下载均正常（SHA256 一致）；5MB 下载正常（SHA256 一致）；**2MB 上传卡死**：进度走到 100%，`poll: send=19 events=2 done=false`（发了 ZEOF）后 `send=0 events=0 done=false`，状态机永久停在 WaitingZrinit2，远端无文件。
+  - 关键发现：当前运行的 MCP 是 **`E:\Program Files\MyShell\myshell-mcp.exe`（v2.10.0 发布版，8/6 编译）**，不是 debug 版。MCP 日志里出现 `[zmodem_upload] poll/feed/sending bytes back to SSH` —— 这些代码在**当前源码中已完全删除**（grep 0 结果）。
+  - 根因：旧版 MCP 在进程内自跑 `ZmodemSender::poll/feed`，通过 `McpZmodemSink` 把产生的字节（含 ZEOF 收尾帧）跨进程回路喂回 SSH channel。2MB 数据发完后，最后的 19 字节 ZEOF 经这个回路送出时丢失/时序错乱，远端 rz 收不到 ZEOF → 不回 ZFIN → 状态机永久卡死。
+- **当前源码已是修复后的架构：** `run_upload_task`（myshell-mcp.rs:2175）走 `ssh::zmodem_start_upload`（native pump）——ssh.rs reader 线程内联驱动 `ZmodemSender`，数据直发 SSH channel（`channel.data()`），不经 MCP 进程跨回路。native pump 还有三重收尾保护：①正常 ZFIN 路径（sender.feed 解析）②fast-finish（WaitingZrinit2 收到非协议数据立即结束）③30s 超时兜底（force_finish_for_timeout）。
+- **实测验证（新编译 debug MCP + 运行中的 debug GUI）：**
+  - 下载 5MB：✅ SHA256 `920897...` 完全一致，进度 35%→70%→87%→完成 平滑推进。
+  - 上传 2MB（用户在 GUI 点确认框后）：✅ poll 1-2 等待确认 → poll 3 连接中 → poll 4 **已完成 100%**。远端文件 SHA256 `e1f0cdaef2971a15d322b9b54e551529fbcee5df08a2b855fc46c1b7b958d830` 与源文件完全一致。
+- **验证方法：** 因 zmodem_upload 是高危操作会弹 Windows MessageBoxW 强制人工确认，自动化环境无法点击。编写 `.zcode/test_upload.cjs` 用 stdio JSON-RPC 独立驱动 debug 版 `myshell-mcp.exe`（不替换安装版、不影响当前 AI 会话），用户在前端点击确认框后完成完整流程。测试产物已清理。
+- **结论：** 当前源码（native pump）从架构上消除了旧版上传卡死的根因；下载路径一直正常。两个方向均已实测 SHA256 校验通过。建议重新打包发布。
+
+## 五问重启检查（阶段 100）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 100 complete —— ZMODEM 实测：下载 5MB ✅、上传 2MB ✅（均 SHA256 一致）；旧版 v2.10.0 的 2MB 上传卡死经定位确认是已删除的"MCP 进程内 feed/poll 跨回路"架构问题，当前 native pump 架构已修复。 |
+| 我要去哪里？ | 打包发布，让用户用上新版（修复 IPC 卡死 + ZMODEM 上传卡死）。 |
+| 什么可能导致偏离？ | ① 实测只覆盖 2MB/5MB，超大文件（100MB+）未实测（但 native pump 架构与大小无关，瓶颈在 SSH 带宽）；② 只在腾讯云 Ubuntu/OpenCloudOS + lrzsz 0.12.20 上测过，其他 rz 实现（如 busybox）未覆盖。 |
+| 下一步最小可验证动作？ | 打包后用户在新版 GUI 上对生产服务器传一个真实大小的文件（几十 MB），确认上传/下载均完成且可正常打开。 |
+| 目标是什么？ | 确认 ZMODEM 上传/下载在新架构下可靠工作，可以安全打包发布。 |

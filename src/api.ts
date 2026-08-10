@@ -1205,6 +1205,18 @@ export async function zmodemAcceptOffer(
   await invoke("zmodem_accept_offer", { sessionId, path });
 }
 
+/**
+ * Native ZMODEM upload: start uploading one or more local files to the remote
+ * server (remote `rz`). The Rust backend opens the files and streams data
+ * directly over the SSH channel — zero IPC, symmetric to the download path.
+ */
+export async function zmodemStartUpload(
+  sessionId: string,
+  paths: string[]
+): Promise<void> {
+  await invoke("zmodem_start_upload", { sessionId, paths });
+}
+
 // ============ Update check ============
 
 /**

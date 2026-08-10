@@ -8,6 +8,23 @@
   格式参考 keepachangelog.com。新增条目尽量简洁，按 ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全 分组。
 -->
 
+## v2.11.0（2026-08-10）
+
+#### ✨ 新增
+
+- **MCP 新增 lrzsz(ZMODEM) 文件传输**：`zmodem_download`（远端 `sz`→本地，复用原生接收器）与 `zmodem_upload`（本地→远端 `rz`，Rust 发送状态机），覆盖 SFTP 子系统不可用的受限 shell/堡垒机/嵌入式设备场景。上传走 native pump 架构（reader 线程内联驱动，数据直发 SSH channel），中/大文件实测 SHA256 完全一致。
+
+#### 🛠️ 优化
+
+- **底部状态栏内存占用**改用内核 MemAvailable 口径（`(total − available) / total`），与 htop / node_exporter 一致；老 procps（无 available 列）自动回退到 `-/+ buffers/cache:` 修正值，不再虚高。
+- **rz 上传提速**：原生 ZMODEM 发送改为专用 pump task + 1 MB 批量写（不再阻塞终端 select! 循环），子包 64→128 KB，上传进度条正常显示。
+- **rz 上传再提速**：进度 IPC 事件 100ms 节流（每个 128KB 数据块不再各触发 1 次跨进程 IPC + 前端重渲染，100MB 文件减少 ~8× IPC），移除 sender task 的无效 flush()。
+
+#### 🐛 修复
+
+- **MCP `ssh_exec` 高频调用导致 GUI 卡死**：GUI 侧 IPC 监听器为单线程串行 accept，`exec_in_tab`/`screenshot_terminal` 在 accept 线程内同步 block_on 等待前端回结果，单条命令阻塞会冻结整个 IPC 通道（后续 open_connection / vault_status / 其他 exec 全部排队）；改为将阻塞等待 detach 到独立 std 线程，accept 线程立即回到循环；同时移除 exec_in_tab 每次调用都 window.show()+set_focus() 抢焦点的高频骚扰。
+- **ZMODEM(rz) 上传中/大文件卡死**：2MB+ 文件上传进度卡 100% 但远端无文件、任务永不结束。根因是上传发送状态机的 ZEOF 收尾帧经跨进程回路送出时丢失/时序错乱，远端 rz 收不到 ZEOF → 不回 ZFIN → 状态机永久卡在 WaitingZrinit2。已重构为 native pump 架构（ssh.rs reader 线程内联驱动 ZmodemSender，数据直发 SSH channel，不再经 MCP 进程跨回路），并加 fast-finish + 30s 超时双重兜底。
+
 ## v2.10.0（2026-08-03）
 
 #### ✨ 新增

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 pub mod ssh;
 pub mod zmodem_rx;
+pub mod zmodem_tx;
 pub mod sftp;
 pub mod db;
 pub mod secrets;
@@ -222,6 +223,9 @@ pub struct QuickCommandExecItem {
 
 // ============ App State ============
 
+/// `Clone`-able so the MCP server can hand a copy to each background transfer
+/// task (each field is `Arc`/`Mutex`, so cloning is cheap and shares state).
+#[derive(Clone)]
 pub struct AppState {
     /// Arc-wrapped so per-session SshClient handlers can clone a reference
     /// for `check_server_key` lookups without borrowing State.
@@ -231,7 +235,7 @@ pub struct AppState {
     /// Local PTY terminal sessions, keyed by UUID session id (== frontend
     /// tab id, same invariant as ssh_sessions).
     pub local_sessions: Arc<Mutex<std::collections::HashMap<String, local::LocalSession>>>,
-    pub zmodem_files: Mutex<HashMap<String, ZmodemFileHandle>>,
+    pub zmodem_files: Arc<Mutex<HashMap<String, ZmodemFileHandle>>>,
     /// Data Encryption Key (DEK) — random 32-byte key for encrypting all
     /// database columns and keyring entries. Derived once at setup and
     /// stored encrypted by the login password. `None` until unlocked.

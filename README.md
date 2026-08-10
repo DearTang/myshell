@@ -35,7 +35,7 @@
 - **命令历史栏**：最近 50 条命令 + 钉住置顶
 - **快捷命令**：全局快捷命令 + 服务器专属快捷命令，多行命令按行顺序一键执行（`#` 注释与空行自动跳过），支持广播到多终端
 - **广播输入**：同时向多个终端发送相同命令
-- ZMODEM 协议支持（rz/sz 文件传输）
+- ZMODEM 协议支持（rz/sz 文件传输）：原生 Rust 收发（零 JS 数据路径），128 KB 子包批量直写 SSH channel，进度 IPC 事件 100ms 节流削减跨进程开销，传输期间进度条实时显示、取消可用
 - 服务器状态实时监控（CPU、内存、磁盘）
 - **本地终端**：直连本地 PowerShell / CMD / WSL / 自定义 shell，作为可保存的连接，体验等同 SSH 终端
 - **终端字体**：从系统已安装字体下拉选择（也可手输），默认字体栈 Nerd Font 优先，正确渲染 Powerline / 图标字形（Oh My Posh / Starship / powerlevel10k 等）；支持**按连接单独覆盖字体**
@@ -107,9 +107,22 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 ```
 
 > **安全模型**：MCP server 不存储 vault 密码，也不持有解密密钥。所有服务器访问必须经过 MyShell GUI——ssh_exec 在 GUI 终端标签页内执行（用户已在 GUI 中解锁 vault），SFTP 工具通过 IPC 向 GUI 请求解密后的连接凭证。GUI 未运行或 vault 未解锁时，MCP 返回错误提示用户打开 GUI。
-暴露 11 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`test_connection`、`screenshot_terminal`、`open_in_gui`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。
+暴露 15 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz`/`rz`（lrzsz）走 ZMODEM 协议传输文件，用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 sftp_*，SFTP 不可用时才用 zmodem_*。
 
 ## 更新日志
+
+### v2.11.0（2026-08-10）
+
+#### ✨ 新增
+- **MCP 新增 lrzsz(ZMODEM) 文件传输**：`zmodem_download`/`zmodem_upload` 覆盖 SFTP 子系统不可用的受限 shell/堡垒机/嵌入式设备场景。上传走 native pump 架构，中/大文件实测 SHA256 完全一致。
+
+#### 🛠️ 优化
+- **底部状态栏内存占用**改用内核 MemAvailable 口径，与 htop / node_exporter 一致，不再虚高。
+- **rz 上传提速**：专用 pump task + 1 MB 批量写，子包 64→128 KB；进度 IPC 事件 100ms 节流（100MB 文件减少 ~8× IPC）。
+
+#### 🐛 修复
+- **MCP `ssh_exec` 高频调用导致 GUI 卡死**：IPC 监听器串行阻塞改为独立线程处理，单条命令不再冻结整个通道；移除 exec 每次抢焦点骚扰。
+- **ZMODEM(rz) 上传中/大文件卡死**：ZEOF 收尾帧经跨进程回路丢失导致永久卡死，已重构为 native pump 架构 + fast-finish + 30s 超时双重兜底。
 
 ### v2.10.0（2026-08-03）
 

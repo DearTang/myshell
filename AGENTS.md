@@ -77,7 +77,7 @@ Vault unlock: OS keyring (via `myshell-cli vault save-passphrase`) > `--passphra
 ### MCP server (`myshell-mcp`)
 
 Exposes SSH/SFTP operations as MCP tools for AI agents (Claude Desktop, Cursor, ZCode, etc.):
-- Tools: `list_connections`, `ssh_exec`, `sftp_list`, `sftp_download`, `sftp_upload`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, `test_connection`
+- Tools: `list_connections`, `ssh_exec`, `sftp_list`, `sftp_download`, `sftp_upload`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, `upload_project`, `download_project`, `test_connection`, `screenshot_terminal`, `open_in_gui`, `zmodem_download`, `zmodem_upload`
 - Transport: stdio (Content-Length framed JSON-RPC 2.0)
 - Auth: `MYSHELL_PASSPHRASE` env var on startup
 
