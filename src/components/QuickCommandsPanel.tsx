@@ -446,11 +446,81 @@ function EditorForm({
   onCancel: () => void;
 }) {
   const canSave = label.trim().length > 0 && command.trim().length > 0 && !saving;
+  const [helpOpen, setHelpOpen] = useState(false);
+  const codeStyle = {
+    background: "var(--bg-surface)",
+    padding: "1px 5px",
+    borderRadius: 3,
+    fontFamily: "'Cascadia Code', 'Fira Code', monospace",
+    fontSize: 12,
+    color: "var(--text-primary)",
+  };
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-      <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>
+      <div
+        style={{
+          fontSize: 14,
+          fontWeight: 600,
+          color: "var(--text-primary)",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+        }}
+      >
         {isNew ? "新增快捷命令" : "编辑快捷命令"}
+        <button
+          type="button"
+          onClick={() => setHelpOpen((v) => !v)}
+          title="命令编写规则"
+          style={{
+            width: 18,
+            height: 18,
+            borderRadius: "50%",
+            border: "1px solid var(--border-default)",
+            background: helpOpen ? "var(--accent-primary)" : "var(--bg-input)",
+            color: helpOpen ? "white" : "var(--text-muted)",
+            fontSize: 11,
+            fontWeight: 700,
+            lineHeight: 1,
+            cursor: "pointer",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 0,
+            flexShrink: 0,
+          }}
+        >
+          ?
+        </button>
       </div>
+      {helpOpen && (
+        <div
+          style={{
+            background: "var(--bg-input)",
+            border: "1px solid var(--border-default)",
+            borderRadius: "var(--radius-md)",
+            padding: "10px 12px",
+            fontSize: 12,
+            color: "var(--text-secondary)",
+            lineHeight: 1.7,
+            display: "flex",
+            flexDirection: "column",
+            gap: 5,
+          }}
+        >
+          <div>• 每行一条命令，按顺序逐行发送到终端</div>
+          <div>
+            • 以 <code style={codeStyle}>#</code> 开头的行和空行会被跳过（注释）
+          </div>
+          <div>
+            • <code style={codeStyle}>##delay:500</code> — 两行之间等待 500 毫秒（如等待密码提示）
+          </div>
+          <div>
+            • <code style={codeStyle}>##delay:1s</code> / <code style={codeStyle}>##delay:0.5s</code> — 也支持秒
+          </div>
+          <div>• 「设置 → 快捷命令」开启「智能等待」可自动等上一行输出静止后再发下一行（推荐）</div>
+        </div>
+      )}
       <div>
         <label
           style={{
@@ -502,13 +572,14 @@ function EditorForm({
             marginBottom: 4,
           }}
         >
-          命令（每行一条，按顺序执行；以 # 开头的行和空行会被跳过）
+          命令
           <span style={{ color: "var(--error)", marginLeft: 3, fontWeight: 700 }}>*</span>
+          <span style={{ color: "var(--text-muted)", fontWeight: 400, marginLeft: 6, fontSize: 11 }}>每行一条，点标题旁 ? 查看写法</span>
         </label>
         <textarea
           value={command}
           onChange={(e) => onCommand(e.target.value)}
-          placeholder={"sudo systemctl restart nginx\n# 清理 7 天前的日志\nfind /var/log -mtime +7 -delete"}
+          placeholder={"sudo systemctl restart nginx\n# 清理 7 天前的日志\nfind /var/log -mtime +7 -delete\n\n# 需要等待交互提示时，用 ##delay:N 插入延迟：\n# mysql -u root -p\n# ##delay:800\n# mypassword"}
           rows={8}
           className={!command.trim() ? "field-error" : undefined}
           onFocus={(e) => {

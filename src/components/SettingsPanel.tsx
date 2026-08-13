@@ -2935,6 +2935,84 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
               </button>
             </div>
           </Section>
+
+          <Divider />
+
+          {/* 行间延迟 — 多行快捷命令逐行发送的间隔控制，避免下一条命令在交互
+              提示（sudo/mysql 密码）就绪前被送出。三档模式 + ##delay:N 行内指令。 */}
+          {(() => {
+            const selectStyle = {
+              background: "var(--bg-surface)",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border)",
+              borderRadius: "var(--radius)",
+              padding: "6px 10px",
+              fontSize: 13,
+              outline: "none",
+              cursor: "pointer",
+            };
+            const codeStyle = {
+              background: "var(--bg-input)",
+              padding: "1px 5px",
+              borderRadius: 3,
+              fontFamily: "'Cascadia Code','Fira Code',monospace",
+              fontSize: 12,
+            };
+            // Effective mode: explicit key, else migrate from the old delay-ms
+            // value (>0 ⇒ fixed). Re-read each render (forced via setAutoLockTick).
+            const qcMode =
+              localStorage.getItem("myshell-quick-command-mode") ||
+              (Number(localStorage.getItem("myshell-quick-command-line-delay-ms")) > 0
+                ? "fixed"
+                : "off");
+            const qcMs = localStorage.getItem("myshell-quick-command-line-delay-ms") || "300";
+            return (
+              <Section title="⏱ 行间延迟">
+                <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.6 }}>
+                  多行快捷命令逐行发送时的间隔策略。<b>智能等待</b>监听终端输出，等上一行输出静止后再发下一行（推荐，自动适配命令速度，能处理密码提示）；<b>固定延迟</b>每行固定等待；<b>关闭</b>一次性全部发出。
+                  <br />
+                  需在某处精确等待时，可在命令里单独写一行 <code style={codeStyle}>##delay:800</code>（毫秒）或 <code style={codeStyle}>##delay:1s</code>（秒），作为最小等待下限（与模式叠加生效）。
+                </div>
+                <Field label="等待模式">
+                  <select
+                    value={qcMode}
+                    onChange={(e) => {
+                      localStorage.setItem("myshell-quick-command-mode", e.target.value);
+                      setAutoLockTick((t) => t + 1);
+                    }}
+                    style={selectStyle}
+                  >
+                    <option value="off">关闭（一次性发出）</option>
+                    <option value="fixed">固定延迟</option>
+                    <option value="idle">智能等待（推荐）</option>
+                  </select>
+                </Field>
+                {qcMode !== "off" && (
+                  <Field label={qcMode === "idle" ? "静止判定时长" : "固定延迟时长"}>
+                    <select
+                      value={qcMs}
+                      onChange={(e) => {
+                        localStorage.setItem("myshell-quick-command-line-delay-ms", e.target.value);
+                        setAutoLockTick((t) => t + 1);
+                      }}
+                      style={selectStyle}
+                    >
+                      <option value="100">100 毫秒</option>
+                      <option value="300">300 毫秒</option>
+                      <option value="500">500 毫秒（推荐）</option>
+                      <option value="1000">1 秒</option>
+                      <option value="2000">2 秒</option>
+                    </select>
+                  </Field>
+                )}
+                {qcMode === "idle" && (
+                  <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4, lineHeight: 1.5 }}>
+                    ⚠ 基于"输出静止"判定：对断续输出的命令（如 apt install 有较长停顿）可能略早发送下一条；可调大静止时长，或在该处用 ##delay:N 兜底。
+                  </div>
+                )}
+              </Section>
+            );
+          })()}
             </>
           )}
           </div>

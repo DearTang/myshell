@@ -2509,3 +2509,56 @@
 | 什么可能导致偏离？ | ① 实测只覆盖 2MB/5MB，超大文件（100MB+）未实测（但 native pump 架构与大小无关，瓶颈在 SSH 带宽）；② 只在腾讯云 Ubuntu/OpenCloudOS + lrzsz 0.12.20 上测过，其他 rz 实现（如 busybox）未覆盖。 |
 | 下一步最小可验证动作？ | 打包后用户在新版 GUI 上对生产服务器传一个真实大小的文件（几十 MB），确认上传/下载均完成且可正常打开。 |
 | 目标是什么？ | 确认 ZMODEM 上传/下载在新架构下可靠工作，可以安全打包发布。 |
+
+### 阶段 101：快捷命令多行执行——行间延迟优化（2026-08-13）
+
+- **背景：** 用户反馈多行快捷命令逐行执行时，上一条命令（如 `sudo` / `mysql -u root -p` / `ssh` 触发的交互提示）尚未就绪，下一条命令已被送出，导致账号密码等输入失败。原实现 `CommandBar.handleExecuteQuickCommand` 把所有行 `.join("\r")` 后一次性 `sendFn`，中间无任何停顿。
+- **方案（纯前端，零 Rust/DB 改动）：** 两种互补机制——
+  1. **行内延迟指令** `##delay:<N>`：命令文本里单独占一行，在该处插入延迟。`<N>` 默认毫秒，可带 `s` 后缀表秒（`##delay:1s`、`##delay:0.5s`）；`##pause:<N>` 为同义别名。指令行不发给 shell，仅控制两行之间的时序。
+  2. **全局默认行间延迟**：localStorage `myshell-quick-command-line-delay-ms`，默认 `0`（关闭=旧行为，向后兼容）。设置 → 快捷命令 → ⏱ 行间延迟 提供预设下拉（不启用/100/300/500/1000/2000ms）。
+- **语义：** 两行之间若有显式 `##delay:` 指令，则该间隔**只**用显式值（不叠加默认值）；没有指令的间隔才用全局默认值。即"标了的地方精确等、没标的地方有兜底"，不重复计时。
+- **改动点：**
+  - `src/components/CommandBar.tsx`：新增 `parseQuickCommand()`（逐行解析为 cmd/delay 步骤，先识别 `##delay`/`##pause` 再判 `#` 注释）、`sleep()`、`readQuickCmdLineDelayMs()`；重写 `handleExecuteQuickCommand` 为"解析成步骤序列 → 循环逐行发送、间隔按语义插入延迟"，面板立即关闭、中途断连由 `Promise.allSettled` 吞掉。单行输入框 `handleExecute` 不受影响。
+  - `src/components/SettingsPanel.tsx`：快捷命令分类新增 `<Divider/>` + `<Section title="⏱ 行间延迟">` + `<Field>` + 预设 `<select>`，复用既有 `setAutoLockTick` 强制重渲染，并在说明中介绍 `##delay:N` 指令。
+  - `src/components/QuickCommandsPanel.tsx`：更新编辑器 textarea label 与 placeholder，说明 `##delay:N` 用法并给出 mysql 密码示例。
+- **验证：** `npx tsc --noEmit` 通过（无类型错误）。待用户手动验证：建一条 `mysql -u root -p` + `##delay:800` + 密码 的快捷命令，确认延迟生效、密码正确进入提示。
+
+## 五问重启检查（阶段 101）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 101 complete —— 快捷命令多行执行新增行间延迟（`##delay:N` 行内指令 + 全局默认延迟设置），纯前端改动，tsc 通过。 |
+| 我要去哪里？ | 此功能随下一次 `打包` 发布。 |
+| 什么可能导致偏离？ | ① 延迟是固定时长，非"等待提示出现"——对极慢的交互程序仍可能不够，需用户手动调大 `##delay` 值；② 未做"检测到 shell 提示符再发下一条"的智能同步（实现复杂且不可靠，本期不做）。 |
+| 下一步最小可验证动作？ | 用户在新版 GUI 建一条含 `##delay:800` 的 mysql 登录快捷命令，确认密码正确进入提示而非被当作命令。 |
+| 目标是什么？ | 解决多行快捷命令中交互提示/密码输入被下一条命令提前冲掉的问题。 |
+
+### 阶段 102：快捷命令「智能等待」——输出静止检测自动同步下一行（2026-08-13）
+
+- **背景：** 阶段 101 用固定延迟 + `##delay:N` 解决了行间时序，但固定时长无法适配命令真实速度（慢命令不够等、快命令白等）。用户提出"能否等上一行确认执行完再发下一行"作为互补。
+- **可行性调研：** 仓库已有先例——`App.tsx` 的 MCP `runExec`（673 行起）就是"发命令 + 哨兵 `echo __MCP_DONE_xxx__:$?` + 监听 `ssh_output` + 三层完成（哨兵/空闲兜底/硬超时）"。但**哨兵法解决不了密码提示**：`mysql -p` 触发的是 mysql 自己的 Password: 提示，shell 没回来，无法 echo 哨兵。因此采用**输出静止检测（idle/quiescence）**作为主机制——输出停了，要么 shell 提示符回来了，要么程序在等输入，两种情况下一条都可安全发出。零配置、不污染终端/历史，能同时覆盖 shell 命令与交互提示。
+- **方案（纯前端）：** 把"行间延迟"升级为**三档模式**（localStorage `myshell-quick-command-mode`）：
+  - `off`：一次性全发（旧行为，默认）
+  - `fixed`：固定延迟（阶段 101 已做）
+  - `idle`：智能等待——发完一行后监听 `ssh_output`，等输出静止 `ms`（静止判定窗口，下限 300ms）再发下一行
+  - `##delay:N` 始终作为**最小等待下限**，与模式叠加（floor 与 idle 都满足才发）；floor 之间取 max。
+- **关键技术点（均已处理）：**
+  - **回显竞态**：发完一行若立刻判"静止"，`lastDataAt` 还是上一条的旧值会误判立即发。解法：发送前置 `landed=false`，先等"该行回显到达"（PTY 默认开回显，命令必有回显；1.5s 超时兜底无回显情况）再进入静止判定。
+  - **慢速断续输出**（apt install 有停顿）：每次输出重置静止计时器，间隔 >窗口 时可能略早发；UI 提示用户调大窗口或该处用 `##delay:N` 兜底。
+  - **硬上限**：每段间隔最多等 30s，防止 `tail -f` / hang 永久阻塞序列。
+  - **本地终端**：`local.rs` 复用 `ssh_output` 事件（AGENTS.md 已述），同一监听器覆盖 local tab。
+  - **广播**：监听主会话 `sessionId` 的输出作为同步基准（其他会话假定相近），无需特例。
+  - **清理**：`try/finally` 保证 `unlisten` 必被调用，组件卸载/断连不影响（send 失败由 `Promise.allSettled` 吞掉）。
+- **改动点：**
+  - `src/components/CommandBar.tsx`：`readQuickCmdLineDelayMs` → `readQuickCmdDelayConfig`（返回 `{mode,ms}`，含旧值迁移：旧 delay-ms>0 ⇒ fixed）；`handleExecuteQuickCommand` 重写为 mode 驱动 + idle 监听（`onSshOutput` + `lastDataAt`/`landed` + `waitForQuiescence` 两阶段）。
+  - `src/components/SettingsPanel.tsx`：⏱ 行间延迟 Section 重做——等待模式下拉（关闭/固定延迟/智能等待）+ 时长下拉（仅模式≠关闭时显示，idle 时标"静止判定时长"），idle 选中时附局限性提示。
+  - `src/components/QuickCommandsPanel.tsx`：编辑器 label 补"智能等待"说明。
+- **验证：** `npx tsc --noEmit` 通过。待手动：设为「智能等待」，建一条 `mysql -u root -p` + 密码 的快捷命令（无需 `##delay`），确认密码在提示出现后才发出。
+
+## 五问重启检查（阶段 102）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 102 complete —— 快捷命令新增「智能等待」模式（输出静止检测），三档模式 + ##delay:N 叠加语义，纯前端，tsc 通过。 |
+| 我要去哪里？ | 随下一次 `打包` 发布（与阶段 101 一同）。 |
+| 什么可能导致偏离？ | ① idle 基于固定静止窗口，断续输出命令可能略早发（已用 ##delay:N/调大窗口兜底）；② 广播时只监听主会话，其他会话若速度差异大可能不同步；③ 未做"检测 shell 提示符"的精确同步（实现复杂不可靠，idle 已是务实最优）。 |
+| 下一步最小可验证动作？ | 用户设「智能等待」，跑一条 mysql 登录（无 ##delay）确认密码时序正确；再跑一条 apt install 类断续命令确认不会卡死。 |
+| 目标是什么？ | 让多行快捷命令自动适配命令速度，等上一行真正就绪（含密码提示）再发下一行，无需手测延迟值。 |

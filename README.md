@@ -33,7 +33,7 @@
 - **连接状态指示**：tab 页顶部显示在线（绿色）/离线（红色）/异常（红色×）状态
 - **连接失败重连**：tab 页右下角显示失败提示，支持一键重连
 - **命令历史栏**：最近 50 条命令 + 钉住置顶
-- **快捷命令**：全局快捷命令 + 服务器专属快捷命令，多行命令按行顺序一键执行（`#` 注释与空行自动跳过），支持广播到多终端
+- **快捷命令**：全局快捷命令 + 服务器专属快捷命令，多行命令按行顺序一键执行（`#` 注释与空行自动跳过），支持广播到多终端；支持**行间延迟**——三档模式：`##delay:500`（或 `##delay:1s`）在两行之间精确等待、固定延迟、或「智能等待」（监听终端输出，等上一行输出静止后再发下一行，自动适配命令速度、能处理 `sudo`/`mysql` 密码提示）；在「设置 → 快捷命令」配置
 - **广播输入**：同时向多个终端发送相同命令
 - ZMODEM 协议支持（rz/sz 文件传输）：原生 Rust 收发（零 JS 数据路径），128 KB 子包批量直写 SSH channel，进度 IPC 事件 100ms 节流削减跨进程开销，传输期间进度条实时显示、取消可用
 - 服务器状态实时监控（CPU、内存、磁盘）
@@ -110,6 +110,16 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 暴露 15 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz`/`rz`（lrzsz）走 ZMODEM 协议传输文件，用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 sftp_*，SFTP 不可用时才用 zmodem_*。
 
 ## 更新日志
+
+### v2.11.1（2026-08-13）
+
+#### 🛠️ 优化
+
+- **快捷命令多行执行支持行间延迟**，避免下一条命令在交互提示/密码输入就绪前被提前送出。在「设置 → 快捷命令 → ⏱ 行间延迟」选择模式：
+  - **智能等待**：监听终端输出，等上一行输出静止后再发下一行，自动适配命令速度，能处理 `sudo`/`mysql` 密码提示（推荐）；
+  - **固定延迟**：每行之间固定等待；
+  - **关闭**：一次性全部发出（旧行为）。
+- **行内延迟指令** `##delay:500`（或 `##delay:1s`）在两行之间精确等待，作为最小下限与模式叠加生效；命令编辑器标题旁新增 `?` 按钮可展开/收起编写规则说明。
 
 ### v2.11.0（2026-08-10）
 

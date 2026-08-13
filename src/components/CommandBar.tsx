@@ -8,6 +8,7 @@ import {
   sshSend,
   localSend,
   listQuickCommandsForConnection,
+  onSshOutput,
 } from "../api";
 import type { CommandHistoryItem, ConnType, QuickCommandExecItem } from "../api";
 
@@ -35,6 +36,75 @@ interface Props {
   /** Capture a PNG screenshot of the terminal viewport (excludes this
    * CommandBar). Saves to the configured attachment directory. */
   onScreenshot?: () => void;
+}
+
+// ============ Quick command parsing & inter-line delay ============
+
+/** localStorage keys for inter-line delay between multi-line quick commands. */
+const QUICK_CMD_LINE_DELAY_KEY = "myshell-quick-command-line-delay-ms";
+const QUICK_CMD_MODE_KEY = "myshell-quick-command-mode";
+
+/** How lines of a multi-line quick command are spaced when sent to the PTY.
+ *  - `off`:   send all lines at once (legacy behaviour).
+ *  - `fixed`: wait a fixed number of ms between consecutive lines.
+ *  - `idle`:  wait until the previous line's output has gone quiet for `ms`
+ *             before sending the next line. Handles interactive prompts
+ *             (sudo/mysql password) that a fixed delay or shell sentinel
+ *             cannot — when output stops, either the shell prompt is back or
+ *             the program is waiting for input. */
+type QuickCmdDelayMode = "off" | "fixed" | "idle";
+
+/** Read the configured inter-line delay mode + duration. `ms` is the fixed
+ *  delay (mode=`fixed`) or the output-quiescence window (mode=`idle`). */
+function readQuickCmdDelayConfig(): { mode: QuickCmdDelayMode; ms: number } {
+  const msRaw = Number(localStorage.getItem(QUICK_CMD_LINE_DELAY_KEY));
+  const ms = Number.isFinite(msRaw) && msRaw > 0 ? Math.min(msRaw, 60_000) : 0;
+  const stored = localStorage.getItem(QUICK_CMD_MODE_KEY) as QuickCmdDelayMode | null;
+  const mode: QuickCmdDelayMode =
+    stored === "off" || stored === "fixed" || stored === "idle"
+      ? stored
+      : // Migration: before the mode key existed, a non-zero delay-ms meant
+        // fixed delay. Anything else (unset / 0) = off.
+        ms > 0
+        ? "fixed"
+        : "off";
+  return { mode, ms };
+}
+
+/** Promise-based sleep. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type QuickCmdStep =
+  | { type: "cmd"; text: string }
+  | { type: "delay"; ms: number };
+
+/** Parse a quick command's raw text into an ordered list of steps.
+ *
+ *  - Empty lines and `#`-comment lines are dropped.
+ *  - A line `##delay:<N>` / `##pause:<N>` inserts a delay of <N> ms. `<N>`
+ *    may be suffixed with `s` for seconds (e.g. `##delay:1s`, `##delay:0.5s`).
+ *    These directive lines are NOT sent to the shell — they only gate timing
+ *    between the surrounding command lines (useful before a password prompt).
+ *  - Everything else is a command line, sent verbatim with a trailing CR. */
+function parseQuickCommand(command: string): QuickCmdStep[] {
+  const steps: QuickCmdStep[] = [];
+  for (const raw of command.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.length === 0) continue;
+    const m = line.match(/^##(?:delay|pause):\s*(\d+(?:\.\d+)?)\s*(ms|s)?\s*$/i);
+    if (m) {
+      const value = parseFloat(m[1]);
+      const unit = (m[2] ?? "ms").toLowerCase();
+      const ms = unit === "s" ? Math.round(value * 1000) : Math.round(value);
+      steps.push({ type: "delay", ms: Math.max(0, ms) });
+      continue;
+    }
+    if (line.startsWith("#")) continue; // comment
+    steps.push({ type: "cmd", text: line });
+  }
+  return steps;
 }
 
 export function CommandBar({ sessionId, connectionId, connType, broadcastTargets = [], onRegisterRefresh, status, onReconnect, onOpenQuickCommandsManage, onOpenAi, onOpenMultiWindow, onScreenshot }: Props) {
@@ -146,22 +216,98 @@ export function CommandBar({ sessionId, connectionId, connType, broadcastTargets
     if (quickPanelOpen) reloadQuickCommands();
   }, [quickPanelOpen, reloadQuickCommands]);
 
-  /** Execute a quick command: split on newlines, trim, drop empty lines and
-   *  line-start `#` comments, re-join with CR (PTY executes on \r, not \n),
-   *  fan out to broadcast targets (or just this session), then close. */
+  /** Execute a quick command: parse into ordered steps (command lines + delay
+   *  directives), send each command line with a trailing CR, fanning out to
+   *  broadcast targets (or just this session).
+   *
+   *  Inter-line timing is controlled by the configured mode (see
+   *  `readQuickCmdDelayConfig`) plus any `##delay:<N>` directives:
+   *  - A `##delay:<N>` directive between two lines is always honoured as a
+   *    minimum wait floor of <N> ms.
+   *  - mode=`fixed` adds a fixed baseline between lines with no directive
+   *    (combined with the floor by max).
+   *  - mode=`idle` watches the session's output stream and only sends the next
+   *    line once the previous line's output has gone quiet for `ms`. This
+   *    reliably handles interactive prompts (sudo/mysql/ssh password) that
+   *    neither a fixed delay nor a shell sentinel can detect — when output
+   *    stops, either the shell prompt is back or the program is waiting for
+   *    input. The floor (directive/fixed) AND the idle wait both apply.
+   *  - mode=`off` sends immediately unless a directive provides a floor. */
   async function handleExecuteQuickCommand(command: string) {
     if (status === "disconnected" || status === "error") return;
-    const executable = command
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0 && !l.startsWith("#"))
-      .join("\r");
-    if (!executable) return;
+    const steps = parseQuickCommand(command);
+    if (steps.length === 0) return;
+    const { mode, ms: configMs } = readQuickCmdDelayConfig();
     const destinations = broadcastTargets.length > 0 ? broadcastTargets : [sessionId];
-    await Promise.allSettled(
-      destinations.map((sid) => sendFn(sid, executable + "\r"))
-    );
+    const useIdle = mode === "idle";
+    // Idle quiescence window — floor at 300 ms so a misconfigured 0 still waits
+    // for output to actually settle.
+    const quietMs = useIdle ? Math.max(configMs, 300) : 0;
+
     setQuickPanelOpen(false);
+
+    // ── Idle-detection state (shared across the whole run) ──────────────
+    // local.rs emits its PTY output on the same `ssh_output` event, so this
+    // listener covers local tabs too.
+    let lastDataAt = Date.now();
+    let landed = false; // has ANY output arrived since the most recent send?
+    let unlisten: (() => void) | null = null;
+
+    /** Wait until the previous line's output has quiesced. Phase 1 waits for
+     *  the line's PTY echo to land (so a stale lastDataAt isn't mistaken for
+     *  "settled"); phase 2 waits for `quietMs` of silence. A hard cap stops a
+     *  hung command (tail -f) from blocking the sequence forever. */
+    const waitForQuiescence = async () => {
+      const FIRST_OUTPUT_TIMEOUT_MS = 1500;
+      const MAX_GAP_WAIT_MS = 30_000;
+      const echoDeadline = Date.now() + FIRST_OUTPUT_TIMEOUT_MS;
+      while (!landed && Date.now() < echoDeadline) await sleep(40);
+      const start = Date.now();
+      while (Date.now() - start < MAX_GAP_WAIT_MS) {
+        if (Date.now() - lastDataAt >= quietMs) return;
+        await sleep(40);
+      }
+    };
+
+    try {
+      if (useIdle) {
+        unlisten = await onSshOutput(sessionId, () => {
+          lastDataAt = Date.now();
+          landed = true;
+        });
+      }
+
+      let pendingDelay = 0; // ms accumulated from ##delay directives since last cmd
+      let hadExplicitDelay = false; // any directive seen since last cmd?
+      let firstCmd = true;
+      for (const step of steps) {
+        if (step.type === "delay") {
+          pendingDelay += step.ms;
+          hadExplicitDelay = true;
+          continue;
+        }
+        if (!firstCmd) {
+          // Floor: explicit directive OR fixed-mode baseline, combined by max.
+          const floorMs = Math.max(
+            hadExplicitDelay ? pendingDelay : 0,
+            mode === "fixed" ? configMs : 0
+          );
+          if (floorMs > 0) await sleep(floorMs);
+          if (useIdle) await waitForQuiescence();
+        }
+        // Arm the landing flag BEFORE sending so this line's echo flips it
+        // true and arms the next gap's quiescence check.
+        if (useIdle) landed = false;
+        await Promise.allSettled(
+          destinations.map((sid) => sendFn(sid, step.text + "\r"))
+        );
+        pendingDelay = 0;
+        hadExplicitDelay = false;
+        firstCmd = false;
+      }
+    } finally {
+      unlisten?.();
+    }
   }
 
   /** 点击历史项：填入输入框，不自动执行 */
