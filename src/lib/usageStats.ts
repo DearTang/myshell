@@ -102,7 +102,7 @@ export async function reportVersion(version: string, os: string): Promise<void> 
     type: "event" as const,
     payload: {
       website: UMAMI_WEBSITE_ID,
-      name: `app_launch_v${version}`,
+      name: `myshell_app_launch_v${version}`,
       // Custom properties — viewable & groupable in the Umami dashboard.
       data: {
         device_id: deviceId,
