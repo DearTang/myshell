@@ -8,6 +8,19 @@
   格式参考 keepachangelog.com。新增条目尽量简洁，按 ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全 分组。
 -->
 
+## v2.11.2（2026-08-17）
+
+#### 🛠️ 优化
+
+- **MCP exec 互斥锁改 Map+timestamp，超过 60s 自动 force-release**，根治"上一条命令还在跑"误锁。锁从 `Set<string>` 改成 `Map<connection_id, 加锁时间戳>`，每次加锁前检查存在时间：超 60s 视为遗留自动释放（`console.warn` 让运维可追踪）。原 Set 在 `finishExec` 漏调（unhandled exception / IPC crash / 30s hard-timeout 在 AI 已经发起下一次调用之后才触发）时会永久锁死连接，只能重启 GUI；自愈后这种 race 退化为 60s 可恢复 blip。改动位于 `src/App.tsx`（GUI 端 `mcpExecLocksRef`）。配合 `ssh_exec` 60s 默认 timeout，AI 长任务工作流基本不再卡。
+- **`ssh_exec` / `ssh_run` 输出上限改用 `MCP_SSH_MAX_OUTPUT_BYTES` 环境变量配置**，默认 4 MiB，合法范围 64 KiB~1 GiB（超出范围/解析失败日志告警并保持默认）。`myshell-mcp` 启动时读取一次、缓存到 `static SSH_MAX_OUTPUT_BYTES: AtomicUsize`，每次 channel-data chunk 用 `Relaxed` 原子读（~1 ns）。解决 `docker pull` 大镜像、`npm install` 大仓等场景下的静默截断。改动位于 `src-tauri/src/bin/myshell-mcp.rs`（两处 `const MAX = 4*1024*1024` 替换为 `let max = ssh_max_output_bytes()`）。
+- **新增 `ssh_cancel` 工具**：根据 `ssh_run` 返回的 `task_id` 中断后台执行。实现走 `tokio::sync::watch` 通道（`McpState.exec_controls: HashMap<task_id, ExecControl>`），后台任务 `run_ssh_exec_task` 的 collect loop 用 `tokio::select!`（biased 让 cancel 优先于 channel 帧）监听取消信号。取消时关闭 SSH channel → task 标 Failed + `cancelled: true` + result 含截至取消点的 stdout/stderr → 清理 control 句柄。`ssh_cancel` 工具幂等、不弹 OS 弹窗、对已完成任务返回错误。改动位于 `src-tauri/src/bin/myshell-mcp.rs`（新增工具定义 + `ExecControl` 结构 + `ssh_cancel` match 分支 + run_ssh_exec_task 签名/select! 改造）。
+- **Umami 统计事件名前缀加 `myshell_`**（`app_launch_vX.Y.Z` → `myshell_app_launch_vX.Y.Z`），与 zcode-assistant 在同一个 Umami 实例里区分开，避免装机量数据混入对方 dashboard。改动位于 `src/lib/usageStats.ts`。
+
+#### 🛠️ 优化（myshell-cli）
+
+- `myshell-cli exec` 默认 timeout 30s → 60s，`--timeout` 加 `clap::value_parser!(u64).range(1..=3600)` 强校验 1s-1h；超时错误信息补充建议（>1h 用 `nohup ... > /tmp/log 2>&1 &` + tail 日志）。改动位于 `src-tauri/src/bin/myshell-cli.rs`。
+
 ## v2.11.1（2026-08-13）
 
 #### 🛠️ 优化

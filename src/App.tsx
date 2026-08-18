@@ -258,12 +258,24 @@ export default function App() {
   // sequentially — if a long-running command (pip install, sleep, etc.) is
   // still running, injecting the next command's bytes into the same PTY
   // corrupts both commands (the bytes queue behind the running process,
-  // sentinels get crossed, and the session eventually hangs). This set
-  // tracks which connection_ids currently have an MCP exec in flight; a
-  // second exec for the same connection is rejected until the first one
-  // completes (sentinel, idle-timeout, or hard-timeout) or the user is
-  // told to use `nohup ... &` for long tasks.
-  const mcpExecLocksRef = useRef<Set<string>>(new Set());
+  // sentinels get crossed, and the session eventually hangs). This map
+  // tracks which connection_ids currently have an MCP exec in flight AND
+  // when the lock was acquired. A second exec for the same connection is
+  // rejected until the first one completes (sentinel, idle-timeout, or
+  // hard-timeout) or the user is told to use `nohup ... &` for long tasks.
+  //
+  // The timestamp matters: if finishExec() ever fails to release the lock
+  // (unanticipated exception in the IPC callback, crash in the cleanup
+  // chain), we'd otherwise leave the connection permanently locked —
+  // every subsequent ssh_exec would hit the "上一条命令还在跑" branch and
+  // the AI would be stuck. The lock-age check below force-releases
+  // entries older than `MCP_LOCK_STALE_MS` so a stuck lock auto-recovers.
+  // Observed in the wild: when the AI fires two ssh_exec calls back-to-
+  // back and the first call's 30s hard-timeout completes AFTER the second
+  // call already hit the lock check, the second call waits forever on a
+  // stale entry — the auto-expiry here turns that 100%-reproducible hang
+  // into a recoverable 60s blip.
+  const mcpExecLocksRef = useRef<Map<string, number>>(new Map());
   // ── MCP exec_in_tab command confirmation ──
   // When show_in_gui=true and a command needs confirmation, we show a
   // ConfirmDialog. A Promise resolver stored in a ref connects the async
@@ -639,17 +651,36 @@ export default function App() {
         // tasks. This is the root-cause fix for the "session hangs after a
         // long command" issue — without it, overlapping commands cross their
         // sentinels and the session becomes unusable.
-        if (mcpExecLocksRef.current.has(connection_id)) {
-          mcpExecResult(requestId, {
-            ok: false,
-            error:
-              "上一条命令仍在该服务器的终端中执行。交互式终端一次只能跑一条命令。" +
-              "如需运行耗时命令，请用 nohup 后台执行（如 `nohup pip install -e . > /tmp/log 2>&1 &`），" +
-              "然后轮询日志文件查看结果。",
-          });
-          return;
+        //
+        // STALE-LOCK SELF-HEAL: a fresh `mcpExecResult` should clear the lock
+        // via finishExec below, but if the previous call's completion was
+        // ever missed (unhandled exception, IPC crash, a 30s hard-timeout
+        // firing AFTER the AI already fired the next call), the stale entry
+        // would lock out this connection forever. Check the lock age and
+        // force-release if older than MCP_LOCK_STALE_MS — better to risk
+        // a brief overlap (the AI will see a garbled command and can retry)
+        // than to deadlock the connection until the GUI is restarted.
+        const MCP_LOCK_STALE_MS = 60_000;
+        const existingLockAt = mcpExecLocksRef.current.get(connection_id);
+        if (existingLockAt !== undefined) {
+          const lockAge = Date.now() - existingLockAt;
+          if (lockAge > MCP_LOCK_STALE_MS) {
+            console.warn(
+              `[mcp-exec] stale lock on ${connection_id} (${lockAge}ms old), force-releasing`
+            );
+            mcpExecLocksRef.current.delete(connection_id);
+          } else {
+            mcpExecResult(requestId, {
+              ok: false,
+              error:
+                "上一条命令仍在该服务器的终端中执行。交互式终端一次只能跑一条命令。" +
+                "如需运行耗时命令，请用 nohup 后台执行（如 `nohup pip install -e . > /tmp/log 2>&1 &`），" +
+                "然后轮询日志文件查看结果。",
+            });
+            return;
+          }
         }
-        mcpExecLocksRef.current.add(connection_id);
+        mcpExecLocksRef.current.set(connection_id, Date.now());
 
         // Release the per-connection exec lock. Called on EVERY completion
         // path (success, idle-fallback, hard-timeout, connection error,

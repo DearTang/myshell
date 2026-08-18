@@ -2562,3 +2562,99 @@
 | 什么可能导致偏离？ | ① idle 基于固定静止窗口，断续输出命令可能略早发（已用 ##delay:N/调大窗口兜底）；② 广播时只监听主会话，其他会话若速度差异大可能不同步；③ 未做"检测 shell 提示符"的精确同步（实现复杂不可靠，idle 已是务实最优）。 |
 | 下一步最小可验证动作？ | 用户设「智能等待」，跑一条 mysql 登录（无 ##delay）确认密码时序正确；再跑一条 apt install 类断续命令确认不会卡死。 |
 | 目标是什么？ | 让多行快捷命令自动适配命令速度，等上一行真正就绪（含密码提示）再发下一行，无需手测延迟值。 |
+
+### 阶段 103 — MCP `ssh_exec` 30s 默认 timeout + 长任务无 async 通道（mcp + cli 优化）
+
+**背景：** 部署 TencentDB-Agent-Memory 到 nas.ggbond.fun 的过程中，AI 通过 `myshell-mcp` 的 `ssh_exec` 工具跑 `git clone` / `apt install` / `docker pull` / `./start-all.sh` 等长任务，全部在 **30 秒硬超时** 处失败。即便手工把 timeout 调到 600，2-3 分钟的 git clone 还是不够，且即便够，30 分钟的任务也不现实。同时 `ssh_exec` 的工具描述虽写了"default 30"但不够醒目，AI（我）第一次没注意，反复踩坑。
+
+**根因：**
+1. `src-tauri/src/bin/myshell-mcp.rs:724` 写死 `unwrap_or(30)`，且 30s 在 tokio::time::timeout 上限可调到 3600 但 30s 默认就毙了
+2. `src-tauri/src/bin/myshell-cli.rs:50-51` 同样 `default_value = "30"`
+3. **没有 async 模式**——`McpState.tasks` 字段只给 zmodem_* 用，ssh_exec 始终同步
+4. 工具描述虽提到 `timeout` 但写法不够突出
+
+**改动：**
+
+`src-tauri/src/bin/myshell-mcp.rs`（MCP server）：
+- `ssh_exec` 默认 timeout **30 → 60s**，且 `min(3600)` 强制上限
+- 工具描述重写：① 显眼写"长任务（>5min）用 `ssh_run` 而非提高 timeout"；② 注明 stdout/stderr 4MB 截断是静默的，建议大输出用 `> log 2>&1` + `sftp_download`
+- 新增 `ssh_run` 工具（async 模式）：立即返回 `task_id`（<1s），后台 tokio::spawn 跑 dial + exec + collect
+- 新增 `ssh_status` 工具：按 `task_id` 查进度，返回 phase + 累积 stdout/stderr + exit_code
+- 复用 `McpState.tasks` + `TransferTask` 表（与 zmodem_* 同一套），`direction = "exec"` 触发 `exec_status_to_json` 自定义渲染
+- `evict_stale_tasks()`：每次 `ssh_status` 顺手清理完成超过 1h 的任务，防止内存泄漏
+- `run_ssh_exec_task()`：5 阶段状态机（Confirming → Connecting → Transferring → Done/Failed），与 zmodem 同样模式
+- 复用 `resolve_config_for_task` 处理 vault/GUI 启动，避免阻塞同步路径
+- 注意：**没有 cancel 机制**——如果需要停掉 runaway 进程，AI 用 `ssh_exec kill <pid>` 在远端 kill
+
+`src-tauri/src/bin/myshell-cli.rs`（本地 CLI）：
+- `exec` 默认 timeout **30 → 60s**
+- 加 `clap::value_parser!(u64).range(1..=3600)` 强校验 1s-1h
+- 超时错误信息补充"超过 1h 用 `nohup ... > /tmp/log 2>&1 &` + tail"
+
+**性能/资源：**
+- 每次 `ssh_status` 调用会做一次 `evict_stale_tasks`（O(n) 全表扫，但 n 通常 <10，无压力）
+- TaskMap 默认小（<10 个活跃 task），无清理风险
+- 后台 tokio::spawn 在 MCP server 进程退出时被 tokio runtime 一起 drop，安全
+
+**验证：**
+- `cargo check` —— 一次过（`TaskPhase::Running` 不存在，改用 `Transferring`；`resolve_config_for_task` 期望 `&impl Fn(String)`，fail 闭包签名改回 `|msg: String|`）
+- `npx tsc --noEmit` —— 通过（无 TS 改动，但前端的 ssh_run/ssh_status 类型是从 MCP JSON 推断的，已有的 ssh_exec 类型是后端给，TS 不感知）
+- **未做端到端测试**：手上没有 GUI 在跑，无法实际跑 ssh_run 验。建议下次 GUI 启动时手动测：① ssh_run "sleep 5 && echo done" → 立即返回 task_id；② 5s 后 ssh_status 看到 done + exit_code=0 + stdout="done"；③ 等 1h 后查同 task_id 应该报"已过期"。
+
+## 五问重启检查（阶段 103）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 103 complete —— MCP ssh_exec 默认 30→60s + 新增 ssh_run/ssh_status 异步通道 + myshell-cli exec 同步优化，cargo check + tsc 都过。 |
+| 我要去哪里？ | 随下一次 `打包` 发布。 |
+| 什么可能导致偏离？ | ① ssh_run 后台任务没有 cancel 机制，runaway 进程只能靠远端 kill；② 1h 清理窗口写死，没暴露配置项；③ 工具描述虽然显眼但 AI 仍可能没读到，建议未来加 `INSTAGRAM`-式"重要提示"开头顶置；④ myshell-cli exec 超时 1h 上限，>1h 任务必须 nohup 后台跑。 |
+| 下一步最小可验证动作？ | GUI 启动后跑一条 `ssh_run "sleep 5 && echo hello"` 验证 task_id 返回 + 5s 后 ssh_status 显示 done。 |
+| 目标是什么？ | 让 AI 跑 `apt upgrade` / `git clone` / `docker pull` 这类 5min+ 的任务不再因 30s 超时失败，能可靠完成后取回结果。 |
+
+### 阶段 104 — MCP 防抖锁自愈 + 4MB 截断可配置 + ssh_run cancel 机制
+
+**背景：** 阶段 103 完成 `ssh_exec` 60s 默认 timeout + `ssh_run`/`ssh_status` 后，3 个"没改"的问题决定继续攻：
+1. **MCP 防抖误报**——`mcpExecLocksRef` 是 `Set<string>`，一旦 `finishExec` 漏调（unhandled exception / IPC crash / 30s hard-timeout 在 AI 已经发起下一次调用之后才触发），连接被永久锁死，只能重启 GUI。实际部署里触发频次大约"每隔一次命令"。
+2. **4MB stdout/stderr 截断**是 `const MAX: usize` 写死的，AI 没有控制权，只能靠"用 `> log 2>&1` 重定向 + sftp_download"绕开。
+3. **`ssh_run` 没 cancel 机制**——runaway 进程（误下大镜像、错误目标的 `npm install`）只能等自然结束或远端 `kill`，但 ssh_run 是异步的，AI 没法在 SSH 通道外 kill。
+
+**改动：**
+
+`src/App.tsx`（MyShell GUI 端）：
+- `mcpExecLocksRef`: `Set<string>` → `Map<string, number>`（connection_id → 加锁时间戳）
+- 加 `MCP_LOCK_STALE_MS = 60_000` 常量；锁存在但超过 60s 自动 force-release（保留 `console.warn` 让运维可追踪）
+- 锁添加改成 `mcpExecLocksRef.current.set(connection_id, Date.now())`
+- `finishExec` 删除逻辑不变（`.delete(connection_id)`）
+- 注释里写清 "observed in the wild" 的 race 场景
+
+`src-tauri/src/bin/myshell-mcp.rs`（MCP server）：
+- 加 `static SSH_MAX_OUTPUT_BYTES: AtomicUsize`，默认 `4 * 1024 * 1024`
+- 加 `fn ssh_max_output_bytes()` 读 atomic（Relaxed ordering，cheap）
+- `log_init()` 启动时读 `MCP_SSH_MAX_OUTPUT_BYTES` env var；合法范围 64 KiB ~ 1 GiB，越界/解析失败日志告警并保持默认
+- `ssh_exec` 和 `run_ssh_exec_task` 两处 `const MAX = 4*1024*1024` 全部替换成 `let max = ssh_max_output_bytes()`
+- 加 `struct ExecControl { cancel_tx: tokio::sync::watch::Sender<bool> }`
+- `McpState` 加 `exec_controls: Arc<Mutex<HashMap<String, ExecControl>>>`
+- `ssh_run` 注册 task 时同时插入 `ExecControl`，spawn 时把 `cancel_rx` 传给后台任务
+- `run_ssh_exec_task` 签名加 `cancel_rx`，collect loop 改用 `tokio::select! { biased; _ = cancel_rx.changed() => ...; msg = channel.wait() => ... }`
+- 取消时：watch flag → 后台任务退出循环 → handle.disconnect → task.phase = Failed（带 `cancelled: true`）→ result 含截至取消点的 stdout/stderr
+- 任务结束（Done/Failed/Cancelled）`controls.remove(task_id)` 释放控制句柄
+- 新增 `ssh_cancel` 工具（match 分支 + tool_definitions 描述）：先验证 task 存在且未结束，再 `cancel_tx.send(true)`，幂等，无 OS 弹窗
+- vault gate 加 `ssh_cancel` 到免 gate 列表（不阻塞，无需凭证）
+
+**性能/资源：**
+- `SSH_MAX_OUTPUT_BYTES` 用 Relaxed atomic，per-chunk load = 1 ns
+- `McpState.exec_controls` 大小约等于活跃 ssh_run 数（默认 <10）；task 结束同步 remove，无内存泄漏
+- watch::Sender/Receiver 不需要 Mutex，发送和接收都是 lock-free
+
+**验证：**
+- `cargo check` —— 一次过（`cancel_rx: Receiver<bool>` 必须 `mut` 才能 `borrow()`，编译器已抓到）
+- `npx tsc --noEmit` —— 通过（无 TS 改动）
+- **未做端到端测试**：① 防抖自愈——需要 GUI 在跑；② 4MB env var——重启 myshell-mcp.exe 后 `MCP_SSH_MAX_OUTPUT_BYTES=104857600 ./myshell-mcp.exe`，跑大输出验证；③ ssh_cancel——跑 `ssh_run "sleep 60"`，10s 后 `ssh_cancel <task_id>`，再 `ssh_status` 看 cancelled=true
+
+## 五问重启检查（阶段 104）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 104 complete —— MCP 防抖锁自愈（Map+timestamp）、4MB 截断可配置（env var）、ssh_run cancel 机制（ssh_cancel 工具 + watch channel）三件全改完，cargo check + tsc 都过。 |
+| 我要去哪里？ | 随下一次 `打包` 发布（与阶段 103 一同）。 |
+| 什么可能导致偏离？ | ① cancel 关闭 SSH 通道不保证杀掉远端所有子进程（child reparent 后可能继续跑），AI 仍需 `ssh_exec 'kill <pid>'` 兜底；② MCP_SSH_MAX_OUTPUT_BYTES 设太大可能 OOM（chatty 任务把 RAM 吃光），clamp 到 1 GiB；③ 60s 锁自愈窗口内，AI 真并发跑两条命令时第二条会立刻拒绝（OK 的设计），但 AI 可能误以为"刚才那条没生效"而重发；④ ssh_cancel 对正在 Confirming（弹 OS 弹窗）的任务无效——只能等用户点完才能看到 cancel。 |
+| 下一步最小可验证动作？ | ① GUI 启动后手动连发 5 条 ssh_exec，确认不再出现"上一条还在跑"误报；② `MCP_SSH_MAX_OUTPUT_BYTES=209715200 ./myshell-mcp.exe` + 跑 docker pull，确认 200MB 输出不被截；③ `ssh_run "sleep 60"` + 5s 后 `ssh_cancel <tid>` + `ssh_status` 看 cancelled=true。 |
+| 目标是什么？ | 让 AI 长任务工作流完全不卡（锁不会僵、输出不会丢、runaway 可中断），从 5min+ 部署任务的实践反馈。 |

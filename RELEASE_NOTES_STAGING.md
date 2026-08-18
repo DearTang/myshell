@@ -13,5 +13,7 @@
 ---
 
 ## 待发布条目（打包后清空）
+- 🛠️ MCP exec 互斥锁改 Map+timestamp，超过 60s 自动 force-release，根治"上一条命令还在跑"误锁；ssh_exec 输出上限改用 `MCP_SSH_MAX_OUTPUT_BYTES` 环境变量配置（默认 4 MiB，范围 64 KiB~1 GiB）；新增 `ssh_cancel` 工具支持中断后台任务，已积累的 stdout/stderr 截至取消点保留
 
+- 🛠️ Umami 统计事件名前缀加 `myshell_`，与 zcode-assistant 区分（避免数据混入对方 dashboard）
 <!-- 上一个版本 v2.11.1 已发布。新的改动完成后在此追加一行：`- <emoji> <一句话描述>` -->

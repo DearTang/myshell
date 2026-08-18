@@ -111,6 +111,15 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 
 ## 更新日志
 
+### v2.11.2（2026-08-17）
+
+#### 🛠️ 优化
+- **MCP exec 互斥锁自愈**：GUI 端"上一条命令还在跑"误锁改为 Map+timestamp，超 60s 自动释放，不再需要重启 GUI。
+- **MCP ssh_exec/ssh_run 输出上限可配置**：`MCP_SSH_MAX_OUTPUT_BYTES` 环境变量（默认 4 MiB，64 KiB~1 GiB），解决大镜像/大仓安装日志静默截断。
+- **MCP 新增 `ssh_run`/`ssh_status`/`ssh_cancel`**：异步长任务通道——`ssh_run` 立即返回 task_id，`ssh_status` 轮询进度，`ssh_cancel` 中断 runaway 任务（保留截至取消点的输出）。适配 apt upgrade / docker pull / git clone 等 5min+ 任务。
+- **ssh_exec 默认 timeout 30s → 60s**（上限 1h）；`myshell-cli exec` 同步 60s + `--timeout` 范围校验 1s~3600s。
+- Umami 统计事件名加 `myshell_` 前缀，与 zcode-assistant 区分。
+
 ### v2.11.1（2026-08-13）
 
 #### 🛠️ 优化

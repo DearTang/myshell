@@ -46,8 +46,11 @@ enum Commands {
         connection: String,
         /// Command to execute
         command: String,
-        /// Timeout in seconds (default: 30)
-        #[arg(long, default_value = "30")]
+        /// Timeout in seconds (default: 60, max 3600=1h). Raise for long jobs
+        /// (apt upgrade, git clone, big rsync). For tasks >5min, prefer
+        /// running with `nohup ... &` on the remote and tailing a log file
+        /// — this tool is synchronous and blocks until the command exits.
+        #[arg(long, default_value = "60", value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
     },
 
@@ -439,7 +442,12 @@ async fn cmd_exec(
         collect,
     )
     .await
-    .map_err(|_| format!("命令超时（{}秒）", timeout_secs))?;
+    .map_err(|_| {
+        format!(
+            "命令超时（{}秒）。如需更长时间，--timeout 上限 3600s = 1h；超过 1h 的任务建议在远端用 `nohup ... > /tmp/log 2>&1 &` 后台跑，再 tail 日志。",
+            timeout_secs
+        )
+    })?;
 
     // Graceful disconnect
     let _ = handle

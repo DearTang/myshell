@@ -224,15 +224,49 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "ssh_exec",
-                "description": "Run a shell command on a remote SSH server (non-interactive, one-shot). Returns stdout, stderr, and the process exit code.\n\nWHEN TO USE: The user wants to run a command on a remote server they've saved in MyShell — e.g. 'check disk usage on prod-db', 'restart nginx on web1', 'tail the log on api-server'. Prefer this over opening an interactive shell when the task is a single command with a defined end.\n\nWHEN NOT TO USE: \n- Interactive sessions (top, vim, less, mysql prompt) — this tool times out and won't stream output. Suggest the user run these in MyShell's GUI terminal instead.\n- Operations on a server NOT saved in MyShell — this tool can only reach pre-saved connections.\n- Operations the agent should do locally (read/write local files, run local commands) — use your own tools for those.\n\n⚠️ HUMAN CONFIRMATION REQUIRED: A native OS dialog pops up asking the user to approve. The command WILL NOT run until the user clicks 'Yes'. This is by design — AI-initiated remote execution is dangerous. Tell the user a confirmation dialog is coming.\n\nOUTPUT: JSON `{exit_code, stdout, stderr}`. `exit_code` is 0 on success. stdout/stderr are truncated at 4MB each. Commands that don't exit within `timeout` seconds return an error.",
+                "description": "Run a shell command on a remote SSH server (non-interactive, one-shot). Returns stdout, stderr, and the process exit code.\n\nWHEN TO USE: The user wants to run a command on a remote server they've saved in MyShell — e.g. 'check disk usage on prod-db', 'restart nginx on web1', 'tail the log on api-server'. Prefer this over opening an interactive shell when the task is a single command with a defined end.\n\nWHEN NOT TO USE:\n- Interactive sessions (top, vim, less, mysql prompt) — this tool times out and won't stream output. Suggest the user run these in MyShell's GUI terminal instead.\n- Operations on a server NOT saved in MyShell — this tool can only reach pre-saved connections.\n- Operations the agent should do locally (read/write local files, run local commands) — use your own tools for those.\n- Long-running tasks (>5min): `apt upgrade`, `git clone` of large repos, `docker pull` of big images, full `npm install`, big `tar`/`rsync`. For these, use `ssh_run` instead — it returns a task_id immediately and you poll `ssh_status` to follow progress. `ssh_exec` is the wrong tool here because even max `timeout=3600` can still hit the call's overall budget on very long jobs.\n\n⚠️ HUMAN CONFIRMATION REQUIRED: A native OS dialog pops up asking the user to approve. The command WILL NOT run until the user clicks 'Yes'. This is by design — AI-initiated remote execution is dangerous. Tell the user a confirmation dialog is coming.\n\nOUTPUT: JSON `{exit_code, stdout, stderr}`. `exit_code` is 0 on success. stdout/stderr are truncated at 4MB each (silently — if you suspect truncation, redirect to a file on the server and `sftp_download` it instead). Commands that don't exit within `timeout` seconds return an error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
                         "command": { "type": "string", "description": "Shell command to run. Executed via `bash -c` semantics on the remote. Avoid commands that read from stdin or wait for input." },
-                        "timeout": { "type": "integer", "description": "Max seconds to wait before killing the command (default 30). Raise for long jobs like log scans, but note the human confirmation dialog is only shown once at the start.", "default": 30 }
+                        "timeout": { "type": "integer", "description": "Max seconds to wait before killing the command (default 60, max 3600=1h). For tasks longer than ~5min, prefer `ssh_run` + `ssh_status` polling instead of raising this.", "default": 60, "minimum": 1, "maximum": 3600 }
                     },
                     "required": ["connection", "command"]
+                }
+            },
+            {
+                "name": "ssh_run",
+                "description": "Run a shell command on a remote SSH server asynchronously (returns a task_id immediately, then poll `ssh_status` to follow progress). Designed for long-running tasks where blocking the conversation for minutes is impractical.\n\nWHEN TO USE:\n- Commands expected to take >1min: `apt upgrade`, `apt install`, `docker pull`, `docker compose up`, `git clone` of large repos, `npm/pnpm install`, `tar`/`rsync` of large trees, full system backups, long-running `find`/`grep`.\n- Any command where you'd otherwise need to set `ssh_exec` timeout >120s.\n\nWHEN NOT TO USE:\n- Quick status checks — use `ssh_exec` (synchronous, returns immediately on completion).\n- Interactive sessions — same as `ssh_exec`, doesn't stream.\n- Tasks you want the user to watch live — open a GUI terminal tab instead via `open_in_gui`.\n\nWORKFLOW:\n1. Call `ssh_run` → returns `{ task_id, status: \"started\" }` immediately (well under 1s, the actual command kicks off in background).\n2. Poll `ssh_status` with the same `task_id` every 10-30s. Each call returns the current phase + accumulated stdout/stderr so far (last 4MB each; full output is preserved on the server — `sftp_download` the log file if you need more).\n3. When `status` becomes `done` or `failed`, the task is finished and the final `exit_code` + full output is in the response.\n4. Tasks are kept in memory for 1h after completion, then auto-cleaned. Stale `task_id`s (older than 1h) return an error.\n\n⚠️ HUMAN CONFIRMATION REQUIRED (same as `ssh_exec`): A native OS dialog pops up before the command starts. The user MUST click 'Yes' for the command to run.\n\nOUTPUT on start: `{ task_id, status: \"started\", description: \"<conn>: <cmd prefix>\" }`. On poll: see `ssh_status` description.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
+                        "command": { "type": "string", "description": "Shell command to run. Executed via `bash -c` semantics on the remote. Avoid commands that read from stdin or wait for input. For long tasks, consider redirecting output to a log file (`> /tmp/run.log 2>&1`) and then `sftp_download` it after — keeps the live output small." }
+                    },
+                    "required": ["connection", "command"]
+                }
+            },
+            {
+                "name": "ssh_status",
+                "description": "Poll the status of a command launched by `ssh_run`. Returns current phase, accumulated stdout/stderr (last 4MB each), and the task_id.\n\nPHASES:\n- `Confirming`: waiting for the user to click 'Yes' on the OS confirmation dialog. If stuck here, remind the user to check for the dialog.\n- `Connecting`: SSH handshake + auth in progress.\n- `Running`: command is executing on the remote.\n- `Done`: finished successfully. `exit_code` is 0 (usually).\n- `Failed`: command exited non-zero, the connection died, the OS confirmation was cancelled, or the user denied the dialog. `error` field explains.\n\nRECOMMENDED POLL INTERVAL: 10-30s. Don't poll faster than 5s — the task state only updates on actual progress, and aggressive polling wastes your tool budget.\n\nWORKFLOW:\n1. After `ssh_run` returns, store the `task_id`.\n2. Loop: call `ssh_status` with the task_id, sleep 10-30s, repeat until `status` is `done` or `failed`.\n3. If you no longer need a task (e.g. you found a better way), call `ssh_status` once and ignore — the task is harmless and will auto-clean after 1h. There's no explicit `kill` yet (use `ssh_exec kill <pid>` on the remote if you really need to stop a runaway process).\n\nOUTPUT: `{ task_id, status, phase?, progress_pct?, bytes_done?, bytes_total?, stdout, stderr, exit_code?, error?, result? }`. `stdout`/`stderr` are the accumulated output so far (or final output if `done`/`failed`).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": { "type": "string", "description": "The task_id returned by `ssh_run`." }
+                    },
+                    "required": ["task_id"]
+                }
+            },
+            {
+                "name": "ssh_cancel",
+                "description": "Cancel a running `ssh_run` task. The remote SSH channel is closed (which interrupts the running process), the task is marked failed with `error` containing '用户通过 ssh_cancel 取消', and any stdout/stderr captured up to the cancel point is preserved.\n\nWHEN TO USE: A `ssh_run` task is taking too long or has gone sideways, and you want to stop it without waiting for the natural exit. Useful for runaway `docker pull`, `npm install` on the wrong repo, mis-targeted `find`, etc.\n\nWHEN NOT TO USE:\n- The task is already `done` or `failed` — returns an error. Use `ssh_status` to check first.\n- You want to kill a process on the REMOTE that `ssh_run` isn't directly managing — use `ssh_exec 'kill <pid>'` instead, which targets the remote's process tree more precisely. `ssh_cancel` closes the SSH channel; the remote shell may still have child processes that survive.\n\nBEHAVIOR:\n- The cancel signal is sent immediately and is idempotent (calling twice is safe).\n- The task transitions from its current phase straight to `failed` with `cancelled: true` in the result. Future `ssh_status` calls see this state until the 1h eviction.\n- No OS confirmation dialog — cancellation is non-destructive (the remote is left with whatever state the command had reached), so we don't pester the user with a Yes/No prompt.\n\nOUTPUT: `{ task_id, ok: true, status: \"cancelling\" }` on success, or an error string if the task_id is unknown / already finalized.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": { "type": "string", "description": "The task_id returned by `ssh_run` (must still be in Running/Connecting/Confirming state — not yet Done/Failed)." }
+                    },
+                    "required": ["task_id"]
                 }
             },
             {
@@ -531,6 +565,22 @@ struct McpState {
     /// actual transfer drivers), read by the synchronous `zmodem_status` tool.
     /// Each entry is updated in place as the transfer progresses.
     tasks: Arc<Mutex<HashMap<String, TransferTask>>>,
+    /// Per-exec-task cancel control plane. Inserted by `ssh_run`, looked up
+    /// by `ssh_cancel` to flip a `watch::Sender` that the collect loop in
+    /// `run_ssh_exec_task` is subscribed to via `tokio::select!`. Entries
+    /// are removed in the same place the `TransferTask` entry is finalized
+    /// (the spawn closure), so a stale task_id won't get a phantom cancel.
+    exec_controls: Arc<Mutex<HashMap<String, ExecControl>>>,
+}
+
+/// Control handle for a running ssh_run task. The collect loop in
+/// `run_ssh_exec_task` subscribes to `cancel_tx` and bails out of the
+/// select! when a value arrives; `ssh_cancel` is what flips it.
+struct ExecControl {
+    /// Single-value watch channel: starts at `false`, `ssh_cancel` sends
+    /// `true` to request termination. Subscribers re-check on every
+    /// `changed()` wakeup.
+    cancel_tx: tokio::sync::watch::Sender<bool>,
 }
 
 /// Resolve a connection name/group-path to its id WITHOUT needing the DEK
@@ -685,12 +735,13 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
     // allowed so the AI can still enumerate servers even when locked.
     match name {
         "list_connections" | "screenshot_terminal" | "open_in_gui" | "zmodem_status"
-        | "zmodem_download" | "zmodem_upload" => {
+        | "zmodem_download" | "zmodem_upload" | "ssh_run" | "ssh_status" | "ssh_cancel" => {
             // These tools either don't need credentials (list_connections),
             // trigger the GUI's own unlock flow (screenshot/open_in_gui), or
             // run asynchronously and handle the vault gate inside their
-            // background task (zmodem_*). Skipping the synchronous gate here
-            // avoids colliding with the client's 30s tool-call timeout.
+            // background task (zmodem_*, ssh_run). Skipping the synchronous
+            // gate here avoids colliding with the client's tool-call
+            // timeout.
         }
         _ => {
             wait_for_vault_unlocked()?;
@@ -718,10 +769,15 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&items).unwrap() }] }))
         }
 
-        "ssh_exec" => {
+            "ssh_exec" => {
             let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
             let command = args["command"].as_str().ok_or("缺少 command 参数")?;
-            let timeout = args["timeout"].as_u64().unwrap_or(30);
+            // Default 60s (up from 30s) — gives 2x headroom for typical ops
+            // (apt update, system health checks, log scans) without forcing
+            // every AI call to override. For genuinely long tasks (>5min) use
+            // the `ssh_run` tool (async + poll) instead of raising this.
+            // Clamped to 1h max — anything longer should be `ssh_run`.
+            let timeout = args["timeout"].as_u64().unwrap_or(60).min(3600);
 
             // Command confirmation: read the user's whitelist/blacklist rules
             // (regex) from the config file. Only commands that look dangerous
@@ -803,18 +859,21 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 let mut stdout: Vec<u8> = Vec::new();
                 let mut stderr: Vec<u8> = Vec::new();
                 let mut exit_code: Option<u32> = None;
-                const MAX: usize = 4 * 1024 * 1024;
+                // Per-stream cap is configurable via MCP_SSH_MAX_OUTPUT_BYTES;
+                // reads from an atomic so we can adjust at startup without
+                // paying a mutex on every chunk.
+                let max = ssh_max_output_bytes();
                 loop {
                     match channel.wait().await {
                         Some(ChannelMsg::Data { ref data }) => {
-                            if stdout.len() < MAX {
-                                let room = MAX - stdout.len();
+                            if stdout.len() < max {
+                                let room = max - stdout.len();
                                 stdout.extend_from_slice(&data[..data.len().min(room)]);
                             }
                         }
                         Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => {
-                            if stderr.len() < MAX {
-                                let room = MAX - stderr.len();
+                            if stderr.len() < max {
+                                let room = max - stderr.len();
                                 stderr.extend_from_slice(&data[..data.len().min(room)]);
                             }
                         }
@@ -841,6 +900,206 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 "stderr": String::from_utf8_lossy(&stderr),
             });
             Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] }))
+        }
+
+        "ssh_run" => {
+            // Async start of a long-running command. Returns task_id immediately
+            // (well under the client's call timeout) and a background task does
+            // the dial + exec + collect. The AI polls `ssh_status` with the
+            // task_id to follow progress. Output accumulation is bounded at 4MB
+            // per stream; for tasks with more output, redirect to a file
+            // server-side and sftp_download it.
+            //
+            // Reuses the TransferTask table (McpState.tasks) — same machinery
+            // as zmodem_*. direction="exec" tells ssh_status how to render the
+            // status text.
+            let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?.to_string();
+            let command = args["command"].as_str().ok_or("缺少 command 参数")?.to_string();
+
+            // Pre-flight: ensure GUI is running + vault will be unlockable.
+            // We don't actually wait for the vault here (the background task
+            // does that) — we just confirm the GUI binary exists so the user
+            // gets a fast error if it isn't installed. Mirrors zmodem_*
+            // pattern: do the cheap checks here, push the slow ones into bg.
+            if let Err(e) = ensure_gui_running() {
+                return Err(e);
+            }
+
+            // Command confirmation check is done in the BACKGROUND task, not
+            // here — pop the OS dialog inside the task so the tool call
+            // returns instantly and we don't block on the user's "Yes" click.
+            let rules = load_command_rules();
+            let needs_confirm = command_rules::command_needs_confirmation(&command, &rules);
+
+            // Build a short description (full command can be very long; truncate).
+            let cmd_preview: String = command.chars().take(60).collect();
+            let cmd_preview = if command.chars().count() > 60 {
+                format!("{}…", cmd_preview)
+            } else {
+                cmd_preview
+            };
+            let description = format!("[{}] {}", conn_name, cmd_preview);
+
+            // Register the task in Confirming phase. If the command doesn't
+            // need confirmation, we still leave it in Confirming briefly (the
+            // bg task flips to Connecting immediately) — keeping the model
+            // consistent means the AI sees the same phases either way.
+            let task_id = format!("ssh-{}", chrono_like_ts());
+            // Cancel control plane: created here so the task_id is bound to
+            // a cancel handle BEFORE the background task starts. If the user
+            // hits `ssh_cancel` before the task gets to its select!, the
+            // signal sits in the watch channel buffer and fires the moment
+            // the loop starts polling it — no race window.
+            let (cancel_tx, _cancel_rx_init) = tokio::sync::watch::channel(false);
+            {
+                let mut tasks = state.tasks.lock().map_err(|e| e.to_string())?;
+                tasks.insert(
+                    task_id.clone(),
+                    TransferTask::new("exec", description.clone(), 0),
+                );
+                let mut controls = state.exec_controls.lock().map_err(|e| e.to_string())?;
+                controls.insert(
+                    task_id.clone(),
+                    ExecControl { cancel_tx },
+                );
+            }
+
+            // Spawn the background driver. cancel_rx is created here (in the
+            // spawning task, not in the bg task) so the bg task can move it
+            // into its select! without any extra locking — watch::Sender is
+            // cheap to clone, and the receiver stays valid for the bg task's
+            // entire lifetime.
+            let cancel_rx = {
+                let controls = state.exec_controls.lock().expect("controls mutex");
+                controls.get(&task_id).expect("just inserted").cancel_tx.subscribe()
+            };
+            let app = state.app.clone();
+            let tasks_table = Arc::clone(&state.tasks);
+            let controls_table = Arc::clone(&state.exec_controls);
+            let tid = task_id.clone();
+            tokio::spawn(async move {
+                run_ssh_exec_task(
+                    &app, &tasks_table, &controls_table, &tid,
+                    &conn_name, &command, needs_confirm, cancel_rx,
+                ).await;
+            });
+
+            log(&format!("ssh_run [{}] 已启动: {}", task_id, cmd_preview));
+
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "⏳ ssh_run 已启动（任务 {}）。\n命令：{}\n请用 ssh_status 查询进度（建议每 10-30 秒轮询一次）。如命令需要确认，会有系统弹窗；如不需要则自动开始。",
+                        task_id, description
+                    )
+                }],
+                "task_id": task_id,
+                "status": "started",
+                "poll_with": "ssh_status"
+            }))
+        }
+
+        "ssh_status" => {
+            // Poll a ssh_run task. Returns the current phase + accumulated
+            // output (truncated to 4MB per stream). Tasks are kept in memory
+            // for 1h after completion, then auto-evicted; stale task_ids
+            // return an error.
+            let task_id = args["task_id"].as_str().ok_or("缺少 task_id 参数")?;
+            // Drop any tasks older than TTL before lookup. Cheap (mutex-held
+            // microseconds) and keeps the map from growing unbounded across
+            // a long session.
+            evict_stale_tasks(&state.tasks);
+            let tasks = state.tasks.lock().map_err(|e| e.to_string())?;
+            match tasks.get(task_id) {
+                Some(task) => {
+                    // For exec tasks, render a status text tailored to command
+                    // semantics (no "X% / N bytes" wording — exec doesn't
+                    // track bytes). zmodem tasks still get the original
+                    // "X% / N bytes" rendering.
+                    if task.direction == "exec" {
+                        Ok(exec_status_to_json(task_id, task))
+                    } else {
+                        Ok(task.to_status_text(task_id))
+                    }
+                }
+                None => Err(format!(
+                    "任务 {} 不存在或已过期（任务完成后 1 小时会被清理）",
+                    task_id
+                )),
+            }
+        }
+
+        "ssh_cancel" => {
+            // Cancel a running ssh_run task. Idempotent — second call on the
+            // same task_id is harmless (the watch::Sender::send succeeds
+            // even if no one's listening). We refuse to cancel a finalized
+            // task (Done/Failed) because the bg task has already torn down
+            // its control entry — a cancel call at that point would just
+            // confuse the operator into thinking something went wrong.
+            let task_id = args["task_id"].as_str().ok_or("缺少 task_id 参数")?;
+
+            // First: confirm the task still exists and is in a cancellable
+            // phase. We do this BEFORE touching the controls map so a
+            // typo'd task_id doesn't silently no-op.
+            {
+                let tasks = state.tasks.lock().map_err(|e| e.to_string())?;
+                match tasks.get(task_id) {
+                    Some(t) if matches!(t.phase, TaskPhase::Done | TaskPhase::Failed) => {
+                        return Err(format!(
+                            "任务 {} 已经结束（phase={:?}），无需取消",
+                            task_id, t.phase
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "任务 {} 不存在或已过期",
+                            task_id
+                        ));
+                    }
+                    _ => {} // fall through to cancel
+                }
+            }
+
+            // Flip the watch channel. The collect loop in run_ssh_exec_task
+            // is subscribed via cancel_rx.changed() in its tokio::select!,
+            // and will exit on the next iteration. The watch semantics
+            // guarantee the signal is delivered even if no one is awaiting
+            // it RIGHT NOW — the value sits in the channel until the
+            // receiver wakes up.
+            {
+                let controls = state.exec_controls.lock().map_err(|e| e.to_string())?;
+                match controls.get(task_id) {
+                    Some(c) => {
+                        let _ = c.cancel_tx.send(true);
+                        log(&format!("ssh_cancel [{}] signal sent", task_id));
+                    }
+                    None => {
+                        // Race: the bg task already finished between our
+                        // existence check and the cancel attempt (the map
+                        // entries are torn down in the bg task's Phase 5
+                        // cleanup). Surface this as a soft error so the
+                        // AI knows the task is gone.
+                        return Err(format!(
+                            "任务 {} 的控制句柄已被清理（任务可能刚结束），取消信号未发送",
+                            task_id
+                        ));
+                    }
+                }
+            }
+
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "🛑 ssh_cancel 已发送（任务 {}）。后台任务会在下一次循环迭代时检测到并退出，stdout/stderr 截至取消点的部分会被保留。请稍候用 ssh_status 确认 cancelled 状态。",
+                        task_id
+                    )
+                }],
+                "task_id": task_id,
+                "ok": true,
+                "status": "cancelling"
+            }))
         }
 
         "sftp_list" => {
@@ -2243,6 +2502,293 @@ fn chrono_like_ts() -> String {
     format!("{}", secs)
 }
 
+// ============ ssh_run / ssh_status (async exec) ============
+//
+// Long-running commands (apt upgrade, git clone, docker pull, etc.) can't fit
+// inside `ssh_exec`'s timeout — even max 1h can be hit, and a 30-minute wait
+// inside a single tool call is bad UX for the AI. ssh_run launches the
+// command in a background task and returns a task_id immediately; the AI
+// polls ssh_status to follow progress.
+//
+// Reuses the same McpState.tasks table and TransferTask struct as zmodem_*,
+// just with direction = "exec" and a different status renderer. Output is
+// stored in the task's `result` field (json {exit_code, stdout, stderr})
+// after completion; while running, the latest 4MB per stream is in
+// `result_in_progress` (a custom field on TransferTask — see below).
+
+/// One hour. Tasks older than this (since completion) are evicted on the
+/// next ssh_status call or any new ssh_run, to keep the map from growing
+/// unbounded.
+const EXEC_TASK_TTL_SECS: u64 = 3600;
+
+/// Background driver for an ssh_run task. Owns the SSH handle, runs the
+/// command to completion, and updates the task entry in place as it
+/// progresses. Spawned by the `ssh_run` tool call; never called directly.
+async fn run_ssh_exec_task(
+    app: &AppState,
+    tasks: &Arc<Mutex<HashMap<String, TransferTask>>>,
+    controls: &Arc<Mutex<HashMap<String, ExecControl>>>,
+    task_id: &str,
+    conn_name: &str,
+    command: &str,
+    needs_confirm: bool,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    // Helper closures: mark() and fail() mutate the shared task entry.
+    // fail() mirrors the zmodem_*-style closure signature (just `String`) so
+    // it slots directly into resolve_config_for_task's `&impl Fn(String)`
+    // parameter — the partial-output tracking lives in the structured
+    // result field of the task entry, updated by the streaming loop.
+    let fail = |msg: String| {
+        log(&format!("ssh_run [{}] failed: {}", task_id, msg));
+        let mut tasks = tasks.lock().expect("tasks mutex");
+        if let Some(t) = tasks.get_mut(task_id) {
+            t.phase = TaskPhase::Failed;
+            t.error = Some(msg);
+        }
+        // Always release the cancel control plane so a subsequent
+        // ssh_cancel on this task_id (or a stale one) doesn't try to
+        // touch a dropped watch::Sender.
+        let mut controls = controls.lock().expect("controls mutex");
+        controls.remove(task_id);
+    };
+
+    // Phase 1: confirmation (if needed). Skipped for safe commands.
+    if needs_confirm {
+        let detail = format!("ssh_run 在服务器 [{}] 上执行: {}", conn_name, command);
+        if !confirm_dangerous_operation("ssh_run（后台执行）", &detail) {
+            fail("用户取消了高危操作".to_string());
+            return;
+        }
+    } else {
+        log(&format!("ssh_run [{}] 免确认: {}", task_id, command));
+    }
+
+    // Phase 2: resolve credentials. resolve_config_for_task handles GUI
+    // launch + vault wait + decryption, and reports failures via fail().
+    let config = match resolve_config_for_task(app, conn_name, Some("ssh"), &fail).await {
+        Some(c) => c,
+        None => return, // fail() already recorded
+    };
+
+    // Phase 3: dial + exec.
+    {
+        let mut tasks = tasks.lock().expect("tasks mutex");
+        if let Some(t) = tasks.get_mut(task_id) {
+            t.phase = TaskPhase::Connecting;
+        }
+    }
+
+    let handle = match ssh::dial_and_authenticate(app, &config, false).await {
+        Ok(h) => h,
+        Err(e) => {
+            fail(format!("SSH 连接失败: {}", e));
+            return;
+        }
+    };
+
+    let mut channel = match handle.channel_open_session().await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = handle.disconnect(russh::Disconnect::ByApplication, "fail", "en").await;
+            fail(format!("打开通道失败: {}", e));
+            return;
+        }
+    };
+    if let Err(e) = channel.exec(true, command).await {
+        let _ = handle.disconnect(russh::Disconnect::ByApplication, "fail", "en").await;
+        fail(format!("exec 失败: {}", e));
+        return;
+    }
+
+    // Phase 4: collect. No timeout here — the WHOLE POINT of ssh_run is to
+    // allow commands that take longer than ssh_exec's max 1h. Cancellation
+    // is via `ssh_cancel` (flips cancel_rx below); a runaway remote process
+    // not responding to cancel falls back to closing the SSH channel which
+    // makes channel.wait() return Eof/Close.
+    {
+        let mut tasks = tasks.lock().expect("tasks mutex");
+        if let Some(t) = tasks.get_mut(task_id) {
+            t.phase = TaskPhase::Transferring;
+        }
+    }
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut exit_code: Option<u32> = None;
+    // Per-stream cap is configurable via MCP_SSH_MAX_OUTPUT_BYTES — see
+    // the matching note in the ssh_exec collect block.
+    let max = ssh_max_output_bytes();
+
+    // Track whether the loop exited via the cancel arm of select!. We can't
+    // use the exit_code from the channel cleanly after a cancel (the
+    // remote process may or may not have flushed its exit status before we
+    // yanked the channel), so we mark the task accordingly.
+    let mut cancelled = false;
+
+    use russh::ChannelMsg;
+    loop {
+        tokio::select! {
+            // Bias toward the channel: if a channel frame AND a cancel are
+            // both ready at the same time, the cancel wins (we'd rather
+            // stop than process one more batch of bytes).
+            biased;
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    cancelled = true;
+                    break;
+                }
+            }
+            msg = channel.wait() => match msg {
+                Some(ChannelMsg::Data { ref data }) => {
+                    if stdout.len() < max {
+                        let room = max - stdout.len();
+                        stdout.extend_from_slice(&data[..data.len().min(room)]);
+                    }
+                }
+                Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => {
+                    if stderr.len() < max {
+                        let room = max - stderr.len();
+                        stderr.extend_from_slice(&data[..data.len().min(room)]);
+                    }
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status),
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(_) => {}
+            }
+        }
+    }
+
+    let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+
+    // Phase 5: finalize. Store final exit_code + accumulated output in
+    // result so the AI sees it on the last poll. error stays None for
+    // non-zero exit (that's not a task failure — the command ran to
+    // completion; just returned non-zero). Cancelled tasks DO get an error
+    // because the work didn't complete.
+    {
+        let mut tasks = tasks.lock().expect("tasks mutex");
+        if let Some(t) = tasks.get_mut(task_id) {
+            if cancelled {
+                t.phase = TaskPhase::Failed;
+                t.error = Some(format!(
+                    "用户通过 ssh_cancel 取消（已收到 {} 字节 stdout / {} 字节 stderr）",
+                    stdout.len(),
+                    stderr.len()
+                ));
+                t.result = Some(json!({
+                    "cancelled": true,
+                    "stdout": String::from_utf8_lossy(&stdout).into_owned(),
+                    "stderr": String::from_utf8_lossy(&stderr).into_owned(),
+                }));
+            } else {
+                let code = exit_code.unwrap_or(0);
+                t.phase = TaskPhase::Done;
+                t.result = Some(json!({
+                    "exit_code": code,
+                    "stdout": String::from_utf8_lossy(&stdout).into_owned(),
+                    "stderr": String::from_utf8_lossy(&stderr).into_owned(),
+                }));
+            }
+        }
+    }
+    // Release the cancel control entry — last thing the bg task does, so
+    // even a panic in earlier code paths would (eventually) leave a stale
+    // entry that only gets cleared by the next ssh_run on the same id
+    // (effectively never — but harmless). Putting it here under the
+    // non-cancelled branch means a cancelled task still cleans up.
+    {
+        let mut controls = controls.lock().expect("controls mutex");
+        controls.remove(task_id);
+    }
+    log(&format!(
+        "ssh_run [{}] 完成: cancelled={} exit={:?} stdout={}B stderr={}B",
+        task_id,
+        cancelled,
+        exit_code,
+        stdout.len(),
+        stderr.len()
+    ));
+}
+
+/// Render a TransferTask (direction="exec") as the JSON the AI sees on
+/// `ssh_status` polls. Skips the "X% / N bytes" wording that zmodem uses —
+/// exec has no byte stream. The real payload (stdout/stderr/exit_code) is
+/// in the `result` field; we also surface it as top-level keys for the
+/// common case where the AI just wants the strings.
+fn exec_status_to_json(task_id: &str, task: &TransferTask) -> Value {
+    let phase_str = match task.phase {
+        TaskPhase::Confirming => "等待用户确认（请点击弹出的对话框）",
+        TaskPhase::Connecting => "连接中（SSH 握手）",
+        TaskPhase::Transferring => "运行中（命令在远端执行）",
+        TaskPhase::Done => "已完成",
+        TaskPhase::Failed => "失败",
+    };
+    let elapsed = task.started_at.elapsed().as_secs();
+    let text = format!(
+        "ssh_run 任务 [{}]：{}\n状态：{}（已运行 {} 秒）",
+        task_id, task.description, phase_str, elapsed
+    );
+    let (status, error) = match &task.phase {
+        TaskPhase::Done => ("done", None),
+        TaskPhase::Failed => ("failed", task.error.clone()),
+        _ => ("running", None),
+    };
+
+    // Pull result fields to top level for easy AI consumption. `result`
+    // shape is { stdout, stderr } while running and { exit_code, stdout,
+    // stderr } when done — we surface the fields we know about and stash
+    // the whole object in result for completeness.
+    let result_obj = task.result.clone().unwrap_or(json!({}));
+    let stdout = result_obj.get("stdout").cloned().unwrap_or(json!(""));
+    let stderr = result_obj.get("stderr").cloned().unwrap_or(json!(""));
+    let exit_code = result_obj.get("exit_code").cloned();
+
+    let mut payload = json!({
+        "content": [{ "type": "text", "text": text }],
+        "task_id": task_id,
+        "status": status,
+        "elapsed_secs": elapsed,
+        "stdout": stdout,
+        "stderr": stderr,
+        "result": result_obj,
+    });
+    if let Some(ec) = exit_code {
+        payload["exit_code"] = ec;
+    }
+    if let Some(err) = error {
+        payload["status"] = json!("failed");
+        let prev_text = payload["content"][0]["text"].as_str().unwrap_or("").to_string();
+        payload["content"][0]["text"] = json!(format!("{}\n错误：{}", prev_text, err));
+        payload["error"] = json!(err);
+    }
+    payload
+}
+
+/// Periodic eviction of completed exec/zmodem tasks older than TTL.
+/// Called lazily on each `ssh_status`/`zmodem_status` call so we don't
+/// need a background timer task.
+fn evict_stale_tasks(tasks: &Mutex<HashMap<String, TransferTask>>) {
+    let mut tasks = match tasks.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let now = std::time::Instant::now();
+    let before = tasks.len();
+    tasks.retain(|_, t| {
+        // Only evict done/failed; running tasks are never stale.
+        if matches!(t.phase, TaskPhase::Done | TaskPhase::Failed) {
+            now.duration_since(t.started_at).as_secs() < EXEC_TASK_TTL_SECS
+        } else {
+            true
+        }
+    });
+    let after = tasks.len();
+    if before != after {
+        log(&format!("evict_stale_tasks: removed {} stale tasks ({} → {})", before - after, before, after));
+    }
+}
+
 // ============ SFTP helpers (same as CLI) ============
 
 async fn open_sftp(
@@ -2319,8 +2865,29 @@ async fn sftp_upload_file(sftp: &russh_sftp::client::SftpSession, local: &str, r
 // ============ Logging to file (stdout is reserved for JSON-RPC only) ============
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static LOG_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Per-stream stdout/stderr cap for ssh_exec and ssh_run. Configurable via
+/// the `MCP_SSH_MAX_OUTPUT_BYTES` env var (read once at startup); defaults
+/// to 4 MiB. The atomic makes it cheap to read on every channel-data chunk
+/// without a lock — writes only happen at startup (or via the env-var
+/// setter below if we ever expose it).
+///
+/// Why configurable: deploys of big projects (`docker pull` of a 1GB image,
+/// `npm install` on a huge monorepo) generate output streams well past
+/// 4 MiB. The previous hardcoded cap silently truncated and the AI had no
+/// way to know — the fix is to bump this via env var, redirect to a
+/// server-side log file (recommended) and `sftp_download` it, or just
+/// raise the cap for the one-off job.
+static SSH_MAX_OUTPUT_BYTES: AtomicUsize = AtomicUsize::new(4 * 1024 * 1024);
+
+/// Read the current per-stream output cap. Cheap (atomic load) — called on
+/// every channel-data chunk in the collect loops.
+fn ssh_max_output_bytes() -> usize {
+    SSH_MAX_OUTPUT_BYTES.load(Ordering::Relaxed)
+}
 
 fn log_init() {
     if let Some(dir) = dirs::data_dir() {
@@ -2328,6 +2895,29 @@ fn log_init() {
         let _ = std::fs::create_dir_all(&log_dir);
         let path = log_dir.join("mcp.log");
         let _ = LOG_PATH.set(path);
+    }
+
+    // Pick up the per-stream output cap from MCP_SSH_MAX_OUTPUT_BYTES. Env
+    // var is read once at startup so the read path stays a cheap atomic
+    // load. Clamped to [64 KiB, 1 GiB] — below 64 KiB is useless for any
+    // real command, above 1 GiB would risk OOM on a chatty job. Invalid
+    // values are silently ignored (the default sticks); we log a warning
+    // so the operator knows.
+    if let Ok(raw) = std::env::var("MCP_SSH_MAX_OUTPUT_BYTES") {
+        match raw.trim().parse::<usize>() {
+            Ok(n) if n >= 64 * 1024 && n <= 1024 * 1024 * 1024 => {
+                SSH_MAX_OUTPUT_BYTES.store(n, Ordering::Relaxed);
+                log(&format!("MCP_SSH_MAX_OUTPUT_BYTES = {} bytes", n));
+            }
+            Ok(_) => log(&format!(
+                "MCP_SSH_MAX_OUTPUT_BYTES={} 越界，保持默认 4 MiB（合法范围 64 KiB ~ 1 GiB）",
+                raw
+            )),
+            Err(e) => log(&format!(
+                "MCP_SSH_MAX_OUTPUT_BYTES={:?} 解析失败，保持默认 4 MiB：{}",
+                raw, e
+            )),
+        }
     }
 }
 
@@ -2380,7 +2970,11 @@ async fn main() {
     // connection config via IPC (get_connection_secrets). The DEK here stays
     // None permanently — the MCP server cannot access any server on its own.
 
-    let state = McpState { app, tasks: Arc::new(Mutex::new(std::collections::HashMap::new())) };
+    let state = McpState {
+        app,
+        tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        exec_controls: Arc::new(Mutex::new(std::collections::HashMap::new())),
+    };
     log("MCP server ready — waiting for first message on stdin");
 
     // MCP stdio loop.
