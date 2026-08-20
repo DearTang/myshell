@@ -45,7 +45,7 @@ When adding a command, update **three** places in lockstep:
 2. The relevant module in `myshell_core` (`ssh.rs` / `sftp.rs` / `db.rs`) for the actual logic
 3. `src/api.ts` — typed wrapper so the frontend gets types
 
-Current command surface (see `generate_handler!` in `main.rs` for the full list): `get_connections`, `save_connection`, `delete_connection`, `ssh_connect`, `ssh_send`, `ssh_resize`, `ssh_disconnect`, `sftp_list_dir`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, plus vault / folder / quick-command / FTP commands and the local-terminal set `local_connect` / `local_send` / `local_resize` / `local_disconnect`.
+Current command surface (see `generate_handler!` in `main.rs` for the full ~120-command list): `get_connections`, `save_connection`, `delete_connection`, `ssh_connect`, `ssh_send`, `ssh_resize`, `ssh_disconnect`, `sftp_list_dir`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, `sftp_upload`, `sftp_download`, `sftp_cancel_transfer`, plus vault / folder / quick-command / command-history / FTP / zmodem (`rz_*`/`sz_*`) / AI-assistant / MCP-config commands and the local-terminal set `local_connect` / `local_send` / `local_resize` / `local_disconnect`.
 
 Shared types (`ConnectionConfig`, `FileEntry`) are defined in `src-tauri/src/lib.rs` (serde-derived structs, `myshell_core` crate) and mirrored in `src/api.ts` (TS interfaces). Update both in lockstep.
 
@@ -70,16 +70,19 @@ Provides command-line access to saved SSH/SFTP connections:
 - `myshell-cli ssh <连接名>` — interactive terminal session
 - `myshell-cli test <连接名>` — test connection reachability
 - `myshell-cli vault status` — vault status check
-- `myshell-cli vault save-passphrase` — save vault master passphrase to OS keyring (DPAPI-encrypted) for MCP server use
 
-Vault unlock: OS keyring (via `myshell-cli vault save-passphrase`) > `--passphrase` flag > interactive prompt. The MCP server reads from keyring at startup (no env var needed).
+Vault unlock priority: `--passphrase` flag > `MYSHELL_PASSPHRASE` env var > interactive prompt. The MCP server does NOT use any of these — it never holds the passphrase (see below).
 
 ### MCP server (`myshell-mcp`)
 
 Exposes SSH/SFTP operations as MCP tools for AI agents (Claude Desktop, Cursor, ZCode, etc.):
-- Tools: `list_connections`, `ssh_exec`, `sftp_list`, `sftp_download`, `sftp_upload`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, `upload_project`, `download_project`, `test_connection`, `screenshot_terminal`, `open_in_gui`, `zmodem_download`, `zmodem_upload`
-- Transport: stdio (Content-Length framed JSON-RPC 2.0)
-- Auth: `MYSHELL_PASSPHRASE` env var on startup
+- Tools (18): `list_connections`, `ssh_exec`, `ssh_run`, `ssh_status`, `ssh_cancel`, `sftp_list`, `sftp_download`, `sftp_upload`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, `upload_project`, `download_project`, `test_connection`, `screenshot_terminal`, `open_in_gui`, `zmodem_download`, `zmodem_upload`
+- Transport: stdio, newline-delimited JSON-RPC 2.0 (MCP 2025-06-18 spec). Read side also accepts legacy LSP-style `Content-Length` framing for old clients (Claude Desktop et al).
+- Auth: NONE — the MCP server stores no passphrase and holds no DEK. All credential access is delegated to the GUI over a localhost IPC bridge (port discovered via `<config_dir>/myshell/gui-ipc-port`).
+
+**Vault gate (fail-fast).** Every tool except `ssh_status` / `ssh_cancel` / `zmodem_status` requires the GUI's vault to be unlocked — including `list_connections`. The gate (`ensure_vault_ready` in `myshell-mcp.rs`):
+1. Auto-launches `myshell.exe` when the GUI isn't running. A stale `gui-ipc-port` file (left by a crashed GUI) is detected by probing the port: connection refused → delete the file and relaunch; connected-but-unresponsive → error only (never relaunch — would trigger the single-instance "覆盖启动" flow and could kill a hung-but-alive instance).
+2. Queries the vault state ONCE. Locked → sends a `focus_unlock` IPC action (brings the GUI's password gate to the front), then returns an immediate actionable error. No silent waiting — the old 30s poll was removed.
 
 Auto-configuration: The GUI settings panel (MCP → "一键配置全部") auto-detects installed AI tools and writes configs. Manually configure other tools:
 
@@ -88,11 +91,11 @@ Auto-configuration: The GUI settings panel (MCP → "一键配置全部") auto-d
 - Zcode: `<USERPROFILE>\.zcode\cli\config.json` → `mcp.servers.myshell.command`
 - Cursor: `<USERPROFILE>\.cursor\mcp.json` → `mcpServers.myshell.command`
 
-**Safety: dangerous operation confirmation.** The MCP server blocks high-risk tools (`ssh_exec`, `sftp_remove`, `sftp_rename`, `sftp_upload`) behind a native Windows `MessageBoxW` dialog. Human must click "Yes" to proceed; "Cancel" returns an error. Cannot be bypassed by the AI agent.
+**Safety: dangerous operation confirmation.** `ssh_exec` / `ssh_run` use a configurable whitelist/blacklist (regex rules in `<config_dir>/myshell/mcp-command-rules.json`, editable in the GUI: 设置 → MCP 支持 → 命令确认规则): read-only commands (ps, ls, cat, ...) run without a dialog; dangerous ones (rm, kill, sudo, shutdown, write-redirects, ...) must be confirmed by a human. When `show_in_gui` is enabled (default) the confirmation is a React dialog in the GUI tab; headless fallback pops a native Windows `MessageBoxW`. The file tools `sftp_upload`, `sftp_remove`, `sftp_rename`, `upload_project`, `download_project`, and `zmodem_upload` ALWAYS confirm regardless of rules. "Cancel" returns an error; the AI agent cannot bypass this.
 
 ### Rust backend (`src-tauri/src/`)
 
-- `lib.rs` — `myshell_core` library crate root. Holds shared types (`ConnectionConfig`, `FileEntry`, `AppState`), `EventSink` trait (abstracts Tauri's `WebviewWindow::emit` for CLI/MCP), and `pub mod` declarations for all 14 modules. This is the single source of truth for types used by GUI, CLI, and MCP binaries.
+- `lib.rs` — `myshell_core` library crate root. Holds shared types (`ConnectionConfig`, `FileEntry`, `AppState`), `EventSink` trait (abstracts Tauri's `WebviewWindow::emit` for CLI/MCP), and `pub mod` declarations for all 18 modules. This is the single source of truth for types used by GUI, CLI, and MCP binaries.
 - `main.rs` — Tauri GUI binary: thin `#[tauri::command]` wrappers calling into `myshell_core`, `WindowSink` adapter for `EventSink`, Tauri builder.
 - `bin/myshell-cli.rs` — CLI binary (clap-based)
 - `bin/myshell-mcp.rs` — MCP server binary (stdio JSON-RPC 2.0)
@@ -121,10 +124,7 @@ Auto-configuration: The GUI settings panel (MCP → "一键配置全部") auto-d
 
 ### Known incomplete spots
 
-- `check_server_key` in `ssh.rs` returns `Ok(true)` unconditionally — accepts all host keys. Intentional placeholder; revisit before any release.
-- Passwords are stored plaintext in SQLite.
-- App/window close does not disconnect active sessions — SSH TCP connections leak until OS reaps them. Add a `RunEvent::Exit` handler in `main.rs` to drain `ssh_sessions`.
-- `load_secret_key` accepts arbitrary path (no canonicalization/allow-list) — file existence oracle.
+- GUI IPC bridge (localhost TCP, port discovered via the `gui-ipc-port` file) has **no authentication** — any process running as the same user can call `get_connection_secrets` while the vault is unlocked and receive full decrypted credentials. Inherent to the current MCP architecture (the MCP server is itself such a process); a full fix needs named pipes with ACLs or a token handshake. Recorded in `progress.md` 阶段 106.
 - Known risk: `channel.wait()` in `select!` may not be cancel-safe — if bytes are observed being dropped under high traffic, switch to `channel.make_reader()` + `tokio::io::split()`.
 - **Chinese IME input shifts the terminal viewport left — ConPTY upstream bug, not fixable at the app layer.** Typing Chinese via an IME in a line-redrawing program (PowerShell PSReadLine, Codex/ink) makes ConPTY miscalculate the composition string's width and emit a wrong cursor-position sequence, so xterm.js shifts the viewport left during composition; it snaps back when the IME is confirmed (space/enter). ASCII input is unaffected. Matches [VSCode #255285](https://github.com/microsoft/vscode/issues/255285) verbatim. VSCode's workaround is the winpty backend, but **`portable-pty` 0.8.1 has dropped winpty** (`src/win/` ships `conpty.rs` only), so we can't switch backends without replacing the PTY crate — and winpty is UTF-8-hostile (would trade this left-shift for Chinese mojibake). Accepted as a known limitation; waiting on Microsoft to fix ConPTY. See `progress.md` 阶段23. User workaround: confirm the IME often (the shift recovers instantly) and avoid very long single compositions.
 

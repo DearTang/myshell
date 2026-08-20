@@ -1,6 +1,6 @@
 [package]
 name = "myshell"
-version = "2.11.2"
+version = "2.12.0"
 edition = "2021"
 description = "A Rust-based SSH/SFTP shell tool"
 # Three binaries share this crate (myshell / myshell-cli / myshell-mcp). `tauri dev`
@@ -78,4 +78,12 @@ winapi = { version = "0.3", features = [
     "handleapi",
     "shellapi",
     "winuser",
+    # single-instance guard: CreateMutexW / WaitForSingleObject
+    "synchapi",
+    # single-instance guard: WAIT_OBJECT_0 / WAIT_ABANDONED wait results
+    "winbase",
+    # single-instance guard fallback: enumerate myshell.exe processes
+    "tlhelp32",
+    # GetLastError for ERROR_ALREADY_EXISTS detection
+    "errhandlingapi",
 ] }

@@ -2658,3 +2658,65 @@
 | 什么可能导致偏离？ | ① cancel 关闭 SSH 通道不保证杀掉远端所有子进程（child reparent 后可能继续跑），AI 仍需 `ssh_exec 'kill <pid>'` 兜底；② MCP_SSH_MAX_OUTPUT_BYTES 设太大可能 OOM（chatty 任务把 RAM 吃光），clamp 到 1 GiB；③ 60s 锁自愈窗口内，AI 真并发跑两条命令时第二条会立刻拒绝（OK 的设计），但 AI 可能误以为"刚才那条没生效"而重发；④ ssh_cancel 对正在 Confirming（弹 OS 弹窗）的任务无效——只能等用户点完才能看到 cancel。 |
 | 下一步最小可验证动作？ | ① GUI 启动后手动连发 5 条 ssh_exec，确认不再出现"上一条还在跑"误报；② `MCP_SSH_MAX_OUTPUT_BYTES=209715200 ./myshell-mcp.exe` + 跑 docker pull，确认 200MB 输出不被截；③ `ssh_run "sleep 60"` + 5s 后 `ssh_cancel <tid>` + `ssh_status` 看 cancelled=true。 |
 | 目标是什么？ | 让 AI 长任务工作流完全不卡（锁不会僵、输出不会丢、runaway 可中断），从 5min+ 部署任务的实践反馈。 |
+
+### 阶段 105 — 启动时单实例检测：弹窗选择「覆盖启动 / 退出」
+
+**背景：** 双击安装包升级或误双击图标时，Windows 上会出现两个 MyShell GUI 并存——两个进程各持一套 SSH 会话、各写一份 `gui-ipc-port` 文件（后写的覆盖先写的），MCP server 会连到错误的 GUI。此前项目无任何单实例机制。
+
+**方案：**
+- **检测**：`Global\MyShellSingleInstanceMutex` named mutex（`CreateMutexW`）。OS 在进程死亡（含崩溃/TerminateProcess）时自动释放，零 stale 问题——比 gui-ipc-port 文件可靠（后者崩溃时残留）。`Global\` 前缀跨 session/用户互斥，符合单实例语义
+- **弹窗**：`TaskDialogIndirect`（comctl32，raw FFI——winapi 0.3 无包装）。用户反馈后从 MessageBoxW 升级：MB_YESNO 按钮文案固定为「是/否」无法自定义，TaskDialog 支持「退出 / 覆盖启动」自定义按钮 + 主标题「应用已在运行」+ 正文说明，且 Win11 自动应用圆角按钮现代样式。「覆盖启动」设为 nDefaultButton（Enter 触发 + 强调色），按钮顺序左「退出」右「覆盖启动」（破坏性小的靠左）。TASKDIALOGCONFIG/union 手写 repr(C) 定义
+- **覆盖启动路径三级兜底**：① 优雅——读 `gui-ipc-port` → 连 localhost IPC bridge → 发新增的 `{"action":"shutdown"}` → 旧实例 `app.exit(0)` 走 `RunEvent::ExitRequested`（drain_all_sessions + 删 port file，PTY 子进程正确收尾），等 mutex 释放最多 5s；② 强杀——`CreateToolhelp32Snapshot` 枚举进程，`myshell.exe` 且 PID≠自己 → `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`，再等 5s；③ 都失败——错误弹窗（提示手动任务管理器结束）+ 新进程退出
+- **等待语义**：`WaitForSingleObject` 轮询 500ms 切片；`WAIT_OBJECT_0` 和 `WAIT_ABANDONED` 都算获得（abandoned = 旧 owner 未 release 就死了，正是要等的状态）
+- **mutex handle 故意 leak**：进程生命周期内保持持有，kernel 在进程退出时回收
+
+**改动：**
+- `src-tauri/Cargo.toml`：winapi features 加 `synchapi`（CreateMutexW/WaitForSingleObject）、`winbase`（WAIT_OBJECT_0/WAIT_ABANDONED）、`tlhelp32`（进程枚举）、`errhandlingapi`（GetLastError）
+- `src-tauri/src/main.rs`：
+  - 新增 `acquire_single_instance_lock() -> Result<bool, String>`（Windows 完整实现 + 非 Windows no-op stub 返回 Ok(true)，跟 confirm_dangerous_operation 惯例一致）
+  - 新增 `ask_restart_or_quit()`、`shutdown_existing_via_ipc()`、`kill_other_myshell_processes()` 三个辅助函数
+  - `run()` 在 env_logger/setup_file_logging 之后、DB 初始化之前插入 guard 调用——「退出」决策不留半初始化状态，「重启」不与旧实例 teardown 竞争
+  - IPC bridge 加 `"shutdown"` action（dispatch 首位）：写 ack 后 `ipc_handle.exit(0)`
+
+**已知限制（写入注释）：**
+- 非 Windows no-op（项目惯例，winapi 弹窗/互斥体都是 Windows-only）
+- 强杀兜底路径跳过旧实例的 ExitRequested 清理——本地 PTY 的 shell 子进程可能成孤儿（影响极小）；正常路径（IPC 优雅退出）不受影响
+- 旧实例以其他 session 提权运行时 `OpenProcess` 可能权限不足 → 走到错误弹窗（正确行为：宁可失败不可双开）
+
+**验证：** `cargo check` ✅（一次修正：WAIT_OBJECT_0/WAIT_ABANDONED 在 `winapi::um::winbase` 而非 `winnt`，需加 `winbase` feature；TaskDialog 版一次修正：`lpCallbackData` 需 `null_mut()` 非 `null()`）；`cargo build --bin myshell`（debug）✅；`npx tsc --noEmit` ✅（无前端改动）。**手动验收（2026-08-18，debug build + vite dev server）**：① 双开 → TaskDialog 弹出（应用已在运行 / 退出+覆盖启动按钮，覆盖启动为默认）✅；② 「退出」路径：第二个进程退出、旧实例 PID 29968 保持 ✅；③ 「覆盖启动」核心机制：向旧实例 IPC（127.0.0.1:57977）发 `{"action":"shutdown"}` → 旧实例优雅退出（响应 `{"ok":true,"shutting_down":true}`，进程消失）✅。注：debug build 需 vite dev server（localhost:1420）在线，否则 webview 报 ERR_CONNECTION_REFUSED（Tauri debug profile 走 devUrl）；debug 附带 console 窗口属预期（`windows_subsystem` 仅 release 生效）。
+
+## 五问重启检查（阶段 105）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 105 complete —— 单实例检测（named mutex + TaskDialog「覆盖启动/退出」+ IPC 优雅退出/强杀兜底）已实现并实测验收，cargo check + build + tsc 都过。 |
+| 我要去哪里？ | 随下一次 `打包` 发布（✨新增 → minor bump v2.12.0）。 |
+| 什么可能导致偏离？ | ① 强杀兜底跳过旧实例清理，PTY 子 shell 可能残留；② 非 Windows 无检测（惯例）；③ 旧版本实例（< 本次发布）没有 shutdown action，覆盖启动会走 5s 等待 + 强杀（首次升级体验略慢但正确）；④ 提权运行的旧实例强杀权限不足 → 错误弹窗。 |
+| 下一步最小可验证动作？ | 装好新版后：双开 MyShell → 弹窗 → 选「退出」旧实例保留；再双开 → 选「覆盖启动」旧实例退出新实例接管；任务管理器杀掉后立启 → 不弹窗。 |
+| 目标是什么？ | 杜绝双实例并存（SSH 会话分裂 + port file 互相覆盖），升级/误双击时给用户明确选择权。 |
+### 阶段 106 — MCP 保险库门禁重构：自动拉起 GUI、快速失败、全工具覆盖 + 命令注入修复
+
+**背景（用户四项反馈）：** ① agent 调 MCP 时 GUI 未运行会直接报错，不会自动启动应用；② 保险库锁定时 MCP 静默轮询 30 秒才报「可能未解锁」，AI 和用户干等；③ 锁定状态下 list_connections / open_in_gui / screenshot_terminal 等工具绕过门禁照常工作（连接名称/分组元数据泄漏）；④ 审计发现 upload_project / download_project 存在引号注入（远端路径直接拼进 sudo shell 命令与内联 Python 代码 → root 任意命令执行），zmodem 的 `'"\"'` 转义会丢撇号，screenshot_terminal 输出的 user@host 恒为空（明文查询不含加密列）。
+
+**方案：**
+- **门禁重构（myshell-mcp.rs）**：删除 `wait_for_vault_unlocked`（30s 轮询），新增 `ensure_vault_ready()`：先 `ensure_gui_running()`（自动拉起 GUI），再查一次 vault 状态——未初始化/锁定都**立即**返回可操作错误；锁定时先经新 IPC action `focus_unlock` 把 GUI 窗口置顶（密码门正对用户），再返回「保险库未解锁：…窗口已置顶…解锁后重新调用此工具即可」
+- **门禁覆盖所有工具**：豁免名单从 9 个收到 3 个（仅 ssh_status / ssh_cancel / zmodem_status——纯任务状态查询，且必须能读到因门禁失败的任务错误）；list_connections / open_in_gui / screenshot_terminal / zmodem_* / ssh_run 全部纳入。锁定时连连接列表都拿不到（用户明确要求）
+- **ensure_gui_running 防陈旧端口文件**：端口文件存在时先验证端口真能连——连接被拒 = 无监听 = GUI 已死（崩溃/被杀后残留文件），删文件重新拉起；连接成功但 IPC 无响应 = 进程可能活着只是挂起，**不**重启（避免触发单实例「覆盖启动」误杀正在运行的实例），报错让用户处理。实测本机就有陈旧端口文件（GUI 没跑但文件在），旧代码会全部报「IPC 无响应」
+- **GUI 侧（main.rs）**：IPC bridge 新增 `focus_unlock` action（show + set_focus，用户不见密码门是「MCP 卡住」的主因之一）
+- **命令注入修复**：新增 `shell_quote()`（标准 `'\''` 转义）。upload_project 的 sudo mkdir/mv/tar/rm 链全部走它；download_project 的 Python 打包命令改为 **环境变量传路径**（MYTAR/MYDIR + os.environ，Python 体内只用双引号可安全放进单引号 shell 串），cleanup 的 sudo rm -f 同样转义；zmodem 的 sz 路径与 cd 子句改用 shell_quote（顺带修复丢撇号 bug）
+- **顺带修复**：download_project 的 tar_size 在 remove_file 之后才读 metadata（永远报 0）→ 先取再删；screenshot_terminal 改用 resolve_via_gui 拿真实 user@host（旧明文查询两字段恒空）
+- **文档同步**：SERVER_INSTRUCTIONS 的 VAULT NOTE / ENCOUNTERING ERRORS 段、list_connections 与 zmodem_* 工具描述全部改为「立即失败 + 重试」语义
+
+**改动文件：** `src-tauri/src/bin/myshell-mcp.rs`（门禁/转义/描述）、`src-tauri/src/main.rs`（focus_unlock action）。
+
+**已知残留风险（记录不修）：** GUI IPC（localhost TCP + 端口文件发现）无认证——本机同用户的任意进程都能在保险库解锁期间调 `get_connection_secrets` 拿到完整解密凭证。这是 MCP 架构的固有面（MCP 本身也是这样一个本地进程）；彻底修需换 named pipe + ACL 或 token 握手，暂记为已知限制。
+
+**验证：** `cargo check --bin myshell-mcp --bin myshell` ✅、`cargo build --bin myshell-mcp` ✅。**stdio 冒烟测试（.zcode/test-mcp-gate.mjs，实机）**：陈旧端口文件 + GUI 未运行 → 自动删除残留文件并拉起 debug GUI（IPC listener 5384 就绪）→ list_connections **立即**返回「保险库未解锁：MyShell 窗口已置顶…」（全程 5.4s，其中 5s 是 GUI 启动）→ 测试后经 IPC shutdown 优雅关闭 GUI、端口文件正常清理 ✅。GUI 已解锁路径无法无头验证（需要主密码），逻辑为单次查询直通。
+
+## 五问重启检查（阶段 106）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 106 complete —— MCP 门禁重构（自动拉起 + 快速失败 + 全覆盖 + 防陈旧端口文件）与命令注入修复全部完成，cargo check/build 过，实机冒烟测试过。 |
+| 我要去哪里？ | 随下一次 `打包` 发布（🔒安全 + 🐛修复 + 🛠️优化 → patch bump v2.11.3）。 |
+| 什么可能导致偏离？ | ① GUI 挂起但监听还在的场景只报错不自愈（有意为之，防误杀）；② GUI IPC 无认证的固有面（见已知残留风险）；③ 首次调用冷启动要等 GUI 拉起（最长 30s），AI 客户端 30s 超时边缘；④ 老版本 AI 客户端缓存了旧工具描述，语义变化（立即失败）要靠 initialize 重新拉取。 |
+| 下一步最小可验证动作？ | ① 锁定保险库 → 让 agent 调 list_connections → 应秒回「保险库未解锁」且 GUI 置顶；② 解锁后重试 → 正常返回列表；③ 关掉 GUI（任务管理器强杀留残留文件）→ 调任意工具 → 应自动拉起 GUI 而非报错。 |
+| 目标是什么？ | MCP 的保险库交互从「静默等待 30s 才含糊报错」变成「毫秒级明确提示 + 窗口置顶 + 重试即恢复」，且锁定态零信息泄漏、远端路径注入零容忍。 |

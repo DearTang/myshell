@@ -5,7 +5,10 @@
 // Auth: NONE — the MCP server does NOT hold the vault passphrase or DEK.
 // All credential access is delegated to the GUI: ssh_exec runs in a GUI
 // terminal tab, SFTP tools ask the GUI to decrypt connection credentials
-// via IPC. The GUI must be running and the vault must be unlocked.
+// via IPC. If the GUI is not running, the MCP server AUTO-LAUNCHES it.
+// Every tool (except the task-status trio) is gated behind the GUI vault:
+// locked vault → immediate error + the GUI window is focused so the user
+// can type the master password. No silent waiting anywhere.
 //
 // Configuration example (Claude Desktop claude_desktop_config.json):
 //   { "mcpServers": { "myshell": {
@@ -208,18 +211,18 @@ FILE TRANSFER (strict two-step policy):\n\
 2. If the sftp tool FAILS for ANY reason, fall back to `zmodem_download`/`zmodem_upload` (ZMODEM over the remote `sz`/`rz` programs). Common failure reasons: the connection is saved as SSH type (no SFTP), the SFTP subsystem is disabled, restricted/chroot shells, jump hosts (堡垒机), embedded devices, or the remote refuses the SFTP channel. Tell the user: 'sftp 失败，改用 ZMODEM (lrzsz) 方式传输'.\n\
 3. NEVER use `ssh_exec` to transfer file content via base64/echo/heredoc/cat workaround — it is fragile, slow, and breaks on binary/large files. If both sftp and zmodem fail, tell the user and stop; do NOT invent a workaround.\n\
 \n\
-VAULT NOTE: '保险库未解锁' / 'MyShell GUI 未运行' errors affect sftp_*, zmodem_*, and ssh_exec(headless) alike. If you see this error, tell the user to unlock the GUI vault and RETRY the same file-transfer tool — do NOT switch to a different approach. The sftp → zmodem fallback only applies when the failure is about SFTP availability, NOT about the vault.\n\
+VAULT GATE (applies to EVERY tool except ssh_status/ssh_cancel/zmodem_status): MyShell stores all connection credentials in an encrypted vault. If the MyShell GUI isn't running, the tool AUTO-LAUNCHES it. If the vault is locked, the tool FAILS IMMEDIATELY (no waiting) with '保险库未解锁' and brings the MyShell window to the front. When you see this error: tell the user to enter their master password in the MyShell window, then RETRY the same tool — do NOT switch to a different approach. The sftp → zmodem fallback only applies when the failure is about SFTP availability, NOT about the vault.\n\
 \n\
 ZMODEM IS ASYNC: `zmodem_upload`/`zmodem_download` return IMMEDIATELY with a `task_id` (status=`running`); the transfer (including GUI launch, vault-unlock wait, and the confirmation dialog) runs in the background. You MUST then poll `zmodem_status` with the `task_id` every 5-10 seconds until `status` is `done` or `failed`. Do not report success until you see `done`.\n\
 \n\
-ENCOUNTERING ERRORS: if a tool returns '保险库未解锁' or 'MyShell GUI 未运行', the user needs to open the MyShell desktop app and enter their master password to unlock the vault. Tell them this and RETRY the same tool — do not switch approaches (see VAULT NOTE above).";
+ENCOUNTERING ERRORS: '保险库未解锁' means the user must enter their master password in the (now foregrounded) MyShell window — tell them, wait for them to confirm, then RETRY the same tool. '保险库尚未初始化' means first-time setup is needed in the GUI. Both are instant errors by design: the tools never hang waiting for the vault.";
 
 fn tool_definitions() -> Value {
     json!({
         "tools": [
             {
                 "name": "list_connections",
-                "description": "List all SSH/SFTP/FTP connections saved in this user's MyShell client.\n\nWHEN TO USE: Always call this FIRST when the user mentions a remote server by name, nickname, alias, OR IP address — even if you think you know the name. Call this when the user asks 'what servers do I have', 'show my connections', or wants to know if a specific host is already configured. Knowing the full list helps you pick the right `connection` value for other tools.\n\nWHEN NOT TO USE: Don't use this for connections the user is defining on the fly (e.g. 'ssh to user@1.2.3.4'). MyShell tools only work with pre-saved connections.\n\nOUTPUT: JSON array, each item has `name`, `conn_type` (ssh/sftp/ftp/local), `group_path`. For security, host/port/username are NOT included - they are encrypted and only accessible when the GUI vault is unlocked.\n\nIMPORTANT: other tools accept the connection `name` or the group-prefixed path ('/production/prod-db'). IP-based lookup requires the GUI to be running and the vault unlocked (IPs are encrypted). Passwords are never included, for security.",
+                "description": "List all SSH/SFTP/FTP connections saved in this user's MyShell client.\n\nWHEN TO USE: Always call this FIRST when the user mentions a remote server by name, nickname, alias, OR IP address — even if you think you know the name. Call this when the user asks 'what servers do I have', 'show my connections', or wants to know if a specific host is already configured. Knowing the full list helps you pick the right `connection` value for other tools.\n\nWHEN NOT TO USE: Don't use this for connections the user is defining on the fly (e.g. 'ssh to user@1.2.3.4'). MyShell tools only work with pre-saved connections.\n\nOUTPUT: JSON array, each item has `name`, `conn_type` (ssh/sftp/ftp/local), `group_path`. For security, host/port/username are NOT included - they are encrypted.\n\nIMPORTANT: other tools accept the connection `name` or the group-prefixed path ('/production/prod-db'). IP-based lookup requires the vault unlocked (IPs are encrypted). Passwords are never included, for security.\n\nVAULT REQUIRED: this call FAILS INSTANTLY with '保险库未解锁' when the MyShell vault is locked (the MyShell window is brought to the front for the user) — tell the user to enter their master password, then retry. The GUI auto-launches when it isn't running.",
                 "inputSchema": { "type": "object", "properties": {}, "required": [] }
             },
             {
@@ -411,7 +414,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "zmodem_download",
-                "description": "Download a file from a remote SSH server using the ZMODEM protocol (remote `sz` → local). This is the FALLBACK transfer method — use it when `sftp_download` fails or is unavailable.\n\nWHEN TO USE (strict two-step policy):\n1. First call `sftp_download` for the same file. In most cases it succeeds and is faster.\n2. If `sftp_download` fails for ANY reason (connection is SSH-only with no SFTP saved, SFTP subsystem disabled, restricted/chroot shell, jump host, embedded device, etc.), call THIS tool as the fallback. Tell the user: 'sftp 失败，改用 ZMODEM (lrzsz) 方式传输'.\n3. If the user explicitly asked for ZMODEM/sz, use this tool directly.\n\nNEVER use `ssh_exec` + base64/cat/heredoc to transfer file content — it breaks on binary/large files. If both sftp and zmodem fail, tell the user and stop.\n\nPREREQUISITE: The remote server must have `sz` installed (part of the `lrzsz` package). If it's missing, the task fails after ~20s with a hint to install lrzsz.\n\nASYNC: returns IMMEDIATELY with {task_id, status:\"running\"}; the transfer (including GUI launch + vault-unlock wait if needed) runs in the background. You MUST then poll `zmodem_status(task_id)` every 5-10s until status is `done` or `failed`. No human confirmation dialog (read-only on the remote).\n\nFINAL RESULT: when `zmodem_status` returns status=\"done\", its `result` field has `{files:[{name, local_path, bytes}]}`.\n\nNOTE: the `timeout` param (default 120s) caps the background transfer, not the tool-call window (which is <1s).",
+                "description": "Download a file from a remote SSH server using the ZMODEM protocol (remote `sz` → local). This is the FALLBACK transfer method — use it when `sftp_download` fails or is unavailable.\n\nWHEN TO USE (strict two-step policy):\n1. First call `sftp_download` for the same file. In most cases it succeeds and is faster.\n2. If `sftp_download` fails for ANY reason (connection is SSH-only with no SFTP saved, SFTP subsystem disabled, restricted/chroot shell, jump host, embedded device, etc.), call THIS tool as the fallback. Tell the user: 'sftp 失败，改用 ZMODEM (lrzsz) 方式传输'.\n3. If the user explicitly asked for ZMODEM/sz, use this tool directly.\n\nNEVER use `ssh_exec` + base64/cat/heredoc to transfer file content — it breaks on binary/large files. If both sftp and zmodem fail, tell the user and stop.\n\nPREREQUISITE: The remote server must have `sz` installed (part of the `lrzsz` package). If it's missing, the task fails after ~20s with a hint to install lrzsz.\n\nASYNC: returns IMMEDIATELY with {task_id, status:\"running\"}; the transfer runs in the background. The GUI auto-launches if it isn't running; a locked vault fails the tool call INSTANTLY with '保险库未解锁' (the MyShell window is brought to the front for the user) — tell the user to unlock, then retry. No human confirmation dialog (read-only on the remote).\n\nFINAL RESULT: when `zmodem_status` returns status=\"done\", its `result` field has `{files:[{name, local_path, bytes}]}`.\n\nNOTE: the `timeout` param (default 120s) caps the background transfer, not the tool-call window (which is <1s).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -425,7 +428,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "zmodem_upload",
-                "description": "Upload a local file to a remote SSH server using the ZMODEM protocol (local → remote `rz`). This is the FALLBACK transfer method — use it when `sftp_upload` fails or is unavailable.\n\nWHEN TO USE (strict two-step policy):\n1. First call `sftp_upload` for the same file. In most cases it succeeds and is faster.\n2. If `sftp_upload` fails for ANY reason (connection is SSH-only with no SFTP saved, SFTP subsystem disabled, restricted/chroot shell, jump host, embedded device, etc.), call THIS tool as the fallback. Tell the user: 'sftp 失败，改用 ZMODEM (lrzsz) 方式传输'.\n3. If the user explicitly asked for ZMODEM/rz, use this tool directly.\n\nNEVER use `ssh_exec` + base64/cat/heredoc/echo to transfer file content — it breaks on binary/large files. If both sftp and zmodem fail, tell the user and stop.\n\nPREREQUISITE: The remote server must have `rz` installed (part of the `lrzsz` package). If missing, the task fails after ~20s.\n\nASYNC: returns IMMEDIATELY with {task_id, status:\"running\"}; the transfer (including GUI launch, vault-unlock wait, and the confirmation dialog) runs in the background. The OS dialog pops AFTER the tool returns — remind the user to click it if the first `zmodem_status` poll shows phase=`Confirming`. You MUST then poll `zmodem_status(task_id)` every 5-10s until status is `done` or `failed`.\n\n⚠️ HUMAN CONFIRMATION REQUIRED: A native OS dialog pops up (writing to the remote server). Won't proceed until the user clicks 'Yes'. This happens AFTER the tool returns, in the background.\n\nFINAL RESULT: when `zmodem_status` returns status=\"done\", its `result` field has `{remote_path, bytes}`.\n\nNOTE: the `timeout` param (default 120s) caps the background transfer, not the tool-call window (which is <1s).",
+                "description": "Upload a local file to a remote SSH server using the ZMODEM protocol (local → remote `rz`). This is the FALLBACK transfer method — use it when `sftp_upload` fails or is unavailable.\n\nWHEN TO USE (strict two-step policy):\n1. First call `sftp_upload` for the same file. In most cases it succeeds and is faster.\n2. If `sftp_upload` fails for ANY reason (connection is SSH-only with no SFTP saved, SFTP subsystem disabled, restricted/chroot shell, jump host, embedded device, etc.), call THIS tool as the fallback. Tell the user: 'sftp 失败，改用 ZMODEM (lrzsz) 方式传输'.\n3. If the user explicitly asked for ZMODEM/rz, use this tool directly.\n\nNEVER use `ssh_exec` + base64/cat/heredoc/echo to transfer file content — it breaks on binary/large files. If both sftp and zmodem fail, tell the user and stop.\n\nPREREQUISITE: The remote server must have `rz` installed (part of the `lrzsz` package). If missing, the task fails after ~20s.\n\nASYNC: returns IMMEDIATELY with {task_id, status:\"running\"}; the transfer runs in the background. The GUI auto-launches if it isn't running; a locked vault fails the tool call INSTANTLY with '保险库未解锁' (the MyShell window is brought to the front for the user) — tell the user to unlock, then retry. The OS confirmation dialog pops AFTER the tool returns — remind the user to click it if the first `zmodem_status` poll shows phase=`Confirming`. You MUST then poll `zmodem_status(task_id)` every 5-10s until status is `done` or `failed`.\n\n⚠️ HUMAN CONFIRMATION REQUIRED: A native OS dialog pops up (writing to the remote server). Won't proceed until the user clicks 'Yes'. This happens AFTER the tool returns, in the background.\n\nFINAL RESULT: when `zmodem_status` returns status=\"done\", its `result` field has `{remote_path, bytes}`.\n\nNOTE: the `timeout` param (default 120s) caps the background transfer, not the tool-call window (which is <1s).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -642,25 +645,21 @@ fn resolve_connection_id(
     ))
 }
 
-/// Full credential resolution for background tasks: ensure the GUI is running,
-/// wait for the vault to unlock, then ask the GUI to decrypt the connection.
-/// Each failure is reported as a task error via `fail`.
+/// Full credential resolution for background tasks: ensure the GUI is running
+/// and the vault is unlocked (fail-fast, auto-launching the GUI if needed),
+/// then ask the GUI to decrypt the connection. Each failure is reported as a
+/// task error via `fail`.
 async fn resolve_config_for_task(
     app: &AppState,
     conn_name: &str,
     expected_conn_type: Option<&str>,
     fail: &impl Fn(String),
 ) -> Option<ConnectionConfig> {
-    // Ensure the GUI is running (auto-launch if needed).
-    if let Err(e) = ensure_gui_running() {
-        fail(format!(
-            "MyShell GUI 未运行且无法自动启动：{}。请手动打开 MyShell 桌面应用并输入主密码解锁保险库，然后重新调用此工具。",
-            e
-        ));
-        return None;
-    }
-    // Wait for the vault to be unlocked (up to 30s).
-    if let Err(e) = wait_for_vault_unlocked() {
+    // This is mostly a race guard: the synchronous vault gate at the top of
+    // call_tool has already run, so the common case is an instant Ok. If the
+    // vault got locked in between (auto-lock timer), we fail the task fast
+    // instead of silently waiting.
+    if let Err(e) = ensure_vault_ready() {
         fail(e);
         return None;
     }
@@ -727,33 +726,32 @@ fn ambiguous_error(
 // ============ Tool dispatch ============
 
 async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, String> {
-    // ── Vault-unlock gate ────────────────────────────────────────────────
-    // Tools that touch encrypted credentials (host/password) require the GUI
-    // vault to be unlocked. If it's locked, wait up to 30s for the user to
-    // unlock it (polling every 3s) before giving up. Tools that don't need
-    // credentials are exempt: list_connections (plaintext-only) is always
-    // allowed so the AI can still enumerate servers even when locked.
+    // ── Vault-unlock gate (fail-fast, applies to EVERY tool except task
+    // status/cancel) ────────────────────────────────────────────────────
+    // Every tool requires the GUI vault to be unlocked — INCLUDING
+    // list_connections: without the master password the AI must not even
+    // learn WHICH servers exist (connection names/groups are metadata worth
+    // protecting too). The gate:
+    //   - auto-launches the GUI when it isn't running;
+    //   - checks the vault state ONCE and fails immediately when locked,
+    //     focusing the GUI's password gate so the user sees it right away.
+    // The three exemptions (ssh_status / ssh_cancel / zmodem_status) never
+    // touch credentials and must stay reachable so the AI can observe and
+    // clean up tasks that failed ON this very gate.
     match name {
-        "list_connections" | "screenshot_terminal" | "open_in_gui" | "zmodem_status"
-        | "zmodem_download" | "zmodem_upload" | "ssh_run" | "ssh_status" | "ssh_cancel" => {
-            // These tools either don't need credentials (list_connections),
-            // trigger the GUI's own unlock flow (screenshot/open_in_gui), or
-            // run asynchronously and handle the vault gate inside their
-            // background task (zmodem_*, ssh_run). Skipping the synchronous
-            // gate here avoids colliding with the client's tool-call
-            // timeout.
-        }
+        "ssh_status" | "ssh_cancel" | "zmodem_status" => {}
         _ => {
-            wait_for_vault_unlocked()?;
+            ensure_vault_ready()?;
         }
     }
 
     match name {
         "list_connections" => {
-            // SECURITY: use plaintext-only lookup - do NOT decrypt host/username.
-            // The MCP server must not expose server IPs or credentials to the AI
-            // without the GUI being unlocked. Only name/conn_type/group_path
-            // (non-sensitive plaintext columns) are returned.
+            // SECURITY: the vault gate at the top of call_tool has already
+            // verified the GUI is running and the vault is unlocked — without
+            // it, the AI must not even see which servers exist. The output is
+            // still kept minimal: only name/conn_type/group_path. Host, port,
+            // username and passwords are NEVER returned to the AI.
             let db = state.app.db.lock().map_err(|e| e.to_string())?;
             let connections = db::get_all_connections_plaintext(&db).map_err(|e| e.to_string())?;
             let items: Vec<Value> = connections
@@ -916,18 +914,10 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?.to_string();
             let command = args["command"].as_str().ok_or("缺少 command 参数")?.to_string();
 
-            // Pre-flight: ensure GUI is running + vault will be unlockable.
-            // We don't actually wait for the vault here (the background task
-            // does that) — we just confirm the GUI binary exists so the user
-            // gets a fast error if it isn't installed. Mirrors zmodem_*
-            // pattern: do the cheap checks here, push the slow ones into bg.
-            if let Err(e) = ensure_gui_running() {
-                return Err(e);
-            }
-
-            // Command confirmation check is done in the BACKGROUND task, not
-            // here — pop the OS dialog inside the task so the tool call
-            // returns instantly and we don't block on the user's "Yes" click.
+            // GUI/vault pre-flight has already run at the top of call_tool
+            // (auto-launch + fail-fast unlock check), so there is nothing
+            // slow left to do here — the confirmation dialog is popped in
+            // the BACKGROUND task below so the tool call returns instantly.
             let rules = load_command_rules();
             let needs_confirm = command_rules::command_needs_confirmation(&command, &rules);
 
@@ -1274,14 +1264,23 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // 5. 清理本地临时文件
             std::fs::remove_file(&tmp_tar).ok();
 
-            // 4. 在服务器上：创建目标目录 + sudo 移动 + 解压 + 清理
+            // 4. 在服务器上：创建目标目录 + sudo 移动 + 解压 + 清理。
+            // SECURITY: every interpolated path goes through shell_quote() —
+            // they contain user/AI-controlled segments (remote_dir, the local
+            // dir basename) and run under sudo, so an unescaped quote would
+            // mean arbitrary command execution as root.
             let ssh_config2 = state.resolve_via_gui(conn_name, Some("ssh"))?;
             let ssh_handle2 = ssh::dial_and_authenticate(&state.app, &ssh_config2, false).await?;
             {
                 let channel = ssh_handle2.channel_open_session().await.map_err(|e| format!("打开通道失败: {}", e))?;
                 let extract_cmd = format!(
-                    "sudo mkdir -p '{}' && sudo mv '{}' '{}' && cd '{}' && sudo tar -xzf '{}' && sudo rm -f '{}' && echo 'UPLOAD_OK'",
-                    remote_target, remote_tar_path, remote_target, remote_target, remote_tar_name, remote_tar_name
+                    "sudo mkdir -p {} && sudo mv {} {} && cd {} && sudo tar -xzf {} && sudo rm -f {} && echo 'UPLOAD_OK'",
+                    shell_quote(&remote_target),
+                    shell_quote(&remote_tar_path),
+                    shell_quote(&remote_target),
+                    shell_quote(&remote_target),
+                    shell_quote(&remote_tar_name),
+                    shell_quote(&remote_tar_name),
                 );
                 channel.exec(true, extract_cmd).await.map_err(|e| format!("解压失败: {}", e))?;
             }
@@ -1316,23 +1315,28 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             let _ = sftp.canonicalize(remote_dir).await
                 .map_err(|e| format!("远程目录不存在: {} ({})", remote_dir, e))?;
 
-            // 2. 在服务器上打包到临时文件（用 Python tarfile 处理中文文件名）
+            // 2. 在服务器上打包到临时文件（用 Python tarfile 处理中文文件名）。
+            // SECURITY: paths are passed via environment variables instead of
+            // string interpolation — remote_dir can contain quotes/backslashes
+            // that would otherwise break out of the old inline Python literal
+            // into arbitrary code execution. The Python body itself uses only
+            // double quotes so it can sit inside a single-quoted shell string.
             let tmp_tar = format!("/tmp/_dl_project_{}.tar.gz", dir_name);
             let tar_cmd = format!(
-                "python3 -c \"\
-import tarfile, os, sys
-exclude = {{'.venv', 'venv', '__pycache__', '.git', 'node_modules', 'dist', 'build', 'target'}}
-with tarfile.open('{}', 'w:gz') as tf:
-    for root, dirs, files in os.walk('{}'):
-        dirs[:] = [d for d in dirs if d not in exclude and not d.startswith('.')]
-        for f in files:
-            if f.endswith('.pyc'): continue
-            full = os.path.join(root, f)
-            arcname = os.path.relpath(full, '{}')
-            tf.add(full, arcname=arcname)
-print('TAR_OK')
-\" 2>&1",
-                tmp_tar, remote_dir, remote_dir
+                "MYTAR={} MYDIR={} python3 -c '{}' 2>&1",
+                shell_quote(&tmp_tar),
+                shell_quote(remote_dir),
+                "import tarfile, os\n\
+                 exclude = {\".venv\", \"venv\", \"__pycache__\", \".git\", \"node_modules\", \"dist\", \"build\", \"target\"}\n\
+                 with tarfile.open(os.environ[\"MYTAR\"], \"w:gz\") as tf:\n\
+                     for root, dirs, files in os.walk(os.environ[\"MYDIR\"]):\n\
+                         dirs[:] = [d for d in dirs if d not in exclude and not d.startswith(\".\")]\n\
+                         for f in files:\n\
+                             if f.endswith(\".pyc\"): continue\n\
+                             full = os.path.join(root, f)\n\
+                             arcname = os.path.relpath(full, os.environ[\"MYDIR\"])\n\
+                             tf.add(full, arcname=arcname)\n\
+                 print(\"TAR_OK\")"
             );
             let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
@@ -1357,12 +1361,12 @@ print('TAR_OK')
             sftp_download_file(&sftp2, &tmp_tar, local_tar_str).await?;
             let _ = sftp_handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
-            // 4. 清理服务器上的临时文件
+            // 4. 清理服务器上的临时文件（dir_name 来自远端路径，需转义）
             let cleanup_config = state.resolve_via_gui(conn_name, Some("ssh"))?;
             let cleanup_handle = ssh::dial_and_authenticate(&state.app, &cleanup_config, false).await?;
             {
                 let channel = cleanup_handle.channel_open_session().await.map_err(|e| format!("打开通道失败: {}", e))?;
-                channel.exec(true, format!("sudo rm -f '{}'", tmp_tar)).await.ok();
+                channel.exec(true, format!("sudo rm -f {}", shell_quote(&tmp_tar))).await.ok();
             }
             let _ = cleanup_handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
@@ -1374,6 +1378,9 @@ print('TAR_OK')
                 .output()
                 .map_err(|e| format!("解压失败: {}（确保系统有 tar 命令）", e))?;
 
+            // Record the size BEFORE removing the temp file (the old order
+            // always reported 0 because metadata was read after the delete).
+            let tar_size = std::fs::metadata(local_tar_str).map(|m| m.len()).unwrap_or(0);
             // 清理本地临时文件
             std::fs::remove_file(&local_tar).ok();
 
@@ -1382,7 +1389,6 @@ print('TAR_OK')
                 return Err(format!("解压失败: {}", stderr));
             }
 
-            let tar_size = std::fs::metadata(local_tar_str).map(|m| m.len()).unwrap_or(0);
             Ok(json!({ "content": [{ "type": "text", "text": format!("✅ 项目下载成功！\n远程: {}\n本地: {}\n大小: {} bytes (tar.gz)", remote_dir, local_dir, tar_size) }] }))
         }
 
@@ -1442,13 +1448,11 @@ print('TAR_OK')
             // can't. A future IPC-backed variant (MCP writes a trigger file,
             // GUI watches and captures) is tracked as future work.
             let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
-            // Plaintext lookup only — screenshot tool doesn't need credentials.
-            let db = state.app.db.lock().map_err(|e| e.to_string())?;
-            let conns = db::get_all_connections_plaintext(&db).map_err(|e| e.to_string())?;
-            drop(db);
-            let config = conns.into_iter().find(|c| c.name == conn_name
-                || format!("{}/{}", c.group_path.trim_end_matches('/'), c.name) == conn_name)
-                .ok_or_else(|| format!("未找到连接: {}", conn_name))?;
+            // Full decrypted lookup — the vault gate at the top of call_tool
+            // already verified the GUI is running and unlocked. (The old
+            // plaintext lookup left host/username EMPTY because those columns
+            // are encrypted, so the instruction text showed a bare "@".)
+            let config = state.resolve_via_gui(conn_name, None)?;
             let attachment_dir = secrets_attachment_dir();
 
             let attachment_hint = match attachment_dir {
@@ -1641,13 +1645,40 @@ fn get_config_from_gui(conn_id: &str) -> Result<ConnectionConfig, String> {
 
 // ============ GUI exec_in_tab (show_in_gui mode) ============
 
-/// Ensure the MyShell GUI is running. If the IPC port file exists, assume it's
-/// already up. Otherwise, spawn `myshell.exe` from the same directory as this
+/// Ensure the MyShell GUI is running. If the IPC port file exists, VERIFY the
+/// port actually responds (a crashed / force-killed GUI leaves a stale port
+/// file behind, which used to make every tool call die with a confusing IPC
+/// timeout). Otherwise, spawn `myshell.exe` from the same directory as this
 /// MCP binary and poll for the port file to appear (up to 30s).
 fn ensure_gui_running() -> Result<u16, String> {
-    // Already running?
     if let Some(port) = read_gui_ipc_port() {
-        return Ok(port);
+        // Distinguish two failure modes by whether ANYTHING is listening:
+        //
+        //   connect refused  → the listener is gone, so the GUI process is
+        //     gone too (its exit cleanup never ran — crash / task-manager
+        //     kill). The port file is stale: remove it and relaunch. This is
+        //     safe — a live GUI always has its listener bound.
+        //
+        //   connect ok but no IPC response → a process IS listening but not
+        //     answering. Do NOT relaunch: blindly starting a second GUI would
+        //     pop the "覆盖启动?" dialog and could force-kill the (possibly
+        //     just busy) running instance, losing the user's open sessions.
+        //     Surface an error and let the user decide.
+        let listener_alive = std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+        if listener_alive {
+            if query_gui_vault_status(port).is_some() {
+                return Ok(port);
+            }
+            return Err(
+                "MyShell GUI 正在运行但 IPC 无响应（进程可能已挂起）。请在任务管理器中检查 myshell.exe，必要时手动重启 MyShell 后重试。"
+                    .to_string(),
+            );
+        }
+        log(&format!(
+            "[gui] 陈旧的 gui-ipc-port 文件（端口 {} 无监听）— 删除并重新启动 GUI",
+            port
+        ));
+        remove_gui_ipc_port_file();
     }
 
     // Find myshell.exe — it lives in the same directory as myshell-mcp.exe.
@@ -1682,6 +1713,19 @@ fn ensure_gui_running() -> Result<u16, String> {
     Err("GUI 启动超时（30 秒内未就绪）。请手动打开 MyShell 后重试。".to_string())
 }
 
+/// Delete the GUI's IPC port-discovery file. Only called when we have proven
+/// nothing is listening on that port (stale file from a crashed GUI), so a
+/// freshly launched GUI can publish its real port without confusion.
+fn remove_gui_ipc_port_file() {
+    let mut path = match dirs::config_dir() {
+        Some(d) => d,
+        None => return,
+    };
+    path.push("myshell");
+    path.push("gui-ipc-port");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Query the GUI's vault state via localhost IPC. Returns:
 ///   Some((initialized, unlocked)) — got a valid response
 ///   None                           — GUI unreachable or malformed response
@@ -1707,81 +1751,78 @@ fn query_gui_vault_status(port: u16) -> Option<(bool, bool)> {
     Some((initialized, unlocked))
 }
 
-/// Wait for the GUI vault to be unlocked. Called at the top of every tool
-/// handler that needs credentials (ssh_exec, sftp_*, etc.).
+/// Ask the GUI to bring its window (and thus the master-password gate) to the
+/// front. Fire-and-forget: any failure is ignored — the error text we return
+/// to the AI already tells the user what to do, focusing is just a courtesy.
+fn send_gui_focus_unlock(port: u16) {
+    use std::io::{BufRead, BufReader, Write};
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let cmd = serde_json::json!({ "action": "focus_unlock" });
+    if writeln!(stream, "{}", cmd).is_ok() {
+        let _ = stream.flush();
+        // Drain the one-line {"ok":true} response so the connection closes cleanly.
+        let mut buf = String::new();
+        let _ = BufReader::new(stream).read_line(&mut buf);
+    }
+}
+
+/// Fail-fast vault gate. Called at the top of every tool handler that needs
+/// anything beyond task-status polling (ssh_exec, sftp_*, list_connections,
+/// open_in_gui, screenshot_terminal, and the async starters' pre-flight).
 ///
 /// Behavior:
-///   1. If the GUI is not running → fail fast with a clear message (the user
-///      needs to open MyShell first).
-///   2. If the vault is already unlocked → return Ok immediately.
-///   3. If the vault is locked → poll every 3 seconds for up to 30 seconds.
-///      Each poll re-checks the GUI's vault state, giving the user a window
-///      to switch to the GUI and enter their master password. If the user
-///      unlocks within 30s, we proceed with the tool call. If not, we return
-///      an error telling them (and the AI) exactly what to do.
+///   1. Ensure the GUI is running — AUTO-LAUNCH myshell.exe if it isn't
+///      (waits up to 30s for the IPC port file while it boots).
+///   2. Query the GUI's vault state ONCE (a few retries only to cover a
+///      freshly launched GUI still binding its IPC listener).
+///   3. Unlocked → Ok, proceed with the tool.
+///      Not initialized → immediate actionable error.
+///      Locked → focus the GUI so the password gate is in the user's face,
+///      then return an immediate error telling the AI (and the user) to
+///      unlock and RETRY the same tool.
 ///
-/// The 30-second window is chosen because the AI client typically shows the
-/// tool as "running" during this time — the user sees something is happening
-/// and gets a chance to unlock without the tool giving up too quickly.
-fn wait_for_vault_unlocked() -> Result<(), String> {
-    let port = match read_gui_ipc_port() {
-        Some(p) => p,
-        None => {
-            return Err(
-                "MyShell GUI 未运行。请先打开 MyShell 桌面应用并输入主密码解锁保险库，然后重试。"
-                    .to_string(),
-            );
-        }
-    };
+/// DELIBERATELY no 30-second silent poll anymore: the old wait was the #1
+/// source of "the tool hung forever, then vaguely suggested the password
+/// might be missing" reports. Failing fast surfaces the prompt within
+/// milliseconds; the AI relays it, the user unlocks, the retry succeeds.
+fn ensure_vault_ready() -> Result<(), String> {
+    let port = ensure_gui_running().map_err(|e| {
+        format!("MyShell GUI 未运行且无法自动启动：{}。请手动打开 MyShell 桌面应用，然后重试。", e)
+    })?;
 
-    // First check — fast path (vault already unlocked, no waiting).
-    match query_gui_vault_status(port) {
-        Some((_, true)) => return Ok(()),
-        Some((false, _)) => {
-            return Err(
-                "保险库尚未初始化。请先在 MyShell GUI 中设置主密码（首次启动时会引导设置）。"
-                    .to_string(),
-            );
+    // Right after auto-launch the IPC listener may need a moment; retry the
+    // status query briefly before concluding the GUI is unreachable.
+    let mut status = None;
+    for _ in 0..5 {
+        if let Some(s) = query_gui_vault_status(port) {
+            status = Some(s);
+            break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    match status {
+        Some((_, true)) => Ok(()),
+        Some((false, _)) => Err(
+            "保险库尚未初始化：请先在 MyShell GUI 中设置主密码（首次启动时会引导设置），然后重新调用此工具。"
+                .to_string(),
+        ),
         Some((true, false)) => {
-            log("[vault] locked — waiting up to 30s for user to unlock GUI");
+            send_gui_focus_unlock(port);
+            Err(
+                "保险库未解锁：MyShell 窗口已置顶，请在其中输入主密码解锁保险库，解锁后重新调用此工具即可。"
+                    .to_string(),
+            )
         }
-        None => {
-            // GUI IPC failed even though the port file exists — GUI may be
-            // starting up. Fall through to the poll loop and give it a chance.
-            log("[vault] IPC query failed — GUI may be starting, will retry");
-        }
+        None => Err(
+            "无法查询 MyShell GUI 的保险库状态（IPC 无响应）。请确认 MyShell 桌面应用正在运行后重试。"
+                .to_string(),
+        ),
     }
-
-    // Poll every 3 seconds, up to 30 seconds total (10 attempts).
-    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
-    const MAX_ATTEMPTS: u32 = 10;
-    for attempt in 1..=MAX_ATTEMPTS {
-        std::thread::sleep(INTERVAL);
-        match query_gui_vault_status(port) {
-            Some((true, true)) => {
-                log(&format!("[vault] unlocked on attempt {attempt}"));
-                return Ok(());
-            }
-            Some((false, _)) => {
-                return Err(
-                    "保险库尚未初始化。请先在 MyShell GUI 中设置主密码（首次启动时会引导设置）。"
-                        .to_string(),
-                );
-            }
-            Some((true, false)) => {
-                // Still locked — keep waiting. No log spam, just the final outcome.
-            }
-            None => {
-                // IPC transient failure — keep trying.
-            }
-        }
-    }
-
-    Err(
-        "保险库未解锁（已等待 30 秒）。请在 MyShell GUI 中输入主密码解锁保险库，然后重新调用此工具。"
-            .to_string(),
-    )
 }
 
 /// Send an "exec_in_tab" command to the GUI: run `command` in a visible
@@ -2011,6 +2052,21 @@ fn join_local_path(dir: &str, name: &str) -> String {
     format!("{}{}{}", dir, sep, name)
 }
 
+/// Single-quote `s` for safe interpolation into a POSIX shell command.
+/// Anything inside single quotes is literal; an embedded quote uses the
+/// standard close-quote/escaped-quote/reopen dance (`'\''`).
+///
+/// SECURITY: every remote path that ends up inside a shell command string
+/// (upload_project's sudo chain, download_project's tar/cleanup, zmodem's
+/// sz/rz/cd) MUST go through this — the paths originate from the AI/user and
+/// may contain quotes, which would otherwise break out into arbitrary command
+/// execution (with sudo in the worst case). Note the older `replace('\'',
+/// "'\"\"'")` trick used elsewhere DROPPED the apostrophe instead of escaping
+/// it — this helper replaces it everywhere.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// zmodem_download: run `sz <remote_path>` on the server, receive the file via
 /// the native ZMODEM receiver, and write it to `local_dir`.
 ///
@@ -2026,10 +2082,13 @@ async fn zmodem_download_tool(state: &McpState, args: &Value) -> Result<Value, S
     std::fs::metadata(&local_dir)
         .map_err(|e| format!("本地目录不存在或不可访问 [{}]: {}", local_dir, e))?;
 
-    // NOTE: GUI/vault/credential checks are deferred to the background task —
-    // doing them here would block the synchronous tool-call path and risk the
-    // client's 30s timeout. The background task reports failures via the task
-    // table, which the AI polls with zmodem_status.
+    // NOTE: the GUI/vault gate has already run synchronously at the top of
+    // call_tool (auto-launch + fail-fast unlock check), so by the time we get
+    // here the vault is unlocked. Only the credential decryption and the
+    // actual transfer are deferred to the background task — doing THOSE here
+    // would block the tool-call path and risk the client's 30s timeout. The
+    // background task re-checks the vault as a race guard (auto-lock may fire
+    // mid-flight) and reports failures via the task table.
 
     // Create the task entry.
     let task_id = format!("zm-dl-{}", chrono_like_ts());
@@ -2119,8 +2178,7 @@ async fn run_download_task(
         }
     };
 
-    let escaped = remote_path.replace('\'', "'\"\"'");
-    let cmd = format!("sz '{}'\r", escaped);
+    let cmd = format!("sz {}\r", shell_quote(remote_path));
     if let Err(e) = ssh::send_input(app, &session_id, cmd.as_bytes()).await {
         let _ = ssh::disconnect(app, &session_id).await;
         fail(format!("发送 sz 命令失败: {}", e));
@@ -2249,9 +2307,13 @@ async fn zmodem_upload_tool(state: &McpState, args: &Value) -> Result<Value, Str
         .ok_or_else(|| "无法从本地路径提取文件名".to_string())?
         .to_string();
 
-    // NOTE: GUI/vault/credential checks are deferred to the background task —
-    // doing them here would block the synchronous tool-call path and risk the
-    // client's 30s timeout.
+    // NOTE: the GUI/vault gate has already run synchronously at the top of
+    // call_tool (auto-launch + fail-fast unlock check), so by the time we get
+    // here the vault is unlocked. Only the confirmation dialog, credential
+    // decryption and the actual transfer are deferred to the background task
+    // (the dialog blocks on the user's click, which must not hold the
+    // tool-call window). The background task re-checks the vault as a race
+    // guard.
 
     // Create the task entry (starts in Confirming — the OS dialog is popped
     // inside the background task so the tool call returns instantly).
@@ -2283,10 +2345,10 @@ async fn zmodem_upload_tool(state: &McpState, args: &Value) -> Result<Value, Str
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": format!(
-                "⏳ ZMODEM 上传已启动（任务 {}）。正在后台准备（如 GUI 未运行会自动启动，保险库未解锁会等待解锁，然后弹出系统确认对话框）。文件：{} ({} 字节) → {}/{}\n请用 zmodem_status 查询进度（建议每 5-10 秒轮询一次）。",
-                task_id, local_path, size, remote_dir, basename
-            )
+                "text": format!(
+                    "⏳ ZMODEM 上传已启动（任务 {}）。正在后台准备（随后会弹出系统确认对话框）。文件：{} ({} 字节) → {}/{}\n请用 zmodem_status 查询进度（建议每 5-10 秒轮询一次）。",
+                    task_id, local_path, size, remote_dir, basename
+                )
         }],
         "task_id": task_id,
         "status": "running",
@@ -2370,12 +2432,11 @@ async fn run_upload_task(
     // shell won't expand `~` inside quotes, so `cd '~'` fails with "No such
     // file or directory". For paths starting with `~`, emit them unquoted
     // (tilde expansion is safe; `~` has no shell metacharacters). For all
-    // other paths, single-quote with the standard '\'' escape for embedded
-    // quotes.
+    // other paths, shell_quote single-quotes with proper escaping.
     let cd_target = if remote_dir == "~" || remote_dir.starts_with("~/") {
         remote_dir.to_string()
     } else {
-        format!("'{}'", remote_dir.replace('\'', "'\"\"'"))
+        shell_quote(remote_dir)
     };
     // Launch `rz` directly — no manual `stty`. lrzsz's rz puts the PTY into
     // raw/no-echo mode itself before sending ZRINIT (same as when a user runs

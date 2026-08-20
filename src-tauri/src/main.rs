@@ -3887,6 +3887,385 @@ fn set_windows_app_user_model_id() {
 #[cfg(not(windows))]
 fn set_windows_app_user_model_id() {}
 
+// ============ Single-instance guard ============
+//
+// Detect a running MyShell GUI at startup, before any window/DB work. If one
+// is found, pop a native dialog: [是] restart (kill the old instance, keep
+// starting this one) / [否] quit (leave the old instance alone, exit now).
+//
+// Detection uses a Global named mutex (CreateMutexW). The OS releases it when
+// the owning process dies — crash, TerminateProcess, anything — so there is
+// no stale-lock problem (unlike the gui-ipc-port file, which survives
+// crashes). The `Global\` prefix makes the check span all sessions/users on
+// the machine, matching single-instance semantics.
+//
+// Non-Windows: no-op, startup always proceeds (same convention as
+// confirm_dangerous_operation in myshell-mcp.rs).
+
+/// Try to become the only MyShell GUI instance.
+/// - Ok(true): we hold the mutex — proceed with startup.
+/// - Ok(false): another instance exists and the user chose "quit" — return
+///   from run() immediately.
+/// - Err: the user chose "restart" but the old instance refused to die —
+///   surfaced by the caller as a startup failure.
+#[cfg(windows)]
+fn acquire_single_instance_lock() -> Result<bool, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::synchapi::{CreateMutexW, WaitForSingleObject};
+    use winapi::um::winbase::{WAIT_ABANDONED, WAIT_OBJECT_0};
+    use winapi::um::winuser::{MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_SYSTEMMODAL, MessageBoxW};
+
+    const MUTEX_NAME: &str = "Global\\MyShellSingleInstanceMutex";
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    // Block on the mutex for up to `secs`, polling in 500ms slices so we can
+    // log progress and respect the deadline. WAIT_ABANDONED counts as
+    // acquired: it means the previous owner died without releasing — exactly
+    // the "old instance exited" transition we are waiting for.
+    unsafe fn wait_mutex_free(mutex: winapi::um::winnt::HANDLE, secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        loop {
+            let r = WaitForSingleObject(mutex, 500);
+            if r == WAIT_OBJECT_0 || r == WAIT_ABANDONED {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
+    unsafe {
+        let name = wide(MUTEX_NAME);
+        let mutex = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+        if mutex.is_null() || mutex == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+            return Err("无法创建单实例互斥体（CreateMutexW 失败）".into());
+        }
+        // Intentionally leak the handle — it must stay alive for the whole
+        // process lifetime so other starters can detect us. The kernel cleans
+        // it up on process exit.
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            return Ok(true); // we are the first instance
+        }
+
+        log::info!("[single-instance] 检测到已有实例，弹窗询问用户");
+
+        if !ask_restart_or_quit() {
+            log::info!("[single-instance] 用户选择退出，保持现有实例");
+            return Ok(false);
+        }
+        log::info!("[single-instance] 用户选择重启，尝试结束旧实例");
+
+        // Phase 1: graceful — ask the old instance to exit via the localhost
+        // IPC bridge. Its shutdown handler calls app.exit(0), which flows
+        // through RunEvent::ExitRequested (drains SSH/local-PTY sessions,
+        // deletes the port file). This is the clean path.
+        shutdown_existing_via_ipc();
+
+        if wait_mutex_free(mutex, 5) {
+            log::info!("[single-instance] 旧实例已优雅退出");
+            return Ok(true);
+        }
+
+        // Phase 2: fallback — the old instance didn't exit in time (hung,
+        // IPC port stale, older build without the shutdown action). Force-
+        // terminate every myshell.exe that isn't us. This skips the old
+        // instance's ExitRequested cleanup — local-PTY child shells may be
+        // orphaned — but leaves the machine in a working state, which wins.
+        log::warn!("[single-instance] 优雅退出超时，强杀旧实例进程");
+        kill_other_myshell_processes();
+
+        if wait_mutex_free(mutex, 5) {
+            log::info!("[single-instance] 旧实例已被强制结束");
+            return Ok(true);
+        }
+
+        // Both phases failed (e.g. the old instance runs elevated under
+        // another session and we lack PROCESS_TERMINATE rights). Tell the
+        // user and bail — starting anyway would corrupt the single-instance
+        // invariant.
+        let msg = wide("无法结束已运行的 MyShell 实例（可能权限不足或进程无响应）。\n\
+                       请手动在任务管理器中结束 myshell.exe 后重试。");
+        MessageBoxW(
+            std::ptr::null_mut(),
+            msg.as_ptr(),
+            wide("MyShell 启动失败").as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_SETFOREGROUND,
+        );
+        Err("无法结束已运行的 MyShell 实例".into())
+    }
+}
+
+/// The "already running" dialog. true = user chose overwrite/restart, false
+/// = user chose quit (or dismissed with X). Uses the Win32 TaskDialog API
+/// so the buttons can carry our own labels ("覆盖启动" / "退出") instead of
+/// the fixed MB_YESNO labels — gives the modern Windows 11 rounded-button
+/// styling automatically.
+#[cfg(windows)]
+fn ask_restart_or_quit() -> bool {
+    use std::os::raw::{c_int, c_void};
+    use std::os::windows::ffi::OsStrExt;
+
+    const BTN_QUIT: c_int = 100;
+    const BTN_OVERWRITE: c_int = 101;
+
+    #[repr(C)]
+    struct TASKDIALOG_BUTTON {
+        nButtonID: c_int,
+        pszButtonText: *const u16,
+    }
+
+    #[repr(C)]
+    union TaskDialogIcon {
+        hMainIcon: *mut c_void,
+        pszMainIcon: *const u16,
+    }
+
+    #[repr(C)]
+    union TaskDialogFooterIcon {
+        hFooterIcon: *mut c_void,
+        pszFooterIcon: *const u16,
+    }
+
+    #[repr(C)]
+    struct TASKDIALOGCONFIG {
+        cbSize: u32,
+        hwndParent: *mut c_void,
+        hInstance: *mut c_void,
+        dwFlags: u32,
+        dwCommonButtons: u32,
+        pszWindowTitle: *const u16,
+        mainIcon: TaskDialogIcon,
+        pszMainInstruction: *const u16,
+        pszContent: *const u16,
+        cButtons: u32,
+        pButtons: *const TASKDIALOG_BUTTON,
+        nDefaultButton: c_int,
+        cRadioButtons: u32,
+        pRadioButtons: *const TASKDIALOG_BUTTON,
+        nDefaultRadioButton: c_int,
+        pszVerificationText: *const u16,
+        pszExpandedInformation: *const u16,
+        pszExpandedControlText: *const u16,
+        pszCollapsedControlText: *const u16,
+        footerIcon: TaskDialogFooterIcon,
+        pszFooter: *const u16,
+        pfCallback: *const c_void,
+        lpCallbackData: *mut c_void,
+        cxWidth: u32,
+    }
+
+    #[link(name = "comctl32")]
+    extern "system" {
+        fn TaskDialogIndirect(
+            pTaskConfig: *const TASKDIALOGCONFIG,
+            pnButton: *mut c_int,
+            pnRadioButton: *mut c_int,
+            pfVerificationFlagChecked: *mut c_int,
+        ) -> c_int;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    // All wide() Vecs must outlive the call — TaskDialogIndirect only reads
+    // them during the call itself, but Rust borrow checker can't see that,
+    // so we bind them to locals and let them drop at function end.
+    let title = wide("MyShell");
+    let main_instruction = wide("应用已在运行");
+    let content = wide(
+        "检测到另一次启动。覆盖启动会结束当前实例并重新启动应用；\
+         退出则保持当前实例继续运行（本次启动已自动结束）。",
+    );
+    let quit_label = wide("退出");
+    let overwrite_label = wide("覆盖启动");
+
+    // Buttons render left-to-right in array order. "退出" on the left
+    // (less destructive, lighter visual weight), "覆盖启动" on the right
+    // (primary action — nDefaultButton makes Enter trigger it and gives
+    // it the accent colour).
+    let buttons = [
+        TASKDIALOG_BUTTON {
+            nButtonID: BTN_QUIT,
+            pszButtonText: quit_label.as_ptr(),
+        },
+        TASKDIALOG_BUTTON {
+            nButtonID: BTN_OVERWRITE,
+            pszButtonText: overwrite_label.as_ptr(),
+        },
+    ];
+
+    let cfg = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: std::ptr::null_mut(),
+        hInstance: std::ptr::null_mut(),
+        dwFlags: 0,
+        dwCommonButtons: 0,
+        pszWindowTitle: title.as_ptr(),
+        mainIcon: TaskDialogIcon {
+            pszMainIcon: std::ptr::null(),
+        },
+        pszMainInstruction: main_instruction.as_ptr(),
+        pszContent: content.as_ptr(),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: BTN_OVERWRITE,
+        cRadioButtons: 0,
+        pRadioButtons: std::ptr::null(),
+        nDefaultRadioButton: 0,
+        pszVerificationText: std::ptr::null(),
+        pszExpandedInformation: std::ptr::null(),
+        pszExpandedControlText: std::ptr::null(),
+        pszCollapsedControlText: std::ptr::null(),
+        footerIcon: TaskDialogFooterIcon {
+            pszFooterIcon: std::ptr::null(),
+        },
+        pszFooter: std::ptr::null(),
+        pfCallback: std::ptr::null(),
+        lpCallbackData: std::ptr::null_mut(),
+        cxWidth: 0,
+    };
+
+    let mut clicked: c_int = 0;
+    log::info!(
+        "[single-instance] TaskDialog cbSize={} (expect 176), buttons_ptr={:p}, n_buttons={}",
+        std::mem::size_of::<TASKDIALOGCONFIG>(),
+        buttons.as_ptr(),
+        buttons.len()
+    );
+    let hr = unsafe {
+        TaskDialogIndirect(
+            &cfg,
+            &mut clicked,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if hr < 0 {
+        log::warn!(
+            "[single-instance] TaskDialogIndirect 失败 hr={}，默认按退出处理",
+            hr
+        );
+        return false;
+    }
+    // Cancel (X button) → clicked == 0 → falls through to "false" = quit,
+    // which is the safe choice: never overwrite on an ambiguous result.
+    clicked == BTN_OVERWRITE
+}
+
+/// Ask the running instance to exit gracefully through the localhost IPC
+/// bridge (`{"action":"shutdown"}`). Best-effort: any failure just falls
+/// through to the force-kill fallback — the caller re-checks the mutex.
+#[cfg(windows)]
+fn shutdown_existing_via_ipc() {
+    let Some(dir) = dirs::config_dir() else { return };
+    let port_file = dir.join("myshell").join("gui-ipc-port");
+    let Ok(raw) = std::fs::read_to_string(&port_file) else {
+        log::warn!("[single-instance] 无 gui-ipc-port 文件，跳过优雅退出");
+        return;
+    };
+    let Ok(port) = raw.trim().parse::<u16>() else {
+        log::warn!("[single-instance] gui-ipc-port 内容无效: {:?}", raw.trim());
+        return;
+    };
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        log::warn!("[single-instance] IPC 端口 {} 连接失败（stale port file?）", port);
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    use std::io::{Read, Write};
+    if stream.write_all(b"{\"action\":\"shutdown\"}\n").is_err() {
+        log::warn!("[single-instance] 发送 shutdown 指令失败");
+        return;
+    }
+    // Read the ack (best-effort — the old instance exits right after
+    // writing it, so a reset here is normal).
+    let mut buf = [0u8; 128];
+    let _ = stream.read(&mut buf);
+    log::info!("[single-instance] shutdown 指令已送达旧实例");
+}
+
+/// Terminate every myshell.exe process except ourselves. Fallback when the
+/// graceful IPC shutdown doesn't complete in time.
+#[cfg(windows)]
+fn kill_other_myshell_processes() {
+    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+    use winapi::um::processthreadsapi::{OpenProcess, TerminateProcess};
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use winapi::um::winnt::PROCESS_TERMINATE;
+
+    let me = std::process::id();
+    let mut killed = 0usize;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            log::error!("[single-instance] CreateToolhelp32Snapshot 失败");
+            return;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let name_len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]);
+                if name.eq_ignore_ascii_case("myshell.exe") && entry.th32ProcessID != me {
+                    let proc = OpenProcess(PROCESS_TERMINATE, 0, entry.th32ProcessID);
+                    if !proc.is_null() && proc != INVALID_HANDLE_VALUE {
+                        if TerminateProcess(proc, 1) != 0 {
+                            killed += 1;
+                            log::warn!(
+                                "[single-instance] 已强制结束 myshell.exe (pid={})",
+                                entry.th32ProcessID
+                            );
+                        }
+                        CloseHandle(proc);
+                    } else {
+                        log::warn!(
+                            "[single-instance] OpenProcess(pid={}) 失败（权限不足）",
+                            entry.th32ProcessID
+                        );
+                    }
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    if killed == 0 {
+        log::warn!("[single-instance] 未找到可结束的 myshell.exe 进程");
+    }
+}
+
+/// Non-Windows: single-instance detection is Windows-only (the project's
+/// convention — see confirm_dangerous_operation in myshell-mcp.rs). Startup
+/// always proceeds.
+#[cfg(not(windows))]
+fn acquire_single_instance_lock() -> Result<bool, String> {
+    Ok(true)
+}
+
 pub fn run() {
     // GPU acceleration escape hatch — MUST run before any window is created.
     // WebView2 reads WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS once during its
@@ -3903,6 +4282,21 @@ pub fn run() {
         .init();
     #[cfg(not(debug_assertions))]
     setup_file_logging();
+
+    // Single-instance guard — MUST run before any window/DB/session work so
+    // a "quit" decision doesn't leave half-initialized state behind, and a
+    // "restart" decision doesn't race the old instance's teardown.
+    match acquire_single_instance_lock() {
+        Ok(true) => {}
+        Ok(false) => {
+            log::info!("[startup] another instance is running; user chose to quit");
+            return;
+        }
+        Err(e) => {
+            log::error!("[startup] single-instance guard failed: {}", e);
+            return;
+        }
+    }
 
     // Set the Windows taskbar identity before any window is created, so the
     // taskbar shows the MyShell icon instead of a generic one.
@@ -4194,6 +4588,17 @@ pub fn run() {
 
                         let action = cmd["action"].as_str().unwrap_or("");
                         match action {
+                            // Single-instance restart path: a freshly started
+                            // MyShell asks us to exit so it can take over.
+                            // app.exit(0) flows through RunEvent::ExitRequested
+                            // (drain_all_sessions + port-file cleanup). Ack
+                            // before exiting — the starter may be gone by the
+                            // time we write, which is fine (best-effort).
+                            "shutdown" => {
+                                let _ = writeln!(reader.get_mut(), "{{\"ok\":true,\"shutting_down\":true}}");
+                                log::info!("[ipc] shutdown 收到退出指令（单实例重启）");
+                                ipc_handle.exit(0);
+                            }
                             "open_connection" => {
                                 let conn_id = cmd["connection_id"].as_str().unwrap_or("").to_string();
                                 if conn_id.is_empty() {
@@ -4343,13 +4748,26 @@ pub fn run() {
                                 });
                             }
 
+                            // MCP detected a locked vault and is about to
+                            // return a "请解锁" error to the AI. Bring the
+                            // window to the front so the password gate is
+                            // right in the user's face — without this the
+                            // gate can sit in the background while the user
+                            // wonders why the AI seems stuck.
+                            "focus_unlock" => {
+                                if let Some(window) = ipc_handle.get_webview_window("main") {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
+                                let _ = writeln!(reader.get_mut(), "{{\"ok\":true}}");
+                            }
+
                             // MCP polls the GUI's vault state. Used by the
-                            // MCP server's wait_for_vault_unlocked gate: when
-                            // a tool is called while the vault is still
-                            // locked, the MCP server waits (polling every 3s
-                            // up to 30s) for the user to unlock the GUI,
-                            // instead of failing immediately. Returns
-                            // {ok, initialized, unlocked}.
+                            // MCP server's ensure_vault_ready gate: when a
+                            // tool is called while the vault is still locked,
+                            // the MCP server fails FAST (no silent waiting)
+                            // after asking us to focus the unlock gate.
+                            // Returns {ok, initialized, unlocked}.
                             "vault_status" => {
                                 let app_state = ipc_handle.state::<AppState>();
                                 let initialized = vault::is_initialized();

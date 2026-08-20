@@ -8,6 +8,22 @@
   格式参考 keepachangelog.com。新增条目尽量简洁，按 ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全 分组。
 -->
 
+## v2.12.0（2026-08-20）
+
+#### ✨ 新增
+
+- **启动时单实例检测**：已有实例运行时弹 TaskDialog 选择「覆盖启动」（结束旧实例并继续启动）或「退出」（保持现有实例）。覆盖启动优先走 IPC 优雅退出（旧实例 `app.exit(0)`，正确清理 SSH/PTY 会话与 IPC 端口文件），超时兜底强杀；检测用 named mutex（`Global\MyShellSingleInstanceMutex`），进程崩溃自动释放、零 stale 风险。杜绝双实例并存导致的 SSH 会话分裂与 `gui-ipc-port` 互相覆盖（升级安装 / 误双击场景）。
+
+#### 🛠️ 优化
+
+- **MCP 调用时 GUI 未运行自动拉起应用**：所有工具统一走 `ensure_gui_running()`（原先仅 ssh_run 等少数路径会拉起，其余直接报错）。同时识别崩溃残留的陈旧 IPC 端口文件——探测端口无监听即删除残留并重新拉起 GUI；连接成功但无响应只报错不重启（避免触发单实例「覆盖启动」误杀挂起但存活的实例）。
+- **保险库锁定时 MCP 立即提示，不再静默等待 30 秒**：原「每 3s 轮询、最多 30s」逻辑删除，改为单次状态查询直出错误；锁定时先经新增的 `focus_unlock` IPC 把 MyShell 窗口置顶（密码输入框正对用户），再返回可操作的「保险库未解锁」提示——AI 转告用户、解锁后重试即恢复。保险库未初始化（首次使用）同样立即给出引导。
+
+#### 🔒 安全
+
+- **MCP 保险库门禁覆盖全部工具**：豁免名单从 9 个收到 3 个（仅 `ssh_status` / `ssh_cancel` / `zmodem_status` 任务状态查询保留），`list_connections`、`open_in_gui`、`screenshot_terminal`、`zmodem_*`、`ssh_run` 全部纳入——锁定状态下 AI 无法获取任何连接元数据（连接名称 / 分组也不行）。
+- **修复 upload_project / download_project 远端路径命令注入**：远端路径原先未转义直接拼进 `sudo mkdir/mv/tar/rm` 命令链与内联 Python 代码，含引号的路径可逃逸为 root 权限任意命令执行。现统一 `shell_quote()`（标准 `'\''` 转义），Python 打包命令改为环境变量传路径（`MYTAR` / `MYDIR`）。顺带修复：zmodem `sz` / `cd` 路径转义丢撇号、`download_project` 体积统计恒为 0（原先在删除临时文件后才读 metadata）、`screenshot_terminal` 输出的 user@host 恒为空（改用解密解析）。
+
 ## v2.11.2（2026-08-17）
 
 #### 🛠️ 优化
