@@ -2720,3 +2720,29 @@
 | 什么可能导致偏离？ | ① GUI 挂起但监听还在的场景只报错不自愈（有意为之，防误杀）；② GUI IPC 无认证的固有面（见已知残留风险）；③ 首次调用冷启动要等 GUI 拉起（最长 30s），AI 客户端 30s 超时边缘；④ 老版本 AI 客户端缓存了旧工具描述，语义变化（立即失败）要靠 initialize 重新拉取。 |
 | 下一步最小可验证动作？ | ① 锁定保险库 → 让 agent 调 list_connections → 应秒回「保险库未解锁」且 GUI 置顶；② 解锁后重试 → 正常返回列表；③ 关掉 GUI（任务管理器强杀留残留文件）→ 调任意工具 → 应自动拉起 GUI 而非报错。 |
 | 目标是什么？ | MCP 的保险库交互从「静默等待 30s 才含糊报错」变成「毫秒级明确提示 + 窗口置顶 + 重试即恢复」，且锁定态零信息泄漏、远端路径注入零容忍。 |
+
+### 阶段 107 — AI 模型选择器即时刷新：新增模型无需重启即可选到 + 选中模型显示/高亮修正
+
+**背景（用户反馈）：** 在设置里给供应商新增模型后，AI 面板的模型选择器里看不到刚加的那个模型，必须重启应用才能选到。
+
+**根因：**
+- `AiPanel` 的供应商/模型列表（`listAiModels()`）只在组件挂载时拉取一次，之后永不刷新；而新增模型发生在 `SettingsPanel`（保存后只刷新自己的 `useAiConfig` 副本），AI 面板打开着不关就永远拿不到新数据。后端无缓存（每次直查 SQLite），纯前端状态陈旧问题。
+- 连带问题：新模型是**追加到供应商模型列表尾部**（`SettingsPanel` 手动添加/接口拉取都是 push 到末尾），永远不是主模型（`models[0]`）；而后端 `set_active_ai_model` 明明把具体选中的模型串存进了 `ai_settings.active_model_string`，前端却只读回 `active_model_id`——头部标签固定显示主模型、下拉里高亮也只标主模型。用户选中新模型后会看到标签仍是旧模型，观感上等于「没选上」。
+
+**方案：**
+- **后端新增 `get_active_ai_selection` 命令**（ai.rs `ActiveAiSelection { id, model_string }` + main.rs 注册）：一次读回 `active_model_id` + `active_model_string`，语义与 `load_settings` 的解析一致（model_string 为空 = 供应商主模型）。保留原 `get_active_ai_model_id` 不动。
+- **AiPanel 每次打开选择器时重新拉取**（`modelPickerOpen` 变 true 触发 `refreshAiModels`）：列表与选中状态在打开瞬间总是最新 DB 状态，设置面板任何增删改立即生效，无需重启/重开面板。
+- **显示/高亮修正**：头部标签显示 `active_model_string ?? 主模型`（仅当选中串属于当前激活供应商时）；下拉里高亮 `activeModelString || supplier.modelId`；选中后本地同步记录 modelString。
+
+**改动文件：** `src-tauri/src/ai.rs`（ActiveAiSelection + get_active_selection_cmd）、`src-tauri/src/main.rs`（命令注册）、`src/api.ts`（getActiveAiSelection 包装）、`src/components/AiPanel.tsx`（刷新时机 + 标签/高亮）。
+
+**验证：** `npx tsc --noEmit` ✅、`cargo check` ✅（仅原有警告）。运行时行为需 GUI 手工验证（见下方最小动作）。
+
+## 五问重启检查（阶段 107）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 107 complete —— 模型选择器打开即刷新 + 选中模型串读回显示，前后端检查全过。 |
+| 我要去哪里？ | 随下一次 `打包` 发布（🐛修复 → patch）。 |
+| 什么可能导致偏离？ | ① `active_model_string` 可能指向已被删除的模型（显示与后端行为一致，都按原串使用，不算错但可考虑清理）；② 选择器打开瞬间的异步刷新有几十毫秒延迟（本地 SQLite，无感）；③ 若未来有第二个组件展示模型列表，需同样遵守「用时拉取」或引入共享状态。 |
+| 下一步最小可验证动作？ | ① 打开 AI 面板保持不关 → 设置里给某供应商手动添加一个新模型并保存 → 回到 AI 面板点开模型选择器 → 新模型应立即出现在该供应商下；② 选中新模型 → 头部标签应显示「供应商 / 新模型名」且下拉高亮落在它上面；③ 关闭再重开 AI 面板 → 标签仍显示上次选中的模型（读自 DB）。 |
+| 目标是什么？ | 模型的增删改与选择完全即时生效，选择器永远反映数据库真实状态，选中状态跨面板/跨重启一致可见。 |

@@ -1184,6 +1184,37 @@ pub fn get_active_model_id(state: &AppState) -> Result<Option<i64>, String> {
     .or(Ok(None))
 }
 
+/// The currently active model selection: supplier id plus the specific model
+/// string last chosen within it (None = the supplier's primary model).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveAiSelection {
+    pub id: Option<i64>,
+    pub model_string: Option<String>,
+}
+
+/// Read the full active selection (id + model string). Unlike
+/// `get_active_model_id` this also returns `active_model_string` so the
+/// picker UI can highlight the exact model the user last chose — a newly
+/// added model is never the supplier's primary, so the primary alone can't
+/// represent the selection.
+pub fn get_active_selection_cmd(state: &AppState) -> Result<ActiveAiSelection, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let (id, model_string) = db
+        .query_row(
+            "SELECT active_model_id, active_model_string FROM ai_settings WHERE id = 1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .unwrap_or((None, None));
+    Ok(ActiveAiSelection { id, model_string })
+}
+
 /// Save (create or update) an AI model. If `id` is Some, updates that row;
 /// otherwise inserts a new row. `api_key` is encrypted before storage;
 /// empty string means "keep existing key" on update.

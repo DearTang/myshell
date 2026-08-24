@@ -2807,6 +2807,11 @@ fn get_active_ai_model_id(state: State<'_, AppState>) -> Result<Option<i64>, Str
 }
 
 #[tauri::command]
+fn get_active_ai_selection(state: State<'_, AppState>) -> Result<ai::ActiveAiSelection, String> {
+    ai::get_active_selection_cmd(&state)
+}
+
+#[tauri::command]
 fn save_ai_model(
     state: State<'_, AppState>,
     id: Option<i64>,
@@ -4436,6 +4441,7 @@ pub fn run() {
             ai_test_settings,
             list_ai_models,
             get_active_ai_model_id,
+            get_active_ai_selection,
             save_ai_model,
             delete_ai_model,
             set_active_ai_model,

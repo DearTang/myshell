@@ -15,7 +15,7 @@ import {
   aiChat,
   aiInspectHealthSsh,
   aiInspectHealthLocal,
-  getActiveAiModelId,
+  getActiveAiSelection,
   listAiModels,
   onAiToken,
   onAiDone,
@@ -123,14 +123,37 @@ export function AiPanel({
   // Multi-model state. Only enabled suppliers are shown in the picker.
   const [aiModels, setAiModels] = useState<AiModel[]>([]);
   const [aiActiveId, setAiActiveId] = useState<number | null>(null);
+  // The specific model string chosen within the active supplier (null = the
+  // supplier's primary). Mirrors ai_settings.active_model_string so the label
+  // and dropdown highlight match what the backend actually uses.
+  const [aiActiveModelString, setAiActiveModelString] = useState<string | null>(null);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
-  useEffect(() => {
+  const refreshAiModels = useCallback(() => {
     listAiModels().then(setAiModels).catch(() => {});
-    getActiveAiModelId().then(setAiActiveId).catch(() => {});
+    getActiveAiSelection()
+      .then((sel) => {
+        setAiActiveId(sel.id ?? null);
+        setAiActiveModelString(sel.modelString ?? null);
+      })
+      .catch(() => {});
   }, []);
+  useEffect(() => {
+    refreshAiModels();
+  }, [refreshAiModels]);
+  // Re-fetch every time the picker opens — models added/removed in 设置 must
+  // be selectable immediately, without restarting the app.
+  useEffect(() => {
+    if (modelPickerOpen) refreshAiModels();
+  }, [modelPickerOpen, refreshAiModels]);
   const enabledModels = aiModels.filter((m) => m.isEnabled && !m.isPreset);
   const activeModel = enabledModels.find((m) => m.id === aiActiveId)
     ?? enabledModels[0];
+  // Label the exact model in use: the chosen string when it belongs to the
+  // active supplier, otherwise the supplier's primary modelId.
+  const activeModelIdLabel =
+    activeModel && activeModel.id === aiActiveId
+      ? aiActiveModelString ?? activeModel.modelId
+      : activeModel?.modelId;
   const [messages, setMessages] = useState<Msg[]>([]);
   // Mirror of `messages` for reading inside async callbacks without waiting for
   // the next render (setMessages is async). The send() handler reads this to
@@ -540,7 +563,7 @@ Enter 发送 ● Shift+Enter 换行"
               }}
             >
               {activeModel
-                ? `${activeModel.name}${activeModel.models[0]?.modelId ? ` / ${activeModel.models[0].modelId}` : ""}`
+                ? `${activeModel.name}${activeModelIdLabel ? ` / ${activeModelIdLabel}` : ""}`
                 : "选择模型"}
             </span>
             {activeModel && (
@@ -565,10 +588,14 @@ Enter 发送 ● Shift+Enter 换行"
             <ModelPickerDropdown
               aiModels={enabledModels}
               activeId={aiActiveId}
+              activeModelString={aiActiveModelString}
               onClose={() => setModelPickerOpen(false)}
               onSelect={(modelId, modelString) => {
                 setActiveAiModel(modelId, modelString)
-                  .then(() => setAiActiveId(modelId))
+                  .then(() => {
+                    setAiActiveId(modelId);
+                    setAiActiveModelString(modelString ?? null);
+                  })
                   .catch(() => {});
                 setModelPickerOpen(false);
               }}
@@ -818,11 +845,13 @@ const codeBtnStyle: CSSProperties = {
 function ModelPickerDropdown({
   aiModels,
   activeId,
+  activeModelString,
   onClose,
   onSelect,
 }: {
   aiModels: AiModel[];
   activeId: number | null;
+  activeModelString: string | null;
   onClose: () => void;
   onSelect: (modelId: number, modelString: string) => void;
 }) {
@@ -916,8 +945,11 @@ function ModelPickerDropdown({
           </div>
         ) : (
           modelList.map((m) => {
+            // Highlight the exact chosen model; without a chosen string the
+            // supplier's primary is the active one.
             const isActive =
-              supplier.id === activeId && m.modelId === supplier.modelId;
+              supplier.id === activeId &&
+              m.modelId === (activeModelString || supplier.modelId);
             return (
               <div
                 key={m.id || m.modelId}

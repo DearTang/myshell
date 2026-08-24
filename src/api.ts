@@ -869,6 +869,19 @@ export function getActiveAiModelId(): Promise<number | null> {
   return invoke("get_active_ai_model_id");
 }
 
+/** Currently active model selection: supplier id + the specific model id
+ *  last chosen within it (undefined = the supplier's primary). */
+export interface ActiveAiSelection {
+  id: number | null;
+  modelString?: string;
+}
+
+/** Get the active model id AND the specific model string last chosen, so the
+ *  picker can highlight/display the exact model (not just the supplier). */
+export function getActiveAiSelection(): Promise<ActiveAiSelection> {
+  return invoke("get_active_ai_selection");
+}
+
 /** Save (create or update) an AI model. Pass `id` to update, omit to create.
  *  `models` syncs the full model list for this supplier (replaces all). */
 export function saveAiModel(params: {
