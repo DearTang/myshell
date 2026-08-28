@@ -8,6 +8,18 @@
   格式参考 keepachangelog.com。新增条目尽量简洁，按 ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全 分组。
 -->
 
+## v2.12.2（2026-08-28）
+
+#### 🛠️ 优化
+
+- **MCP 高危操作被用户拒绝后返回「硬性停止」指令**：此前用户在确认弹窗点「取消」，工具只返回一句「用户取消了高危操作」，AI 往往换个工具或路径继续跑任务——拒绝只拦住了那一条命令，没拦住 agent。现拒绝时返回明确的硬停止指令：AI 必须立即停止当前任务的一切后续操作（不重试、不换工具/路径/连接绕过、不继续下一步），向用户输出当前任务说明（在做什么、已完成哪些步骤、被拒绝的是哪一步、剩余计划），并等待用户明确确认是否继续。覆盖全部确认出口：同步工具 `ssh_exec` / `sftp_upload` / `sftp_remove` / `sftp_rename` / `upload_project` / `download_project`、异步任务 `ssh_run` / `zmodem_upload`（经 `ssh_status` / `zmodem_status` 的 error 字段生效）、GUI 内 React 确认框路径；工具描述（server instructions 的 SAFETY 段及 ssh_exec / ssh_status / zmodem_status）同步更新，让 AI 在调用前就知晓规则。GUI 确认框提示语改为「取消后 AI 会立即停止当前任务、向你说明任务进度，并等待你的指示」。
+- **前后端依赖全量更新（各停留在大版本内最新线）**：npm 修复 nanoid / postcss 两个 high 漏洞（vite 传递依赖）并更新 21 个包（`@tauri-apps/api` 2.11.1、`@tauri-apps/cli` 2.11.4、`@tauri-apps/plugin-dialog` 2.7.2）；Rust 侧 `cargo update` 160+ 包（tauri 2.11.5、rustls 0.23.43、russh-sftp 2.4.0、tokio 1.53.1、uuid 1.26 等，全部在 semver 兼容范围内）。React 19 / Vite 8 / xterm 6 / TypeScript 7 等大版本有意不升（需专门迁移与终端渲染回归）。
+
+#### 🔒 安全
+
+- **GUI↔MCP localhost IPC 桥增加随机会话令牌认证**：原先监听在 127.0.0.1 的 IPC 桥无任何认证，而 localhost 端口是机器级可达——本机任意用户的进程发一行 JSON 即可在保险库解锁状态下拿到全部解密后的服务器凭证（`get_connection_secrets`）。现 GUI 每次启动生成 32 字节随机令牌随端口文件下发（`"<port>\\n<token>"` 两行格式），每条 IPC 命令必须携带令牌，监听器以常数时间比较在分发任何动作之前验证（令牌永不落日志）。MCP 侧 5 个请求点（open_connection / get_connection_secrets / vault_status / focus_unlock / exec_in_tab）与单实例 `shutdown` 路径全部携带；旧格式端口文件向后兼容，版本错配（新 GUI + 旧 MCP）返回明确的 unauthorized 提示。窃取凭证的门槛从「任意本机进程」收窄到「能读用户配置目录的同用户进程」。已知接受：`rsa` crate 的 Marvin Attack 时序侧信道公告（上游无修复版本，客户端场景暴露面小，持续跟踪）。
+- **russh 0.50 → 0.60.3，修复两个 high 漏洞**（RUSTSEC-2026-0154 / RUSTSEC-2026-0153）：恶意 SSH 服务器可通过构造报文触发无上限的 32 位内存分配，导致客户端拒绝服务。加密后端由默认 aws-lc-rs（Windows 构建需 NASM/CMake）换为预编译的 ring，与项目「无 OpenSSL」立场一致；所用客户端 API 完全兼容，业务代码零改动。升级后 `cargo audit` 两个 high 清零。
+
 ## v2.12.1（2026-08-24）
 
 #### 🐛 修复

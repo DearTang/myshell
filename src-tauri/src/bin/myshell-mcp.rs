@@ -68,6 +68,25 @@ fn confirm_dangerous_operation(_tool: &str, _detail: &str) -> bool {
     false
 }
 
+/// Tool-result text returned when the user DENIES a dangerous operation
+/// (GUI React dialog or headless MessageBoxW). A denial is a HARD STOP by
+/// project policy: this text is a direct instruction to the AI agent —
+/// halt the whole task (no retry, no workaround), summarize what was in
+/// flight, and hand the continue/abort decision back to the human.
+fn denied_by_user_text(tool: &str, detail: &str) -> String {
+    format!(
+        "⛔ 用户已拒绝高危操作：{}（{}）。\n\n\
+         【硬性停止】请立即停止当前任务的所有后续操作：不要重试该命令，\
+         不要改用其他工具、路径或连接绕过，也不要继续任务中的下一步。\n\
+         请立即做两件事：\n\
+         1. 向用户输出当前任务说明：你正在执行什么任务、已完成哪些步骤、\
+         被拒绝的是哪一步、剩余计划是什么；\n\
+         2. 停止并等待用户明确答复。只有用户明确表示继续后才可以恢复操作，\
+         用户答复前不要发起任何 MCP 调用。",
+        tool, detail
+    )
+}
+
 // ============ MCP Protocol (JSON-RPC 2.0 over stdio, Content-Length framed) ============
 
 /// Read one JSON-RPC message from stdin.
@@ -204,7 +223,7 @@ WORKFLOW:\n\
 2. Pass the name / group-path / host to `ssh_exec` / `sftp_list` / etc. The tool auto-disambiguates by type: ssh_exec prefers ssh connections, sftp_* prefers sftp.\n\
 3. For `ssh_exec`: each invocation is a fresh non-interactive session — no cwd/memory between calls. Use absolute paths or chain commands with && if state matters.\n\
 \n\
-SAFETY: ssh_exec uses a **configurable whitelist/blacklist** to decide which commands need human confirmation. Read-only commands (ps, ls, cat, grep, df, ...) run WITHOUT a dialog. Dangerous commands (rm, kill, sudo, shutdown, write-redirects, pipe-to-shell, ...) trigger a NATIVE OS confirmation dialog the USER must click — you cannot bypass it. Before calling a dangerous command, briefly tell the user a dialog is coming. If they click Cancel, the tool returns an error — surface it, don't retry silently. The sftp tools (sftp_upload/remove/rename) ALWAYS confirm regardless of rules.\n\
+SAFETY: ssh_exec uses a **configurable whitelist/blacklist** to decide which commands need human confirmation. Read-only commands (ps, ls, cat, grep, df, ...) run WITHOUT a dialog. Dangerous commands (rm, kill, sudo, shutdown, write-redirects, pipe-to-shell, ...) trigger a NATIVE OS confirmation dialog the USER must click — you cannot bypass it. Before calling a dangerous command, briefly tell the user a dialog is coming. If they click Cancel, the tool returns a HARD STOP error ('⛔ 用户已拒绝高危操作'): immediately stop ALL further operations — do NOT retry the command, do NOT switch tools/paths/connections to work around it, do NOT continue to the next step of the task. Instead, output a summary of the current task (what you were doing, which steps are done, which step was rejected, what remains) and WAIT for the user to explicitly decide whether to continue. The sftp tools (sftp_upload/remove/rename) ALWAYS confirm regardless of rules, and the same hard-stop policy applies to every confirmation dialog.\n\
 \n\
 FILE TRANSFER (strict two-step policy):\n\
 1. ALWAYS try `sftp_download`/`sftp_upload` FIRST for any file upload/download request. It is faster and more reliable.\n\
@@ -227,7 +246,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "ssh_exec",
-                "description": "Run a shell command on a remote SSH server (non-interactive, one-shot). Returns stdout, stderr, and the process exit code.\n\nWHEN TO USE: The user wants to run a command on a remote server they've saved in MyShell — e.g. 'check disk usage on prod-db', 'restart nginx on web1', 'tail the log on api-server'. Prefer this over opening an interactive shell when the task is a single command with a defined end.\n\nWHEN NOT TO USE:\n- Interactive sessions (top, vim, less, mysql prompt) — this tool times out and won't stream output. Suggest the user run these in MyShell's GUI terminal instead.\n- Operations on a server NOT saved in MyShell — this tool can only reach pre-saved connections.\n- Operations the agent should do locally (read/write local files, run local commands) — use your own tools for those.\n- Long-running tasks (>5min): `apt upgrade`, `git clone` of large repos, `docker pull` of big images, full `npm install`, big `tar`/`rsync`. For these, use `ssh_run` instead — it returns a task_id immediately and you poll `ssh_status` to follow progress. `ssh_exec` is the wrong tool here because even max `timeout=3600` can still hit the call's overall budget on very long jobs.\n\n⚠️ HUMAN CONFIRMATION REQUIRED: A native OS dialog pops up asking the user to approve. The command WILL NOT run until the user clicks 'Yes'. This is by design — AI-initiated remote execution is dangerous. Tell the user a confirmation dialog is coming.\n\nOUTPUT: JSON `{exit_code, stdout, stderr}`. `exit_code` is 0 on success. stdout/stderr are truncated at 4MB each (silently — if you suspect truncation, redirect to a file on the server and `sftp_download` it instead). Commands that don't exit within `timeout` seconds return an error.",
+                "description": "Run a shell command on a remote SSH server (non-interactive, one-shot). Returns stdout, stderr, and the process exit code.\n\nWHEN TO USE: The user wants to run a command on a remote server they've saved in MyShell — e.g. 'check disk usage on prod-db', 'restart nginx on web1', 'tail the log on api-server'. Prefer this over opening an interactive shell when the task is a single command with a defined end.\n\nWHEN NOT TO USE:\n- Interactive sessions (top, vim, less, mysql prompt) — this tool times out and won't stream output. Suggest the user run these in MyShell's GUI terminal instead.\n- Operations on a server NOT saved in MyShell — this tool can only reach pre-saved connections.\n- Operations the agent should do locally (read/write local files, run local commands) — use your own tools for those.\n- Long-running tasks (>5min): `apt upgrade`, `git clone` of large repos, `docker pull` of big images, full `npm install`, big `tar`/`rsync`. For these, use `ssh_run` instead — it returns a task_id immediately and you poll `ssh_status` to follow progress. `ssh_exec` is the wrong tool here because even max `timeout=3600` can still hit the call's overall budget on very long jobs.\n\n⚠️ HUMAN CONFIRMATION REQUIRED: A native OS dialog pops up asking the user to approve. The command WILL NOT run until the user clicks 'Yes'. This is by design — AI-initiated remote execution is dangerous. Tell the user a confirmation dialog is coming. If they click Cancel the tool returns a HARD STOP error: stop the whole task, summarize progress for the user, and wait for their explicit decision to continue (see SAFETY).\n\nOUTPUT: JSON `{exit_code, stdout, stderr}`. `exit_code` is 0 on success. stdout/stderr are truncated at 4MB each (silently — if you suspect truncation, redirect to a file on the server and `sftp_download` it instead). Commands that don't exit within `timeout` seconds return an error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -252,7 +271,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "ssh_status",
-                "description": "Poll the status of a command launched by `ssh_run`. Returns current phase, accumulated stdout/stderr (last 4MB each), and the task_id.\n\nPHASES:\n- `Confirming`: waiting for the user to click 'Yes' on the OS confirmation dialog. If stuck here, remind the user to check for the dialog.\n- `Connecting`: SSH handshake + auth in progress.\n- `Running`: command is executing on the remote.\n- `Done`: finished successfully. `exit_code` is 0 (usually).\n- `Failed`: command exited non-zero, the connection died, the OS confirmation was cancelled, or the user denied the dialog. `error` field explains.\n\nRECOMMENDED POLL INTERVAL: 10-30s. Don't poll faster than 5s — the task state only updates on actual progress, and aggressive polling wastes your tool budget.\n\nWORKFLOW:\n1. After `ssh_run` returns, store the `task_id`.\n2. Loop: call `ssh_status` with the task_id, sleep 10-30s, repeat until `status` is `done` or `failed`.\n3. If you no longer need a task (e.g. you found a better way), call `ssh_status` once and ignore — the task is harmless and will auto-clean after 1h. There's no explicit `kill` yet (use `ssh_exec kill <pid>` on the remote if you really need to stop a runaway process).\n\nOUTPUT: `{ task_id, status, phase?, progress_pct?, bytes_done?, bytes_total?, stdout, stderr, exit_code?, error?, result? }`. `stdout`/`stderr` are the accumulated output so far (or final output if `done`/`failed`).",
+                "description": "Poll the status of a command launched by `ssh_run`. Returns current phase, accumulated stdout/stderr (last 4MB each), and the task_id.\n\nPHASES:\n- `Confirming`: waiting for the user to click 'Yes' on the OS confirmation dialog. If stuck here, remind the user to check for the dialog.\n- `Connecting`: SSH handshake + auth in progress.\n- `Running`: command is executing on the remote.\n- `Done`: finished successfully. `exit_code` is 0 (usually).\n- `Failed`: command exited non-zero, the connection died, the OS confirmation was cancelled, or the user denied the dialog. `error` field explains. If the error contains '⛔ 用户已拒绝高危操作', that is a HARD STOP: stop all further operations, summarize the current task for the user, and wait for their explicit decision to continue.\n\nRECOMMENDED POLL INTERVAL: 10-30s. Don't poll faster than 5s — the task state only updates on actual progress, and aggressive polling wastes your tool budget.\n\nWORKFLOW:\n1. After `ssh_run` returns, store the `task_id`.\n2. Loop: call `ssh_status` with the task_id, sleep 10-30s, repeat until `status` is `done` or `failed`.\n3. If you no longer need a task (e.g. you found a better way), call `ssh_status` once and ignore — the task is harmless and will auto-clean after 1h. There's no explicit `kill` yet (use `ssh_exec kill <pid>` on the remote if you really need to stop a runaway process).\n\nOUTPUT: `{ task_id, status, phase?, progress_pct?, bytes_done?, bytes_total?, stdout, stderr, exit_code?, error?, result? }`. `stdout`/`stderr` are the accumulated output so far (or final output if `done`/`failed`).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -442,7 +461,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "zmodem_status",
-                "description": "Poll the status of a background ZMODEM upload/download task started by `zmodem_upload` or `zmodem_download`.\n\nWHEN TO USE: After calling `zmodem_upload`/`zmodem_download` (which return immediately with a `task_id`), call THIS tool with that `task_id` to check progress. Poll every 5-10 seconds until the response `status` is `done` or `failed`.\n\nOUTPUT: JSON with `task_id`, `status` (running/done/failed), `phase` (Confirming/Connecting/Transferring for running tasks), `progress_pct`, `bytes_done`, `bytes_total`. When `status` is `done`, `result` contains the transfer outcome (files for download, remote_path+bytes for upload). When `failed`, `error` has the message.\n\nIMPORTANT: this is a lightweight read-only poll — no confirmation dialog, fast. Keep calling it (every 5-10s) until you see done/failed. If `phase` is `Confirming`, tell the user a confirmation dialog is waiting for them to click.\n\nERROR '未找到任务': the task was lost (likely the MCP process restarted). The transfer did not complete — tell the user and suggest retrying.",
+                "description": "Poll the status of a background ZMODEM upload/download task started by `zmodem_upload` or `zmodem_download`.\n\nWHEN TO USE: After calling `zmodem_upload`/`zmodem_download` (which return immediately with a `task_id`), call THIS tool with that `task_id` to check progress. Poll every 5-10 seconds until the response `status` is `done` or `failed`.\n\nOUTPUT: JSON with `task_id`, `status` (running/done/failed), `phase` (Confirming/Connecting/Transferring for running tasks), `progress_pct`, `bytes_done`, `bytes_total`. When `status` is `done`, `result` contains the transfer outcome (files for download, remote_path+bytes for upload). When `failed`, `error` has the message. If the error contains '⛔ 用户已拒绝高危操作', that is a HARD STOP — stop all further operations, summarize the current task for the user, and wait for their explicit decision to continue.\n\nIMPORTANT: this is a lightweight read-only poll — no confirmation dialog, fast. Keep calling it (every 5-10s) until you see done/failed. If `phase` is `Confirming`, tell the user a confirmation dialog is waiting for them to click.\n\nERROR '未找到任务': the task was lost (likely the MCP process restarted). The transfer did not complete — tell the user and suggest retrying.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -837,7 +856,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             if command_rules::command_needs_confirmation(command, &rules) {
                 let detail = format!("在服务器 [{}] 执行命令: {}", conn_name, command);
                 if !confirm_dangerous_operation("ssh_exec（远程命令执行）", &detail) {
-                    return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：ssh_exec" }], "isError": true }));
+                    return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("ssh_exec", &detail) }], "isError": true }));
                 }
             } else {
                 log(&format!("ssh_exec 免确认（白名单/非危险）: {}", command));
@@ -1127,7 +1146,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // 高危操作：上传可能覆盖远程文件
             let detail = format!("上传本地文件 [{}] → 服务器 [{}] 路径: {}", local, conn_name, remote);
             if !confirm_dangerous_operation("sftp_upload（上传文件）", &detail) {
-                return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：sftp_upload" }], "isError": true }));
+                return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("sftp_upload", &detail) }], "isError": true }));
             }
 
             let config = state.resolve_via_gui(conn_name, Some("sftp"))?;
@@ -1159,7 +1178,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // 高危操作：删除不可恢复
             let detail = format!("删除服务器 [{}] 上的: {}", conn_name, path);
             if !confirm_dangerous_operation("sftp_remove（删除文件/目录）", &detail) {
-                return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：sftp_remove" }], "isError": true }));
+                return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("sftp_remove", &detail) }], "isError": true }));
             }
 
             let config = state.resolve_via_gui(conn_name, Some("sftp"))?;
@@ -1181,7 +1200,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // 高危操作：重命名/移动可能覆盖目标
             let detail = format!("服务器 [{}] 上: {} → {}", conn_name, old, new);
             if !confirm_dangerous_operation("sftp_rename（重命名/移动）", &detail) {
-                return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：sftp_rename" }], "isError": true }));
+                return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("sftp_rename", &detail) }], "isError": true }));
             }
 
             let config = state.resolve_via_gui(conn_name, Some("sftp"))?;
@@ -1204,7 +1223,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 local_dir, conn_name, remote_dir
             );
             if !confirm_dangerous_operation("upload_project（上传项目目录）", &detail) {
-                return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：upload_project" }], "isError": true }));
+                return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("upload_project", &detail) }], "isError": true }));
             }
 
             // 1. 验证本地目录存在
@@ -1299,7 +1318,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             let detail = format!("从服务器 [{}] 下载目录 {} → 本地 {}", conn_name, remote_dir, local_dir);
             if !confirm_dangerous_operation("download_project（下载项目目录）", &detail) {
-                return Ok(json!({ "content": [{ "type": "text", "text": "❌ 用户取消了高危操作：download_project" }], "isError": true }));
+                return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("download_project", &detail) }], "isError": true }));
             }
 
             // 1. 验证远程目录存在（通过 SFTP，支持 ssh/sftp 连接）
@@ -1494,15 +1513,15 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 _ => "auto",
             };
 
-            // Discover the GUI's IPC port.
-            let port = read_gui_ipc_port().ok_or_else(|| {
+            // Discover the GUI's IPC endpoint (port + auth token).
+            let ep = read_gui_ipc_endpoint().ok_or_else(|| {
                 "MyShell GUI 未运行（找不到 IPC 端口文件）。请先打开 MyShell 桌面应用，然后重试。".to_string()
             })?;
 
             // Send the open command over localhost TCP. The GUI focuses an
             // existing matching tab if one is open (focus_existing=true),
             // otherwise opens a new tab of the requested type.
-            let result = send_gui_open_command(port, &conn_id, tab_type, true).map_err(|e| {
+            let result = send_gui_open_command(&ep, &conn_id, tab_type, true).map_err(|e| {
                 format!("无法与 MyShell GUI 通信（{}）。请确认 MyShell 桌面应用正在运行。", e)
             })?;
 
@@ -1561,14 +1580,34 @@ fn load_command_rules() -> command_rules::CommandRules {
 // on startup and deletes it on exit. We read that file to discover the port,
 // then open a localhost TCP connection and send a one-line JSON command.
 
-/// Read the GUI's IPC port from the port-discovery file. Returns None if the
-/// file is missing (GUI not running) or unparseable.
-fn read_gui_ipc_port() -> Option<u16> {
+/// GUI IPC endpoint discovered from `<config_dir>/myshell/gui-ipc-port`.
+/// File format: `"<port>\n<token>"` — the per-session random token the GUI
+/// requires on every command (auth for the machine-reachable localhost
+/// listener; the file itself is protected by user-profile ACLs). The token
+/// line is absent in pre-token GUI versions — requests then omit the field,
+/// which an old GUI accepts.
+struct GuiIpcEndpoint {
+    port: u16,
+    token: Option<String>,
+}
+
+/// Attach the auth token (when the GUI wrote one) to an IPC request.
+fn ipc_cmd(ep: &GuiIpcEndpoint, mut v: Value) -> Value {
+    if let Some(t) = &ep.token {
+        v["token"] = Value::String(t.clone());
+    }
+    v
+}
+
+fn read_gui_ipc_endpoint() -> Option<GuiIpcEndpoint> {
     let mut path = dirs::config_dir()?;
     path.push("myshell");
     path.push("gui-ipc-port");
     let raw = std::fs::read_to_string(&path).ok()?;
-    raw.trim().parse::<u16>().ok()
+    let mut parts = raw.split_whitespace();
+    let port = parts.next()?.parse::<u16>().ok()?;
+    let token = parts.next().map(|s| s.to_string());
+    Some(GuiIpcEndpoint { port, token })
 }
 
 /// Send an "open_connection" command to the GUI over localhost TCP and wait
@@ -1577,22 +1616,22 @@ fn read_gui_ipc_port() -> Option<u16> {
 ///
 /// `tab_type` is "auto" | "terminal" | "sftp". `focus_existing` tells the GUI
 /// to switch to an already-open matching tab instead of opening a duplicate.
-fn send_gui_open_command(port: u16, connection_id: &str, tab_type: &str, focus_existing: bool) -> Result<bool, String> {
+fn send_gui_open_command(ep: &GuiIpcEndpoint, connection_id: &str, tab_type: &str, focus_existing: bool) -> Result<bool, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
+    let mut stream = TcpStream::connect(("127.0.0.1", ep.port))
         .map_err(|e| format!("TCP 连接失败: {}", e))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .map_err(|e| format!("设置超时失败: {}", e))?;
 
     // Send the command as one NDJSON line.
-    let cmd = serde_json::json!({
+    let cmd = ipc_cmd(ep, serde_json::json!({
         "action": "open_connection",
         "connection_id": connection_id,
         "tab_type": tab_type,
         "focus_existing": focus_existing,
-    });
+    }));
     writeln!(stream, "{}", cmd).map_err(|e| format!("发送命令失败: {}", e))?;
     stream.flush().map_err(|e| format!("flush 失败: {}", e))?;
 
@@ -1613,19 +1652,19 @@ fn send_gui_open_command(port: u16, connection_id: &str, tab_type: &str, focus_e
 /// headless SFTP operations. Requires the GUI to be running and the vault
 /// to be unlocked (user must have entered the master password in the GUI).
 fn get_config_from_gui(conn_id: &str) -> Result<ConnectionConfig, String> {
-    let port = read_gui_ipc_port().ok_or_else(|| {
+    let ep = read_gui_ipc_endpoint().ok_or_else(|| {
         "MyShell GUI 未运行。请先打开 MyShell 桌面应用并输入主密码解锁保险库，然后重试。".to_string()
     })?;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
+    let mut stream = TcpStream::connect(("127.0.0.1", ep.port))
         .map_err(|e| format!("连接 GUI 失败: {e}"))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .map_err(|e| format!("设置超时失败: {e}"))?;
-    let cmd = serde_json::json!({
+        .map_err(|e| format!("设置超时失败: {}", e))?;
+    let cmd = ipc_cmd(&ep, serde_json::json!({
         "action": "get_connection_secrets",
         "connection_id": conn_id,
-    });
+    }));
     writeln!(stream, "{}", cmd).map_err(|e| format!("发送命令失败: {e}"))?;
     stream.flush().map_err(|e| format!("flush 失败: {e}"))?;
     let mut reader = BufReader::new(stream);
@@ -1650,24 +1689,24 @@ fn get_config_from_gui(conn_id: &str) -> Result<ConnectionConfig, String> {
 /// file behind, which used to make every tool call die with a confusing IPC
 /// timeout). Otherwise, spawn `myshell.exe` from the same directory as this
 /// MCP binary and poll for the port file to appear (up to 30s).
-fn ensure_gui_running() -> Result<u16, String> {
-    if let Some(port) = read_gui_ipc_port() {
+fn ensure_gui_running() -> Result<GuiIpcEndpoint, String> {
+    if let Some(ep) = read_gui_ipc_endpoint() {
         // Distinguish two failure modes by whether ANYTHING is listening:
         //
         //   connect refused  → the listener is gone, so the GUI process is
         //     gone too (its exit cleanup never ran — crash / task-manager
-        //     kill). The port file is stale: remove it and relaunch. This is
-        //     safe — a live GUI always has its listener bound.
+        //     kill). The port file is stale: remove it and relaunch. This
+        //     is safe — a live GUI always has its listener bound.
         //
         //   connect ok but no IPC response → a process IS listening but not
         //     answering. Do NOT relaunch: blindly starting a second GUI would
         //     pop the "覆盖启动?" dialog and could force-kill the (possibly
         //     just busy) running instance, losing the user's open sessions.
         //     Surface an error and let the user decide.
-        let listener_alive = std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+        let listener_alive = std::net::TcpStream::connect(("127.0.0.1", ep.port)).is_ok();
         if listener_alive {
-            if query_gui_vault_status(port).is_some() {
-                return Ok(port);
+            if query_gui_vault_status(&ep).is_some() {
+                return Ok(ep);
             }
             return Err(
                 "MyShell GUI 正在运行但 IPC 无响应（进程可能已挂起）。请在任务管理器中检查 myshell.exe，必要时手动重启 MyShell 后重试。"
@@ -1676,7 +1715,7 @@ fn ensure_gui_running() -> Result<u16, String> {
         }
         log(&format!(
             "[gui] 陈旧的 gui-ipc-port 文件（端口 {} 无监听）— 删除并重新启动 GUI",
-            port
+            ep.port
         ));
         remove_gui_ipc_port_file();
     }
@@ -1705,9 +1744,9 @@ fn ensure_gui_running() -> Result<u16, String> {
     // binds). Give it up to 30 seconds — the GUI needs to boot WebView2.
     for _ in 0..60 {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        if let Some(port) = read_gui_ipc_port() {
-            log(&format!("GUI 就绪，IPC port = {}", port));
-            return Ok(port);
+        if let Some(ep) = read_gui_ipc_endpoint() {
+            log(&format!("GUI 就绪，IPC port = {}", ep.port));
+            return Ok(ep);
         }
     }
     Err("GUI 启动超时（30 秒内未就绪）。请手动打开 MyShell 后重试。".to_string())
@@ -1733,11 +1772,11 @@ fn remove_gui_ipc_port_file() {
 /// `initialized` = a vault salt file exists on disk (user has set up a master
 /// password before). `unlocked` = the DEK is currently loaded in the GUI's
 /// AppState (user has entered the master password this session).
-fn query_gui_vault_status(port: u16) -> Option<(bool, bool)> {
+fn query_gui_vault_status(ep: &GuiIpcEndpoint) -> Option<(bool, bool)> {
     use std::io::{BufRead, BufReader, Write};
-    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", ep.port)).ok()?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
-    let cmd = serde_json::json!({ "action": "vault_status" });
+    let cmd = ipc_cmd(ep, serde_json::json!({ "action": "vault_status" }));
     writeln!(stream, "{}", cmd).ok()?;
     stream.flush().ok()?;
     let mut reader = BufReader::new(stream);
@@ -1754,14 +1793,14 @@ fn query_gui_vault_status(port: u16) -> Option<(bool, bool)> {
 /// Ask the GUI to bring its window (and thus the master-password gate) to the
 /// front. Fire-and-forget: any failure is ignored — the error text we return
 /// to the AI already tells the user what to do, focusing is just a courtesy.
-fn send_gui_focus_unlock(port: u16) {
+fn send_gui_focus_unlock(ep: &GuiIpcEndpoint) {
     use std::io::{BufRead, BufReader, Write};
-    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", ep.port)) else {
         return;
     };
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-    let cmd = serde_json::json!({ "action": "focus_unlock" });
+    let cmd = ipc_cmd(ep, serde_json::json!({ "action": "focus_unlock" }));
     if writeln!(stream, "{}", cmd).is_ok() {
         let _ = stream.flush();
         // Drain the one-line {"ok":true} response so the connection closes cleanly.
@@ -1790,7 +1829,7 @@ fn send_gui_focus_unlock(port: u16) {
 /// might be missing" reports. Failing fast surfaces the prompt within
 /// milliseconds; the AI relays it, the user unlocks, the retry succeeds.
 fn ensure_vault_ready() -> Result<(), String> {
-    let port = ensure_gui_running().map_err(|e| {
+    let ep = ensure_gui_running().map_err(|e| {
         format!("MyShell GUI 未运行且无法自动启动：{}。请手动打开 MyShell 桌面应用，然后重试。", e)
     })?;
 
@@ -1798,7 +1837,7 @@ fn ensure_vault_ready() -> Result<(), String> {
     // status query briefly before concluding the GUI is unreachable.
     let mut status = None;
     for _ in 0..5 {
-        if let Some(s) = query_gui_vault_status(port) {
+        if let Some(s) = query_gui_vault_status(&ep) {
             status = Some(s);
             break;
         }
@@ -1812,7 +1851,7 @@ fn ensure_vault_ready() -> Result<(), String> {
                 .to_string(),
         ),
         Some((true, false)) => {
-            send_gui_focus_unlock(port);
+            send_gui_focus_unlock(&ep);
             Err(
                 "保险库未解锁：MyShell 窗口已置顶，请在其中输入主密码解锁保险库，解锁后重新调用此工具即可。"
                     .to_string(),
@@ -1844,7 +1883,7 @@ async fn exec_in_gui_tab(
     let conn_id = state.find_connection_id(conn_name, Some("ssh"))?;
 
     // Ensure the GUI is running (auto-start if needed).
-    let port = ensure_gui_running()?;
+    let ep = ensure_gui_running()?;
 
     // 直接发送 exec_in_tab。前端的 handler 自己会处理三种情况：
     //   1. 该连接已有 connected 的 terminal tab → 直接复用（秒级）
@@ -1859,17 +1898,17 @@ async fn exec_in_gui_tab(
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
 
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
+    let mut stream = TcpStream::connect(("127.0.0.1", ep.port))
         .map_err(|e| format!("TCP 连接 GUI 失败: {e}"))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(timeout + 15)))
         .map_err(|e| format!("设置超时失败: {e}"))?;
 
-    let cmd = serde_json::json!({
+    let cmd = ipc_cmd(&ep, serde_json::json!({
         "action": "exec_in_tab",
         "connection_id": conn_id,
         "command": command,
         "timeout": timeout,
-    });
+    }));
     writeln!(stream, "{}", cmd).map_err(|e| format!("发送命令失败: {e}"))?;
     stream.flush().map_err(|e| format!("flush 失败: {e}"))?;
 
@@ -2395,7 +2434,7 @@ async fn run_upload_task(
         local_path, size, remote_dir
     );
     if !confirm_dangerous_operation("zmodem_upload（ZMODEM 上传）", &detail) {
-        fail("用户取消了高危操作".to_string());
+        fail(denied_by_user_text("zmodem_upload", &detail));
         return;
     }
 
@@ -2618,7 +2657,7 @@ async fn run_ssh_exec_task(
     if needs_confirm {
         let detail = format!("ssh_run 在服务器 [{}] 上执行: {}", conn_name, command);
         if !confirm_dangerous_operation("ssh_run（后台执行）", &detail) {
-            fail("用户取消了高危操作".to_string());
+            fail(denied_by_user_text("ssh_run", &detail));
             return;
         }
     } else {

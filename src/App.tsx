@@ -717,7 +717,19 @@ export default function App() {
               if (!confirmed) {
                 finishExec({
                   ok: false,
-                  error: "❌ 用户取消了高危操作：ssh_exec",
+                  // Keep in sync with denied_by_user_text() in
+                  // myshell-mcp.rs — a denial is a HARD STOP: the AI must
+                  // halt the whole task, report its progress, and wait for
+                  // the user to decide whether to continue.
+                  error:
+                    `⛔ 用户已拒绝高危操作：ssh_exec（在服务器 [${connectionName}] 执行命令: ${command}）。\n\n` +
+                    "【硬性停止】请立即停止当前任务的所有后续操作：不要重试该命令，" +
+                    "不要改用其他工具、路径或连接绕过，也不要继续任务中的下一步。\n" +
+                    "请立即做两件事：\n" +
+                    "1. 向用户输出当前任务说明：你正在执行什么任务、已完成哪些步骤、" +
+                    "被拒绝的是哪一步、剩余计划是什么；\n" +
+                    "2. 停止并等待用户明确答复。只有用户明确表示继续后才可以恢复操作，" +
+                    "用户答复前不要发起任何 MCP 调用。",
                 });
                 return;
               }
@@ -1930,7 +1942,8 @@ export default function App() {
                 {highlightDangerous(mcpConfirm.command, mcpConfirm.rules)}
               </div>
               <div style={{ marginTop: 8, color: "var(--text-muted)" }}>
-                点击「确认执行」允许，点击「取消」拒绝。取消后 AI 会收到错误消息。
+                点击「确认执行」允许，点击「取消」拒绝。取消后 AI
+                会立即停止当前任务、向你说明任务进度，并等待你的指示。
               </div>
             </>
           }

@@ -2746,3 +2746,53 @@
 | 什么可能导致偏离？ | ① `active_model_string` 可能指向已被删除的模型（显示与后端行为一致，都按原串使用，不算错但可考虑清理）；② 选择器打开瞬间的异步刷新有几十毫秒延迟（本地 SQLite，无感）；③ 若未来有第二个组件展示模型列表，需同样遵守「用时拉取」或引入共享状态。 |
 | 下一步最小可验证动作？ | ① 打开 AI 面板保持不关 → 设置里给某供应商手动添加一个新模型并保存 → 回到 AI 面板点开模型选择器 → 新模型应立即出现在该供应商下；② 选中新模型 → 头部标签应显示「供应商 / 新模型名」且下拉高亮落在它上面；③ 关闭再重开 AI 面板 → 标签仍显示上次选中的模型（读自 DB）。 |
 | 目标是什么？ | 模型的增删改与选择完全即时生效，选择器永远反映数据库真实状态，选中状态跨面板/跨重启一致可见。 |
+
+### 阶段 108 — MCP 拒绝即硬停止：用户点「取消」后 AI 必须停止一切后续操作并汇报任务、等用户确认
+
+**背景（用户需求）：** MCP 高危操作确认弹窗被用户拒绝（点「取消」）后，原先只返回一句「❌ 用户取消了高危操作：<工具>」。AI agent 看到后往往只是换个工具/路径继续跑任务，甚至重试同一命令——拒绝没有真正拦住 AI，只拦住了那一条命令。
+
+**方案（拒绝语义升级为硬性停止 HARD STOP）：**
+- **新增统一文案 `denied_by_user_text(tool, detail)`**（myshell-mcp.rs）：拒绝时返回的 isError 文本直接写成给 AI 的指令——①立即停止当前任务的所有后续操作（不重试、不换工具/路径/连接绕过、不继续下一步）；②向用户输出当前任务说明（在做什么、已完成哪些步骤、被拒绝的是哪一步、剩余计划）；③停止并等待用户明确答复，答复前不发起任何 MCP 调用。
+- **覆盖全部 9 个拒绝出口**：同步工具 6 个（ssh_exec / sftp_upload / sftp_remove / sftp_rename / upload_project / download_project）+ 异步后台驱动 2 个（ssh_run、zmodem_upload——失败文案经 ssh_status / zmodem_status 的 error 字段暴露给 AI）+ GUI React 对话框路径 1 个（App.tsx runExec 内拒绝时构造同样的硬停止文案回传 MCP，注释标明与 Rust 侧保持同步）。
+- **工具描述同步更新**（让 AI 调用前就知道规则）：server instructions 的 SAFETY 段把「surface it, don't retry silently」改为完整硬停止流程；ssh_exec、ssh_status（Failed 相位）、zmodem_status（failed 分支）的描述都补上「'⛔ 用户已拒绝高危操作' = HARD STOP」的处置说明。
+- **GUI 对话框提示语**更新：「取消后 AI 会收到错误消息」→「取消后 AI 会立即停止当前任务、向你说明任务进度，并等待你的指示」，让用户理解点取消的实际效果。
+
+**改动文件：** `src-tauri/src/bin/myshell-mcp.rs`（denied_by_user_text + 8 处拒绝出口 + 4 处工具描述）、`src/App.tsx`（GUI 拒绝文案 + 对话框提示语）。
+
+**验证：** `cargo check` ✅（仅原有警告）、`npx tsc --noEmit` ✅。运行时行为需实机验证（见下方最小动作）。
+
+## 五问重启检查（阶段 108）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 108 complete —— 拒绝即硬停止的文案与工具描述全部就位，前后端检查全过。 |
+| 我要去哪里？ | 随下一次 `打包` 发布（🔒安全 → patch）。 |
+| 什么可能导致偏离？ | ① 这是靠 isError 文本约束 AI 的软协议，模型遵循度取决于能力，恶意/低质 agent 仍可能无视（真正硬约束只有确认弹窗本身）；② 异步任务（ssh_run/zmodem_upload）的拒绝要等 AI 下一轮 status 轮询才看到；③ App.tsx 与 myshell-mcp.rs 的文案是两份手工同步的拷贝，改一处要记得改另一处（已互相加注释）。 |
+| 下一步最小可验证动作？ | ① 让 agent 执行一条危险命令（如 `rm`）→ 弹窗点「取消」→ 观察 AI 是否停止并输出任务说明、等待用户；② 用户回复「继续」→ AI 恢复执行；③ 对 sftp_upload / ssh_run 重复同样验证。 |
+| 目标是什么？ | 用户的一次「取消」从「拦住一条命令」升级为「拦住整个 agent」：AI 停下来、说清楚、把继续与否的决定权交还给用户。 |
+
+### 阶段 109 — 安全体检与修复：IPC 令牌认证 + russh 0.60 升级消除 2 个 high 漏洞 + 前后端依赖全量更新
+
+**背景（用户需求）：** 检查 MyShell 当前安全问题并修复；检查组件版本并同步更新。
+
+**安全审查发现（三项工具 + 代码审查）：**
+- `npm audit`：nanoid（GHSA-28wg/2v37，死循环）+ postcss（GHSA-fxqj/r28c，sourceMappingURL 路径穿越读任意 .map）两个 high（均为 vite 传递依赖）。
+- `cargo audit`（新装 0.22.2，advisory 库经 GitHub 拉取需重试一次）：**russh 0.50.4 + russh-cryptovec 0.50.2 两个 high**（RUSTSEC-2026-0154/0153，恶意 SSH 服务器可触发无上限 32 位内存分配 → 客户端 DoS，修复版 ≥0.60.3）；rsa Marvin Attack（medium，上游无修复版，接受：客户端场景主要做公钥验签，私钥运算暴露面小）。
+- 代码审查：阶段 106 记录的 **GUI IPC 桥无认证**——127.0.0.1 监听是机器级可达（本机任意用户的进程都能连），解锁状态下任意本地进程发一行 JSON 即可拿到全部解密凭证（`get_connection_secrets`）。
+
+**修复：**
+1. **IPC 令牌握手**：GUI 启动监听器时生成 32 字节随机令牌（base64），端口文件升级为两行 `"<port>\n<token>"`；accept 循环在分发任何 action 之前用常数时间比较验证 `cmd["token"]`，不匹配返回 unauthorized 并只记录 action 名（令牌永不落日志）。MCP 侧新增 `GuiIpcEndpoint{port,token}` + `ipc_cmd()` 注入助手，5 个请求点（open_connection / get_connection_secrets / vault_status / focus_unlock / exec_in_tab）全部携带；单实例 `shutdown_existing_via_ipc` 同步解析两行格式。**兼容性**：旧格式（仅端口）文件可读、请求省略 token（旧 GUI 接受）；新版 GUI + 旧版 MCP 会得到明确 unauthorized 错误提示升级。**残余暴露**：同用户进程仍可读端口文件完成认证（MCP 架构固有），完整修复需命名管道 + ACL，记录在案。
+2. **russh 0.50→0.60.3**：默认 aws-lc-rs 后端在 Windows 要 NASM/CMake，改 `default-features=false + ["flate2","ring","rsa"]`（ring 预编译、契合项目无 OpenSSL 立场）。客户端 API（connect/authenticate/channel/exec/ChannelMsg）零改动直接编译通过。cargo audit 复扫：2 个 high 消除。
+3. **依赖更新**：`npm audit fix` 清零 + `npm update` 21 包（@tauri-apps/api 2.11.1 / cli 2.11.4 / plugin-dialog 2.7.2）；`cargo update` 160+ 包（tauri 2.11.5、rustls 0.23.43、russh-sftp 2.4.0、tokio 1.53.1、uuid 1.26 等，全部 semver 兼容范围）。**大版本有意不升**：React 19 / Vite 8 / xterm 6 / TypeScript 7（Go 重写版）/ react-markdown 10 —— 需专门迁移与回归，不属于安全修复。
+
+**改动文件：** `src-tauri/src/main.rs`（令牌生成/写入/验证 + constant_time_eq + shutdown 两行解析）、`src-tauri/src/bin/myshell-mcp.rs`（GuiIpcEndpoint/ipc_cmd + 5 请求点）、`src-tauri/Cargo.toml`（russh 0.60 ring 后端）、`package.json`/`package-lock.json`、`Cargo.lock`。
+
+**验证：** `cargo check` ✅（重编 myshell 三二进制无错误）、`npx tsc --noEmit` ✅、`npm run build` ✅（仅原有 chunk 体积提示）、`cargo audit` ✅（仅剩 rsa 无修复版告警）、`npm audit` ✅ 0 漏洞。运行时需实机验证（见下方最小动作）。
+
+## 五问重启检查（阶段 109）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 109 complete —— 三项安全修复 + 双端依赖更新全部落地，静态验证全过。 |
+| 我要去哪里？ | 随下一次 `打包` 发布（🔒安全×2 + 🛠️×2 → 按 staging 条目类型判定 patch/minor：有 ✨才是 minor，本次全为 🔒/🛠️ → patch）。 |
+| 什么可能导致偏离？ | ① russh 0.60 换了加密栈（ring + 新 ssh-key/rsa rc 版），实际连接行为（算法协商、老服务器兼容）需实机冒烟；② 同用户进程仍可读令牌文件（架构固有，已记录）；③ 版本错配场景（新 GUI + 独立放置的旧 mcp.exe）会得到 unauthorized，错误信息已引导同步升级；④ cargo-audit 的 advisory 库拉取走 GitHub，网络不稳时需重试。 |
+| 下一步最小可验证动作？ | ① 启动 GUI → 让 agent 调 list_connections / ssh_exec（验证 vault_status/exec_in_tab 携带令牌正常通信）；② 端口文件应为两行，手工 `ncat 127.0.0.1 <port>` 发不带 token 的 JSON 应返回 unauthorized；③ 用旧客户端（不删场景难造，可选）验证错误提示；④ 连一台老系统服务器确认 russh 0.60 算法协商正常。 |
+| 目标是什么？ | 已知漏洞全部清零或明确接受；本机横向窃取凭证的路径从「任意进程」收窄到「能读用户配置目录的同用户进程」；依赖停在各自大版本内的最新补丁线。 |

@@ -4170,6 +4170,19 @@ fn ask_restart_or_quit() -> bool {
     clicked == BTN_OVERWRITE
 }
 
+/// Constant-time string equality for secret comparison (IPC token check).
+/// Length mismatch returns early — length isn't secret here, only the value.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 /// Ask the running instance to exit gracefully through the localhost IPC
 /// bridge (`{"action":"shutdown"}`). Best-effort: any failure just falls
 /// through to the force-kill fallback — the caller re-checks the mutex.
@@ -4181,8 +4194,14 @@ fn shutdown_existing_via_ipc() {
         log::warn!("[single-instance] 无 gui-ipc-port 文件，跳过优雅退出");
         return;
     };
-    let Ok(port) = raw.trim().parse::<u16>() else {
+    // Format: "<port>\n<token>" (token line absent in pre-token versions).
+    let mut parts = raw.split_whitespace();
+    let (Some(port_str), token) = (parts.next(), parts.next()) else {
         log::warn!("[single-instance] gui-ipc-port 内容无效: {:?}", raw.trim());
+        return;
+    };
+    let Ok(port) = port_str.parse::<u16>() else {
+        log::warn!("[single-instance] gui-ipc-port 端口无效: {:?}", port_str);
         return;
     };
     let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
@@ -4192,7 +4211,11 @@ fn shutdown_existing_via_ipc() {
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     use std::io::{Read, Write};
-    if stream.write_all(b"{\"action\":\"shutdown\"}\n").is_err() {
+    let cmd = match token {
+        Some(t) => format!("{{\"action\":\"shutdown\",\"token\":\"{}\"}}\n", t),
+        None => "{\"action\":\"shutdown\"}\n".to_string(),
+    };
+    if stream.write_all(cmd.as_bytes()).is_err() {
         log::warn!("[single-instance] 发送 shutdown 指令失败");
         return;
     }
@@ -4527,8 +4550,14 @@ pub fn run() {
             // listens for, which triggers handleConnect() — the same code
             // path as double-clicking a connection in the sidebar.
             //
-            // Security: binds 127.0.0.1 only (no external access). The port
-            // file lives in the user's config dir (same ACL as the DB).
+            // Security: binds 127.0.0.1 only (no external access), and every
+            // command must carry the per-session random token written to the
+            // port file alongside the port. The port file lives in the user's
+            // config dir (user-profile ACLs), while a localhost TCP listener
+            // is reachable by ANY local process of ANY user account — the
+            // token bridges that gap: without read access to the user's
+            // profile, a connection is refused before any action (notably
+            // get_connection_secrets) is dispatched.
             {
                 let ipc_handle = app.handle().clone();
                 std::thread::spawn(move || {
@@ -4550,12 +4579,21 @@ pub fn run() {
                         }
                     };
 
+                    // Per-session auth token. Sent to legit clients (MCP
+                    // server / single-instance restart) via the port file;
+                    // never logged.
+                    use base64::Engine as _;
+                    let ipc_token = base64::engine::general_purpose::STANDARD
+                        .encode(rand::random::<[u8; 32]>());
+
                     // Write the port file so the MCP server can discover us.
+                    // Two lines: "<port>\n<token>". Single-line (port only)
+                    // is the pre-token format — readers accept both.
                     if let Some(dir) = dirs::config_dir() {
                         let myshell_dir = dir.join("myshell");
                         let _ = std::fs::create_dir_all(&myshell_dir);
                         let port_file = myshell_dir.join("gui-ipc-port");
-                        if let Err(e) = std::fs::write(&port_file, port.to_string()) {
+                        if let Err(e) = std::fs::write(&port_file, format!("{}\n{}", port, ipc_token)) {
                             log::error!("[ipc] failed to write port file: {}", e);
                         } else {
                             log::info!("[ipc] GUI IPC listener on 127.0.0.1:{}", port);
@@ -4593,6 +4631,15 @@ pub fn run() {
                         };
 
                         let action = cmd["action"].as_str().unwrap_or("");
+
+                        // Auth gate: reject before dispatching ANY action.
+                        // Only the action name is logged — never the token.
+                        if !constant_time_eq(cmd["token"].as_str().unwrap_or(""), &ipc_token) {
+                            let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"unauthorized: IPC token 缺失或错误。请将 myshell-mcp.exe / myshell.exe 更新到同一版本后重试。\"}}");
+                            log::warn!("[ipc] rejected unauthorized command (action={})", action);
+                            continue;
+                        }
+
                         match action {
                             // Single-instance restart path: a freshly started
                             // MyShell asks us to exit so it can take over.

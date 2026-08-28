@@ -108,10 +108,22 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 }}}
 ```
 
-> **安全模型**：MCP server 不存储 vault 密码，也不持有解密密钥。所有服务器访问必须经过 MyShell GUI——ssh_exec 在 GUI 终端标签页内执行（用户已在 GUI 中解锁 vault），SFTP 工具通过 IPC 向 GUI 请求解密后的连接凭证。**所有工具（除任务状态查询）都要求保险库已解锁**：GUI 未运行时 MCP 自动拉起应用（含识别并清理崩溃残留的 IPC 端口文件）；保险库锁定时立即返回明确的「保险库未解锁」错误并把 MyShell 窗口置顶（密码门正对用户），不做静默等待——解锁后重试即恢复。锁定状态下连 `list_connections` 都不可用，AI 无法获取任何连接元数据。
-暴露 15 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz`/`rz`（lrzsz）走 ZMODEM 协议传输文件，用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 sftp_*，SFTP 不可用时才用 zmodem_*。
+> **安全模型**：MCP server 不存储 vault 密码，也不持有解密密钥。所有服务器访问必须经过 MyShell GUI——ssh_exec 在 GUI 终端标签页内执行（用户已在 GUI 中解锁 vault），SFTP 工具通过 IPC 向 GUI 请求解密后的连接凭证。GUI↔MCP 的 localhost IPC 桥要求**每条命令携带随机会话令牌**（写入用户配置目录的端口文件中，受用户目录 ACL 保护；令牌缺失/错误一律在分发动作前拒绝），本机其他用户的进程无法再窃取凭证。**所有工具（除任务状态查询）都要求保险库已解锁**：GUI 未运行时 MCP 自动拉起应用（含识别并清理崩溃残留的 IPC 端口文件）；保险库锁定时立即返回明确的「保险库未解锁」错误并把 MyShell 窗口置顶（密码门正对用户），不做静默等待——解锁后重试即恢复。锁定状态下连 `list_connections` 都不可用，AI 无法获取任何连接元数据。
+暴露 15 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过；用户点「取消」拒绝时返回硬性停止（HARD STOP）错误——AI 必须立即停止当前任务的所有后续操作（不重试、不换工具绕过）、向用户输出任务进度说明，并等待用户明确确认是否继续（`ssh_run` 后台任务拒绝后经 `ssh_status` 同样处理）。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz`/`rz`（lrzsz）走 ZMODEM 协议传输文件，用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 sftp_*，SFTP 不可用时才用 zmodem_*。
 
 ## 更新日志
+
+### v2.12.2（2026-08-28）
+
+#### 🛠️ 优化
+
+- **MCP 高危操作被用户拒绝后返回「硬性停止」指令**：AI 必须立即停止当前任务的一切后续操作（不重试、不换工具绕过），向用户输出当前任务说明（在做什么、已完成哪些步骤、被拒绝的是哪一步、剩余计划），等待用户明确确认是否继续。覆盖全部确认弹窗出口与异步任务（ssh_run / zmodem_upload），GUI 确认框提示语同步更新。
+- **前后端依赖全量更新**：npm 漏洞清零（nanoid / postcss 两个 high）+ 21 包更新（tauri 前端套件最新补丁版）；Rust 侧 160+ 包（tauri 2.11.5、rustls 0.23.43、russh-sftp 2.4.0 等）。React 19 / Vite 8 / xterm 6 / TypeScript 7 等大版本有意不升。
+
+#### 🔒 安全
+
+- **GUI↔MCP localhost IPC 桥增加随机会话令牌认证**：每条 IPC 命令必须携带端口文件中随 GUI 每次启动轮换的随机令牌，否则在分发动作前一律拒绝——本机其他用户的进程无法再在保险库解锁状态下窃取解密凭证。旧格式端口文件向后兼容；版本错配时返回明确的升级提示。
+- **russh 0.50 → 0.60.3，修复两个 high 漏洞**（RUSTSEC-2026-0154/0153）：恶意 SSH 服务器可触发无上限内存分配导致客户端拒绝服务。加密后端换预编译 ring（免 NASM/CMake 依赖），业务代码零改动，`cargo audit` 两个 high 清零。
 
 ### v2.12.1（2026-08-24）
 
