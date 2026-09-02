@@ -3090,7 +3090,7 @@ dependencies = [
 
 [[package]]
 name = "myshell"
-version = "2.12.2"
+version = "2.13.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "base64 0.22.1",

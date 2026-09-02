@@ -1012,9 +1012,14 @@ async fn channel_reader(
                     }
                 }
                 Some(SessionCommand::ZmodemStartUpload { paths }) => {
-                    // Native upload: frontend selected local files. Open the
-                    // first, create a ZmodemSender, queue the rest. Feed any
-                    // buffered ZRINIT bytes to kick off the handshake.
+                    // Native upload: frontend selected local files AND/OR
+                    // folders. Folders are expanded recursively here; each
+                    // file's ZFILE offer name is its path relative to the
+                    // selected folder root ("root/sub/file") — lrzsz's rz
+                    // recreates the directory tree from that path, which is
+                    // how ZMODEM (a file-only protocol) carries a folder.
+                    // Open the first, queue the rest, feed any buffered
+                    // ZRINIT to kick off the handshake.
                     // Reset the abort flag — a fresh transfer starts here.
                     upload_aborted.store(false, std::sync::atomic::Ordering::Relaxed);
                     log::info!("[ssh:{}] ZmodemStartUpload: {} paths, pending={} bytes", session_id, paths.len(), tx_state.pending.len());
@@ -1022,26 +1027,9 @@ async fn channel_reader(
                         log::warn!("[ssh:{}] zmodem_start_upload with empty paths", session_id);
                     } else {
                         tx_state.native = true;
-                        // Build UploadFile entries with metadata.
-                        let mut files: std::collections::VecDeque<UploadFile> = std::collections::VecDeque::new();
-                        for p in &paths {
-                            match std::fs::metadata(p) {
-                                Ok(meta) => {
-                                    if !meta.is_file() { continue; }
-                                    let name = std::path::Path::new(p)
-                                        .file_name().and_then(|n| n.to_str())
-                                        .unwrap_or("file").to_string();
-                                    let mtime = meta.modified().ok()
-                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                        .map(|d| d.as_secs()).unwrap_or(0);
-                                    files.push_back(UploadFile {
-                                        path: p.clone(), name, size: meta.len(), mtime,
-                                    });
-                                }
-                                Err(e) => {
-                                    log::warn!("[ssh:{}] upload file stat failed {}: {}", session_id, p, e);
-                                }
-                            }
+                        let (mut files, walk_errors) = collect_upload_files(&paths);
+                        for e in &walk_errors {
+                            log::warn!("[ssh:{}] upload expansion: {}", session_id, e);
                         }
                         if let Some(first) = files.pop_front() {
                             tx_state.queue = files;
@@ -1069,6 +1057,25 @@ async fn channel_reader(
                                     }));
                                 }
                             }
+                        } else {
+                            // Selection expanded to nothing (e.g. only empty
+                            // folders) — abort now so rz exits instead of
+                            // waiting forever for an offer that never comes.
+                            log::warn!("[ssh:{}] upload selection empty after expansion — aborting", session_id);
+                            let detail = if walk_errors.is_empty() {
+                                "所选内容没有可上传的文件（可能只包含空文件夹）".to_string()
+                            } else {
+                                walk_errors.join("; ")
+                            };
+                            sink.emit("zmodem_error", &serde_json::json!({
+                                "sessionId": session_id, "message": detail
+                            }));
+                            upload_aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let abort = [CAN; 8];
+                            send_data(&data_tx, &abort[..]).await;
+                            mode = TermMode::Normal;
+                            suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                            sink.emit("zmodem_end", &session_id);
                         }
                     }
                 }
@@ -1360,6 +1367,34 @@ async fn channel_reader(
                             }
                         }
                     }
+                // ZMODEM download idle timeout: a sender that died without a
+                // CAN burst (killed by a signal, silent crash) would leave the
+                // native receiver waiting forever — the terminal stays in
+                // Zmodem mode and swallows all shell output, looking frozen.
+                // 30s of total silence (exempting WaitingAccept, where the
+                // save-directory picker can stay open indefinitely) means the
+                // sender is gone.
+                if mode == TermMode::Zmodem {
+                    let rx_timed_out = zmodem_rx
+                        .as_ref()
+                        .map(|rx| rx.idle_timeout(Duration::from_secs(30)))
+                        .unwrap_or(false);
+                    if rx_timed_out {
+                        log::warn!(
+                            "[ssh:{}] zmodem rx idle timeout (30s without data), forcing end",
+                            session_id
+                        );
+                        sink.emit("zmodem_error", &serde_json::json!({
+                            "sessionId": session_id,
+                            "message": "ZMODEM 接收超时：远端 30 秒没有任何数据，会话已结束"
+                        }));
+                        let _ = disk_tx.send(DiskJob::Close);
+                        mode = TermMode::Normal;
+                        suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                        zmodem_rx = None;
+                        sink.emit("zmodem_end", &session_id.to_string());
+                    }
+                }
                 }
         }
     }
@@ -1693,6 +1728,116 @@ fn handle_incoming_data(
                 sink.emit("zmodem_end", &session_id);
             }
             Vec::new()
+        }
+    }
+}
+
+/// Expand the user's upload selection (files and/or folders) into the flat
+/// upload queue. Folders are walked depth-first: each contained file's ZFILE
+/// offer name is `<folder-name>/<sub>/file` — lrzsz's rz creates the remote
+/// directories from the path, which is how ZMODEM (a file-only protocol)
+/// carries a tree. Directly-selected files keep their plain basename.
+/// Depth-capped to survive symlink/junction cycles. Non-fatal problems land
+/// in the returned error list (transfer continues with the rest).
+fn collect_upload_files(
+    paths: &[String],
+) -> (std::collections::VecDeque<UploadFile>, Vec<String>) {
+    let mut queue = std::collections::VecDeque::new();
+    let mut errors = Vec::new();
+    for p in paths {
+        match std::fs::metadata(p) {
+            Ok(md) if md.is_file() => push_upload_file(&mut queue, p, None, &md),
+            Ok(md) if md.is_dir() => {
+                let root = std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("folder")
+                    .to_string();
+                walk_upload_dir(std::path::Path::new(p), &root, &mut queue, &mut errors, 0);
+            }
+            Ok(_) => errors.push(format!("{}: 不是文件或目录（已跳过）", p)),
+            Err(e) => errors.push(format!("{}: 读取本地信息失败: {}", p, e)),
+        }
+    }
+    (queue, errors)
+}
+
+/// Append one file to the upload queue. `rel_prefix` is the file's path
+/// relative to the selected folder root (None = directly-selected file).
+fn push_upload_file(
+    queue: &mut std::collections::VecDeque<UploadFile>,
+    path: &str,
+    rel_prefix: Option<&str>,
+    md: &std::fs::Metadata,
+) {
+    let base = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    // POSIX separators in the offer name — remote rz splits on '/'.
+    let name = match rel_prefix {
+        Some(prefix) => format!("{}/{}", prefix, base),
+        None => base,
+    };
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    queue.push_back(UploadFile {
+        path: path.to_string(),
+        name,
+        size: md.len(),
+        mtime,
+    });
+}
+
+fn walk_upload_dir(
+    dir: &std::path::Path,
+    rel_prefix: &str,
+    queue: &mut std::collections::VecDeque<UploadFile>,
+    errors: &mut Vec<String>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 64;
+    if depth > MAX_DEPTH {
+        errors.push(format!(
+            "{}: 目录层级过深（>{}，可能存在符号链接循环）",
+            rel_prefix, MAX_DEPTH
+        ));
+        return;
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            errors.push(format!("{}: 读取目录失败: {}", rel_prefix, e));
+            return;
+        }
+    };
+    // Deterministic order across platforms (name-sorted, dirs and files
+    // interleaved — a stable sequence makes resume/debugging predictable).
+    let mut names: Vec<std::ffi::OsString> =
+        rd.filter_map(|e| e.ok().map(|e| e.file_name())).collect();
+    names.sort();
+    for fname in names {
+        let full = dir.join(&fname);
+        let disp = fname.to_string_lossy().into_owned();
+        let rel = format!("{}/{}", rel_prefix, disp);
+        // metadata() follows symlinks/junctions (OneDrive etc.) — the depth
+        // cap above is the cycle guard.
+        match std::fs::metadata(&full) {
+            // rel_prefix is the DIRECTORY prefix; push_upload_file appends
+            // the file's basename (rel here already contains it).
+            Ok(md) if md.is_file() => {
+                push_upload_file(queue, &full.to_string_lossy(), Some(rel_prefix), &md)
+            }
+            Ok(md) if md.is_dir() => {
+                walk_upload_dir(&full, &rel, queue, errors, depth + 1)
+            }
+            Ok(_) => {} // special file (socket/device) — skip silently
+            Err(e) => errors.push(format!("{}: {}", rel, e)),
         }
     }
 }
@@ -2270,4 +2415,56 @@ pub async fn exec_once(
         out.push_str("\n[output truncated]\n");
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod upload_expand_tests {
+    use super::collect_upload_files;
+
+    #[test]
+    fn folder_expands_to_relative_offer_names() {
+        let root = std::env::temp_dir().join("zmodem_upload_expand_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub").join("deep")).unwrap();
+        std::fs::write(root.join("a.txt"), b"aaa").unwrap();
+        std::fs::write(root.join("sub").join("b.txt"), b"bb").unwrap();
+        std::fs::write(root.join("sub").join("deep").join("c.bin"), b"cccc").unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap(); // no files inside
+
+        let (queue, errors) = collect_upload_files(&[root.to_string_lossy().to_string()]);
+        assert!(errors.is_empty(), "{:?}", errors);
+        // Offer names = path relative to the selected folder, POSIX seps.
+        // Name-sorted: a.txt, sub/b.txt, sub/deep/c.bin ("empty" contributes
+        // nothing — ZMODEM carries files only, empty dirs can't travel).
+        let names: Vec<&str> = queue.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "zmodem_upload_expand_test/a.txt",
+                "zmodem_upload_expand_test/sub/b.txt",
+                "zmodem_upload_expand_test/sub/deep/c.bin",
+            ]
+        );
+        assert_eq!(queue.iter().find(|f| f.name.ends_with("a.txt")).unwrap().size, 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plain_files_keep_basename() {
+        let tmp = std::env::temp_dir().join("zmodem_upload_flat_test.txt");
+        std::fs::write(&tmp, b"x").unwrap();
+        let (queue, errors) = collect_upload_files(&[tmp.to_string_lossy().to_string()]);
+        assert!(errors.is_empty());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].name, "zmodem_upload_flat_test.txt");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn missing_path_lands_in_errors() {
+        let (queue, errors) =
+            collect_upload_files(&["Z:\\definitely\\not\\here.abc".to_string()]);
+        assert!(queue.is_empty());
+        assert_eq!(errors.len(), 1);
+    }
 }

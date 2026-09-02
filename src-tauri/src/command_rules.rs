@@ -448,6 +448,7 @@ mod tests {
             blacklist: vec!["[invalid".into()], // broken regex
             whitelist: vec![],
             confirm_unknown: false,
+            show_in_gui: true,
         };
         // Broken regex is dropped; nothing matches; command runs freely.
         assert!(!command_needs_confirmation("anything", &rules));

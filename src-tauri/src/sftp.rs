@@ -3,7 +3,7 @@ use crate::{EventSink, EventSinkExt};
 use russh_sftp::client::SftpSession;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -389,73 +389,229 @@ async fn upload_one(
     Ok(())
 }
 
-/// Download a batch of remote files into `local_dest_dir`. `remote_paths` are
-/// taken absolute (they come from the listing). Overwrites local files.
+/// A single file to download, produced by expanding the user's selection
+/// (plain files + recursive folder walk) into a flat list.
+#[derive(Clone)]
+struct DownloadTask {
+    remote_path: String,
+    /// Path relative to the local dest dir ("dir/sub/file.txt").
+    relative: String,
+    size: u64,
+}
+
+/// Recursively expand one selected remote path into download tasks.
+/// Files map to `<dest>/<name>`; folders mirror their subtree under
+/// `<dest>/<folder-name>/...` (empty folders preserved via `dirs`).
+/// Depth-capped: `metadata` follows symlinks, so a symlink cycle looks like
+/// infinite nesting — the cap turns it into a per-path error instead of a hang.
+async fn expand_download_one(
+    sftp: &SftpSession,
+    remote_path: &str,
+    tasks: &mut Vec<DownloadTask>,
+    dirs: &mut Vec<String>,
+    errors: &mut Vec<String>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 64;
+    if depth > MAX_DEPTH {
+        errors.push(format!(
+            "{}: 目录层级过深（>{}，可能存在符号链接循环）",
+            basename(remote_path),
+            MAX_DEPTH
+        ));
+        return;
+    }
+    let md = match sftp.metadata(remote_path).await {
+        Ok(md) => md,
+        Err(e) => {
+            errors.push(format!("{}: 读取远端信息失败: {}", basename(remote_path), e));
+            return;
+        }
+    };
+    if !md.is_dir() {
+        tasks.push(DownloadTask {
+            remote_path: remote_path.to_string(),
+            relative: basename(remote_path),
+            size: md.size.unwrap_or(0),
+        });
+        return;
+    }
+    let root_name = {
+        let n = basename(remote_path);
+        if n.is_empty() { "root".to_string() } else { n }
+    };
+    dirs.push(root_name.clone());
+    expand_dir_recursive(sftp, remote_path, &root_name, tasks, dirs, errors, depth).await;
+}
+
+/// Walk one remote folder level, appending file tasks and relative sub-dirs.
+async fn expand_dir_recursive(
+    sftp: &SftpSession,
+    remote_dir: &str,
+    rel_prefix: &str,
+    tasks: &mut Vec<DownloadTask>,
+    dirs: &mut Vec<String>,
+    errors: &mut Vec<String>,
+    depth: usize,
+) {
+    let entries = match sftp.read_dir(remote_dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            errors.push(format!("{}: 读取目录失败: {}", rel_prefix, e));
+            return;
+        }
+    };
+    for entry in entries {
+        let name = entry.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let full = if remote_dir.ends_with('/') {
+            format!("{}{}", remote_dir, name)
+        } else {
+            format!("{}/{}", remote_dir, name)
+        };
+        let rel = format!("{}/{}", rel_prefix, name);
+        // DirEntry attrs ride along with the listing (no extra round trip).
+        let md = entry.metadata();
+        if md.is_dir() {
+            dirs.push(rel.clone());
+            Box::pin(expand_dir_recursive(
+                sftp, &full, &rel, tasks, dirs, errors, depth + 1,
+            ))
+            .await;
+        } else {
+            tasks.push(DownloadTask {
+                remote_path: full,
+                relative: rel,
+                size: md.size.unwrap_or(0),
+            });
+        }
+    }
+}
+
+/// Download a batch of remote files/folders into `local_dest_dir`.
+/// Folders are expanded recursively (their subtree lands under
+/// `<dest>/<folder-name>/...`); files download concurrently with
+/// `concurrency` workers sharing one SFTP session (russh-sftp multiplexes
+/// by request id, so parallel handles over one channel are protocol-legal).
+/// Overwrites local files. Per-file failures land in the
+/// `sftp_transfer_done` errors list.
 pub async fn download(
     state: &AppState,
     session_id: &str,
     remote_paths: Vec<String>,
     local_dest_dir: &str,
     request_id: &str,
-    sink: &dyn EventSink,
+    concurrency: usize,
+    sink: Arc<dyn EventSink>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let sftp = get_sftp_session(state, session_id).await?;
+    // One shared session: RawSftpSession is Send+Sync (SendWrapper) and
+    // matches replies by request id, so N concurrent file reads multiplex
+    // over a single channel — no per-worker handshake cost.
+    let sftp = Arc::new(get_sftp_session(state, session_id).await?);
     // Local destination — created if missing (covers a freshly-typed path).
     tokio::fs::create_dir_all(local_dest_dir)
         .await
         .map_err(|e| format!("创建本地目录失败: {}", e))?;
 
-    // Pre-stat remote files for the progress bar.
+    // Phase 1: expand selection (recursive walk) into a flat file list.
     let mut errors: Vec<String> = Vec::new();
-    let mut tasks: Vec<String> = Vec::new();
-    let mut bytes_total: u64 = 0;
+    let mut tasks: Vec<DownloadTask> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
     for rp in &remote_paths {
-        match sftp.metadata(rp).await {
-            Ok(md) => {
-                bytes_total = bytes_total.saturating_add(md.size.unwrap_or(0));
-                tasks.push(rp.clone());
-            }
-            Err(e) => errors.push(format!("{}: 读取远端信息失败: {}", basename(rp), e)),
+        expand_download_one(&sftp, rp, &mut tasks, &mut dirs, &mut errors, 0).await;
+    }
+    // Materialize the folder skeleton before transferring so files always
+    // have a parent to land in — and empty folders survive the copy.
+    for d in &dirs {
+        let p = Path::new(local_dest_dir).join(d);
+        if let Err(e) = tokio::fs::create_dir_all(&p).await {
+            errors.push(format!("{}: 创建本地目录失败: {}", d, e));
         }
     }
     let file_count = tasks.len();
+    let bytes_total = tasks.iter().fold(0u64, |acc, t| acc.saturating_add(t.size));
 
-    let mut bytes_done: u64 = 0;
-    for (i, rp) in tasks.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            errors.push("已取消".to_string());
-            break;
-        }
-        let name = basename(rp);
-        let local_path = Path::new(local_dest_dir).join(&name);
-
-        let mut last_emit = Instant::now();
-        emit_transfer_progress(
-            sink, request_id, "download", &name, i, file_count, bytes_done, bytes_total,
-        );
-        if let Err(e) = download_one(
-            &sftp,
-            sink,
-            request_id,
-            rp,
-            &local_path.to_string_lossy(),
-            i,
-            file_count,
-            bytes_total,
-            &mut bytes_done,
-            &mut last_emit,
-            &cancel,
-        )
-        .await
-        {
-            errors.push(e);
-            if cancel.load(Ordering::Relaxed) { break; }
-        }
+    // Phase 2: worker pool. Cursor + shared task list — no channel needed;
+    // fetch_add hands each task to exactly one worker.
+    let tasks = Arc::new(tasks);
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let bytes_done = Arc::new(AtomicU64::new(0));
+    let files_done = Arc::new(AtomicUsize::new(0));
+    let worker_errors = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let workers = concurrency.clamp(1, 16).min(file_count.max(1));
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let sftp = Arc::clone(&sftp);
+        let sink = Arc::clone(&sink);
+        let cancel = Arc::clone(&cancel);
+        let tasks = Arc::clone(&tasks);
+        let cursor = Arc::clone(&cursor);
+        let bytes_done = Arc::clone(&bytes_done);
+        let files_done = Arc::clone(&files_done);
+        let worker_errors = Arc::clone(&worker_errors);
+        let dest = local_dest_dir.to_string();
+        let rid = request_id.to_string();
+        handles.push(tokio::spawn(async move {
+            let mut last_emit = Instant::now();
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                if i >= tasks.len() {
+                    break;
+                }
+                let task = tasks[i].clone();
+                let local_path = Path::new(&dest).join(&task.relative);
+                // Progress slot = files completed so far — a monotonic
+                // counter that reads naturally when files run in parallel.
+                let slot = files_done.load(Ordering::Relaxed);
+                match download_one(
+                    &sftp,
+                    &*sink,
+                    &rid,
+                    &task.remote_path,
+                    &local_path.to_string_lossy(),
+                    slot,
+                    file_count,
+                    bytes_total,
+                    &bytes_done,
+                    &mut last_emit,
+                    &cancel,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        files_done.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        if let Ok(mut g) = worker_errors.lock() {
+                            g.push(e);
+                        }
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    if let Ok(g) = worker_errors.lock() {
+        errors.extend(g.iter().cloned());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        errors.push("已取消".to_string());
     }
 
+    let bytes_done = bytes_done.load(Ordering::Relaxed);
     emit_transfer_progress(
-        sink, request_id, "download", "", file_count, file_count, bytes_done, bytes_total,
+        &*sink, request_id, "download", "", file_count, file_count, bytes_done, bytes_total,
     );
     sink.emit(
         "sftp_transfer_done",
@@ -476,7 +632,7 @@ async fn download_one(
     file_index: usize,
     file_count: usize,
     bytes_total: u64,
-    bytes_done: &mut u64,
+    bytes_done: &AtomicU64,
     last_emit: &mut Instant,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -519,10 +675,10 @@ async fn download_one(
                 log::warn!("[sftp] download {} write failed: {}", name, e);
                 format!("{}: 写入失败: {}", name, e)
             })?;
-        *bytes_done = bytes_done.saturating_add(n as u64);
+        let done_now = bytes_done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
         if last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
             emit_transfer_progress(
-                sink, request_id, "download", &name, file_index, file_count, *bytes_done,
+                sink, request_id, "download", &name, file_index, file_count, done_now,
                 bytes_total,
             );
             *last_emit = Instant::now();

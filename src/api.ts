@@ -558,13 +558,25 @@ export async function sftpUpload(
   await invoke("sftp_upload", { sessionId, localPaths, remoteDestDir, requestId });
 }
 
+/**
+ * Batch-download remote files/folders. Folders are expanded recursively on
+ * the Rust side (subtree lands under `<dest>/<folder-name>/...`); files run
+ * on `concurrency` parallel workers (Rust clamps 1..=16).
+ */
 export async function sftpDownload(
   sessionId: string,
   remotePaths: string[],
   localDestDir: string,
-  requestId: string
+  requestId: string,
+  concurrency?: number
 ): Promise<void> {
-  await invoke("sftp_download", { sessionId, remotePaths, localDestDir, requestId });
+  await invoke("sftp_download", {
+    sessionId,
+    remotePaths,
+    localDestDir,
+    requestId,
+    concurrency: concurrency ?? 3,
+  });
 }
 
 /** Live progress for a transfer (filtered by requestId). */
@@ -1151,6 +1163,26 @@ export function onZmodemEnd(
   return listen<string>("zmodem_end", (event) => {
     if (event.payload === sessionId) handler();
   });
+}
+
+/**
+ * Fires when the native Rust ZMODEM path hits a fatal error (remote abort
+ * burst, ZABORT frame, idle timeout). Always followed by zmodem_end. Note:
+ * the error can precede any zmodem_offer — sz dies before offering the
+ * first file when it can't read it (permission denied / target is a
+ * directory) — so handlers must not assume the progress overlay is active.
+ */
+export function onZmodemError(
+  sessionId: string,
+  handler: (message: string) => void
+): Promise<UnlistenFn> {
+  return listen<{ sessionId: string; message: string }>(
+    "zmodem_error",
+    (event) => {
+      if (event.payload.sessionId === sessionId)
+        handler(event.payload.message);
+    }
+  );
 }
 
 // ── Native ZMODEM download (Rust-side receiver) ──────────────────────────

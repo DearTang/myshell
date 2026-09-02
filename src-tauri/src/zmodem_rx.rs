@@ -8,8 +8,6 @@
 //! the lrzsz wire behavior. We implement the DOWNLOAD path only; uploads
 //! (remote `rz`) fall back to the JS zmodem.js path unchanged.
 
-use std::io::Write;
-
 // ── ZMODEM constants (byte values) ────────────────────────────────────────
 pub(crate) const ZDLE: u8 = 0x18;
 pub(crate) const ZPAD: u8 = b'*';
@@ -27,6 +25,7 @@ pub(crate) mod frame_type {
     pub const ZACK: u8 = 3;
     pub const ZFILE: u8 = 4;
     pub const ZSKIP: u8 = 5;
+    pub const ZABORT: u8 = 7;
     pub const ZFIN: u8 = 8;
     pub const ZRPOS: u8 = 9;
     pub const ZDATA: u8 = 10;
@@ -101,7 +100,7 @@ pub struct RxActions {
 }
 
 /// Frontend-facing events emitted by the native receiver.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum RxEvent {
     /// A file is being offered — frontend should prompt for a save directory.
     /// `path` will be the filename (basename) to save.
@@ -160,6 +159,11 @@ pub struct ZmodemReceiver {
     /// Whether the "native download started" signal has been taken by the caller
     /// (so zmodem_start is emitted exactly once).
     start_emitted: bool,
+    /// Last time feed() was called with data. The reader loop uses this as an
+    /// idle watchdog: a sender that goes silent (crashed / killed / aborted
+    /// without a CAN burst) would otherwise leave the session in Zmodem mode
+    /// forever, swallowing all terminal output.
+    last_feed: Option<std::time::Instant>,
 }
 
 impl ZmodemReceiver {
@@ -178,6 +182,7 @@ impl ZmodemReceiver {
             data_crc32: false,
             passthrough: false,
             start_emitted: false,
+            last_feed: None,
         }
     }
 
@@ -185,6 +190,7 @@ impl ZmodemReceiver {
     /// caller must perform (send bytes to peer, emit events to frontend).
     pub fn feed(&mut self, data: &[u8]) -> RxActions {
         let mut actions = RxActions::default();
+        self.last_feed = Some(std::time::Instant::now());
         self.buf.extend_from_slice(data);
 
         // Direction probe: the first frame decides native-download vs JS
@@ -201,6 +207,24 @@ impl ZmodemReceiver {
             }
         }
         if self.passthrough {
+            return actions;
+        }
+
+        // Abort detection: lrzsz's `canit()` on failure (unreadable file,
+        // target is a directory, user kill) sends a burst of 10× CAN followed
+        // by 10× backspace, then exits. CAN shares the value 0x18 with ZDLE,
+        // but valid data always transmits a literal 0x18 as a ZDLE-escaped
+        // pair, so ≥5 consecutive raw CAN bytes can only be an abort. Without
+        // this check the burst parses as no header at all and the receiver
+        // waits forever — the terminal stays in Zmodem mode and swallows all
+        // subsequent shell output (looks frozen).
+        if let Some(msg) = Self::find_abort_burst(&self.buf[self.scan_pos.min(self.buf.len())..]) {
+            log::warn!("[zmodem_rx] abort burst detected — ending session: {}", msg);
+            self.buf.clear();
+            self.scan_pos = 0;
+            self.in_zdata = false;
+            self.cleanup_file();
+            actions.events.push(RxEvent::Error(msg));
             return actions;
         }
 
@@ -241,6 +265,42 @@ impl ZmodemReceiver {
             true
         } else {
             false
+        }
+    }
+
+    /// Scan for a lrzsz abort burst: ≥5 consecutive CAN (0x18) bytes.
+    /// Returns a user-facing message when found.
+    fn find_abort_burst(buf: &[u8]) -> Option<String> {
+        let mut run = 0usize;
+        for &b in buf {
+            if b == ZDLE {
+                run += 1;
+                if run >= 5 {
+                    return Some(
+                        "远端中止了 ZMODEM 传输（sz 发送了取消序列，常见原因：文件不可读/权限不足，或目标是目录）"
+                            .to_string(),
+                    );
+                }
+            } else {
+                run = 0;
+            }
+        }
+        None
+    }
+
+    /// True when the session should be force-ended: the sender has been
+    /// silent for longer than `limit` and we are NOT waiting for the user to
+    /// pick a save directory (the directory picker can legitimately stay open
+    /// for minutes — no protocol bytes flow while it's open). Covers the
+    /// failure mode where sz dies without a CAN burst (e.g. killed by a
+    /// signal) and the receiver would otherwise wait forever.
+    pub fn idle_timeout(&self, limit: std::time::Duration) -> bool {
+        if self.state == RxState::WaitingAccept {
+            return false;
+        }
+        match self.last_feed {
+            Some(t) => t.elapsed() > limit,
+            None => false,
         }
     }
 
@@ -301,6 +361,23 @@ impl ZmodemReceiver {
                 (actions, None)
             }
             Some(p) => {
+                // `sz -r` offers carry relative subpaths ("dir/sub/file.txt")
+                // — create the parent hierarchy so tree downloads mirror
+                // intact. The caller is responsible for sanitizing the path
+                // (no `..`/absolute escape) before handing it to us.
+                if let Some(parent) = std::path::Path::new(p).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            actions
+                                .events
+                                .push(RxEvent::Error(format!("无法创建目录: {}", e)));
+                            // Skip this file on error.
+                            actions.send = self.build_hex_header(frame_type::ZSKIP, [0, 0, 0, 0]);
+                            self.state = RxState::WaitingZfile;
+                            return (actions, None);
+                        }
+                    }
+                }
                 match std::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
@@ -613,6 +690,17 @@ impl ZmodemReceiver {
                 self.handle_zfin(actions);
                 true
             }
+            frame_type::ZABORT | frame_type::ZFERR => {
+                // Sender-side abort/error frame (e.g. unreadable file).
+                // Respond with nothing — the sender is already going away —
+                // and end the session so the reader returns to Normal mode.
+                log::warn!("[zmodem_rx] ZABORT/ZFERR received in WaitingZfile");
+                self.cleanup_file();
+                actions
+                    .events
+                    .push(RxEvent::Error("远端中止了 ZMODEM 传输（收到 ZABORT/ZFERR 帧）".into()));
+                true
+            }
             _ => true,
         }
     }
@@ -657,6 +745,20 @@ impl ZmodemReceiver {
             frame_type::ZFIN => {
                 self.in_zdata = false;
                 self.handle_zfin(actions);
+            }
+            frame_type::ZABORT | frame_type::ZFERR => {
+                // Sender aborted mid-transfer (e.g. it hit an I/O error).
+                // Keep the partial file (lrzsz-compatible) and end the session.
+                log::warn!("[zmodem_rx] ZABORT/ZFERR received in Transferring");
+                self.in_zdata = false;
+                actions.events.push(RxEvent::Progress {
+                    written: self.bytes_written,
+                    total: self.file_size,
+                });
+                self.cleanup_file();
+                actions
+                    .events
+                    .push(RxEvent::Error("远端中止了 ZMODEM 传输（收到 ZABORT/ZFERR 帧）".into()));
             }
             _ => {}
         }
@@ -980,4 +1082,178 @@ pub(crate) fn crc16_xmodem(bytes: &[u8]) -> u16 {
     }
     crc = updcrc(0, updcrc(0, crc, tab), tab);
     crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CAN — ZMODEM cancel byte (0x18, shares the value with ZDLE).
+    const CAN: u8 = 0x18;
+
+    /// Build a hex header with dummy (unverified) CRC. Reproduces the wire
+    /// format lrzsz uses for control frames: ZPAD ZPAD ZDLE ZHEX <2 hex type>
+    /// <8 hex data> <4 hex crc> CR LF.
+    fn hex_header(typenum: u8) -> Vec<u8> {
+        let mut out = vec![ZPAD, ZPAD, ZDLE, ZHEX];
+        out.extend_from_slice(format!("{:02x}", typenum).as_bytes());
+        out.extend_from_slice(b"00000000"); // data
+        out.extend_from_slice(b"0000"); // crc (parser skips, doesn't verify)
+        out.push(0x0d);
+        out.push(0x0a);
+        out
+    }
+
+    /// ZFILE header + filename/metadata subpacket terminated by ZDLE ZCRCW.
+    fn zfile_frame(name: &str, size: u64) -> Vec<u8> {
+        let mut out = hex_header(frame_type::ZFILE);
+        let mut payload = name.as_bytes().to_vec();
+        payload.push(0);
+        payload.extend_from_slice(format!("{} 0 0 0", size).as_bytes());
+        // Printable ASCII + NUL need no ZDLE escaping on the wire.
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&[ZDLE, subpkt_end::ZCRCW]);
+        out.extend_from_slice(&[0x00, 0x00]); // CRC16 (skipped by parser)
+        out
+    }
+
+    /// lrzsz canit(): 10× CAN followed by 10× backspace.
+    fn canit_burst() -> Vec<u8> {
+        let mut v = vec![CAN; 10];
+        v.extend_from_slice(&[0x08; 10]);
+        v
+    }
+
+    #[test]
+    fn abort_burst_after_zrqinit_ends_session() {
+        let mut rx = ZmodemReceiver::new();
+        let actions = rx.feed(&hex_header(frame_type::ZRQINIT));
+        assert!(
+            !actions.send.is_empty(),
+            "ZRQINIT must be answered with ZRINIT"
+        );
+        assert!(rx.take_start_signal());
+
+        let actions = rx.feed(&canit_burst());
+        assert!(actions.send.is_empty(), "no protocol reply to a dead sender");
+        assert!(
+            matches!(actions.events.last(), Some(RxEvent::Error(_))),
+            "abort burst must surface as an Error event (→ session end), got {:?}",
+            actions.events
+        );
+    }
+
+    #[test]
+    fn abort_burst_split_across_feeds() {
+        let mut rx = ZmodemReceiver::new();
+        let _ = rx.feed(&hex_header(frame_type::ZRQINIT));
+        let actions = rx.feed(&[CAN; 3]);
+        assert!(actions.events.is_empty(), "below threshold — keep waiting");
+        let actions = rx.feed(&[CAN; 3]);
+        assert!(
+            matches!(actions.events.last(), Some(RxEvent::Error(_))),
+            "6 total consecutive CANs must trip the detector"
+        );
+    }
+
+    #[test]
+    fn abort_burst_in_same_feed_as_zrqinit() {
+        // sz can fail so fast that the burst lands in the same SSH packet as
+        // the handshake — the session must end without ever emitting
+        // zmodem_start (take_start_signal stays false).
+        let mut rx = ZmodemReceiver::new();
+        let mut data = hex_header(frame_type::ZRQINIT);
+        data.extend_from_slice(&canit_burst());
+        let actions = rx.feed(&data);
+        assert!(
+            matches!(actions.events.last(), Some(RxEvent::Error(_))),
+            "got {:?}",
+            actions.events
+        );
+        assert!(!rx.take_start_signal());
+    }
+
+    #[test]
+    fn zabort_frame_ends_session() {
+        let mut rx = ZmodemReceiver::new();
+        let _ = rx.feed(&hex_header(frame_type::ZRQINIT));
+        let actions = rx.feed(&hex_header(frame_type::ZABORT));
+        assert!(
+            matches!(actions.events.last(), Some(RxEvent::Error(_))),
+            "got {:?}",
+            actions.events
+        );
+    }
+
+    #[test]
+    fn escaped_zdle_data_is_not_mistaken_for_abort() {
+        // During a healthy transfer every literal 0x18 data byte travels as a
+        // ZDLE pair (0x18, x^0x40) — alternating bytes, never a raw run of
+        // 5+ CANs. Feed a ZFILE + ZDATA + escaped payload + ZEOF sequence and
+        // assert no error fires.
+        let mut rx = ZmodemReceiver::new();
+        let _ = rx.feed(&hex_header(frame_type::ZRQINIT));
+        let actions = rx.feed(&zfile_frame("t.txt", 4));
+        assert!(actions.events.iter().any(|e| matches!(e, RxEvent::Offer { .. })));
+        // Save path in the system temp dir so accept_offer can create it.
+        let save_path = std::env::temp_dir().join("zmodem_rx_test_escaped_zdle.bin");
+        let (a2, file) = rx.accept_offer(&Some(save_path.to_string_lossy().to_string()));
+        assert!(file.is_some(), "accept_offer must create the temp file");
+        assert!(!a2.send.is_empty(), "accept must send ZRPOS");
+
+        // ZDATA header + subpacket "a<0x18>b" (0x18 escaped as ZDLE 0x58) + ZCRCE + crc.
+        let mut zdata = vec![ZPAD, ZPAD, ZDLE, ZBIN32];
+        // type ZDATA=10, offset 0, dummy crc32 bytes — parser skips crc.
+        zdata.extend_from_slice(&[0x0a, 0x00, 0x00, 0x00, 0x00, 1, 2, 3, 4]);
+        zdata.extend_from_slice(b"a");
+        zdata.extend_from_slice(&[ZDLE, 0x18 ^ 0x40]); // escaped 0x18 data byte
+        zdata.extend_from_slice(b"b");
+        zdata.extend_from_slice(&[ZDLE, subpkt_end::ZCRCE, 0x00, 0x00, 0x00, 0x00]);
+        let actions = rx.feed(&zdata);
+        assert!(
+            !actions.events.iter().any(|e| matches!(e, RxEvent::Error(_))),
+            "healthy escaped stream must not trip the abort detector"
+        );
+        let pending = rx.take_pending_write();
+        assert_eq!(pending, vec![b'a', 0x18, b'b'], "decoded payload mismatch");
+        let _ = std::fs::remove_file(save_path);
+    }
+
+    #[test]
+    fn idle_timeout_exempts_waiting_accept() {
+        let mut rx = ZmodemReceiver::new();
+        let _ = rx.feed(&hex_header(frame_type::ZRQINIT));
+        // Just fed — a 1-hour idle limit must not trip.
+        assert!(!rx.idle_timeout(std::time::Duration::from_secs(3600)));
+
+        // Offer arrives → WaitingAccept: the directory picker may stay open
+        // for minutes, so the idle watchdog must never fire in this state,
+        // not even with a zero limit.
+        let _ = rx.feed(&zfile_frame("a.txt", 1));
+        assert!(!rx.idle_timeout(std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn accept_offer_creates_parent_dirs_for_sz_r_subpath() {
+        // `sz -r dir` offers arrive as "dir/sub/file.txt" — the receiver must
+        // create the missing parent hierarchy, not fail the open.
+        let mut rx = ZmodemReceiver::new();
+        let _ = rx.feed(&hex_header(frame_type::ZRQINIT));
+        let _ = rx.feed(&zfile_frame("some/dir/tree.txt", 3));
+        let base = std::env::temp_dir().join("zmodem_rx_test_subpath");
+        let _ = std::fs::remove_dir_all(&base);
+        let target = base.join("some").join("dir").join("tree.txt");
+        let (actions, file) = rx.accept_offer(&Some(target.to_string_lossy().to_string()));
+        assert!(file.is_some(), "nested offer must open after mkdir -p");
+        assert!(
+            !actions
+                .events
+                .iter()
+                .any(|e| matches!(e, RxEvent::Error(_))),
+            "got {:?}",
+            actions.events
+        );
+        assert!(target.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

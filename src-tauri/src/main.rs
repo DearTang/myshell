@@ -3335,18 +3335,20 @@ async fn sftp_upload(
     result
 }
 
-/// Batch-download remote files into a local dir. Same event contract as
-/// `sftp_upload`. See `sftp::download`.
+/// Batch-download remote files/folders into a local dir. Folders are expanded
+/// recursively; files transfer on `concurrency` parallel workers (clamped
+/// 1..=16). Same event contract as `sftp_upload`. See `sftp::download`.
 #[tauri::command]
 async fn sftp_download(
     session_id: String,
     remote_paths: Vec<String>,
     local_dest_dir: String,
     request_id: String,
+    concurrency: Option<usize>,
     state: State<'_, AppState>,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
-    let sink = WindowSink(window);
+    let sink = Arc::new(WindowSink(window));
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     state.transfer_cancels.lock().unwrap().insert(request_id.clone(), cancel.clone());
     let result = sftp::download(
@@ -3355,7 +3357,8 @@ async fn sftp_download(
         remote_paths,
         &local_dest_dir,
         &request_id,
-        &sink,
+        concurrency.unwrap_or(3),
+        sink,
         cancel,
     )
     .await;

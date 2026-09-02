@@ -17,6 +17,7 @@ import {
   ftpRename,
 } from "../api";
 import type { FileEntry, SftpTransferProgressPayload } from "../api";
+import { getSftpDownloadConcurrency } from "../utils/transfer-settings";
 
 interface Props {
   sessionId: string;
@@ -252,10 +253,9 @@ export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDis
     });
   }
 
-  // Download is files-only (contract) — filter selected entries to files.
-  const selectedFileEntries = entries.filter(
-    (e) => !e.is_dir && selected.has(e.path)
-  );
+  // Download accepts files AND folders — folders are expanded recursively
+  // on the Rust side (subtree mirrors under <dest>/<folder-name>/...).
+  const selectedFileEntries = entries.filter((e) => selected.has(e.path));
 
   /** Wire up progress/done listeners, run the transfer, then refresh if asked.
    * Shared by upload + download so the overlay lifecycle lives in one place. */
@@ -327,7 +327,7 @@ export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDis
 
   async function handleDownload() {
     if (selectedFileEntries.length === 0) {
-      alert("请先勾选要下载的文件（仅文件，不含文件夹）");
+      alert("请先勾选要下载的文件或文件夹");
       return;
     }
     const dest = await open({ directory: true, title: "选择保存位置" });
@@ -337,7 +337,7 @@ export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDis
     const paths = selectedFileEntries.map((e) => e.path);
     await runTransfer(
       "download",
-      (rid) => sftpDownload(sessionId, paths, destDir, rid),
+      (rid) => sftpDownload(sessionId, paths, destDir, rid, getSftpDownloadConcurrency()),
       false
     );
   }

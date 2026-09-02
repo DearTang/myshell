@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -16,6 +17,7 @@ import {
   onZmodemStart,
   onZmodemRaw,
   onZmodemEnd,
+  onZmodemError,
   onZmodemOffer,
   onZmodemProgress,
   onZmodemFileComplete,
@@ -89,6 +91,19 @@ function forceVisibleCursor(theme: ITheme): { cursor?: string; cursorAccent?: st
   if (theme.background) out.cursorAccent = theme.background;
   return out;
 }
+
+/** Button style for the rz upload chooser bar (files vs folder vs cancel). */
+const uploadChooserBtn: CSSProperties = {
+  background: "transparent",
+  border: "1px solid #89b4fa",
+  color: "#89b4fa",
+  padding: "3px 12px",
+  borderRadius: 4,
+  cursor: "pointer",
+  fontSize: 12,
+  fontFamily: "inherit",
+  whiteSpace: "nowrap",
+};
 
 interface Props {
   /** STABLE tab identifier — never changes across reconnects. Used as the
@@ -220,6 +235,60 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
     error: null,
     startTime: 0,
   });
+
+  // Inline chooser shown when the remote runs `rz`: OS dialogs can't mix
+  // files and folders in one pick, so we ask which kind to send first.
+  // Folders are expanded recursively on the Rust side (ZFILE offers carry
+  // relative paths; lrzsz rz recreates the tree remotely).
+  const [uploadChooserOpen, setUploadChooserOpen] = useState(false);
+
+  /** Hand the picked files/folders to the native Rust uploader, or abort
+   * when the user dismissed the picker without a selection. */
+  const commitNativeUpload = async (paths: string[]) => {
+    setUploadChooserOpen(false);
+    if (paths.length === 0) {
+      sshSendZmodemAbort(sessionIdRef.current).catch(() => {});
+      return;
+    }
+    try {
+      await zmodemStartUpload(sessionIdRef.current, paths);
+      // Activate the progress overlay. bytesTotal starts at 0 — the first
+      // zmodem_progress event carries the real file size (the backend
+      // stats/expands the selection). onZmodemProgress ignores events while
+      // active is false, so this must be set before bytes flow.
+      const firstName = paths[0].split(/[\\/]/).pop() || "file";
+      setZmodemStatus({
+        active: true,
+        direction: "upload",
+        currentFile: paths.length === 1 ? firstName : `${firstName} 等 ${paths.length} 项`,
+        bytesTransferred: 0,
+        bytesTotal: 0,
+        speedBps: 0,
+        error: null,
+        startTime: Date.now(),
+      });
+    } catch (e) {
+      console.error("native upload start failed:", e);
+      sshSendZmodemAbort(sessionIdRef.current).catch(() => {});
+    }
+  };
+
+  const pickUploadFiles = async () => {
+    const selected = await open({ multiple: true });
+    const paths: string[] = !selected ? [] : Array.isArray(selected) ? selected : [selected];
+    await commitNativeUpload(paths);
+  };
+
+  const pickUploadFolder = async () => {
+    const selected = await open({ directory: true, multiple: true });
+    const paths: string[] = !selected ? [] : Array.isArray(selected) ? selected : [selected];
+    await commitNativeUpload(paths);
+  };
+
+  const cancelNativeUpload = () => {
+    setUploadChooserOpen(false);
+    sshSendZmodemAbort(sessionIdRef.current).catch(() => {});
+  };
 
   // Screenshot status banner — shown transiently after the user clicks 📷.
   // `state` is one of: "capturing" | "saved" | "error". Auto-clears after 4s
@@ -491,6 +560,7 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
     let unlistenZmodemStart: UnlistenFn | null = null;
     let unlistenZmodemRaw: UnlistenFn | null = null;
     let unlistenZmodemEnd: UnlistenFn | null = null;
+    let unlistenZmodemError: UnlistenFn | null = null;
     let unlistenZmodemOffer: UnlistenFn | null = null;
     let unlistenZmodemProgress: UnlistenFn | null = null;
     let unlistenZmodemFileComplete: UnlistenFn | null = null;
@@ -612,11 +682,20 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
     // natively in Rust. The frontend only handles UI (file picker / save dir
     // + progress). zmodem_raw is kept for the subscription lifecycle but no
     // longer fed to the JS bridge.
+    // Join the picked dir with an offer name. `sz -r 目录` offers carry
+    // relative subpaths ("dir/sub/file.txt") — sanitize each segment and
+    // keep the tree: empty / "." / ".." / drive-letter segments are dropped,
+    // so the path can never escape the picked directory. All segments gone
+    // (pathological name) → benign flat fallback, same as before.
     const joinZmodemPath = (dir: string, name: string): string => {
-      const safeName = name.split(/[\\/]/).pop() || name;
       const sep = dir.includes("/") && !dir.includes("\\") ? "/" : "\\";
       const trimmed = dir.endsWith(sep) ? dir.slice(0, -1) : dir;
-      return `${trimmed}${sep}${safeName}`;
+      const segs = name
+        .split(/[\\/]/)
+        .map((s) => s.trim().replace(/[. ]+$/, ""))
+        .filter((s) => s && s !== "." && s !== ".." && !s.includes(":"));
+      if (segs.length === 0) return `${trimmed}${sep}myshell-download.bin`;
+      return `${trimmed}${sep}${segs.join(sep)}`;
     };
     const promptNativeDir = async (): Promise<string | null> => {
       if (nativeCancelledRef.current) return null;
@@ -637,40 +716,10 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
         nativeDirRef.current = null;
         nativeCancelledRef.current = false;
       } else if (direction === "upload") {
-        // Native upload: prompt for files, then hand off to Rust.
-        void (async () => {
-          try {
-            const selected = await open({ multiple: true });
-            const paths: string[] = !selected
-              ? []
-              : Array.isArray(selected)
-              ? selected
-              : [selected];
-            if (paths.length === 0) {
-              sshSendZmodemAbort(sessionIdRef.current).catch(() => {});
-              return;
-            }
-            await zmodemStartUpload(sessionIdRef.current, paths);
-            // Activate the progress overlay. bytesTotal starts at 0 — the
-            // first zmodem_progress event carries the real file size (the
-            // backend stats the file). onZmodemProgress ignores events while
-            // active is false, so this must be set before bytes flow.
-            const firstName = paths[0].split(/[\\/]/).pop() || "file";
-            setZmodemStatus({
-              active: true,
-              direction: "upload",
-              currentFile: paths.length === 1 ? firstName : `${firstName} 等 ${paths.length} 个文件`,
-              bytesTransferred: 0,
-              bytesTotal: 0,
-              speedBps: 0,
-              error: null,
-              startTime: Date.now(),
-            });
-          } catch (e) {
-            console.error("native upload start failed:", e);
-            sshSendZmodemAbort(sessionIdRef.current).catch(() => {});
-          }
-        })();
+        // Native upload: show the inline files-vs-folder chooser (the OS
+        // dialog can't select both kinds at once). The chosen paths then go
+        // through zmodemStartUpload — folders are recursed in Rust.
+        setUploadChooserOpen(true);
       }
       term.write("\r\n\x1b[36m[ZMODEM 传输开始 — 终端输入已屏蔽]\x1b[0m\r\n");
     })
@@ -761,6 +810,7 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
       nativeDownloadRef.current = false;
       nativeDirRef.current = null;
       nativeCancelledRef.current = false;
+      setUploadChooserOpen(false);
       bridge.reset();
       // Cancel any pending force-reset — the Rust backend reported an
       // orderly ZFIN/CAN sequence so the bridge is clean.
@@ -775,6 +825,21 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
         else unlistenZmodemEnd = un;
       })
       .catch((e) => console.error("Failed to subscribe to zmodem_end:", e));
+
+    // Native transfer: Rust-side fatal error (remote abort burst, ZABORT
+    // frame, idle timeout). Write it to the terminal so the user sees WHY —
+    // the overlay may not even be active yet (sz dies before offering the
+    // first file when it can't read it), and the following zmodem_end hides
+    // the overlay anyway.
+    onZmodemError(sessionIdRef.current, (message) => {
+      setZmodemStatus((prev) => ({ ...prev, error: message }));
+      term.write(`\r\n\x1b[31m[ZMODEM 错误] ${message}\x1b[0m\r\n`);
+    })
+      .then((un) => {
+        if (closed) un();
+        else unlistenZmodemError = un;
+      })
+      .catch((e) => console.error("Failed to subscribe to zmodem_error:", e));
 
     termRef.current = term;
     fitRef.current = fitAddon;
@@ -824,6 +889,7 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
       unlistenZmodemStart?.();
       unlistenZmodemRaw?.();
       unlistenZmodemEnd?.();
+      unlistenZmodemError?.();
       unlistenZmodemOffer?.();
       unlistenZmodemProgress?.();
       unlistenZmodemFileComplete?.();
@@ -1096,6 +1162,44 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
             }, 2000);
           }}
         />
+        {/* rz upload chooser — files vs folder. Shown while the remote rz
+            waits; dismissed on pick, cancel, or zmodem_end. */}
+        {uploadChooserOpen && (
+          <div
+            style={{
+              position: "absolute",
+              left: 0,
+              right: 0,
+              bottom: 0,
+              background: "rgba(30, 30, 46, 0.96)",
+              borderTop: "1px solid #45475a",
+              padding: "10px 16px",
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              flexWrap: "wrap",
+              fontFamily: "'Cascadia Code', Consolas, monospace",
+              fontSize: 12,
+              color: "#cdd6f4",
+              zIndex: 10,
+            }}
+          >
+            <span style={{ color: "#a6e3a1", fontWeight: 600 }}>↑ ZMODEM 上传</span>
+            <span style={{ color: "#a6adc8" }}>远端 rz 已就绪，选择要发送的内容：</span>
+            <button onClick={pickUploadFiles} style={uploadChooserBtn}>
+              📄 选择文件
+            </button>
+            <button onClick={pickUploadFolder} style={uploadChooserBtn}>
+              📁 选择文件夹（递归上传）
+            </button>
+            <button
+              onClick={cancelNativeUpload}
+              style={{ ...uploadChooserBtn, color: "#f38ba8", borderColor: "#f38ba8" }}
+            >
+              取消
+            </button>
+          </div>
+        )}
       </div>
       {/* CommandBar — only for SSH terminal tabs (connectionId provided) */}
       {connectionId && (

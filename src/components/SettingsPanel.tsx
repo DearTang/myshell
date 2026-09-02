@@ -44,6 +44,11 @@ import {
 } from "../api";
 import { RecycleDialog } from "./RecycleDialog";
 import { compressImageDataUrl } from "../utils/image";
+import {
+  getSftpDownloadConcurrency,
+  setSftpDownloadConcurrency,
+  DEFAULT_SFTP_CONCURRENCY,
+} from "../utils/transfer-settings";
 import { aiTestSettings } from "../api";
 import { PRESETS, type ColorPalette } from "../themes";
 import { FontField } from "./FontField";
@@ -89,6 +94,7 @@ const categories = [
   { id: "ai", label: "AI 助手", icon: "🤖" },
   { id: "mcp", label: "MCP 支持", icon: "🔌" },
   { id: "multiWindow", label: "多窗口", icon: "🪟" },
+  { id: "transfer", label: "文件传输", icon: "📤" },
   { id: "security", label: "安全", icon: "🔒" },
   { id: "data", label: "数据管理", icon: "💾" },
   { id: "quickCommands", label: "快捷命令", icon: "⚡" },
@@ -161,6 +167,14 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
   const { rendererBackend, setRendererBackend } = useRendererPref();
   const [gpuDisabledInit, setGpuDisabledInit] = useState(false);
   const { gpuDisabled, setGpuDisabled } = useGpuPref(gpuDisabledInit);
+  // ── SFTP download concurrency (localStorage; read at transfer start) ──
+  const [sftpConcurrency, setSftpConcurrencyState] = useState(
+    getSftpDownloadConcurrency()
+  );
+  const setSftpConcurrency = (n: number) => {
+    setSftpConcurrencyState(n);
+    setSftpDownloadConcurrency(n);
+  };
 
   // ── MCP server state ──
   const [mcpEnabled, setMcpEnabled] = useState(false);
@@ -2610,6 +2624,49 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
               </div>
               <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 10, lineHeight: 1.5 }}>
                 默认 2 行 × 3 列，最多同时展示 6 个窗口。超出部分可向下滚动查看。修改后下次进入多窗口生效。
+              </div>
+            </Section>
+          </>
+        )}
+
+        {/* Transfer Category — SFTP 下载并发 */}
+        {activeCategory === "transfer" && (
+          <>
+            <Section title="📤 SFTP 下载">
+              <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.6 }}>
+                勾选的文件夹会递归下载整个子树（含空目录）；多文件同时传输时以下发线程数并行拉取，对大量小文件提速明显。
+              </div>
+              <Field label="并发下载线程数">
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {[1, 2, 3, 4, 6, 8, 12, 16].map((n) => {
+                    const active = sftpConcurrency === n;
+                    return (
+                      <button
+                        key={n}
+                        title={n === DEFAULT_SFTP_CONCURRENCY ? "默认" : undefined}
+                        onClick={() => setSftpConcurrency(n)}
+                        style={{
+                          minWidth: 44,
+                          padding: "8px 10px",
+                          background: active ? "var(--accent-primary-muted)" : "var(--bg-input)",
+                          color: active ? "var(--accent-primary)" : "var(--text-secondary)",
+                          border: `1px solid ${active ? "var(--accent-primary)" : "var(--border-default)"}`,
+                          borderRadius: "var(--radius-md)",
+                          fontSize: 12,
+                          fontWeight: active ? 600 : 400,
+                          cursor: "pointer",
+                          transition: "all var(--duration-fast) var(--ease-in-out)",
+                        }}
+                      >
+                        {n}
+                        {n === DEFAULT_SFTP_CONCURRENCY ? "（默认）" : ""}
+                      </button>
+                    );
+                  })}
+                </div>
+              </Field>
+              <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 10, lineHeight: 1.5 }}>
+                线程数决定同时下载的文件数（单一文件不受影响）。所有线程复用同一条 SSH 连接，过高线程数对高延迟链路收益有限、部分服务器可能限制并发句柄。修改对下一次下载立即生效。ZMODEM（终端 rz/sz）为协议单流串行传输，不适用此设置；终端里用 `sz -r 目录` 可递归下载文件夹。
               </div>
             </Section>
           </>

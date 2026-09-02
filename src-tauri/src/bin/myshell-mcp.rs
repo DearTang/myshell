@@ -438,8 +438,8 @@ fn tool_definitions() -> Value {
                     "type": "object",
                     "properties": {
                         "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
-                        "remote_path": { "type": "string", "description": "Absolute remote file path to download (passed to `sz`). Must be a file, not a directory." },
-                        "local_dir": { "type": "string", "description": "Absolute local directory where the file will be saved. Must exist. The file is named after the remote offer's basename." },
+                        "remote_path": { "type": "string", "description": "Absolute remote path to download (passed to `sz -r`). May be a file OR a directory — directories are recursed and their subtree mirrored under local_dir (relative subpaths preserved)." },
+                        "local_dir": { "type": "string", "description": "Absolute local directory where files land. Must exist. Files are named after the remote offer; a directory download keeps its tree structure under this dir." },
                         "timeout": { "type": "integer", "description": "Max seconds to wait for the transfer (default 120). The first 20s is an initial handshake timeout before the transfer is considered stalled.", "default": 120 }
                     },
                     "required": ["connection", "remote_path", "local_dir"]
@@ -452,7 +452,7 @@ fn tool_definitions() -> Value {
                     "type": "object",
                     "properties": {
                         "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
-                        "local_path": { "type": "string", "description": "Absolute local file path to upload. Must exist and be a regular file." },
+                        "local_path": { "type": "string", "description": "Absolute local path to upload. Must exist. May be a file OR a directory — directories are expanded recursively and their tree mirrored under remote_dir (ZFILE offers carry relative paths; lrzsz rz creates the subdirectories)." },
                         "remote_dir": { "type": "string", "description": "Remote target DIRECTORY (absolute). rz receives into this directory; the file keeps its local basename. `cd <remote_dir>` is run before rz, so the directory must exist." },
                         "timeout": { "type": "integer", "description": "Max seconds to wait for the transfer (default 120).", "default": 120 }
                     },
@@ -2053,29 +2053,85 @@ impl EventSink for McpZmodemSink {
     }
 }
 
-/// Sanitize an untrusted filename (from a remote `sz` offer) into a safe local
-/// basename. Strips directory components, `..`, drive letters, and characters
-/// illegal on Windows. Returns None if nothing usable remains.
-fn sanitize_remote_basename(name: &str) -> Option<String> {
-    // Take the last path component (handles both / and \).
-    let leaf = name.rsplit(['/', '\\']).next()?.trim();
-    if leaf.is_empty() || leaf == "." || leaf == ".." {
-        return None;
+/// Sanitize an untrusted `sz -r` offer name ("dir/sub/file.txt") into a safe
+/// RELATIVE path under the local dir. Each segment is cleaned of characters
+/// illegal on Windows (':' → '_', so drive letters and NTFS alternate data
+/// streams are neutralized); traversal (".", "..", absolute prefixes, empty)
+/// segments are dropped so the tree can never escape `local_dir`. Returns
+/// None if nothing usable remains.
+fn sanitize_relative_path(name: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for raw in name.split(['/', '\\']) {
+        let cleaned: String = raw
+            .chars()
+            .map(|c| match c {
+                '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+                c if (c as u32) < 0x20 => '_',
+                c => c,
+            })
+            .collect();
+        // Trim edges (Windows quirk: trailing dots/spaces are ignored by the
+        // filesystem but defeat the ".." check below).
+        let cleaned = cleaned.trim().trim_end_matches(['.', ' ']);
+        if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+            continue;
+        }
+        parts.push(cleaned.to_string());
     }
-    let cleaned: String = leaf
-        .chars()
-        .map(|c| match c {
-            '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
-            c if (c as u32) < 0x20 => '_',
-            c => c,
-        })
-        .collect();
-    // Trim trailing dots/spaces (Windows quirk).
-    let cleaned = cleaned.trim_end_matches(['.', ' ']).to_string();
-    if cleaned.is_empty() {
+    if parts.is_empty() {
         None
     } else {
-        Some(cleaned)
+        Some(parts.join(std::path::MAIN_SEPARATOR_STR))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_relative_path;
+
+    fn sep() -> char {
+        std::path::MAIN_SEPARATOR
+    }
+
+    #[test]
+    fn preserves_subpath() {
+        let got = sanitize_relative_path("dir/sub/file.txt").unwrap();
+        let want = format!("dir{}sub{}file.txt", sep(), sep());
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn plain_file_stays_flat() {
+        assert_eq!(sanitize_relative_path("a.bin").unwrap(), "a.bin");
+    }
+
+    #[test]
+    fn drops_traversal_segments() {
+        // ".." anywhere in the chain is dropped — never escapes local_dir.
+        let got = sanitize_relative_path("a/../../etc/passwd").unwrap();
+        let want = format!("a{}etc{}passwd", sep(), sep());
+        assert_eq!(got, want);
+        // Trailing dots/spaces (Windows quirk) must not smuggle a "..".
+        assert_eq!(sanitize_relative_path("x/.. ./y").unwrap(), format!("x{}y", sep()));
+    }
+
+    #[test]
+    fn drops_absolute_prefix_and_drive() {
+        // Absolute path → leading separator yields an empty first segment
+        // which is dropped; "C:" maps to "C_" (illegal-char rule).
+        let got = sanitize_relative_path("/var/log/app.log").unwrap();
+        let want = format!("var{}log{}app.log", sep(), sep());
+        assert_eq!(got, want);
+        let got = sanitize_relative_path("C:/evil").unwrap();
+        assert_eq!(got, format!("C_{}evil", sep()));
+    }
+
+    #[test]
+    fn nothing_usable_returns_none() {
+        assert!(sanitize_relative_path("").is_none());
+        assert!(sanitize_relative_path("/").is_none());
+        assert!(sanitize_relative_path("..").is_none());
+        assert!(sanitize_relative_path("./..\\").is_none());
     }
 }
 
@@ -2217,7 +2273,9 @@ async fn run_download_task(
         }
     };
 
-    let cmd = format!("sz {}\r", shell_quote(remote_path));
+    // -r makes sz recurse into directories (no effect on plain files); the
+    // receiver mirrors the tree under local_dir via relative offer paths.
+    let cmd = format!("sz -r {}\r", shell_quote(remote_path));
     if let Err(e) = ssh::send_input(app, &session_id, cmd.as_bytes()).await {
         let _ = ssh::disconnect(app, &session_id).await;
         fail(format!("发送 sz 命令失败: {}", e));
@@ -2250,7 +2308,7 @@ async fn run_download_task(
                 ZmodemEvent::Offer { name, size } => {
                     got_offer = true;
                     mark(TaskPhase::Transferring, 0, size);
-                    let local_name = sanitize_remote_basename(&name).unwrap_or_else(|| {
+                    let local_name = sanitize_relative_path(&name).unwrap_or_else(|| {
                         format!("zmodem_download_{}", chrono_like_ts())
                     });
                     let local_path = join_local_path(local_dir, &local_name);
@@ -2265,7 +2323,7 @@ async fn run_download_task(
                     }
                 }
                 ZmodemEvent::FileComplete { name, bytes } => {
-                    let local_name = sanitize_remote_basename(&name).unwrap_or_default();
+                    let local_name = sanitize_relative_path(&name).unwrap_or_default();
                     let local_path = join_local_path(local_dir, &local_name);
                     saved.push((name, local_path, bytes));
                     mark(TaskPhase::Transferring, bytes, 0);
@@ -2327,11 +2385,13 @@ async fn zmodem_upload_tool(state: &McpState, args: &Value) -> Result<Value, Str
     let remote_dir = args["remote_dir"].as_str().ok_or("缺少 remote_dir 参数")?.to_string();
     let timeout = args["timeout"].as_u64().unwrap_or(120);
 
-    // Validate the local file up front (fail fast).
+    // Validate the local path up front (fail fast). Files upload as-is;
+    // directories are expanded recursively by the native uploader (ZFILE
+    // offers carry relative paths, lrzsz rz recreates the tree remotely).
     let meta = std::fs::metadata(&local_path)
         .map_err(|e| format!("本地文件不存在或不可访问 [{}]: {}", local_path, e))?;
-    if !meta.is_file() {
-        return Err(format!("本地路径不是普通文件: {}", local_path));
+    if !meta.is_file() && !meta.is_dir() {
+        return Err(format!("本地路径不是文件或目录: {}", local_path));
     }
     let size = meta.len();
     let mtime = meta

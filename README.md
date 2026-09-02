@@ -35,7 +35,7 @@
 - **命令历史栏**：最近 50 条命令 + 钉住置顶
 - **快捷命令**：全局快捷命令 + 服务器专属快捷命令，多行命令按行顺序一键执行（`#` 注释与空行自动跳过），支持广播到多终端；支持**行间延迟**——三档模式：`##delay:500`（或 `##delay:1s`）在两行之间精确等待、固定延迟、或「智能等待」（监听终端输出，等上一行输出静止后再发下一行，自动适配命令速度、能处理 `sudo`/`mysql` 密码提示）；在「设置 → 快捷命令」配置
 - **广播输入**：同时向多个终端发送相同命令
-- ZMODEM 协议支持（rz/sz 文件传输）：原生 Rust 收发（零 JS 数据路径），128 KB 子包批量直写 SSH channel，进度 IPC 事件 100ms 节流削减跨进程开销，传输期间进度条实时显示、取消可用
+- ZMODEM 协议支持（rz/sz 文件传输）：原生 Rust 收发（零 JS 数据路径），128 KB 子包批量直写 SSH channel，进度 IPC 事件 100ms 节流削减跨进程开销，传输期间进度条实时显示、取消可用；`sz -r 目录` 递归下载文件夹（接收端按 offer 相对路径自动建目录镜像子树，路径段清洗防 `..`/盘符逃逸），rz 上传可选文件夹递归（ZFILE offer 携带相对路径，lrzsz rz 在远端自动重建目录树）；远端中止（文件无权限 / 是目录 / 进程被杀）时自动识别 lrzsz 取消序列与 ZABORT 帧、30s 静默超时兜底，终端立即或 ≤30s 恢复可用并显示失败原因。协议为单流串行——多文件按顺序传输，无并发
 - 服务器状态实时监控（CPU、内存、磁盘）
 - **本地终端**：直连本地 PowerShell / CMD / WSL / 自定义 shell，作为可保存的连接，体验等同 SSH 终端
 - **终端字体**：从系统已安装字体下拉选择（也可手输），默认字体栈 Nerd Font 优先，正确渲染 Powerline / 图标字形（Oh My Posh / Starship / powerlevel10k 等）；支持**按连接单独覆盖字体**
@@ -45,6 +45,8 @@
 ### 文件传输
 - SFTP/FTP 文件浏览器
 - 文件操作：上传、下载、重命名、删除
+- **文件夹递归下载**：勾选文件夹一键下载整个子树（空目录保留，符号链接循环有深度保护），本地按 `<目标目录>/<文件夹名>/...` 镜像
+- **SFTP 多文件并发下载**：可设并发线程数（设置 → 文件传输，默认 3，1–16），所有线程复用同一条 SSH 连接，海量小文件提速明显
 - 目录导航历史记录
 
 ### 诊断与日志
@@ -109,9 +111,20 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 ```
 
 > **安全模型**：MCP server 不存储 vault 密码，也不持有解密密钥。所有服务器访问必须经过 MyShell GUI——ssh_exec 在 GUI 终端标签页内执行（用户已在 GUI 中解锁 vault），SFTP 工具通过 IPC 向 GUI 请求解密后的连接凭证。GUI↔MCP 的 localhost IPC 桥要求**每条命令携带随机会话令牌**（写入用户配置目录的端口文件中，受用户目录 ACL 保护；令牌缺失/错误一律在分发动作前拒绝），本机其他用户的进程无法再窃取凭证。**所有工具（除任务状态查询）都要求保险库已解锁**：GUI 未运行时 MCP 自动拉起应用（含识别并清理崩溃残留的 IPC 端口文件）；保险库锁定时立即返回明确的「保险库未解锁」错误并把 MyShell 窗口置顶（密码门正对用户），不做静默等待——解锁后重试即恢复。锁定状态下连 `list_connections` 都不可用，AI 无法获取任何连接元数据。
-暴露 15 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过；用户点「取消」拒绝时返回硬性停止（HARD STOP）错误——AI 必须立即停止当前任务的所有后续操作（不重试、不换工具绕过）、向用户输出任务进度说明，并等待用户明确确认是否继续（`ssh_run` 后台任务拒绝后经 `ssh_status` 同样处理）。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz`/`rz`（lrzsz）走 ZMODEM 协议传输文件，用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 sftp_*，SFTP 不可用时才用 zmodem_*。
+暴露 15 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过；用户点「取消」拒绝时返回硬性停止（HARD STOP）错误——AI 必须立即停止当前任务的所有后续操作（不重试、不换工具绕过）、向用户输出任务进度说明，并等待用户明确确认是否继续（`ssh_run` 后台任务拒绝后经 `ssh_status` 同样处理）。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz -r`/`rz`（lrzsz）走 ZMODEM 协议传输文件，双向支持目录递归（zmodem_download 子树按相对路径镜像到 local_dir；zmodem_upload 目录展开后按相对路径 offer，远端 rz 重建目录树），用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 sftp_*，SFTP 不可用时才用 zmodem_*。
 
 ## 更新日志
+
+### v2.13.0（2026-09-02）
+
+#### ✨ 新增
+
+- **SFTP 文件夹递归下载 + 多文件并发下载**：勾选文件夹（可与文件混选）递归下载整个子树，本地按 `<目标目录>/<文件夹名>/...` 镜像、空目录保留、符号链接循环有深度保护；多文件按可配置线程数并行拉取（设置 → 文件传输，默认 3 线程、1–16 可调，即时生效），所有线程复用同一条 SSH 连接，海量小文件提速明显。单文件下载、上传、取消行为不变。
+- **ZMODEM 文件夹递归传输（双向）**：下载 `sz -r 目录` / MCP `zmodem_download` 传目录递归拉回子树（接收端按 offer 相对路径建目录，路径逐段清洗防 `..`/盘符逃逸）；上传 rz 弹「选择文件 / 选择文件夹」选择条，文件夹按相对路径 offer、远端 lrzsz rz 自动重建目录树（MCP `zmodem_upload` 同样支持目录）。ZMODEM 为协议单流串行——多文件顺序传输、无并发（设置页已注明）。
+
+#### 🐛 修复
+
+- **sz 下载两类卡死：远端文件无读权限或目标是目录时应用假死**：接收器不识别 lrzsz 的 10×CAN 中止序列导致会话永不结束，shell 后续输出全部被吞、终端冻结。现自动识别 CAN 连发与 ZABORT/ZFERR 帧立即恢复终端并显示错误原因，另加 30s 空闲超时兜底；前端补上 `zmodem_error` 订阅（此前失败原因无人消费）。顺带修复 `command_rules` 单元测试的既有编译错误。
 
 ### v2.12.2（2026-08-28）
 

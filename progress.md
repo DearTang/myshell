@@ -2796,3 +2796,106 @@
 | 什么可能导致偏离？ | ① russh 0.60 换了加密栈（ring + 新 ssh-key/rsa rc 版），实际连接行为（算法协商、老服务器兼容）需实机冒烟；② 同用户进程仍可读令牌文件（架构固有，已记录）；③ 版本错配场景（新 GUI + 独立放置的旧 mcp.exe）会得到 unauthorized，错误信息已引导同步升级；④ cargo-audit 的 advisory 库拉取走 GitHub，网络不稳时需重试。 |
 | 下一步最小可验证动作？ | ① 启动 GUI → 让 agent 调 list_connections / ssh_exec（验证 vault_status/exec_in_tab 携带令牌正常通信）；② 端口文件应为两行，手工 `ncat 127.0.0.1 <port>` 发不带 token 的 JSON 应返回 unauthorized；③ 用旧客户端（不删场景难造，可选）验证错误提示；④ 连一台老系统服务器确认 russh 0.60 算法协商正常。 |
 | 目标是什么？ | 已知漏洞全部清零或明确接受；本机横向窃取凭证的路径从「任意进程」收窄到「能读用户配置目录的同用户进程」；依赖停在各自大版本内的最新补丁线。 |
+
+### 阶段 110 — 修复 sz 下载两类卡死：远端无读权限 / 下载目录，会话永不结束吞掉全部终端输出（2026-08-28）
+
+**背景（用户需求）：** ① 用户对目标文件无下载（读）权限时执行 `sz`，应用卡死；② `sz 目录` 下载文件夹，应用卡死。
+
+**根因（两类同一机制）：** `sz` 先发 ZRQINIT 握手头、**之后**才逐个打开文件。打不开（EACCES / EISDIR）时 lrzsz 向 stderr 报错并调用 `canit()` 发送 **10×CAN(0x18) + 10×退格** 中止序列后直接退出。而原生接收器状态机（`zmodem_rx.rs`）：
+- **不识别 CAN 连发**——CAN 与 ZDLE 同为 0x18，但不构成帧头，`try_step` 的 `find_header_start` 永远找不到下一个帧，状态停在 WaitingZfile；
+- **不识别 ZABORT(7)/ZFERR(12) 帧**（ WaitingZfile 的 `_ => true` 与 Transferring 的 `_ => {}` 都静默吞掉）；
+- 没有任何超时兜底。
+结果：reader 循环停留在 `TermMode::Zmodem`，此后 shell 的所有 stdout（提示符、回显）都被当作协议数据喂进死掉的状态机——终端表现为完全冻结（输入也看不到回显）。前端虽会收到 Rust 发出的 `zmodem_error` 事件，但 **TerminalPanel 从未订阅过这个事件**，错误被丢弃。SFTP 面板的「下载文件夹」不受影响（面板本来就只允许勾选文件）。
+
+**修复：**
+1. **CAN 连发检测**（`zmodem_rx.rs` `feed()` 入口）：扫描未消费缓冲区，≥5 个连续原始 0x18 即判定为 lrzsz `canit()` 中止序列（合法数据中字面 0x18 总是 ZDLE 转义对出现，不可能连续 5 个），清理缓冲并发出 `RxEvent::Error`（→ ended=true → reader 回 Normal + `zmodem_end`）。跨 feed 的连发也能命中（按累计缓冲扫描）。
+2. **ZABORT/ZFERR 帧处理**：WaitingZfile / Transferring 两个状态收到即结束会话（Transferring 保留已写入的部分文件，与 lrzsz 行为一致），发出带原因的 Error 事件。
+3. **RX 空闲看门狗**（reader 循环 flush tick，30s）：接收器 `idle_timeout()` 基于最近一次 `feed()` 时间判断；**WaitingAccept（用户还开着目录选择框）豁免**——此时协议本来就不会有字节流动。覆盖 sz 被信号杀死等"无 CAN 连发静默死亡"的残余场景；超时发 `zmodem_error` + `zmodem_end` 并回 Normal。
+4. **前端接通 `zmodem_error`**：`api.ts` 新增 `onZmodemError` 封装；TerminalPanel 订阅——错误写进终端（红色 `[ZMODEM 错误] …`）并同步到 overlay 状态。修复前 sz 失败时前端全程无感知（无 offer → 无 overlay），用户只看到终端冻结。
+5. **测试补齐**：`zmodem_rx.rs` 新增 6 个单元测试（ZRQINIT 后 canit 连发、连发跨 feed、连发与 ZRQINIT 同包到达且不发 zmodem_start、ZABORT 帧结束会话、健康转义数据流不误判 + 载荷解码正确、空闲看门狗豁免 WaitingAccept）；顺带修复 `command_rules.rs` 一个**既有**测试编译错误（struct 字段 `show_in_gui` 缺失导致 `cargo test` 全量编不过），给 `RxEvent` 补 `Debug` derive，移除无用 `use std::io::Write`。
+
+**改动文件：** `src-tauri/src/zmodem_rx.rs`（检测 + 帧处理 + 看门狗 + 测试）、`src-tauri/src/ssh.rs`（flush tick 的 RX 30s 超时兜底）、`src/api.ts`（onZmodemError）、`src/components/TerminalPanel.tsx`（订阅 zmodem_error + 清理）、`src-tauri/src/command_rules.rs`（既有测试编译修复）。
+
+**验证：** `cargo test --lib` ✅ 30/30（24 既有 + 6 新增）、`cargo check` ✅（仅既有警告）、`npx tsc --noEmit` ✅。运行时需实机验证（见下方最小动作）。
+
+## 五问重启检查（阶段 110）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 110 complete —— sz 失败/目录两类卡死的 abort 检测、ZABORT 处理、超时兜底、前端错误展示全部就位，30 个测试全过。 |
+| 我要去哪里？ | 用户实机复测两个卡死场景；随下一次 `打包` 发布（🐛修复 → patch 候选）。 |
+| 什么可能导致偏离？ | ① 30s RX 看门狗对"网络完全静默 >30s 的慢链路传输"会主动结束会话（比卡死好，但和 lrzsz 自身 60s 级超时相比更激进，实机如误伤可放宽）；② WaitingAccept 豁免依赖前端目录选择框必返回（选/取消都会回调 accept_offer），若前端异常不回调会一直等（有取消按钮兜底）；③ 真实 lrzsz 的 stderr 报错走 ExtendedData 直接进终端，与 Error 事件文案并存属预期。 |
+| 下一步最小可验证动作？ | ① 服务器上对一个无读权限文件执行 `sz` → 终端应立即显示红色 `[ZMODEM 错误] 远端中止了 ZMODEM 传输…` + `[ZMODEM 传输结束]`，提示符恢复、可继续输入；② `sz 一个目录` 重复同样验证；③ 正常 `sz 大文件` 与多文件传输回归，确认无误杀；④ sz 传输中 Ctrl+C 杀掉 sz 进程 → 最多 30s 后会话应自动结束。 |
+| 目标是什么？ | 远端 sz 的任何失败方式（权限、目录、被杀、静默退出）都能让终端立刻或 ≤30s 恢复可用，且用户能看到失败原因，而不是应用"卡死"。 |
+
+### 阶段 111 — SFTP 文件夹递归下载 + 多文件并发下载（设置可调，默认 3 线程）（2026-08-28）
+
+**背景（用户需求）：** ① 文件夹支持递归下载；② 多文件并发跑，设置中添加并发数，默认 3 线程。
+
+**实现：**
+1. **递归展开**（`sftp.rs` `expand_download_one` / `expand_dir_recursive`）：选中项先 `metadata`（STAT，跟随符号链接）判定文件/目录；目录经 `read_dir` 递归展开成扁平文件任务列表（`DownloadTask{remote_path, relative, size}`，DirEntry 自带 attrs 无额外往返）。本地按 `<目标目录>/<文件夹名>/...` 镜像，**空目录保留**（先落目录骨架再传文件）；深度上限 64——`metadata` 跟随符号链接，循环链接表现为无限嵌套，深度保护把死循环变成单条错误。文件+文件夹混选统一处理。
+2. **并发 worker 池**（`download()` 重写）：`Arc<Vec<Task>>` + `AtomicUsize` 游标分发（fetch_add 保证每个任务只归一个 worker），`workers = concurrency.clamp(1,16).min(file_count)`。**单条 SFTP 会话共享**（`Arc<SftpSession>`）——russh-sftp 的 `RawSftpSession` 用 `SendWrapper` 显式 Send+Sync、按请求 ID 复用，多文件句柄并发在一条通道上协议合法，无每 worker 握手开销。进度聚合改原子量：`bytes_done: AtomicU64`（fetch_add 返回值直接用）、`files_done: AtomicUsize` 作为进度槽位（并发下显示"已完成 N 个"比"第 i 个"更自然）；每 worker 独立 120ms 节流。取消语义不变（同一 AtomicBool，worker 在 32KB 块边界响应，"已取消"汇总追加一次）。每文件失败仍记入 errors 列表不中断整批。
+3. **设置项**：新增 `src/utils/transfer-settings.ts`（localStorage `myshell-sftp-download-concurrency`，默认 3，clamp 1..16）；SftpPanel 发起下载时读取（改动对下一次下载即时生效，无需 prop drilling）；SettingsPanel 新增「📤 文件传输」分类（多窗口之后），按钮组选并发数 1/2/3/4/6/8/12/16，附说明（单文件不受影响、复用单 SSH 连接、过高对高延迟收益有限）。
+4. **命令链路**：`sftp_download` Tauri 命令加 `concurrency: Option<usize>`（缺省 3，向后兼容旧前端调用）；`sftp::download` 的 sink 参数从 `&dyn EventSink` 改 `Arc<dyn EventSink>`（spawn 需要 'static），仅 main.rs 一处调用方同步改。
+
+**上传侧不动**：仍为串行 + 仅文件（本次需求只针对下载；upload 递归/并发留待需要时复用同一套模式）。
+
+**改动文件：** `src-tauri/src/sftp.rs`（递归展开 + 并发池 + download_one 原子计数）、`src-tauri/src/main.rs`（命令签名 + Arc sink）、`src/api.ts`（sftpDownload 加 concurrency）、`src/utils/transfer-settings.ts`（新增）、`src/components/SftpPanel.tsx`（放开文件夹勾选 + 传并发数）、`src/components/SettingsPanel.tsx`（新分类 + 设置 UI）。
+
+**验证：** `cargo check` ✅（仅既有警告）、`cargo test --lib` ✅ 30/30、`npx tsc --noEmit` ✅。递归/并发行为需实机验证（见下方最小动作）。
+
+## 五问重启检查（阶段 111）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 111 complete —— 递归下载 + 并发下载 + 设置项全部落地，静态检查全过。 |
+| 我要去哪里？ | 用户实机验证递归与并发；随下一次 `打包` 发布（✨新增 → minor 候选，与阶段 110 的 🐛 同批）。 |
+| 什么可能导致偏离？ | ① 并发下进度浮层的 `i/N` 计数显示"已完成数"而非"正在传第几个"，多文件并发时数字非严格递增跳变属预期；② 符号链接本身按其目标类型处理（STAT 跟随），链接到目录会递归进目标——与 scp 默认行为一致但需知晓；③ 高并发（>8）对个别限制并发句柄的服务器可能报 open 失败（进入 errors 列表不中断）；④ FTP 面板共用 UI 但走 ftp_* 命令，不受益于本次并发（ftp_download 未改）。 |
+| 下一步最小可验证动作？ | ① 勾选一个含子目录+空目录+中文名文件的文件夹下载，校验本地目录结构与文件完整性；② 勾选 20+ 小文件下载，观察进度条速度与 `N/M` 计数；③ 设置改并发 8 后重复 ②，对比耗时；④ 传输中点「取消」应即时停止；⑤ 旧调用路径回归：单文件下载、上传、取消。 |
+| 目标是什么？ | 文件夹下载开箱即用（整个子树一次拉回），多文件下载吞吐可调（默认 3 并发，设置即时生效），且行为对单文件/上传完全向后兼容。 |
+
+### 阶段 112 — ZMODEM 递归下载文件夹（sz -r）：GUI + MCP 接收端按相对路径镜像子树；协议串行无并发（2026-08-29）
+
+**背景（用户需求）：** "zmodem 也需要这个功能"（承接阶段 111 的文件夹递归 + 并发）。
+
+**协议结论（先行调研）：** ZMODEM 是单流串行协议——一个会话内 ZRQINIT → ZFILE → ZDATA → ZEOF → 下一个 ZFILE → ZFIN，sz 不会同时发送两个文件的数据，**协议层无法并发**（Xshell/SecureCRT 同样串行）。并发部分落地为说明文案（设置页注明不适用 ZMODEM）。递归部分可行：lrzsz 的 `sz -r` 递归发送目录，ZFILE offer 携带相对子路径（`dir/sub/file.txt`），接收端只需按相对路径建目录落盘。
+
+**实现（三处接通）：**
+1. **Rust 接收器**（`zmodem_rx.rs` `accept_offer`）：打开文件前 `create_dir_all(parent)`——GUI 与 MCP 两条下载路径都经此函数，一处改动双端受益；建目录失败 → Error 事件 + ZSKIP（沿用既有错误分支语义）。
+2. **MCP**（`myshell-mcp.rs`）：`sz` → `sz -r`（对普通文件无副作用）；`sanitize_remote_basename`（拍平 basename）升级为 `sanitize_relative_path`——逐段清洗（Windows 非法字符 `:<>|" ?*` 与控制字符 → `_`，段首尾空白/尾点修剪后判 `.`/`..` 丢弃），**段级防逃逸**：`..`、绝对路径前缀（空段）、盘符（`:` 映射 `_`，同时中和 NTFS ADS）全部丢弃，子树永远落在 local_dir 内；Offer 与 FileComplete 用同一 helper 保证报告路径与实际落盘一致。工具描述同步（remote_path 支持 file 或 directory）。
+3. **GUI 前端**（`TerminalPanel.tsx` `joinZmodemPath`）：原先 `split.pop()` 拍平 basename（防逃逸手段但丢子路径）→ 改为逐段过滤（空/`.`/`..`/含 `:` 段丢弃）后按 OS 分隔符拼接，保留目录树；全部段被滤掉 → 沿用良性兜底名 `myshell-download.bin`。用户在终端敲 `sz -r 目录` 即可递归下载。
+
+**验证：** `cargo test --lib` ✅ 31/31（新增 `accept_offer_creates_parent_dirs_for_sz_r_subpath`：嵌套 offer 路径自动建父目录并成功打开）；`cargo test --bin myshell-mcp` ✅ 5/5（新增 `sanitize_relative_path` 5 个用例：保留子路径/平文件/`..` 丢弃/绝对前缀与盘符中和/全空返回 None）；`cargo check` ✅；`npx tsc --noEmit` ✅。真实 `sz -r` 树传输需实机验证（lrzsz 各发行版的相对路径格式）。
+
+**改动文件：** `src-tauri/src/zmodem_rx.rs`（accept_offer 建目录 + 测试）、`src-tauri/src/bin/myshell-mcp.rs`（sz -r + sanitize_relative_path + Offer/FileComplete 接线 + 工具描述 + 测试）、`src/components/TerminalPanel.tsx`（joinZmodemPath 保留安全子路径）、`src/components/SettingsPanel.tsx`（ZMODEM 串行说明文案）。
+
+## 五问重启检查（阶段 112）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 112 complete —— ZMODEM 递归下载三端接通（接收器/ MCP / 前端路径拼接），静态与单元验证全过。 |
+| 我要去哪里？ | 实机验证 `sz -r` 树下载；随下一次 `打包` 发布（✨新增，与 110-111 同批 → minor 候选）。 |
+| 什么可能导致偏离？ | ① lrzsz 不同版本 `sz -r` 的 offer 路径格式（是否带顶层目录前缀）需实机确认——无论哪种格式都落在 local_dir 下，只是层级差一级；② 恶意 offer 名的段清洗是"丢弃危险段继续传"策略（而非整文件拒绝），树内个别文件可能被改名落盘；③ 空目录不通过 ZMODEM 传输（协议只传文件），SFTP 路径才有空目录保留；④ `sz -r` 需远端 sz 支持 -r（lrzsz 标配，极老版本除外）。 |
+| 下一步最小可验证动作？ | ① GUI 终端 `sz -r 一个含子目录的文件夹`，选保存目录后校验本地树结构与文件内容；② MCP 让 agent 调 `zmodem_download` 传目录参数，zmodem_status 看 done 后核对 result.files 的相对路径；③ 恶意名自测（可选）：远端造 `mkdir -p 'a/../b'` 类名字观察落盘位置；④ 普通 `sz 单文件` 回归确认无行为变化。 |
+| 目标是什么？ | ZMODEM 下载能力对齐 SFTP：文件夹一键拉回（树结构完整、无路径逃逸风险），单文件/多文件行为完全向后兼容；并发受协议限制如实告知而不是假装支持。 |
+
+### 阶段 113 — ZMODEM 上传支持文件夹递归（rz 方向）：本地目录树展开 → ZFILE 相对路径 offer → 远端 rz 自动建目录（2026-08-29）
+
+**背景（用户需求）：** 用户确认串行方案（"顺序下载、读取目录、本地建目录、顺序写入"），并要求"上传的时候也一样"。下载方向阶段 112 已完成；本阶段补齐 rz 上传方向。
+
+**机制：** ZMODEM 是纯文件协议（无目录实体），业内标准做法是让 ZFILE offer 的文件名携带相对路径（`文件夹/子目录/文件`，POSIX 分隔符）——lrzsz 的 rz 收到带路径的 offer 会在工作目录下自动创建子目录（zmodem.js 文档明示此约定，SecureCRT/Xshell 上传文件夹同此机制）。上传的 offer 名由我们的 native sender（zmodem_tx.rs）构造，完全可控。
+
+**实现：**
+1. **Rust 展开**（`ssh.rs` 新增 `collect_upload_files` / `walk_upload_dir` / `push_upload_file`）：`ZmodemStartUpload` 命令的 paths 现在接受文件与目录混选——目录深度优先展开（名字排序保证跨平台顺序稳定），文件 offer 名 = `<所选文件夹名>/<相对子路径>`；直接选的文件保持 basename。深度上限 64 防 symlink/junction 循环（metadata 跟随链接）；展开错误（不可读目录等）只记 warning 不中断。**展开后为空**（只选了空文件夹）→ 发 8×CAN 让 rz 立即退出 + zmodem_error 提示，避免 rz 干等 offer 超时。GUI 与 MCP 共享此路径（MCP `zmodem_upload` 走同一 `ssh::zmodem_start_upload`）。
+2. **前端两段式选择**（`TerminalPanel.tsx`）：OS 文件对话框无法同时选文件和文件夹，rz 触发后改为先弹内联选择条（`📄 选择文件` / `📁 选择文件夹（递归上传）` / `取消`，底部浮层风格与进度面板一致），再弹对应 OS 选择器（文件夹用 `open({ directory: true, multiple: true })` 支持多选）；空选/取消 → abort（原语义）；zmodem_end 到来自动收起选择条。
+3. **MCP**（`myshell-mcp.rs`）：`zmodem_upload` 前置校验放宽为 file 或 directory，工具描述同步（目录展开后树镜像到 remote_dir）。
+
+**验证：** `cargo test --lib` ✅ 34/34（新增 `upload_expand_tests` 3 例：目录树→相对路径 offer 名与排序/空目录不产生任务、单文件保 basename、不存在路径记错误）；`cargo test --bin myshell-mcp` ✅ 5/5；`cargo check --bins` ✅；`npx tsc --noEmit` ✅。真实 lrzsz rz 对带路径 offer 的建目录行为需实机验证（lrzsz 标配支持；极老版本可能拍平 basename——那样文件仍会传，只是层级丢失）。
+
+**改动文件：** `src-tauri/src/ssh.rs`（展开 helpers + ZmodemStartUpload 分支重写 + 空选择 abort + 测试）、`src/components/TerminalPanel.tsx`（rz 选择条 UI + pick/commit/cancel 处理器）、`src-tauri/src/bin/myshell-mcp.rs`（校验放宽 + 工具描述）。
+
+## 五问重启检查（阶段 113）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 113 complete —— ZMODEM 双向文件夹递归全部落地（112 下载 + 113 上传），静态与单元验证全过。 |
+| 我要去哪里？ | 实机验证 rz 上传文件夹（lrzsz rz 建目录行为）；随下一次 `打包` 发布（✨新增 → minor 候选，与 110-112 同批）。 |
+| 什么可能导致偏离？ | ① lrzsz rz 对带路径 offer 的处理是**约定行为**而非协议强制——标准 lrzsz 建目录，但某些精简/替代 rz（busybox 无 rz、老版 lrzsz）可能拍平 basename，文件仍传但层级丢失（实机确认）；② 上传空目录无法通过 ZMODEM 传输（协议只传文件，同下载方向）；③ 多文件夹混选时 offer 名都以各自文件夹名为根，远端 rz 工作目录下并列重建；④ 进度面板 currentFile 显示相对路径（带 `/`），窗口窄时截断显示。 |
+| 下一步最小可验证动作？ | ① 终端敲 `rz` → 弹选择条 → 选文件夹 → 传输完成后远端 `find <目录> -type f` 核对树结构与内容（sha256）；② 选文件路径回归（单文件/多文件）；③ 选空文件夹 → 应立即结束并提示"没有可上传的文件"；④ 取消按钮 → rz 应退出回提示符；⑤ MCP `zmodem_upload` 传目录参数核对远端树。 |
+| 目标是什么？ | ZMODEM 双向文件夹传输闭环：下载 `sz -r`、上传选文件夹，本地/远端目录树自动重建，串行顺序传输（协议使然），单文件与多文件行为完全向后兼容。 |
