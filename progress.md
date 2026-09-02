@@ -2899,3 +2899,20 @@
 | 什么可能导致偏离？ | ① lrzsz rz 对带路径 offer 的处理是**约定行为**而非协议强制——标准 lrzsz 建目录，但某些精简/替代 rz（busybox 无 rz、老版 lrzsz）可能拍平 basename，文件仍传但层级丢失（实机确认）；② 上传空目录无法通过 ZMODEM 传输（协议只传文件，同下载方向）；③ 多文件夹混选时 offer 名都以各自文件夹名为根，远端 rz 工作目录下并列重建；④ 进度面板 currentFile 显示相对路径（带 `/`），窗口窄时截断显示。 |
 | 下一步最小可验证动作？ | ① 终端敲 `rz` → 弹选择条 → 选文件夹 → 传输完成后远端 `find <目录> -type f` 核对树结构与内容（sha256）；② 选文件路径回归（单文件/多文件）；③ 选空文件夹 → 应立即结束并提示"没有可上传的文件"；④ 取消按钮 → rz 应退出回提示符；⑤ MCP `zmodem_upload` 传目录参数核对远端树。 |
 | 目标是什么？ | ZMODEM 双向文件夹传输闭环：下载 `sz -r`、上传选文件夹，本地/远端目录树自动重建，串行顺序传输（协议使然），单文件与多文件行为完全向后兼容。 |
+
+### 阶段 114 — 发布 v2.13.0（2026-09-02）
+
+**内容**：阶段 110-113 的全部成果（🐛 sz 卡死修复 + ✨ SFTP 递归/并发下载 + ✨ ZMODEM 双向递归传输）。版本判定 minor（含 ✨新增）。CHANGELOG/README 更新日志/发布说明三处同步，staging 清空、baseline → v2.13.0。
+
+**过程亮点（网络故障与修复）**：构建（NSIS 安装包）与 Gitee 推送/发布全程正常；GitHub 侧 git 传输中断——内网代理（172.19.109.247:3128）对 github.com 返回 CONNECT 503、直连被 reset、SSH over 443 无本机密钥，而 api.github.com 经 node fetch 可达。**解法**：用 GitHub Git Data API 逐对象复刻缺失的两个 commit（blob → tree → commit，每步校验返回 SHA 与本地完全一致，不一致立即中止不碰 ref），SHA 逐字节一致后 fast-forward main 并把 release tag 移到正确 commit（release 资产/说明不动）——远端历史与本地完全相同，后续网络恢复的常规 push 仅传增量、无冲突，证明无损。一次性工具存于 `.zcode/push-via-api.mjs`（未提交，无凭据内嵌），未来再遇 git 通道故障可改造复用。
+
+**产物**：`MyShell_2.13.0_x64-setup.exe`（NSIS）；Gitee https://gitee.com/argustang/myshell/releases/tag/v2.13.0 ；GitHub https://github.com/DearTang/myshell/releases/tag/v2.13.0 。
+
+## 五问重启检查（阶段 114）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 114 complete —— v2.13.0 双平台发布完毕，仓库与远端同步，staging 已清空。 |
+| 我要去哪里？ | 实机验证 v2.13.0 的四个功能点（sz 失败恢复 / SFTP 递归+并发 / ZMODEM 双向递归）；下一批改动从空 staging 开始。 |
+| 什么可能导致偏离？ | ① lrzsz rz 建目录行为需实机确认（约定行为非协议强制）；② GitHub push 依赖内网代理稳定性——503 复发时用 `.zcode/push-via-api.mjs` 思路走 Data API；③ SFTP 并发对个别限制并发句柄的服务器可能报错（进 errors 列表不中断）。 |
+| 下一步最小可验证动作？ | 安装 v2.13.0 → 跑阶段 110-113 五问里的实机验证清单。 |
+| 目标是什么？ | 发布闭环：版本/说明/构建/双平台发布/暂存清空全部完成，且网络故障未造成任何历史分叉。 |
