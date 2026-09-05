@@ -34,6 +34,11 @@ use tokio::sync::mpsc;
 pub enum SessionCommand {
     Input(Vec<u8>),
     Resize { cols: u32, rows: u32 },
+    /// Frontend attached its `ssh_output` listener for this session (sent via
+    /// the `ssh_ready` command). Releases the reader's startup hold so the
+    /// banner bytes captured during connect (MOTD / "Last login") are emitted
+    /// instead of being dropped by the not-yet-subscribed webview.
+    FrontendReady,
     /// ZMODEM bytes flowing from the frontend (zmodem.js socket.send) back to the
     /// SSH channel. Kept on the same mpsc as Input so the biased select! keeps
     /// protocol responses high priority.
@@ -616,10 +621,16 @@ pub async fn test_connection(
     ))
 }
 
+/// Open an interactive SSH session. `hold_startup` = GUI consumers (true):
+/// the reader buffers early terminal data until the frontend signals
+/// `FrontendReady`, so the login banner isn't emitted before the tab's
+/// `ssh_output` listener exists. Headless consumers (CLI, MCP) pass false —
+/// their sinks already exist, and holding would swallow ZMODEM protocol bytes.
 pub async fn connect(
     state: &AppState,
     sink: Arc<dyn EventSink>,
     config: ConnectionConfig,
+    hold_startup: bool,
 ) -> Result<String, String> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let sid = session_id.clone();
@@ -705,8 +716,16 @@ pub async fn connect(
     };
 
     tokio::spawn(async move {
-        channel_reader(sink, reader_sid, channel, reader_handle, command_rx, suppress_tmout)
-            .await;
+        channel_reader(
+            sink,
+            reader_sid,
+            channel,
+            reader_handle,
+            command_rx,
+            suppress_tmout,
+            hold_startup,
+        )
+        .await;
     });
 
     Ok(sid)
@@ -719,6 +738,7 @@ async fn channel_reader(
     handle: Arc<Handle<SshClient>>,
     mut command_rx: mpsc::UnboundedReceiver<SessionCommand>,
     suppress_tmout: bool,
+    hold_startup: bool,
 ) {
     // Capture the channel id once. We use `handle.data(id, ...)` for upload
     // data instead of `channel.data(...)` so the pump's send doesn't share a
@@ -825,6 +845,23 @@ async fn channel_reader(
     if suppress_tmout {
         send_data(&data_tx, b"\nexport TMOUT=0 2>/dev/null\n").await;
     }
+
+    // Startup hold (GUI only): the frontend registers its `ssh_output`
+    // listener only after `ssh_connect` resolves AND React commits the tab's
+    // TerminalPanel — but sshd streams the login banner ("Last login: …",
+    // MOTD) within milliseconds of the shell request. Bytes emitted before
+    // the listener exists are dropped by the webview, so the banner never
+    // rendered (Xshell shows it; we showed nothing). Hold incoming terminal
+    // data until `SessionCommand::FrontendReady` arrives (the frontend sends
+    // it right after its listeners attach), then flush it as one `ssh_output`
+    // batch and go live. Fallback deadline for a consumer that never signals
+    // (version-skewed pairing): release late rather than never.
+    let mut startup_hold = if hold_startup {
+        Some(Vec::with_capacity(4096))
+    } else {
+        None
+    };
+    let hold_deadline = Instant::now() + Duration::from_secs(3);
 
     let mut mode = TermMode::Normal;
     // Post-ZMODEM suppression window. After a ZMODEM session ends (normally
@@ -1079,6 +1116,21 @@ async fn channel_reader(
                         }
                     }
                 }
+                Some(SessionCommand::FrontendReady) => {
+                    // Release the startup hold: the tab's listeners are now
+                    // attached, so the buffered banner can be delivered.
+                    if let Some(held) = startup_hold.take() {
+                        if !held.is_empty() {
+                            sink.emit(
+                                "ssh_output",
+                                &SshOutputPayload {
+                                    session_id: session_id.clone(),
+                                    data: held,
+                                },
+                            );
+                        }
+                    }
+                }
                 Some(SessionCommand::Disconnect) | None => {
                     let _ = channel.close().await;
                     break;
@@ -1089,6 +1141,19 @@ async fn channel_reader(
             msg = channel.wait() => match msg {
                 Some(ChannelMsg::Data { ref data }) => {
                     log::debug!("[ssh:{}] Data {} bytes", session_id, data.len());
+                    // Startup hold: buffer instead of emitting (see the
+                    // startup_hold comment above). Checked before ZMODEM
+                    // handling — during login there is no ZMODEM traffic.
+                    if let Some(held) = startup_hold.as_mut() {
+                        // Cap bounds memory against a server that floods
+                        // output before the frontend attaches (login scripts
+                        // cat-ing huge files); past the cap, early bytes are
+                        // dropped — same as the pre-fix behavior.
+                        const MAX_HOLD_BYTES: usize = 1024 * 1024;
+                        let space = MAX_HOLD_BYTES.saturating_sub(held.len());
+                        held.extend_from_slice(&data[..data.len().min(space)]);
+                        continue;
+                    }
                     // Post-ZMODEM suppression: after a session ends (abort or
                     // normal ZFIN), lrzsz emits CAN bursts, error text, ZFERR
                     // frames, and "OO". Suppress ALL incoming data until the
@@ -1334,6 +1399,22 @@ async fn channel_reader(
                         flush_buffer(&*sink, &session_id, &mut buffer);
                     }
                     last_flush = Instant::now();
+                }
+                // Startup-hold fallback: a consumer that never signals
+                // FrontendReady (version-skewed old frontend, unexpected path)
+                // gets the banner after the deadline instead of never.
+                if startup_hold.is_some() && Instant::now() >= hold_deadline {
+                    if let Some(held) = startup_hold.take() {
+                        if !held.is_empty() {
+                            sink.emit(
+                                "ssh_output",
+                                &SshOutputPayload {
+                                    session_id: session_id.clone(),
+                                    data: held,
+                                },
+                            );
+                        }
+                    }
                 }
                 // ZMODEM upload timeout: if the sender has been waiting in
                 // WaitingZrinit2 (post-ZEOF) for too long without rz
@@ -2094,6 +2175,21 @@ fn append_capped(
         flush_buffer(sink, session_id, buffer);
         *last_flush = Instant::now();
     }
+}
+
+/// Release the reader's startup hold (see `channel_reader`): the frontend has
+/// attached its `ssh_output` listener, so buffered banner bytes can flush.
+/// Unknown / already-gone sessions are a silent no-op — the hold dies with
+/// the reader task anyway.
+pub async fn frontend_ready(state: &AppState, session_id: &str) -> Result<(), String> {
+    let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+    if let Some(session) = sessions.get(session_id) {
+        session
+            .command_tx
+            .send(SessionCommand::FrontendReady)
+            .map_err(|_| "Session command channel closed".to_string())?;
+    }
+    Ok(())
 }
 
 pub async fn send_input(

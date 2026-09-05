@@ -1,6 +1,6 @@
 [package]
 name = "myshell"
-version = "2.13.0"
+version = "2.14.0"
 edition = "2021"
 description = "A Rust-based SSH/SFTP shell tool"
 # Three binaries share this crate (myshell / myshell-cli / myshell-mcp). `tauri dev`
@@ -44,7 +44,14 @@ log = "0.4"
 env_logger = "0.11"
 dirs = "5"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
-suppaftp = { version = "8", features = ["tokio", "async-secure", "tokio-rustls-ring"] }
+suppaftp = { version = "10", features = ["tokio", "async-secure", "tokio-rustls-ring", "deprecated"] }
+# FTPS: rustls connector (ring provider — matches russh; no aws-lc-rs/NASM build)
+# + Mozilla root bundle. suppaftp's "deprecated" feature unlocks implicit-FTPS
+# connect (the API is flagged deprecated upstream; the protocol itself is what
+# our users' servers still speak).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots = "1"
 tokio-socks = "0.5"
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }

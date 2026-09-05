@@ -2916,3 +2916,191 @@
 | 什么可能导致偏离？ | ① lrzsz rz 建目录行为需实机确认（约定行为非协议强制）；② GitHub push 依赖内网代理稳定性——503 复发时用 `.zcode/push-via-api.mjs` 思路走 Data API；③ SFTP 并发对个别限制并发句柄的服务器可能报错（进 errors 列表不中断）。 |
 | 下一步最小可验证动作？ | 安装 v2.13.0 → 跑阶段 110-113 五问里的实机验证清单。 |
 | 目标是什么？ | 发布闭环：版本/说明/构建/双平台发布/暂存清空全部完成，且网络故障未造成任何历史分叉。 |
+
+### 阶段 115 — 系统监控内存识别修复：`/proc/meminfo` 直读（locale 免疫），`free -b` 兜底（2026-09-03）
+
+**背景（用户报告）：** Ubuntu 26.04.1 LTS（argus-SER9，locale zh_CN.UTF-8）上系统监控面板内存显示 `0 B/0 B 0%`，CPU（24 核 3.0%）与磁盘正常。
+
+**根因：** 探测脚本 `=M=` 段用 `free -b`，解析器按 `starts_with("Mem:")` 定位内存行；zh_CN locale 下 procps 把行标签本地化为 `内存：`（全角冒号），匹配失败 → 返回 (0,0)。CPU（`nproc`）、磁盘（只认 `/dev/` 开头行）不依赖英文标签，所以只有内存坏。真机（MCP `ssh_exec`）确认输出确为 `内存：  61705637888 …`，复现闭环。
+
+**实现：**
+1. **探测脚本**（`main.rs` `SERVER_INFO_SCRIPT`）：`=M=` 段改为 `awk '/^(MemTotal|MemAvailable|MemFree|Buffers|Cached|SReclaimable):/' /proc/meminfo 2>/dev/null || LC_ALL=C free -b 2>/dev/null`。`/proc/meminfo` 由内核生成——键恒英文、单位恒 kB，天然免疫 locale 与 procps 缺失（与 CPU 段读 `/proc/stat` 的既有做法一致）；选 awk 而非 grep，规避服务器上 `grep --color` 别名给输出加 ANSI 码的风险（GUI 走无 PTY exec 通道本不受影响，防御性选择）。
+2. **解析器**（`parse_server_info`）：meminfo 键值 ×1024 转字节；used = MemTotal − MemAvailable（htop 3.x / node_exporter 语义）；无 MemAvailable 的老内核（< 3.14）回退 total − (MemFree+Buffers+Cached+SReclaimable)；meminfo 键全缺时回退原 `free -b` 解析（探测端 `LC_ALL=C` 保证标签恒英文，两条 legacy 分支保留）。
+
+**验证：** `cargo test server_info_tests` 5/5——新增 `mem_usage_from_proc_meminfo`（主路径 + 百分比）、`mem_usage_meminfo_without_available_estimates`（老内核估算）；原 modern-procps 用例更名 `mem_usage_free_fallback_prefers_total_minus_available` 转为兜底路径用例，legacy 与缺段用例不变。真机验证新探测行（nas.ggbond.fun）：输出干净 `MemTotal: 60259412 kB` 等 6 键。GUI 侧待用户重连该 Ubuntu 后确认面板显示。
+
+**改动文件：** `src-tauri/src/main.rs`（`SERVER_INFO_SCRIPT` `=M=` 段、`parse_server_info` 内存解析、`ServerInfo` 字段文档、`server_info_tests`）。
+
+## 五问重启检查（阶段 115）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 115 complete —— 内存采集改读 `/proc/meminfo`，单元测试 5/5，真机探测行已验证。 |
+| 我要去哪里？ | 用户在 GUI 重连该 Ubuntu 确认监控面板显示真实内存（约 60 GB 总量）；随下一次 `打包` 发布（🐛修复 → patch 候选）。 |
+| 什么可能导致偏离？ | ① 非 Linux 远端（BSD/macOS）无 `/proc/meminfo` → 走 `LC_ALL=C free` 兜底，BSD free 无 `-b` 仍解析为 0——与改动前一致，非回归；② 容器内 `/proc/meminfo` 反映宿主机内存而非 cgroup 限额，与 `free` 行为一致，非回归。 |
+| 下一步最小可验证动作？ | GUI 连接 argus-SER9 → 监控面板显示 ~60 GB 总内存与真实占用；再连任意英文 locale 的 Debian/CentOS 回归确认无变化。 |
+| 目标是什么？ | 系统监控内存显示在任何 locale / 任何 procps 版本的 Linux 服务器上都正确。 |
+
+### 阶段 116 — 连接后展示登录横幅（MOTD / Last login）：前端监听时序修复（startup hold + FrontendReady 握手）（2026-09-05）
+
+**背景（用户报告）：** Xshell 连上就显示"Last login: …"和 MOTD 横幅，MyShell 只有裸提示符。`connect()` 实际上已请求 PTY+shell——banner 确实随 shell 流发过来了，问题在前端订阅时序。
+
+**根因（竞态丢字节）：** `handleOpenConnection` 先建 tab 再 `await sshConnect`；拿到 sessionId 后 React 提交 `TerminalPanel`，其 effect 才通过 `listen("ssh_output")` 注册监听（IPC 往返）。而 sshd 在 shell 请求后几毫秒就推 banner，`channel_reader` 的 16ms 批量 emit 那一刻 webview 里还没有匹配的监听 → Tauri 事件直接丢弃。局域网低延迟下几乎必现（WAN 慢链路反而经常能看到 banner）；提示符能显示是因为 mount 100ms 的 fit/resize 触发 PTY 重绘。
+
+**实现（Rust 侧启动保持 + 前端就绪握手）：**
+1. **`SessionCommand::FrontendReady`**（`ssh.rs` 新变体）+ **`frontend_ready()`** + **`ssh_ready` 命令**（`main.rs` 注册）：前端在 `onSshOutput` 监听 `.then` 里调用，未知/已消失会话静默 Ok。
+2. **`channel_reader` startup hold**（新增 `hold_startup: bool` 参数）：hold 期间 `ChannelMsg::Data` 不走 emit，进 `startup_hold` 缓冲（1 MB 上限，防登录脚本洪泛）；收到 FrontendReady → 缓冲整体作为一条 `ssh_output` 刷出并转实时；3 秒兜底超时（版本错配的消费者晚拿到而不是拿不到）。
+3. **调用方分流**：GUI `main.rs` 传 `true`；CLI（CliSink 先于 reader 存在，无竞态）与 MCP `zmodem_download`/`upload`（hold 会吞掉早期 ZMODEM 协议字节且永远等不到 FrontendReady）传 `false`，行为不变。
+4. **前端**（`api.ts` `sshReady` + `TerminalPanel.tsx`）：`onSshOutput(...).then` 注册成功后调 `sshReady(sessionId)`（local tab 跳过）；订阅 effect 依赖 `[sessionId]`，重连换 sessionId 后自动对新会话再次握手。banner 刷出即 `firstOutputHandled` 的首次输出 → 触发既有的真实列宽同步逻辑，顺带对齐。
+
+**有意不扩到本地终端**：local.rs 是"阻塞读线程 + writer task"结构，无法在不引入跨线程唤醒通道的情况下优雅实现 hold，且本地 shell 无 MOTD 语义；待有真实需求再做。
+
+**验证：** `cargo check` ?；`npx tsc --noEmit` ?；`cargo test` 全量 44/44（lib 34 + GUI bin 5 + MCP bin 5）。GUI 侧待用户 `cargo tauri dev` 重连服务器目视确认 banner 出现。
+
+**改动文件：** `src-tauri/src/ssh.rs`（FrontendReady 变体、connect/channel_reader 签名、hold 状态与释放、frontend_ready）、`src-tauri/src/main.rs`（ssh_ready 命令 + 注册、GUI 调用传参）、`src-tauri/src/bin/myshell-cli.rs` 与 `bin/myshell-mcp.rs`（调用传 `false`）、`src/api.ts`（sshReady 包装）、`src/components/TerminalPanel.tsx`（订阅后握手）。
+
+## 五问重启检查（阶段 116）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 116 complete —— banner 时序修复三端接通，静态检查与 44/44 单测全过。 |
+| 我要去哪里？ | 用户 dev 运行重连服务器目视验证 MOTD/Last login 出现；随下一次 `打包` 发布（🛠️优化 → 与阶段 115 同批，115🐛+116🛠️ → patch 候选）。 |
+| 什么可能导致偏离？ | ① 前端监听若在 3 秒兜底后才就绪（极端卡顿/几十个 tab 同开），banner 晚到但不丢；② SFTP-only 会话无 shell 无 banner，属预期；③ 本地终端 tab 未实现 hold（有意缩窄范围），本地 shell 的 profile 横幅仍可能出现丢首帧；④ MCP `open_in_gui` 走 GUI tab 路径，天然受益。 |
+| 下一步最小可验证动作？ | ① GUI 连任意 Linux 服务器，首屏应出现 "Last login: …"（二次登录）与 /etc/motd；② 重连按钮回归：断开后重连，新会话 banner 应再次出现；③ MCP `ssh_run`/`zmodem_upload` 回归确认无 banner 延迟、传输正常。 |
+| 目标是什么？ | 连接体验对齐 Xshell：登录横幅（上次登录时间/IP + MOTD）稳定完整展示，且不引入任何 headless 路径的回归。 |
+
+### 阶段 117 — 安全审计整改批：MCP 确认绕过 / SFTP 路径逃逸 / suppaftp 注入 / FTP 闭环 / 密码验证下沉 / IPC 加固 / 配置原子写 / 历史加密（2026-09-05）
+
+**背景：** 本轮对功能设计、能力完整性与安全做了一次全面只读审计（结论 B-：核心架构与凭据保护扎实，但存在 3 项 P1 与若干 P2）。本阶段按"先封攻击面、再补协议能力、最后纵深防御"顺序完成整改。全程无网络可达的 P0。
+
+**1. MCP 复合命令确认绕过（P1）**
+- 根因：白名单在整条命令上匹配即可豁免黑名单命中 → `rm -rf x; grep y f` 免确认。且默认白/黑名单同为"命令位锚定"，两者重叠时白名单的唯一作用就是豁免黑名单。
+- 修复（`command_rules.rs` 重写 `command_needs_confirmation`）：① 命令按**未引用**的 `;`/`&&`/`||`/`|`/换行分段（`split_shell_segments`，单双引号与反斜杠转义感知）；② 逐段判定，任一段命中黑名单即确认——**白名单永远不能豁免黑名单命中**，仅用于 `confirm_unknown` 严格模式下豁免未知段；③ 硬底线（命令替换/写重定向）不变。
+- 单一策略源：删除 `App.tsx` 里手写的 JS 镜像（`checkCommandNeedsConfirmation`/`hasWriteRedirect`），新增 `check_command_confirmation` 命令，GUI 确认框改调后端。
+- 测试：绕过回归 6 例（`;`/`&&`/`||`/`|`/换行复合）、"白名单不能豁免黑名单"（用户自定义 `\brm\b` 白名单仍确认）、引号内分号不分段、`\;` 转义。
+
+**2. Windows SFTP 递归下载本地路径逃逸（P1）**
+- 根因：远端目录项名（POSIX 合法的 `..\evil.txt`、`a:b`）直接 `Path::join`，Windows 反斜杠成路径分隔符；`File::create` 跟随既有符号链接。
+- 新模块 `path_safety.rs`：① `validate_component`——名称只能形成**一个**本地组件：拒空/`.`/`..`/NUL/控制符/双平台分隔符，Windows 额外拒 `:*?"<>|`、盘符流语法、尾点尾空格、保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9，含带扩展名）、255 字节上限；② `build_path`——逐组件 push（构造性 containment）；③ `ensure_no_symlink_components`——逐祖先检查 symlink/junction/reparse point（Windows 查 0x400 属性位）。
+- 接入点（`sftp.rs`）：expand 阶段（文件/根目录/递归子项）全部校验，不安全项报错跳过；目录骨架与 worker 目标改 `local_components`（再校验+组件化构建）；`download_one` 写前符号链接检查。
+
+**3. suppaftp 8.0.5 → 10.0.2 + FTP 参数校验（P1）**
+- Cargo.toml 升级，`cargo audit` 复扫：RUSTSEC-2026-0271 消失，仅剩 rsa 0.10.0-rc.16（上游无修复，维持已接受风险）。tokio API（connect/login/mlsd/list/mkdir/rm/rmdir/rename/active_mode/transfer_type）v10 兼容无改动。
+- 后端自有策略：`ftp.rs` `validate_ftp_arg` 对所有进入控制通道的用户参数（用户名/密码/路径）拒 CR/LF/NUL——不依赖上游。
+
+**4. FTP/FTPS 功能闭环（P1 功能）**
+- FTPS：suppaftp rustls connector（`ftps_connector`：webpki-roots Mozilla 根 + 显式 ring provider，**无跳过验证开关**）；explicit（AUTH TLS 后升级）+ implicit（990 端口，启用上游 `deprecated` feature）。FTPS+代理明确报错不支持。`FtpStream` enum（Plain/Tls）+ `ftp_dispatch!` 宏分派控制操作；传输 helper 泛型于 `T: TokioTlsStream`。
+- 传输：`ftp_upload`/`ftp_download`/`ftp_cancel_transfer` 命令，复用 `sftp_transfer_progress`/`sftp_transfer_done` 事件契约与 `transfer_cancels` 取消表（sftp.rs 的 payload/fn 提为 pub(crate)）。FTP 下载递归展开（SIZE 探测文件、LIST 回退、单条目文件消歧），本地落盘走 `path_safety` 全套；顺序执行（FTP 单控制连接禁并行数据命令，concurrency 参数仅为 API 对齐）。
+- 前端：`SftpPanel` 按 `source` 路由 upload/download/cancel（`transferApi`），FTP tab 不再把 sessionId 发给 SFTP 命令。
+- 附带真 bug 修复：`return_ftp_session` 的 `contains_key` 守卫在 take 已 remove 后恒 false → 会话永不归还、第二次 FTP 操作必失败；改为始终插回。
+
+**5. 密码查看二次验证下沉（P2）**
+- 删除仅凭 DEK 的 `get_connection_password`/`get_connection_proxy_password`；新增 `reveal_connection_password`/`reveal_connection_proxy_password`——同一命令内"KDF 验证主密码（复用 verify_password 的 lockout 策略，抽为 `verify_master_password_inner`）+ 解密返回"。`PasswordVerifyDialog` 转发输入的主密码（对话框内验一次仅属 UX，后端重验才是边界）。
+
+**6. GUI localhost IPC 加固（P2）**
+- 单请求 1 MiB 上限（`read_ipc_line` 逐字节限长读取，超限回 `request too large` 后断开）——旧 `read_line` 在令牌校验前无上限增长，任意本地进程可打爆 GUI 内存。
+- 并发上限 32 + 逐连接线程（`handle_ipc_connection` 抽出）：慢客户端/长 exec_in_tab 等待不再串行阻塞 accept 循环。127.0.0.1 绑定、随机 32B 令牌、常量时间比较、5s 读写超时均保留。
+
+**7. MCP 外部工具配置原子写（P2）**
+- `mcp_tools.rs`：`read_tool_config` 严格解析——已存在但无效 JSON 直接报错（旧代码 `unwrap_or_else(json!({})` 会清空用户配置）；`ensure_object_nodes` 拒绝非对象节点被 IndexMut 静默替换；`write_tool_config` 原子写（同目录临时文件 + fsync + rename，Windows rename 自带替换语义）+ 原文件 `.json.bak` 备份；remove 路径同样走原子写。
+
+**8. 命令历史/快捷命令加密 + 历史开关（P2 隐私）**
+- `command_history.command_enc`、`quick_commands.command_enc`（幂等 ALTER）。写路径只存密文（明文列恒 ''）；读路径 `decrypt_field` 失败即错（fail-closed）；`add_command_history` 去重因 GCM 随机 nonce 不能按密文比较，改为候选行解密比对。
+- `migrate_plaintext_history`（幂等：仅 `command_enc IS NULL AND command <> ''`）挂载于 `setup_vault` 与 `unlock_vault`。
+- `settings.json`（file-backed，同附件目录/GPU 开关模式）：`disable_command_history` 后端强制开关 + `get/set_app_settings` + 设置面板「🛡️ 隐私」Toggle。
+- 审计发现 `ai_conversations` 表只有 schema、无任何读写代码（死表）——AI 对话实际不落盘，无需加密，文档说明即可。
+
+**验证：** `npx tsc --noEmit` 通过；`cargo check` 通过；`cargo test` 全量 61/61（lib 51，含新增 path_safety 4、command_rules 绕过回归 5、ftp 参数校验 3、mcp_tools 原子写 4、expand 回归；GUI bin 5；MCP bin 5）；`cargo audit` 仅剩 rsa Marvin（上游无修复，已接受）；npm audit 0 漏洞。
+
+**改动文件：** `command_rules.rs`（分段判定+白名单语义）、`path_safety.rs`（新增）、`lib.rs`（模块注册）、`sftp.rs`（组件校验/符号链接检查/事件结构 pub(crate)）、`ftp.rs`（v10+FTPS+传输+校验重写）、`Cargo.toml`/`Cargo.lock`（suppaftp 10、rustls/tokio-rustls/webpki-roots）、`main.rs`（check_command_confirmation、reveal 命令、ftp 传输命令、IPC 重构、历史加密接线、AppSettings）、`mcp_tools.rs`（严格读+原子写+测试）、`db.rs`（_enc 列+加密读写+迁移）、`src/api.ts`（reveal/ftp 传输/appSettings/checkCommandConfirmation）、`src/App.tsx`（删 JS 镜像改调后端）、`src/components/SftpPanel.tsx`（transferApi 路由）、`src/components/ConnectionDialog.tsx` + `PasswordVerifyDialog.tsx`（原子 reveal 流）、`src/components/SettingsPanel.tsx`（隐私开关）。
+
+## 五问重启检查（阶段 117）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 117 complete —— 审计 3 项 P1 与 5 项 P2 全部整改，61/61 测试通过，audit 仅剩已接受的 rsa。 |
+| 我要去哪里？ | 用户 GUI 回归（FTP/FTPS 连真实服务器、密码查看、设置开关）；随下一次 `打包` 发布（🔒×6 + ✨FTP 闭环 + 🐛/🛠️ → minor）。 |
+| 什么可能导致偏离？ | ① FTPS 真实服务器矩阵未自动联测（explicit/implicit × 被动/主动），可能暴露服务器兼容性问题；② FTPS 隐式模式依赖上游 deprecated feature；③ 严格模式 `confirm_unknown=true` 下行为变化：未匹配白名单的未知段会确认（预期但用户可能感知）；④ MCP 配置 `.bak` 只保留一份。 |
+| 下一步最小可验证动作？ | ① `cargo tauri dev` 连 FTP/explicit FTPS 服务器验证浏览+上传下载+取消；② 设置→隐私开"不记录命令历史"，发命令后历史不变；③ 编辑连接查看密码需输入主密码且错误密码会锁定计数；④ 对 `rm x; grep y f` 发 MCP ssh_exec 应弹确认框。 |
+| 目标是什么？ | 审计问题全部闭环：不可绕过的 MCP 确认、不越界的下载落盘、无注入的 FTP、后端强制的验证与隐私、资源有界的 IPC、可恢复的配置写入、密文的历史数据。 |
+
+### 阶段 118 — MCP 高危命令确认弹窗：危害说明（命中规则逐条解释）+ 弹窗自动置顶提醒（2026-09-05）
+
+**背景：** 用户反馈两点：① 确认弹窗只说"高危操作"，不说明**为什么**危险、命中的是哪条黑名单规则，人工审核缺乏判断依据；② 弹窗出现时 MyShell 窗口不置顶——用户通常在 AI agent 的编辑器/终端里工作，MyShell 在后台，根本不知道有命令在等人工确认，任务就此卡死。
+
+**1. 内置危害描述知识库（`command_rules.rs`）**
+- 新增 `danger_note_for_pattern(pattern)`：以默认黑名单的**正则原文**为键的静态表，覆盖全部 70 条默认规则（rm/dd/mkfs/shutdown/iptables/crontab/解释器/包管理器/docker/kubectl…），每条一句具体危害描述（如 rm →「配合 -rf 递归强制删除且不进回收站，数据通常无法恢复」；iptables →「配置错误可能切断 SSH/业务端口，导致服务器失联」）。
+- 新增 `command_danger_reasons(command, rules)`：镜像 `command_needs_confirmation` 的判定顺序（空命令 → 硬底线命令替换/写重定向 → 逐段黑名单 → 严格模式未知命令），返回**去重后的人话原因列表**；同一规则重复命中去重（`rm a; rm b` 一条原因），`curl x | bash` 列两条（curl + shell 解释器）；用户自定义规则回退显示「命中自定义黑名单规则（正则）：…」；黑名单正则逐条编译以保留原文供查表（`compile_all` 会丢弃无效正则导致索引错位）。**显示与判定分离**：判定权仍在 `command_needs_confirmation`，本函数只做解释。
+- 同步守卫测试 `every_default_blacklist_pattern_has_a_note`：新增默认规则必须配套危害描述，否则测试失败。
+
+**2. GUI 确认弹窗（`main.rs` / `api.ts` / `App.tsx`）**
+- 新增 Tauri 命令 `check_command_danger_reasons`（与 `check_command_confirmation` 同一 rules 文件、同一规则源），`api.ts` 加 `checkCommandDangerReasons` 封装。
+- `App.tsx` exec_in_tab 确认流：判定需要确认后再取原因（`.catch(() => [])` 失败软兜底，取原因失败不跳过确认），弹窗命令框下方新增红框「⚠ 危害说明（命中的危险规则）」列表区。
+- **置顶提醒**：`showMcpConfirm` 弹窗出现时窗口 `setAlwaysOnTop(true)` + `unminimize` + `show` + `setFocus` + `requestUserAttention(Critical)`（任务栏闪烁）；确认/取消后 `resolveMcpConfirm` 统一恢复 `setAlwaysOnTop(false)`，置顶只在审核期间生效。`capabilities/main.json` 补 5 项 core:window 权限（set-always-on-top / unminimize / show / set-focus / request-user-attention）。
+
+**3. headless MessageBoxW 路径（`myshell-mcp.rs`）**
+- 新增 `danger_reasons_text(command)`：把原因列表格式化为「⚠ 检测到的危险点:」编号块；`ssh_exec`（静默回退路径）与 `ssh_run`（后台任务）的确认详情末尾附带，拒绝文本（`denied_by_user_text`）因引用 detail 也随之带上原因——AI 能看到自己触发了哪条规则。原生 MessageBoxW 本就带 `MB_SYSTEMMODAL`（= WS_EX_TOPMOST），无需改动。
+
+**验证：** `npx tsc --noEmit` 通过；`cargo check` 通过；`cargo test` lib 61/61（command_rules 34，含新增 10：危害描述全覆盖守卫、复合命令多原因、去重、硬底线解释、严格模式解释、自定义规则回退、无效正则不崩、原因与判定一致性抽样）；GUI bin 5；MCP bin 5。
+
+**改动文件：** `command_rules.rs`（知识库 + command_danger_reasons + 10 测试）、`main.rs`（check_command_danger_reasons + 注册）、`src/api.ts`（封装）、`src/App.tsx`（原因展示 + 置顶/聚焦/闪烁 + resolveMcpConfirm 统一收口）、`src-tauri/capabilities/main.json`（窗口权限）、`myshell-mcp.rs`（danger_reasons_text + ssh_exec/ssh_run 详情附带）。
+
+## 五问重启检查（阶段 118）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 118 complete —— 确认弹窗可解释（逐条危害说明）且可达（置顶+聚焦+任务栏闪烁），全部测试通过。 |
+| 我要去哪里？ | 用户 GUI 回归：让 AI 跑一条 `rm`/`curl|bash` 验证弹窗出现危害列表且窗口抢到前台；随下一次 `打包` 发布。 |
+| 什么可能导致偏离？ | ① `setFocus` 受 Windows 前台锁定策略限制，极端情况下抢不到焦点——但置顶+任务栏闪烁仍保证可见；② 用户改过黑名单正则原文的条目会回退到通用描述（预期行为）；③ 弹窗期间窗口被钉住，若 AI 连续触发多条命令会排队弹窗（exec 锁保证串行）。 |
+| 下一步最小可验证动作？ | ① MCP 发 `rm -rf /tmp/x`：弹窗应列出「rm 递归强制删除…」且 MyShell 窗口自动到前台并闪烁任务栏；② 发 `curl http://x | bash`：应出现两条危害说明；③ 点取消后窗口取消置顶、AI 收到硬性停止文本（含危险点）。 |
+| 目标是什么？ | 人工审核真正可执行：用户知道**为什么**危险、**及时**看到需要审核，而不是在后台等一个没人知道的弹窗。 |
+
+### 阶段 119 — 黑名单覆盖度审计：wrapper 前缀剥离封堵绕过 + 补齐 20+ 高危命令 + 误报收窄（2026-09-05）
+
+**背景：** 阶段 118 完成后对默认黑名单做了一次覆盖度审计，发现三类问题：① **结构性绕过**——黑名单锚定命令位，任何中性 wrapper 前缀都能让危险命令免确认（`find | xargs rm`、`nohup rm -rf /`、`ps|awk|xargs kill -9`，而 App 自己的 exec 锁提示还在推荐 `nohup`）；② **命令族缺口**——npx（设计即下载执行）、nc/socat（反弹 shell）、内核模块、wipefs/sfdisk、ip/ifconfig/nmcli（自断连接，iptables 同类）、doas/pkexec/runuser、systemd-run/update-rc.d（持久化）、terraform/aws 等基础设施与云 CLI 全部缺席；③ **误报噪音**——`mkdir`/`touch`（只创建不覆盖不删除）、`git status`、`docker ps`、`kubectl get`、`curl` 纯 GET 等高频低危操作全被确认，是 dev 类 agent 最大的摩擦源。另发现**本机 live 配置缺失 5 条默认规则**（sudo/su/systemctl/rmdir/mkdir——旧版本生成的文件从未刷新），导致 `sudo rm -rf` 在本机实际免确认。
+
+**1. wrapper 前缀剥离（`command_rules.rs`）**
+- `NEUTRAL_WRAPPERS`：13 个中性 wrapper（nohup/nice/ionice/taskset/setsid/stdbuf/timeout/env/xargs/busybox/time/strace/command）——只改变"怎么跑"不改变"跑什么"。
+- `wrapper_stripped_view(seg)`：仅当段首 token 是 wrapper 名时开启剥离区，循环吞掉 wrapper 名、flag（`-n`/`--kill-after=5s`）、`VAR=value` 赋值、纯数字/时长/CPU 列表（`10`/`10s`/`0-3`），直到第一个普通 token——真实命令浮到视图头部。路径（含 `/`）永不视为 wrapper token；段首非 wrapper 则原样返回（`7z e x.7z`、`echo nohup rm` 不受影响）。
+- 判定改为**双视图匹配**：`command_needs_confirmation` 与 `command_danger_reasons` 对每段同时匹配原文 + 剥离视图，危害描述随视图命中正确标注（`nohup rm` 报 rm 的 note 而非 wrapper）。严格模式白名单仍匹配原文段（`xargs grep` 语义不变）。
+
+**2. 默认黑名单 70 → 90 条**
+- **新增**：npx、bun/bunx/deno、uvx?/pipx、nc/ncat/netcat/socat、modprobe/insmod/rmmod、chattr、wipefs/sfdisk/blkdiscard、ip、ifconfig/ifdown/ifup/nmcli/ethtool、doas/pkexec/runuser、dpkg/rpm、supervisorctl、systemd-run、update-rc.d/chkconfig/rc-update、fuser、chpasswd/chsh、setenforce、sysctl、podman/crictl/ctr、terraform/tofu/ansible/helm、aws/gcloud/az/aliyun/tccli/ossutil。
+- **移除**：mkdir、touch（只创建，永不覆盖/删除）。
+- **收窄**（regex crate 无负向预查，写子命令枚举）：`git` → 30 个写子命令（push/reset/clean/checkout/config 等；status/log/diff/fetch/branch/tag 免确认；git config 单列——可植入钩子执行任意代码）；`docker` → 写子命令主表 + container/image/volume/network 分表 + `(system|builder) prune`（ps/images/logs/inspect/image ls 免确认）；`kubectl` → 写子命令（get/describe/logs/top 免确认）；`curl` → 带 `-o/-O/-J/-T/--output/--upload-file/--data*/--form/-X/--request` 才确认（纯 GET 免确认，管道到 shell 由 shell 规则兜底、`> file` 由硬底线兜底）；`wget` 保持整体（默认行为就写文件）。残留风险：劣质 API 的带副作用 GET 免确认（已知取舍）。
+- **明确不收**（危险真实但噪音大，留给用户自配）：ssh/sshpass、tcpdump/nmap、DB 客户端（mysql/psql/redis-cli）、make/cargo、java/go run/Rscript、tar、expect。
+
+**3. 本机 live 配置同步**
+- 以 `CommandRules::default()` 序列化结果直接写入 `%APPDATA%\myshell\mcp-command-rules.json`（临时 example 导出后即删，保证与代码零漂移），旧文件备份为 `mcp-command-rules.json.bak-20260905`。校验：blacklist 90、whitelist 7、sudo/su/systemctl/npx/nc/aws/ip 在列、mkdir/touch 已移出、git 收窄模式在列。live 配置与代码默认从此一致。
+
+**验证：** `cargo test` lib 70/70（command_rules 43：新增 wrapper 前缀确认 9 例、wrapper 只读放行 8 例、git/docker/kubectl/curl 收窄 24 例、审计缺口命令 24 例、mkdir/touch 翻转、wrapper 危害描述）；GUI bin 5；MCP bin 5；`npx tsc --noEmit` 通过（前端无改动）。`every_default_blacklist_pattern_has_a_note` 同步守卫保证 90 条规则全部有危害描述。
+
+**改动文件：** `command_rules.rs`（wrapper 剥离 + 默认名单增删/收窄 + KB 90 条描述 + 9 个新测试）、`%APPDATA%\myshell\mcp-command-rules.json`（live 同步，含 .bak 备份）、`README.md`、`RELEASE_NOTES_STAGING.md`。
+
+## 五问重启检查（阶段 119）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 119 complete —— wrapper 绕过封堵、黑名单 90 条、误报收窄、本机 live 配置与代码默认一致，70/70 测试通过。 |
+| 我要去哪里？ | 用户回归：AI 跑 `git status`/`docker ps`/`curl GET` 应免确认，`find \| xargs rm`/`nohup rm` 应弹确认；随下一次 `打包` 发布（✨危害说明+置顶 + 🔒×2 + 🛠️收窄 → minor）。 |
+| 什么可能导致偏离？ | ① wrapper 剥离只认段首精确 wrapper 名，`/usr/bin/nohup rm` 绝对路径形式仍绕过（罕见，未堵）；② `script -c "…"` 的命令藏在 -c 参数里，剥离模型覆盖不到；③ 收窄后 git/docker/kubectl 的未枚举写子命令会免确认（枚举法的固有残留，依赖测试清单维护）；④ 用户 live 配置今后仍可能随版本演进再次过时——暂无自动合并机制（会覆盖用户刻意删除）。 |
+| 下一步最小可验证动作？ | ① MCP 发 `find . \| xargs rm -rf /tmp/t1` 应弹确认且危害说明指 rm；② `git status`、`docker ps`、`curl -fsSL https://ip.sb` 应免确认直接执行；③ `git push`、`kubectl apply` 应弹确认；④ 设置→MCP→命令确认规则应显示 90 条新名单。 |
+| 目标是什么？ | 黑名单防得住（wrapper 不能洗白危险命令）、放得准（高频低危操作不再弹窗），且本机实际生效配置与代码默认一致。 |
+
+### 阶段 120 — MCP 文件传输顺序反转：zmodem 优先、SFTP 兜底（2026-09-05）
+
+**背景：** 用户要求把 MCP 上传/下载的调用顺序改为 zmodem 优先、失败再试 SFTP（原策略是 sftp 优先、zmodem 兜底）。实际使用场景中 SFTP 不可用的情况（SSH-only 连接、SFTP subsystem 被禁、受限 shell/堡垒机、嵌入式设备）比 lrzsz 缺失更常见，zmodem-first 减少首轮传输失败。
+
+**改动（全部为 `myshell-mcp.rs` 内嵌的 agent 指引文本，传输逻辑零改动）：**
+1. `SERVER_INSTRUCTIONS` FILE TRANSFER 段：两步策略翻转为「先 `zmodem_download`/`zmodem_upload`，技术性失败后回退 `sftp_download`/`sftp_upload`」；提示语改为「zmodem 失败，改用 SFTP 方式传输」。
+2. `zmodem_download`/`zmodem_upload` 工具描述：FALLBACK → PREFERRED，两步策略重写（zmodem 先行；`sz`/`rz` 缺失约 20s 失败或超时才回退 SFTP；用户拒绝确认弹窗属 hard stop，不得回退）。
+3. `sftp_download`/`sftp_upload` 工具描述：补 FALLBACK ORDER 说明（zmodem 优先，本工具在 zmodem 失败或用户点名 SFTP 时使用）。
+4. VAULT GATE 段兜底限定语同步翻转：回退仅适用于 zmodem 可用性失败，不适用于保险库锁定，也不适用于用户拒绝确认弹窗。
+
+**验证：** `cargo check --bin myshell-mcp` 通过；`cargo build --release --bin myshell-mcp` 成功并已部署 `E:\Program Files\MyShell\myshell-mcp.exe`（旧 exe 改名 `.old`，运行中进程不受影响，MCP 客户端重启后生效）；措辞核查：旧文案（"sftp 失败，改用" / "FALLBACK transfer method"）0 残留，新文案（"zmodem 失败，改用" ×3 / "PREFERRED transfer method" ×2 / "FALLBACK ORDER" ×2）全部就位。
+
+**改动文件：** `src-tauri/src/bin/myshell-mcp.rs`、`E:\Program Files\MyShell\myshell-mcp.exe`（部署产物）、`RELEASE_NOTES_STAGING.md`。
+
+## 五问重启检查（阶段 120）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 120 complete —— MCP 传输顺序已翻转为 zmodem 优先、SFTP 兜底，描述文本全部更新并部署到安装目录。 |
+| 我要去哪里？ | 用户重启 MCP 客户端会话（ZCode/Claude Desktop 等）后新描述生效；随下一次 `打包` 发布（🛠️ → patch）。 |
+| 什么可能导致偏离？ | ① 远端无 lrzsz 时每次首轮传输要等 ~20s 超时才回退，高频小文件场景体验变差（用户点名要此顺序的已知取舍）；② 已在运行的 MCP 会话仍缓存旧工具描述，直到重启；③ `myshell-mcp.exe.old` 待重启确认后手删。 |
+| 下一步最小可验证动作？ | 重启 MCP 会话后查看工具列表，`zmodem_download`/`zmodem_upload` 描述应含 "PREFERRED transfer method"；让 AI 传一个文件应先调 zmodem 工具。 |
+| 目标是什么？ | AI agent 的文件传输首选路径与用户真实环境匹配：先走受限环境可用性最好的 zmodem，SFTP 只做兜底。 |

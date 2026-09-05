@@ -2,7 +2,10 @@ import { useState, useRef, useEffect } from "react";
 import { verifyPassword } from "../api";
 
 interface Props {
-  onSuccess: () => void;
+  /** Called with the typed master password after the inline pre-check.
+   * The BACKEND re-verifies authoritatively when decrypting (atomic
+   * reveal) — this dialog's check is just UX (inline errors, lockout info). */
+  onSuccess: (masterPassword: string) => void;
   onClose: () => void;
 }
 
@@ -27,8 +30,9 @@ export function PasswordVerifyDialog({ onSuccess, onClose }: Props) {
     try {
       const valid = await verifyPassword(pass);
       if (valid) {
+        const typed = pass;
         setPass("");
-        onSuccess();
+        onSuccess(typed);
       } else {
         setErr("密码错误");
         setPass("");

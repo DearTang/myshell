@@ -43,9 +43,11 @@
 - **终端截图**：每个终端窗口工具栏的 📷 按钮一键截取当前终端画面（仅终端 viewport，不含标签栏/工具栏/输入命令栏），自动保存到「设置 → MCP 支持 → 附件目录」配置的目录，文件名带毫秒防覆盖；直接读 xterm buffer 自绘，完整还原颜色（16 色/216 cube/24 灰阶/24-bit RGB）和文字属性（bold/italic/underline/inverse）
 
 ### 文件传输
-- SFTP/FTP 文件浏览器
+- SFTP/FTP/FTPS 文件浏览器
 - 文件操作：上传、下载、重命名、删除
-- **文件夹递归下载**：勾选文件夹一键下载整个子树（空目录保留，符号链接循环有深度保护），本地按 `<目标目录>/<文件夹名>/...` 镜像
+- **FTPS（显式/隐式 TLS）**：连接对话框选 explicit（AUTH TLS，默认 21）或 implicit（默认 990），rustls + Mozilla 根证书链，证书校验始终开启
+- **FTP/FTPS 上传下载**：与 SFTP 同一套传输 UI（进度浮层 / 取消 / 错误列表）；FTP 无并行数据连接能力，下载按顺序执行
+- **文件夹递归下载**：勾选文件夹一键下载整个子树（空目录保留，符号链接循环有深度保护），本地按 `<目标目录>/<文件夹名>/...` 镜像；远端文件名严格按单一路径组件校验（反斜杠/盘符/保留设备名等非法名报错跳过），构建目标前检查符号链接，杜绝越出下载目录
 - **SFTP 多文件并发下载**：可设并发线程数（设置 → 文件传输，默认 3，1–16），所有线程复用同一条 SSH 连接，海量小文件提速明显
 - 目录导航历史记录
 
@@ -60,6 +62,11 @@
 - 登录密码与数据加密密钥（DEK）分离
 - PBKDF2-HMAC-SHA256 密钥派生（600k 迭代，OWASP 2023 推荐；旧 vault 首次解锁时透明迁移）
 - AES-256-GCM 数据加密
+- **命令历史 / 快捷命令密文存储**（AES-GCM，保险库解锁后自动迁移旧明文；设置 → 隐私可开启「不记录命令历史」后端强制开关）
+- **密码查看原子验证**：查看连接/代理明文密码须在后端同一命令内完成主密码验证 + 解密，无法绕过前端弹窗
+- **MCP 命令确认逐段判定**：复合命令按分号/管道/换行等分段独立评估，白名单不能豁免黑名单命中，GUI 与 headless MCP 共用同一 Rust 策略源
+- **MCP 高危命令危害说明 + 弹窗置顶**：确认弹窗逐条列出命中的黑名单规则及具体危害（如「rm 递归强制删除且不可恢复」），弹窗出现时窗口自动置顶、聚焦并闪烁任务栏，人工审核不再被后台窗口淹没
+- **黑名单 wrapper 绕过封堵 + 规则收窄**：nohup/xargs/env/timeout 等 13 个中性前缀在判定前剥离（`find | xargs rm`、`nohup rm -rf` 不再免确认）；补齐 npx/nc/modprobe/wipefs/ip/doas/systemd-run/terraform/云 CLI 等默认规则；mkdir/touch 移出黑名单，git/docker/kubectl/curl 收窄为写子命令/写参数才确认
 - SSH 主机键 TOFU 验证（按 `(host, port)` 隔离，指纹变更自动拒绝）
 - 严格 CSP 白名单（关闭 XSS 暴露面）
 - OSC 52 剪贴板劫持防护
@@ -69,6 +76,7 @@
 - ZMODEM 写入路径保护（拒绝软链与系统目录）
 - 密码错误锁定机制（3 次错误锁定 5 分钟，每日最多 30 次）
 - 敏感信息存储于 OS Keyring
+- **GUI IPC 资源边界**：单请求 1 MiB 上限、并发连接上限 32、逐连接线程，拒绝资源耗尽型本地滥用
 - **安装器数据删除二次确认**：卸载/更新时勾选「删除应用数据」会弹危险提示并要求二次确认（默认「否」），明确告知将删除连接 / 密码 / 历史 / 密钥库且不可恢复，防止误删
 
 ### 版本管理
@@ -111,9 +119,38 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 ```
 
 > **安全模型**：MCP server 不存储 vault 密码，也不持有解密密钥。所有服务器访问必须经过 MyShell GUI——ssh_exec 在 GUI 终端标签页内执行（用户已在 GUI 中解锁 vault），SFTP 工具通过 IPC 向 GUI 请求解密后的连接凭证。GUI↔MCP 的 localhost IPC 桥要求**每条命令携带随机会话令牌**（写入用户配置目录的端口文件中，受用户目录 ACL 保护；令牌缺失/错误一律在分发动作前拒绝），本机其他用户的进程无法再窃取凭证。**所有工具（除任务状态查询）都要求保险库已解锁**：GUI 未运行时 MCP 自动拉起应用（含识别并清理崩溃残留的 IPC 端口文件）；保险库锁定时立即返回明确的「保险库未解锁」错误并把 MyShell 窗口置顶（密码门正对用户），不做静默等待——解锁后重试即恢复。锁定状态下连 `list_connections` 都不可用，AI 无法获取任何连接元数据。
-暴露 15 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过；用户点「取消」拒绝时返回硬性停止（HARD STOP）错误——AI 必须立即停止当前任务的所有后续操作（不重试、不换工具绕过）、向用户输出任务进度说明，并等待用户明确确认是否继续（`ssh_run` 后台任务拒绝后经 `ssh_status` 同样处理）。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz -r`/`rz`（lrzsz）走 ZMODEM 协议传输文件，双向支持目录递归（zmodem_download 子树按相对路径镜像到 local_dir；zmodem_upload 目录展开后按相对路径 offer，远端 rz 重建目录树），用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 sftp_*，SFTP 不可用时才用 zmodem_*。
+暴露 15 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过；命令类确认（`ssh_exec` / `ssh_run`）会逐条列出命中的黑名单规则及具体危害说明，弹窗出现时 MyShell 窗口自动置顶、聚焦并闪烁任务栏，避免人工审核被遗漏；用户点「取消」拒绝时返回硬性停止（HARD STOP）错误——AI 必须立即停止当前任务的所有后续操作（不重试、不换工具绕过）、向用户输出任务进度说明，并等待用户明确确认是否继续（`ssh_run` 后台任务拒绝后经 `ssh_status` 同样处理）。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz -r`/`rz`（lrzsz）走 ZMODEM 协议传输文件，双向支持目录递归（zmodem_download 子树按相对路径镜像到 local_dir；zmodem_upload 目录展开后按相对路径 offer，远端 rz 重建目录树），用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 zmodem_*，技术性失败（如远端无 lrzsz）时再回退 sftp_*。
 
 ## 更新日志
+
+### v2.14.0（2026-09-05）
+
+#### ✨ 新增
+
+- **FTP/FTPS 功能闭环**：FTP 连接支持 explicit FTPS（rustls 标准信任链）与 implicit FTPS；FTP 上传/下载与 SFTP 同一套传输 UI（递归展开、进度浮层、取消、错误列表）；并修复 FTP 会话归还导致第二次操作必失败的 bug。
+- **MCP 高危命令确认弹窗新增「危害说明」**：逐条列出命中的黑名单规则及具体危害（约 70 条内置描述，自定义规则回退显示正则），弹窗自动置顶、聚焦、闪烁任务栏提醒人工审核，headless MessageBoxW 详情同步附带。
+
+#### 🛠️ 优化
+
+- **连接后展示登录横幅**：Last login 时间/IP 与 MOTD，对齐 Xshell 首屏体验——修复前端监听就绪前的 banner 字节丢失。
+- **降低确认噪音**：mkdir/touch 移出默认黑名单（只创建不覆盖不删除）；git/docker/kubectl 改为写子命令才确认（status/log/diff、ps/logs、get 免确认）；curl 收窄为带写文件/发数据参数才确认（纯 GET 免确认），wget 保持整体确认。
+- **MCP 文件传输顺序反转**：zmodem（rz/sz）优先，技术性失败（如远端无 lrzsz、超时）后再回退 SFTP——工具描述与系统提示同步翻转，用户拒绝确认弹窗仍为硬停止不回退。
+
+#### 🐛 修复
+
+- **中文 locale 服务器系统监控内存显示 0 B/0 B**（如 Ubuntu zh_CN）：内存改为直读 /proc/meminfo（free -b 兜底），不再受 free 本地化标签影响。
+
+#### 🔒 安全
+
+- **修复 MCP 命令确认白名单绕过**：改为逐命令段判定（引号/转义感知），白名单不再能豁免黑名单命中，GUI 与 MCP 共用同一 Rust 判定。
+- **修复 Windows 下 SFTP 递归下载本地路径逃逸**：远端文件名严格按单一路径组件校验（反斜杠/盘符/保留设备名/尾点尾空格等），构建目标前检查符号链接与 reparse point。
+- **suppaftp 8.0.5 → 10.0.2**（RUSTSEC-2026-0271 FTP CRLF 命令注入），并在后端对所有 FTP 参数统一拒绝 CR/LF/NUL。
+- **密码查看改为后端原子「验证主密码 + 解密」命令**（reveal_connection_password），WebView 无法再绕过前端二次验证。
+- **GUI localhost IPC 加固**：单请求上限 1 MiB、并发连接上限 32、逐连接线程处理，长 exec_in_tab 不再阻塞后续请求。
+- **修复「一键配置 MCP」对损坏配置的覆盖风险**：无效 JSON 直接报错不写、非对象节点拒绝覆盖、临时文件 + rename 原子写、原文件自动备份 .bak。
+- **命令历史与快捷命令 AES-GCM 加密存储**（保险库解锁后自动迁移旧明文），并提供后端强制的「不记录命令历史」开关。
+- **封堵黑名单 wrapper 绕过**：nohup/xargs/env/timeout/nice/setsid/busybox 等 13 个中性前缀在判定前剥离，`find | xargs rm`、`nohup rm -rf`、`ps|awk|xargs kill` 不再免确认。
+- **补齐高危命令默认黑名单**：npx/bun/uv、nc/socat（反弹 shell）、modprobe/insmod（内核模块）、chattr、wipefs/sfdisk、ip/ifconfig/nmcli（自断连接）、doas/pkexec/runuser（提权）、dpkg/rpm、systemd-run/update-rc.d（持久化）、supervisorctl、fuser -k、chpasswd、setenforce、sysctl、podman、terraform/ansible/helm、aws/gcloud/az 等云 CLI。
 
 ### v2.13.0（2026-09-02）
 

@@ -193,7 +193,7 @@ const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(120);
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TransferProgressPayload {
+pub(crate) struct TransferProgressPayload {
     request_id: String,
     /// "upload" | "download" — drives the overlay label.
     phase: &'static str,
@@ -206,12 +206,14 @@ struct TransferProgressPayload {
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TransferDonePayload {
-    request_id: String,
-    errors: Vec<String>,
+pub(crate) struct TransferDonePayload {
+    pub(crate) request_id: String,
+    pub(crate) errors: Vec<String>,
 }
 
-fn emit_transfer_progress(
+/// Shared with ftp.rs — FTP transfers emit the SAME event contract so the
+/// frontend's transfer overlay works unchanged for either protocol.
+pub(crate) fn emit_transfer_progress(
     sink: &dyn EventSink,
     request_id: &str,
     phase: &'static str,
@@ -238,8 +240,8 @@ fn emit_transfer_progress(
 /// Best-effort basename. Using `Path::file_name` (not a naive rsplit on `/`)
 /// avoids a Windows local path like `C:\Users\foo\bar.txt` leaking the
 /// directory into the remote filename. Falls back to the full path on weird
-/// input so the UI still shows *something*.
-fn basename(path: &str) -> String {
+/// input so the UI still shows *something*. Shared with ftp.rs.
+pub(crate) fn basename(path: &str) -> String {
     Path::new(path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -429,9 +431,17 @@ async fn expand_download_one(
         }
     };
     if !md.is_dir() {
+        // The remote name is attacker-controlled data. A POSIX-legal name like
+        // `..\evil.txt` would become a Windows path separator client-side and
+        // escape the download dir — reject instead of writing.
+        let name = basename(remote_path);
+        if let Err(reason) = crate::path_safety::validate_component(&name) {
+            errors.push(format!("{}: {}", name, reason));
+            return;
+        }
         tasks.push(DownloadTask {
             remote_path: remote_path.to_string(),
-            relative: basename(remote_path),
+            relative: name,
             size: md.size.unwrap_or(0),
         });
         return;
@@ -440,8 +450,24 @@ async fn expand_download_one(
         let n = basename(remote_path);
         if n.is_empty() { "root".to_string() } else { n }
     };
+    if let Err(reason) = crate::path_safety::validate_component(&root_name) {
+        errors.push(format!("{}: {}", root_name, reason));
+        return;
+    }
     dirs.push(root_name.clone());
     expand_dir_recursive(sftp, remote_path, &root_name, tasks, dirs, errors, depth).await;
+}
+
+/// Split a "/"-joined relative task path into validated components and build
+/// the local absolute path under `dest`. Component-wise construction means
+/// the result cannot escape `dest` — no remote-derived string is ever handed
+/// to `Path::join`.
+fn local_components(dest: &str, relative: &str) -> Result<std::path::PathBuf, String> {
+    let parts: Vec<&str> = relative.split('/').collect();
+    for p in &parts {
+        crate::path_safety::validate_component(p)?;
+    }
+    Ok(crate::path_safety::build_path(Path::new(dest), &parts))
 }
 
 /// Walk one remote folder level, appending file tasks and relative sub-dirs.
@@ -464,6 +490,12 @@ async fn expand_dir_recursive(
     for entry in entries {
         let name = entry.file_name();
         if name == "." || name == ".." {
+            continue;
+        }
+        // Reject names that can't form ONE local filename component (the
+        // expand-download root validates the same way).
+        if let Err(reason) = crate::path_safety::validate_component(&name) {
+            errors.push(format!("{}/{}: {}", rel_prefix, name, reason));
             continue;
         }
         let full = if remote_dir.ends_with('/') {
@@ -525,10 +557,21 @@ pub async fn download(
     }
     // Materialize the folder skeleton before transferring so files always
     // have a parent to land in — and empty folders survive the copy.
+    // Paths are rebuilt from validated components (never `join`ed from remote
+    // strings) and checked for symlinks BEFORE create_dir_all, so an
+    // attacker-planted link can't redirect the directory creation.
     for d in &dirs {
-        let p = Path::new(local_dest_dir).join(d);
-        if let Err(e) = tokio::fs::create_dir_all(&p).await {
-            errors.push(format!("{}: 创建本地目录失败: {}", d, e));
+        match local_components(local_dest_dir, d) {
+            Ok(p) => {
+                if let Err(e) = crate::path_safety::ensure_no_symlink_components(&p).await {
+                    errors.push(format!("{}: {}", d, e));
+                    continue;
+                }
+                if let Err(e) = tokio::fs::create_dir_all(&p).await {
+                    errors.push(format!("{}: 创建本地目录失败: {}", d, e));
+                }
+            }
+            Err(reason) => errors.push(format!("{}: {}", d, reason)),
         }
     }
     let file_count = tasks.len();
@@ -565,7 +608,17 @@ pub async fn download(
                     break;
                 }
                 let task = tasks[i].clone();
-                let local_path = Path::new(&dest).join(&task.relative);
+                // Rebuild the local path from validated components — never
+                // `Path::join` a remote-derived string (backslash trap).
+                let local_path = match local_components(&dest, &task.relative) {
+                    Ok(p) => p,
+                    Err(reason) => {
+                        if let Ok(mut g) = worker_errors.lock() {
+                            g.push(format!("{}: {}", task.relative, reason));
+                        }
+                        continue;
+                    }
+                };
                 // Progress slot = files completed so far — a monotonic
                 // counter that reads naturally when files run in parallel.
                 let slot = files_done.load(Ordering::Relaxed);
@@ -637,6 +690,12 @@ async fn download_one(
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let name = basename(remote_path);
+    // A pre-planted local symlink (leaf or any ancestor) must not redirect
+    // the write outside the destination — check before open/create.
+    if let Err(e) = crate::path_safety::ensure_no_symlink_components(Path::new(local_path)).await {
+        log::warn!("[sftp] download {} blocked: {}", name, e);
+        return Err(format!("{}: {}", name, e));
+    }
     // open() = READ.
     let mut remote = sftp
         .open(remote_path)

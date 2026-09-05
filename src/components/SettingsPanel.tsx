@@ -19,6 +19,8 @@ import {
   showInFolder,
   getCommandRules,
   setCommandRules,
+  getAppSettings,
+  setAppSettings,
 } from "../api";
 import type { CommandRules } from "../api";
 import type { BackupInfo, AiToolInfo } from "../api";
@@ -175,6 +177,13 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
     setSftpConcurrencyState(n);
     setSftpDownloadConcurrency(n);
   };
+  // ── Privacy: backend-enforced command-history switch (settings.json) ──
+  const [disableCommandHistory, setDisableCommandHistory] = useState(false);
+  useEffect(() => {
+    getAppSettings()
+      .then((s) => setDisableCommandHistory(s.disable_command_history))
+      .catch(() => {});
+  }, []);
 
   // ── MCP server state ──
   const [mcpEnabled, setMcpEnabled] = useState(false);
@@ -2487,6 +2496,36 @@ export function SettingsPanel({ onClose, onRefresh, connectionCount, onOpenQuick
                 <option value="0">不启用</option>
               </select>
             </Field>
+          </Section>
+
+          <Divider />
+
+          {/* Privacy Section — backend-enforced history switch */}
+          <Section title="🛡️ 隐私">
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 14, lineHeight: 1.6 }}>
+              命令历史已始终加密存储（随保险库解锁）。开启下方开关后，后端将不再记录任何命令历史（已保存的历史保留，可按连接清空）。
+            </div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+              <div>
+                <div style={{ fontSize: 13, color: "var(--text-primary)" }}>不记录命令历史</div>
+                <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
+                  适合执行含临时令牌、内联密码等敏感命令的场景。立即生效。
+                </div>
+              </div>
+              <Toggle
+                checked={disableCommandHistory}
+                onChange={async (next) => {
+                  setDisableCommandHistory(next);
+                  try {
+                    await setAppSettings({
+                      disable_command_history: next,
+                    });
+                  } catch {
+                    setDisableCommandHistory(!next);
+                  }
+                }}
+              />
+            </div>
           </Section>
 
           <Divider />

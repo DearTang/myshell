@@ -87,6 +87,25 @@ fn denied_by_user_text(tool: &str, detail: &str) -> String {
     )
 }
 
+/// Danger notes for `command` (from the built-in knowledge base in
+/// command_rules), formatted as a "检测到的危险点" block appended to the
+/// confirmation detail. Makes the MessageBoxW specific — the user sees WHICH
+/// rule matched and WHAT it destroys, not a bare "高危". Empty string when
+/// nothing matched (confirmation is still driven by command_needs_confirmation).
+fn danger_reasons_text(command: &str) -> String {
+    let rules = load_command_rules();
+    let reasons = command_rules::command_danger_reasons(command, &rules);
+    if reasons.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = reasons
+        .iter()
+        .enumerate()
+        .map(|(i, r)| format!("  {}. {}", i + 1, r))
+        .collect();
+    format!("\n\n⚠ 检测到的危险点:\n{}", lines.join("\n"))
+}
+
 // ============ MCP Protocol (JSON-RPC 2.0 over stdio, Content-Length framed) ============
 
 /// Read one JSON-RPC message from stdin.
@@ -226,11 +245,11 @@ WORKFLOW:\n\
 SAFETY: ssh_exec uses a **configurable whitelist/blacklist** to decide which commands need human confirmation. Read-only commands (ps, ls, cat, grep, df, ...) run WITHOUT a dialog. Dangerous commands (rm, kill, sudo, shutdown, write-redirects, pipe-to-shell, ...) trigger a NATIVE OS confirmation dialog the USER must click — you cannot bypass it. Before calling a dangerous command, briefly tell the user a dialog is coming. If they click Cancel, the tool returns a HARD STOP error ('⛔ 用户已拒绝高危操作'): immediately stop ALL further operations — do NOT retry the command, do NOT switch tools/paths/connections to work around it, do NOT continue to the next step of the task. Instead, output a summary of the current task (what you were doing, which steps are done, which step was rejected, what remains) and WAIT for the user to explicitly decide whether to continue. The sftp tools (sftp_upload/remove/rename) ALWAYS confirm regardless of rules, and the same hard-stop policy applies to every confirmation dialog.\n\
 \n\
 FILE TRANSFER (strict two-step policy):\n\
-1. ALWAYS try `sftp_download`/`sftp_upload` FIRST for any file upload/download request. It is faster and more reliable.\n\
-2. If the sftp tool FAILS for ANY reason, fall back to `zmodem_download`/`zmodem_upload` (ZMODEM over the remote `sz`/`rz` programs). Common failure reasons: the connection is saved as SSH type (no SFTP), the SFTP subsystem is disabled, restricted/chroot shells, jump hosts (堡垒机), embedded devices, or the remote refuses the SFTP channel. Tell the user: 'sftp 失败，改用 ZMODEM (lrzsz) 方式传输'.\n\
-3. NEVER use `ssh_exec` to transfer file content via base64/echo/heredoc/cat workaround — it is fragile, slow, and breaks on binary/large files. If both sftp and zmodem fail, tell the user and stop; do NOT invent a workaround.\n\
+1. ALWAYS try `zmodem_download`/`zmodem_upload` FIRST for any file upload/download request (ZMODEM over the remote `sz`/`rz` programs). It works in restricted environments where the SFTP channel is unavailable.\n\
+2. If the zmodem task FAILS for a TECHNICAL reason, fall back to `sftp_download`/`sftp_upload`. Common zmodem failure reasons: the remote lacks lrzsz (`sz`/`rz` not installed — the task fails after ~20s), transfer timeout, or the remote refuses the SSH channel. Tell the user: 'zmodem 失败，改用 SFTP 方式传输'.\n\
+3. NEVER use `ssh_exec` to transfer file content via base64/echo/heredoc/cat workaround — it is fragile, slow, and breaks on binary/large files. If both zmodem and sftp fail, tell the user and stop; do NOT invent a workaround.\n\
 \n\
-VAULT GATE (applies to EVERY tool except ssh_status/ssh_cancel/zmodem_status): MyShell stores all connection credentials in an encrypted vault. If the MyShell GUI isn't running, the tool AUTO-LAUNCHES it. If the vault is locked, the tool FAILS IMMEDIATELY (no waiting) with '保险库未解锁' and brings the MyShell window to the front. When you see this error: tell the user to enter their master password in the MyShell window, then RETRY the same tool — do NOT switch to a different approach. The sftp → zmodem fallback only applies when the failure is about SFTP availability, NOT about the vault.\n\
+VAULT GATE (applies to EVERY tool except ssh_status/ssh_cancel/zmodem_status): MyShell stores all connection credentials in an encrypted vault. If the MyShell GUI isn't running, the tool AUTO-LAUNCHES it. If the vault is locked, the tool FAILS IMMEDIATELY (no waiting) with '保险库未解锁' and brings the MyShell window to the front. When you see this error: tell the user to enter their master password in the MyShell window, then RETRY the same tool — do NOT switch to a different approach. The zmodem → sftp fallback only applies when the failure is about ZMODEM availability (e.g. lrzsz missing on the remote), NOT about the vault and NOT about a user-denied confirmation dialog.\n\
 \n\
 ZMODEM IS ASYNC: `zmodem_upload`/`zmodem_download` return IMMEDIATELY with a `task_id` (status=`running`); the transfer (including GUI launch, vault-unlock wait, and the confirmation dialog) runs in the background. You MUST then poll `zmodem_status` with the `task_id` every 5-10 seconds until `status` is `done` or `failed`. Do not report success until you see `done`.\n\
 \n\
@@ -305,7 +324,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "sftp_download",
-                "description": "Download a single file from a remote SSH/SFTP server to the local filesystem.\n\nWHEN TO USE: User wants to fetch a remote file — e.g. 'download /etc/nginx/nginx.conf from web1', 'grab yesterday's log from /var/log/myapp.log'. Read-only on the server; writes to local disk.\n\nWHEN NOT TO USE: For reading a file's content into the conversation, you usually want to download it first then read it locally. Don't try to 'stream' large files — download to disk.\n\nOUTPUT: Confirmation message on success. The local file is overwritten if it exists.",
+                "description": "Download a single file from a remote SSH/SFTP server to the local filesystem.\n\nWHEN TO USE: User wants to fetch a remote file — e.g. 'download /etc/nginx/nginx.conf from web1', 'grab yesterday's log from /var/log/myapp.log'. Read-only on the server; writes to local disk.\n\nWHEN NOT TO USE: For reading a file's content into the conversation, you usually want to download it first then read it locally. Don't try to 'stream' large files — download to disk.\n\nFALLBACK ORDER: `zmodem_download` is tried FIRST; use this tool when the ZMODEM task fails (e.g. lrzsz missing on the remote) or the user explicitly asked for SFTP.\n\nOUTPUT: Confirmation message on success. The local file is overwritten if it exists.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -318,7 +337,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "sftp_upload",
-                "description": "Upload a single local file to a remote SSH/SFTP server.\n\nWHEN TO USE: User wants to push a file — e.g. 'deploy this config to /etc/nginx/nginx.conf', 'copy the new build to /var/www/html'. If `remote_path` is an existing file, it WILL be overwritten (no backup).\n\n⚠️ HUMAN CONFIRMATION REQUIRED: A native OS dialog pops up warning the user about the upload (potential overwrite). Won't proceed until the user clicks 'Yes'.\n\nOUTPUT: Confirmation message. The remote filename is taken from the local file's basename; only the remote *directory* path is used from `remote_path`.",
+                "description": "Upload a single local file to a remote SSH/SFTP server.\n\nWHEN TO USE: User wants to push a file — e.g. 'deploy this config to /etc/nginx/nginx.conf', 'copy the new build to /var/www/html'. If `remote_path` is an existing file, it WILL be overwritten (no backup).\n\nFALLBACK ORDER: `zmodem_upload` is tried FIRST; use this tool when the ZMODEM task fails (e.g. lrzsz missing on the remote) or the user explicitly asked for SFTP.\n\n⚠️ HUMAN CONFIRMATION REQUIRED: A native OS dialog pops up warning the user about the upload (potential overwrite). Won't proceed until the user clicks 'Yes'.\n\nOUTPUT: Confirmation message. The remote filename is taken from the local file's basename; only the remote *directory* path is used from `remote_path`.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -433,7 +452,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "zmodem_download",
-                "description": "Download a file from a remote SSH server using the ZMODEM protocol (remote `sz` → local). This is the FALLBACK transfer method — use it when `sftp_download` fails or is unavailable.\n\nWHEN TO USE (strict two-step policy):\n1. First call `sftp_download` for the same file. In most cases it succeeds and is faster.\n2. If `sftp_download` fails for ANY reason (connection is SSH-only with no SFTP saved, SFTP subsystem disabled, restricted/chroot shell, jump host, embedded device, etc.), call THIS tool as the fallback. Tell the user: 'sftp 失败，改用 ZMODEM (lrzsz) 方式传输'.\n3. If the user explicitly asked for ZMODEM/sz, use this tool directly.\n\nNEVER use `ssh_exec` + base64/cat/heredoc to transfer file content — it breaks on binary/large files. If both sftp and zmodem fail, tell the user and stop.\n\nPREREQUISITE: The remote server must have `sz` installed (part of the `lrzsz` package). If it's missing, the task fails after ~20s with a hint to install lrzsz.\n\nASYNC: returns IMMEDIATELY with {task_id, status:\"running\"}; the transfer runs in the background. The GUI auto-launches if it isn't running; a locked vault fails the tool call INSTANTLY with '保险库未解锁' (the MyShell window is brought to the front for the user) — tell the user to unlock, then retry. No human confirmation dialog (read-only on the remote).\n\nFINAL RESULT: when `zmodem_status` returns status=\"done\", its `result` field has `{files:[{name, local_path, bytes}]}`.\n\nNOTE: the `timeout` param (default 120s) caps the background transfer, not the tool-call window (which is <1s).",
+                "description": "Download a file from a remote SSH server using the ZMODEM protocol (remote `sz` → local). This is the PREFERRED transfer method — try it first for file downloads.\n\nWHEN TO USE (strict two-step policy):\n1. First call THIS tool for the download. ZMODEM works in restricted environments where SFTP is unavailable (connection saved as SSH-only with no SFTP, SFTP subsystem disabled, restricted/chroot shell, jump host, embedded device, etc.).\n2. If the ZMODEM task fails for a TECHNICAL reason (most commonly `sz` missing on the remote — the task fails after ~20s with a hint to install lrzsz, or transfer timeout), fall back to `sftp_download`. Tell the user: 'zmodem 失败，改用 SFTP 方式传输'. Do NOT fall back after a user-denied confirmation dialog — that is a hard stop.\n3. If the user explicitly asked for SFTP, use `sftp_download` directly.\n\nNEVER use `ssh_exec` + base64/cat/heredoc to transfer file content — it breaks on binary/large files. If both zmodem and sftp fail, tell the user and stop.\n\nPREREQUISITE: The remote server must have `sz` installed (part of the `lrzsz` package). If it's missing, the task fails after ~20s with a hint to install lrzsz.\n\nASYNC: returns IMMEDIATELY with {task_id, status:\"running\"}; the transfer runs in the background. The GUI auto-launches if it isn't running; a locked vault fails the tool call INSTANTLY with '保险库未解锁' (the MyShell window is brought to the front for the user) — tell the user to unlock, then retry. No human confirmation dialog (read-only on the remote).\n\nFINAL RESULT: when `zmodem_status` returns status=\"done\", its `result` field has `{files:[{name, local_path, bytes}]}`.\n\nNOTE: the `timeout` param (default 120s) caps the background transfer, not the tool-call window (which is <1s).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -447,7 +466,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "zmodem_upload",
-                "description": "Upload a local file to a remote SSH server using the ZMODEM protocol (local → remote `rz`). This is the FALLBACK transfer method — use it when `sftp_upload` fails or is unavailable.\n\nWHEN TO USE (strict two-step policy):\n1. First call `sftp_upload` for the same file. In most cases it succeeds and is faster.\n2. If `sftp_upload` fails for ANY reason (connection is SSH-only with no SFTP saved, SFTP subsystem disabled, restricted/chroot shell, jump host, embedded device, etc.), call THIS tool as the fallback. Tell the user: 'sftp 失败，改用 ZMODEM (lrzsz) 方式传输'.\n3. If the user explicitly asked for ZMODEM/rz, use this tool directly.\n\nNEVER use `ssh_exec` + base64/cat/heredoc/echo to transfer file content — it breaks on binary/large files. If both sftp and zmodem fail, tell the user and stop.\n\nPREREQUISITE: The remote server must have `rz` installed (part of the `lrzsz` package). If missing, the task fails after ~20s.\n\nASYNC: returns IMMEDIATELY with {task_id, status:\"running\"}; the transfer runs in the background. The GUI auto-launches if it isn't running; a locked vault fails the tool call INSTANTLY with '保险库未解锁' (the MyShell window is brought to the front for the user) — tell the user to unlock, then retry. The OS confirmation dialog pops AFTER the tool returns — remind the user to click it if the first `zmodem_status` poll shows phase=`Confirming`. You MUST then poll `zmodem_status(task_id)` every 5-10s until status is `done` or `failed`.\n\n⚠️ HUMAN CONFIRMATION REQUIRED: A native OS dialog pops up (writing to the remote server). Won't proceed until the user clicks 'Yes'. This happens AFTER the tool returns, in the background.\n\nFINAL RESULT: when `zmodem_status` returns status=\"done\", its `result` field has `{remote_path, bytes}`.\n\nNOTE: the `timeout` param (default 120s) caps the background transfer, not the tool-call window (which is <1s).",
+                "description": "Upload a local file to a remote SSH server using the ZMODEM protocol (local → remote `rz`). This is the PREFERRED transfer method — try it first for file uploads.\n\nWHEN TO USE (strict two-step policy):\n1. First call THIS tool for the upload. ZMODEM works in restricted environments where SFTP is unavailable (connection saved as SSH-only with no SFTP, SFTP subsystem disabled, restricted/chroot shell, jump host, embedded device, etc.).\n2. If the ZMODEM task fails for a TECHNICAL reason (most commonly `rz` missing on the remote — the task fails after ~20s, or transfer timeout), fall back to `sftp_upload`. Tell the user: 'zmodem 失败，改用 SFTP 方式传输'. Do NOT fall back after a user-denied confirmation dialog — that is a hard stop.\n3. If the user explicitly asked for SFTP, use `sftp_upload` directly.\n\nNEVER use `ssh_exec` + base64/cat/heredoc/echo to transfer file content — it breaks on binary/large files. If both zmodem and sftp fail, tell the user and stop.\n\nPREREQUISITE: The remote server must have `rz` installed (part of the `lrzsz` package). If missing, the task fails after ~20s.\n\nASYNC: returns IMMEDIATELY with {task_id, status:\"running\"}; the transfer runs in the background. The GUI auto-launches if it isn't running; a locked vault fails the tool call INSTANTLY with '保险库未解锁' (the MyShell window is brought to the front for the user) — tell the user to unlock, then retry. The OS confirmation dialog pops AFTER the tool returns — remind the user to click it if the first `zmodem_status` poll shows phase=`Confirming`. You MUST then poll `zmodem_status(task_id)` every 5-10s until status is `done` or `failed`.\n\n⚠️ HUMAN CONFIRMATION REQUIRED: A native OS dialog pops up (writing to the remote server). Won't proceed until the user clicks 'Yes'. This happens AFTER the tool returns, in the background.\n\nFINAL RESULT: when `zmodem_status` returns status=\"done\", its `result` field has `{remote_path, bytes}`.\n\nNOTE: the `timeout` param (default 120s) caps the background transfer, not the tool-call window (which is <1s).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -854,7 +873,12 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             // ── Confirmation check (headless path) ──
             if command_rules::command_needs_confirmation(command, &rules) {
-                let detail = format!("在服务器 [{}] 执行命令: {}", conn_name, command);
+                let detail = format!(
+                    "在服务器 [{}] 执行命令: {}{}",
+                    conn_name,
+                    command,
+                    danger_reasons_text(command)
+                );
                 if !confirm_dangerous_operation("ssh_exec（远程命令执行）", &detail) {
                     return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("ssh_exec", &detail) }], "isError": true }));
                 }
@@ -2265,7 +2289,9 @@ async fn run_download_task(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ZmodemEvent>();
     let sink = Arc::new(McpZmodemSink::new(tx));
 
-    let session_id = match ssh::connect(app, sink.clone(), config).await {
+    // hold_startup=false: headless ZMODEM task — a startup hold would swallow
+    // early ZMODEM protocol bytes until a FrontendReady that never comes.
+    let session_id = match ssh::connect(app, sink.clone(), config, false).await {
         Ok(id) => id,
         Err(e) => {
             fail(format!("SSH 连接失败: {}", e));
@@ -2519,7 +2545,9 @@ async fn run_upload_task(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ZmodemEvent>();
     let sink = Arc::new(McpZmodemSink::new(tx));
 
-    let session_id = match ssh::connect(app, sink.clone(), config).await {
+    // hold_startup=false: headless ZMODEM task — a startup hold would swallow
+    // early ZMODEM protocol bytes until a FrontendReady that never comes.
+    let session_id = match ssh::connect(app, sink.clone(), config, false).await {
         Ok(id) => id,
         Err(e) => {
             fail(format!("SSH 连接失败: {}", e));
@@ -2715,7 +2743,12 @@ async fn run_ssh_exec_task(
 
     // Phase 1: confirmation (if needed). Skipped for safe commands.
     if needs_confirm {
-        let detail = format!("ssh_run 在服务器 [{}] 上执行: {}", conn_name, command);
+        let detail = format!(
+            "ssh_run 在服务器 [{}] 上执行: {}{}",
+            conn_name,
+            command,
+            danger_reasons_text(command)
+        );
         if !confirm_dangerous_operation("ssh_run（后台执行）", &detail) {
             fail(denied_by_user_text("ssh_run", &detail));
             return;

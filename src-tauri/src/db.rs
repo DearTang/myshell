@@ -150,6 +150,17 @@ pub fn init_db() -> Result<Connection> {
     if !column_exists(&conn, "ai_models", "is_enabled") {
         conn.execute("ALTER TABLE ai_models ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1", [])?;
     }
+    // command_enc / content_enc — AES-GCM ciphertext columns for stored
+    // command text. Terminal commands often embed tokens or inline secrets;
+    // they now live encrypted under the vault DEK (migrated at unlock —
+    // see `migrate_plaintext_history`). The plaintext `command` column stays
+    // NOT NULL for schema compat but is written as ''.
+    if !column_exists(&conn, "command_history", "command_enc") {
+        conn.execute("ALTER TABLE command_history ADD COLUMN command_enc TEXT", [])?;
+    }
+    if !column_exists(&conn, "quick_commands", "command_enc") {
+        conn.execute("ALTER TABLE quick_commands ADD COLUMN command_enc TEXT", [])?;
+    }
     Ok(conn)
 }
 
@@ -1167,8 +1178,18 @@ fn like_prefix_pattern(prefix: &str) -> String {
 // Created_at is an epoch-seconds string (same scheme as `folders`); we
 // additionally order by `id DESC` as a stable tiebreaker for sub-second
 // bursts (rapid-fire pastes, scripted `ssh_send` from broadcast).
+//
+// SECURITY: `command` text is stored ONLY as AES-GCM ciphertext in
+// `command_enc` (the plaintext column stays for schema compat, always '').
+// Every add/list takes the vault DEK — locked vault means fail-closed.
 
-pub fn add_command_history(conn: &Connection, connection_id: &str, command: &str, created_at: &str) -> Result<i64> {
+pub fn add_command_history(
+    conn: &Connection,
+    key: &[u8; 32],
+    connection_id: &str,
+    command: &str,
+    created_at: &str,
+) -> Result<i64> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return Ok(0);
@@ -1176,18 +1197,32 @@ pub fn add_command_history(conn: &Connection, connection_id: &str, command: &str
 
     let tx = conn.unchecked_transaction()?;
 
-    // Delete any existing UNPINNED entry with the same command (dedup across
-    // recent history). Preserve pinned entries — without `AND pinned = 0`
-    // re-running a command the user pinned would silently delete the pin.
-    tx.execute(
-        "DELETE FROM command_history WHERE connection_id = ?1 AND command = ?2 AND pinned = 0",
-        params![connection_id, trimmed],
-    )?;
+    // Dedup across recent history: delete any existing UNPINNED entry with
+    // the same command. Ciphertexts use a random nonce, so equality must be
+    // decided by DECRYPTING candidates — can't be done in SQL.
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, command_enc FROM command_history WHERE connection_id = ?1 AND pinned = 0",
+        )?;
+        let candidates: Vec<(i64, Option<String>)> = stmt
+            .query_map(params![connection_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, enc) in candidates {
+            let matches = decrypt_field(key, enc)
+                .map(|pt| pt.as_deref() == Some(trimmed))
+                .unwrap_or(false);
+            if matches {
+                tx.execute("DELETE FROM command_history WHERE id = ?1", params![id])?;
+            }
+        }
+    }
 
     tx.execute(
-        "INSERT INTO command_history (connection_id, command, pinned, created_at, pinned_at)
-         VALUES (?1, ?2, 0, ?3, NULL)",
-        params![connection_id, trimmed, created_at],
+        "INSERT INTO command_history (connection_id, command, command_enc, pinned, created_at, pinned_at)
+         VALUES (?1, '', ?2, 0, ?3, NULL)",
+        params![connection_id, encrypt_field(key, trimmed)?, created_at],
     )?;
     let new_id = tx.last_insert_rowid();
 
@@ -1208,20 +1243,24 @@ pub fn add_command_history(conn: &Connection, connection_id: &str, command: &str
     Ok(new_id)
 }
 
-pub fn list_command_history(conn: &Connection, connection_id: &str) -> Result<Vec<(i64, String, bool, String)>> {
+pub fn list_command_history(
+    conn: &Connection,
+    key: &[u8; 32],
+    connection_id: &str,
+) -> Result<Vec<(i64, String, bool, String)>> {
     // Pinned first (by pinned_at DESC — most recently pinned wins top spot,
     // falling back to id DESC when pinned_at ties or is null), then up to 50
     // most-recent unpinned. We select all columns needed for sorting and let
     // the outer ORDER BY reference them.
     let mut stmt = conn.prepare(
-        "SELECT id, command, pinned, created_at, pinned_at FROM (
-            SELECT id, command, pinned, created_at, pinned_at FROM command_history
+        "SELECT id, command_enc, pinned, created_at, pinned_at FROM (
+            SELECT id, command_enc, pinned, created_at, pinned_at FROM command_history
              WHERE connection_id = ?1 AND pinned = 1
              ORDER BY pinned_at DESC, id DESC
          )
          UNION ALL
-         SELECT id, command, pinned, created_at, pinned_at FROM (
-            SELECT id, command, pinned, created_at, pinned_at FROM command_history
+         SELECT id, command_enc, pinned, created_at, pinned_at FROM (
+            SELECT id, command_enc, pinned, created_at, pinned_at FROM command_history
              WHERE connection_id = ?1 AND pinned = 0
              ORDER BY created_at DESC, id DESC
              LIMIT 50
@@ -1231,14 +1270,16 @@ pub fn list_command_history(conn: &Connection, connection_id: &str) -> Result<Ve
     let rows = stmt.query_map(params![connection_id], |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(1)?,
             row.get::<_, i64>(2)? != 0,
             row.get::<_, String>(3)?,
         ))
     })?;
     let mut out = Vec::new();
     for r in rows {
-        out.push(r?);
+        let (id, enc, pinned, created_at) = r?;
+        let command = decrypt_field(key, enc)?.unwrap_or_default();
+        out.push((id, command, pinned, created_at));
     }
     Ok(out)
 }
@@ -1282,24 +1323,33 @@ pub fn clear_command_history(conn: &Connection, connection_id: &str, include_pin
 // scope (available on every server) or a `ConnectionConfig.id` for per-server
 // scope. Multi-line commands are stored verbatim (with `\n`); line splitting
 // for ordered execution happens in the frontend before `sshSend`.
+//
+// SECURITY: same encrypted-at-rest scheme as command history — the command
+// body lives only in `command_enc`; the plaintext column stays ''.
 
 /// `(id, connection_id, label, command, sort_order)` — raw column tuple for
 /// the management listing, unwrapped into a struct in main.rs.
 type QuickCommandTuple = (i64, Option<String>, String, String, i64);
 
-/// Read a quick_commands row into [`QuickCommandTuple`].
-fn read_quick_command_row(row: &rusqlite::Row) -> rusqlite::Result<QuickCommandTuple> {
+/// Read a quick_commands row, decrypting `command_enc` with the vault DEK.
+fn read_quick_command_row(
+    key: &[u8; 32],
+    row: &rusqlite::Row,
+) -> rusqlite::Result<QuickCommandTuple> {
+    let enc: Option<String> = row.get(3)?;
+    let command = decrypt_field(key, enc)?.unwrap_or_default();
     Ok((
         row.get::<_, i64>(0)?,
         row.get::<_, Option<String>>(1)?,
         row.get::<_, String>(2)?,
-        row.get::<_, String>(3)?,
+        command,
         row.get::<_, i64>(4)?,
     ))
 }
 
 pub fn add_quick_command(
     conn: &Connection,
+    key: &[u8; 32],
     connection_id: Option<&str>,
     label: &str,
     command: &str,
@@ -1323,9 +1373,9 @@ pub fn add_quick_command(
         )?
     };
     tx.execute(
-        "INSERT INTO quick_commands (connection_id, label, command, sort_order, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![connection_id, label, command, next_order, created_at],
+        "INSERT INTO quick_commands (connection_id, label, command, command_enc, sort_order, created_at)
+         VALUES (?1, ?2, '', ?3, ?4, ?5)",
+        params![connection_id, label, encrypt_field(key, command)?, next_order, created_at],
     )?;
     let new_id = tx.last_insert_rowid();
     tx.commit()?;
@@ -1334,54 +1384,62 @@ pub fn add_quick_command(
 
 pub fn list_quick_commands(
     conn: &Connection,
+    key: &[u8; 32],
     connection_id: Option<&str>,
 ) -> Result<Vec<QuickCommandTuple>> {
     // Branch on scope to avoid relying on `connection_id IS ?1` NULL semantics
     // (whose behavior with a bound NULL can vary across SQLite versions).
     let (sql, scoped): (&str, bool) = if connection_id.is_some() {
         (
-            "SELECT id, connection_id, label, command, sort_order FROM quick_commands
+            "SELECT id, connection_id, label, command_enc, sort_order FROM quick_commands
              WHERE connection_id = ?1 ORDER BY sort_order ASC, id ASC",
             true,
         )
     } else {
         (
-            "SELECT id, connection_id, label, command, sort_order FROM quick_commands
+            "SELECT id, connection_id, label, command_enc, sort_order FROM quick_commands
              WHERE connection_id IS NULL ORDER BY sort_order ASC, id ASC",
             false,
         )
     };
     let mut stmt = conn.prepare(sql)?;
-    let rows = if scoped {
-        stmt.query_map(params![connection_id], read_quick_command_row)?
+    let mut out: Vec<QuickCommandTuple> = Vec::new();
+    // The two branches produce distinct closure types — collect separately.
+    if scoped {
+        let rows = stmt.query_map(params![connection_id], |row| read_quick_command_row(key, row))?;
+        for r in rows {
+            out.push(r?);
+        }
     } else {
-        stmt.query_map([], read_quick_command_row)?
-    };
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
+        let rows = stmt.query_map([], |row| read_quick_command_row(key, row))?;
+        for r in rows {
+            out.push(r?);
+        }
     }
     Ok(out)
 }
 
 pub fn list_quick_commands_for_connection(
     conn: &Connection,
+    key: &[u8; 32],
     connection_id: &str,
 ) -> Result<Vec<(i64, bool, String, String)>> {
     // Union of global + this connection's per-server commands. Global first
     // (is_global DESC) so shared commands surface above server-specific ones.
     let mut stmt = conn.prepare(
-        "SELECT id, (connection_id IS NULL) AS is_global, label, command
+        "SELECT id, (connection_id IS NULL) AS is_global, label, command_enc
          FROM quick_commands
          WHERE connection_id IS NULL OR connection_id = ?1
          ORDER BY is_global DESC, sort_order ASC, id ASC",
     )?;
     let rows = stmt.query_map(params![connection_id], |row| {
+        let enc: Option<String> = row.get(3)?;
+        let command = decrypt_field(key, enc)?.unwrap_or_default();
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)? != 0,
             row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
+            command,
         ))
     })?;
     let mut out = Vec::new();
@@ -1391,11 +1449,17 @@ pub fn list_quick_commands_for_connection(
     Ok(out)
 }
 
-pub fn update_quick_command(conn: &Connection, id: i64, label: &str, command: &str) -> Result<()> {
+pub fn update_quick_command(
+    conn: &Connection,
+    key: &[u8; 32],
+    id: i64,
+    label: &str,
+    command: &str,
+) -> Result<()> {
     // Scope is immutable — changing scope equals delete + re-add.
     conn.execute(
-        "UPDATE quick_commands SET label = ?2, command = ?3 WHERE id = ?1",
-        params![id, label, command],
+        "UPDATE quick_commands SET label = ?2, command = '', command_enc = ?3 WHERE id = ?1",
+        params![id, label, encrypt_field(key, command)?],
     )?;
     Ok(())
 }
@@ -1414,6 +1478,62 @@ pub fn delete_quick_command(conn: &Connection, id: i64) -> Result<()> {
 }
 
 // ============ Helpers ============
+
+/// Encrypt a value into a storable ciphertext blob. Errors surface as
+/// rusqlite failures so the caller's `?` propagates cleanly.
+fn encrypt_field(key: &[u8; 32], plaintext: &str) -> Result<String> {
+    crypto::encrypt_with_key(key, plaintext.as_bytes()).map_err(|e| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e,
+        )))
+    })
+}
+
+/// Migrate pre-encryption plaintext rows to ciphertext. Idempotent: only
+/// rows with `command_enc IS NULL AND command <> ''` are touched, and the
+/// plaintext column is blanked after a successful encrypt. Called from the
+/// GUI right after the DEK becomes available (setup + unlock).
+pub fn migrate_plaintext_history(conn: &mut Connection, key: &[u8; 32]) -> Result<usize> {
+    let mut migrated = 0usize;
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, command FROM command_history WHERE command_enc IS NULL AND command <> ''",
+        )?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, command) in rows {
+            tx.execute(
+                "UPDATE command_history SET command_enc = ?2, command = '' WHERE id = ?1",
+                params![id, encrypt_field(key, &command)?],
+            )?;
+            migrated += 1;
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, command FROM quick_commands WHERE command_enc IS NULL AND command <> ''",
+        )?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, command) in rows {
+            tx.execute(
+                "UPDATE quick_commands SET command_enc = ?2, command = '' WHERE id = ?1",
+                params![id, encrypt_field(key, &command)?],
+            )?;
+            migrated += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(migrated)
+}
 
 /// Decrypt an encrypted column value. None → None (NULL column or fresh row
 /// not yet populated). Error surfaces as a rusqlite failure so the caller's

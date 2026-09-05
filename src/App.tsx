@@ -6,7 +6,7 @@ import { TabBar } from "./components/TabBar";
 import { TerminalPanel } from "./components/TerminalPanel";
 import { SftpPanel } from "./components/SftpPanel";
 import { MultiWindowPicker } from "./components/MultiWindowPicker";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { ServerInfoPanel } from "./components/ServerInfoPanel";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 import { MasterPasswordGate } from "./components/MasterPasswordGate";
@@ -45,6 +45,8 @@ import {
   onSshOutput,
   mcpExecResult,
   getCommandRules,
+  checkCommandConfirmation,
+  checkCommandDangerReasons,
 } from "./api";
 import type { ConnectionConfig, ConnType, Tab } from "./api";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
@@ -98,60 +100,6 @@ function stripFromAnsiPosition(str: string, visibleIndex: number): string {
     i++;
   }
   return str.slice(0, i);
-}
-
-/**
- * Client-side mirror of the Rust `command_rules::command_needs_confirmation`.
- * Checks if a command matches any blacklist regex (and isn't exempted by
- * whitelist). Used in show_in_gui mode to show a React dialog instead of the
- * MCP process's raw OS MessageBoxW.
- *
- * Returns true if the command needs confirmation, false if it can run freely.
- * On any regex error, returns true (fail-safe).
- */
-function checkCommandNeedsConfirmation(command: string, rules: CommandRules): boolean {
-  const cmd = command.trim();
-  if (!cmd) return true;
-
-  // Dangerous patterns (hard floor) — always confirm.
-  if (cmd.includes("$(") || cmd.includes("`")) return true;
-  if (hasWriteRedirect(cmd)) return true;
-
-  try {
-    // Compile regexes (case-insensitive). Invalid patterns are dropped.
-    const compile = (pats: string[]) =>
-      pats.map((p) => { try { return new RegExp(p, "i"); } catch { return null; } }).filter(Boolean) as RegExp[];
-
-    const blacklistRe = compile(rules.blacklist);
-    const whitelistRe = compile(rules.whitelist);
-
-    const blacklisted = blacklistRe.some((re) => re.test(cmd));
-    if (blacklisted) {
-      // Whitelist exemption?
-      if (whitelistRe.some((re) => re.test(cmd))) return false;
-      return true;
-    }
-    return rules.confirm_unknown;
-  } catch {
-    return true; // fail-safe
-  }
-}
-
-/** Check for write-redirect to a real file (not /dev/null or fd-dup). */
-function hasWriteRedirect(cmd: string): boolean {
-  for (let i = 0; i < cmd.length; i++) {
-    if (cmd[i] === ">") {
-      let j = i + 1;
-      if (cmd[j] === ">") j++; // append
-      while (cmd[j] === " " || cmd[j] === "\t") j++;
-      const rest = cmd.slice(j);
-      if (!rest.startsWith("/dev/null") && !rest.startsWith("&")) {
-        return true;
-      }
-      i = j;
-    }
-  }
-  return false;
 }
 
 /**
@@ -284,16 +232,39 @@ export default function App() {
     command: string;
     connectionName: string;
     rules: CommandRules;
+    /** One human-readable harm note per matched danger rule (display-only). */
+    reasons: string[];
   } | null>(null);
   const mcpConfirmResolver = useRef<((ok: boolean) => void) | null>(null);
 
   /** Show a confirmation dialog for an MCP-triggered command. Returns a
-   * Promise that resolves to true (confirm) or false (cancel). */
-  function showMcpConfirm(command: string, connectionName: string, rules: CommandRules): Promise<boolean> {
+   * Promise that resolves to true (confirm) or false (cancel).
+   *
+   * While the dialog is open the window is pinned always-on-top, un-minimized,
+   * focused and taskbar-flashed: the user is usually working in another app
+   * (the AI agent's editor/terminal) when this fires, and a backgrounded
+   * dialog means the manual review silently waits forever. The pin is cleared
+   * on resolve so normal window behavior resumes. */
+  function showMcpConfirm(command: string, connectionName: string, rules: CommandRules, reasons: string[]): Promise<boolean> {
     return new Promise((resolve) => {
       mcpConfirmResolver.current = resolve;
-      setMcpConfirm({ command, connectionName, rules });
+      setMcpConfirm({ command, connectionName, rules, reasons });
+      const win = getCurrentWindow();
+      win.setAlwaysOnTop(true).catch(() => {});
+      win.unminimize().catch(() => {});
+      win.show().catch(() => {});
+      win.setFocus().catch(() => {});
+      win.requestUserAttention(UserAttentionType.Critical).catch(() => {});
     });
+  }
+
+  /** Close the MCP confirm dialog with `ok`, resolving the awaiting exec flow
+   * and restoring normal (non-topmost) window behavior. */
+  function resolveMcpConfirm(ok: boolean) {
+    setMcpConfirm(null);
+    mcpConfirmResolver.current?.(ok);
+    mcpConfirmResolver.current = null;
+    getCurrentWindow().setAlwaysOnTop(false).catch(() => {});
   }
 
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
@@ -708,12 +679,17 @@ export default function App() {
           // beautiful React dialog instead of a raw Windows MessageBoxW.
           try {
             const rules = await getCommandRules();
-            // Simple client-side check: if the command matches a blacklist
-            // regex and no whitelist regex matches, show confirmation.
-            const needsConfirm = checkCommandNeedsConfirmation(command, rules);
+            // Backend decides — the GUI must not re-implement the policy.
+            // (A drifted client-side copy previously allowed whitelist
+            // bypasses on compound commands.)
+            const needsConfirm = await checkCommandConfirmation(command);
             if (needsConfirm) {
               const connectionName = config.name || connection_id;
-              const confirmed = await showMcpConfirm(command, connectionName, rules);
+              // Why it was flagged — shown in the dialog so the user reviews
+              // a concrete harm instead of a bare "dangerous". Fails soft:
+              // a reason-fetch error must not skip the confirmation itself.
+              const reasons = await checkCommandDangerReasons(command).catch(() => [] as string[]);
+              const confirmed = await showMcpConfirm(command, connectionName, rules, reasons);
               if (!confirmed) {
                 finishExec({
                   ok: false,
@@ -1941,6 +1917,26 @@ export default function App() {
               >
                 {highlightDangerous(mcpConfirm.command, mcpConfirm.rules)}
               </div>
+              {mcpConfirm.reasons.length > 0 && (
+                <div
+                  style={{
+                    marginTop: 8,
+                    background: "var(--bg-base)",
+                    border: "1px solid var(--error)",
+                    borderRadius: "var(--radius-sm)",
+                    padding: "8px 10px",
+                  }}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "var(--error)", marginBottom: 4 }}>
+                    ⚠ 危害说明（命中的危险规则）
+                  </div>
+                  <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.7 }}>
+                    {mcpConfirm.reasons.map((reason, i) => (
+                      <li key={i}>{reason}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
               <div style={{ marginTop: 8, color: "var(--text-muted)" }}>
                 点击「确认执行」允许，点击「取消」拒绝。取消后 AI
                 会立即停止当前任务、向你说明任务进度，并等待你的指示。
@@ -1950,16 +1946,8 @@ export default function App() {
           confirmLabel="确认执行"
           cancelLabel="取消"
           danger={true}
-          onConfirm={() => {
-            setMcpConfirm(null);
-            mcpConfirmResolver.current?.(true);
-            mcpConfirmResolver.current = null;
-          }}
-          onCancel={() => {
-            setMcpConfirm(null);
-            mcpConfirmResolver.current?.(false);
-            mcpConfirmResolver.current = null;
-          }}
+          onConfirm={() => resolveMcpConfirm(true)}
+          onCancel={() => resolveMcpConfirm(false)}
         />
       )}
 

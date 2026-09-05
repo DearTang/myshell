@@ -163,12 +163,24 @@ export async function getLockoutInfo(): Promise<LockoutInfo> {
   return await invoke("get_lockout_info");
 }
 
-export async function getConnectionPassword(id: string): Promise<string | null> {
-  return await invoke("get_connection_password", { id });
+/**
+ * Atomically verify the master password AND return the stored connection
+ * password. Verification happens in the backend — the reveal step cannot be
+ * bypassed by calling a decrypt-only command.
+ */
+export async function revealConnectionPassword(
+  id: string,
+  passphrase: string
+): Promise<string | null> {
+  return await invoke("reveal_connection_password", { id, passphrase });
 }
 
-export async function getConnectionProxyPassword(id: string): Promise<string | null> {
-  return await invoke("get_connection_proxy_password", { id });
+/** Atomically verify the master password AND return the stored proxy password. */
+export async function revealConnectionProxyPassword(
+  id: string,
+  passphrase: string
+): Promise<string | null> {
+  return await invoke("reveal_connection_proxy_password", { id, passphrase });
 }
 
 // ============ Backup API ============
@@ -432,6 +444,16 @@ export async function sshDisconnect(sessionId: string): Promise<void> {
   await invoke("ssh_disconnect", { sessionId });
 }
 
+/**
+ * Tell the backend this session's ssh_output listener is attached. Releases
+ * the reader's startup hold so connect-time banner bytes (MOTD / "Last
+ * login") captured before the listener existed are delivered instead of
+ * dropped. No-op when the session is unknown / already gone.
+ */
+export async function sshReady(sessionId: string): Promise<void> {
+  await invoke("ssh_ready", { sessionId });
+}
+
 // ============ Local Terminal API ============
 //
 // Local PTY terminals (conn_type === "local"). They reuse the SSH event
@@ -639,6 +661,42 @@ export async function ftpRename(
 
 export async function ftpDisconnect(sessionId: string): Promise<void> {
   await invoke("ftp_disconnect", { sessionId });
+}
+
+/** Batch-upload local files to the FTP/FTPS server. Same event contract as sftpUpload. */
+export async function ftpUpload(
+  sessionId: string,
+  localPaths: string[],
+  remoteDestDir: string,
+  requestId: string
+): Promise<void> {
+  await invoke("ftp_upload", { sessionId, localPaths, remoteDestDir, requestId });
+}
+
+/**
+ * Batch-download remote files/folders from the FTP/FTPS server (recursive).
+ * Runs sequentially server-side (FTP forbids parallel data connections);
+ * `concurrency` is accepted for SFTP-API parity and ignored.
+ */
+export async function ftpDownload(
+  sessionId: string,
+  remotePaths: string[],
+  localDestDir: string,
+  requestId: string,
+  concurrency?: number
+): Promise<void> {
+  await invoke("ftp_download", {
+    sessionId,
+    remotePaths,
+    localDestDir,
+    requestId,
+    concurrency,
+  });
+}
+
+/** Cancel an in-flight FTP transfer (same cancel table as SFTP). */
+export async function ftpCancelTransfer(requestId: string): Promise<void> {
+  await invoke("ftp_cancel_transfer", { requestId });
 }
 
 // ============ SSH Event Subscriptions ============
@@ -1427,6 +1485,39 @@ export async function getCommandRules(): Promise<CommandRules> {
 /** Persist command rules to the JSON config file. */
 export async function setCommandRules(rules: CommandRules): Promise<void> {
   await invoke("set_command_rules", { rules });
+}
+
+/**
+ * Ask the backend whether an MCP command needs human confirmation. The
+ * backend owns the policy (same rules file + same decision function the
+ * headless MCP server uses) — the GUI must not re-implement it.
+ */
+export async function checkCommandConfirmation(command: string): Promise<boolean> {
+  return invoke<boolean>("check_command_confirmation", { command });
+}
+
+/**
+ * Ask the backend WHY a command was flagged: one human-readable entry per
+ * matched danger rule (empty array = not flagged). Display-only — the
+ * confirm/deny verdict still comes from checkCommandConfirmation above.
+ */
+export async function checkCommandDangerReasons(command: string): Promise<string[]> {
+  return invoke<string[]>("check_command_danger_reasons", { command });
+}
+
+// ============ App settings (backend-enforced preferences) ============
+
+export interface AppSettings {
+  /** When true the backend drops add_command_history calls entirely. */
+  disable_command_history: boolean;
+}
+
+export async function getAppSettings(): Promise<AppSettings> {
+  return invoke<AppSettings>("get_app_settings");
+}
+
+export async function setAppSettings(settings: AppSettings): Promise<void> {
+  await invoke("set_app_settings", { settings });
 }
 
 /**

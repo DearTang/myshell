@@ -412,6 +412,9 @@ fn setup_vault(state: State<AppState>, passphrase: String) -> Result<(), String>
     if let Err(e) = db::migrate_to_vault(&mut conn, &dek) {
         return Err(format!("数据迁移失败: {}", e));
     }
+    if let Err(e) = db::migrate_plaintext_history(&mut conn, &dek) {
+        log::warn!("[vault] history encryption migration failed: {}", e);
+    }
     Ok(())
 }
 
@@ -494,6 +497,15 @@ fn unlock_vault(state: State<AppState>, passphrase: String) -> Result<(), String
 
     let mut slot = state.dek.lock().map_err(|e| e.to_string())?;
     *slot = Some(dek);
+
+    // Encrypt any plaintext history rows left over from a pre-encryption
+    // build (idempotent — only touches rows with NULL command_enc).
+    {
+        let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+        if let Err(e) = db::migrate_plaintext_history(&mut conn, &dek) {
+            log::warn!("[vault] history encryption migration failed: {}", e);
+        }
+    }
     Ok(())
 }
 
@@ -505,12 +517,11 @@ fn lock_vault(state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// Verify login password (for viewing plaintext passwords in UI).
-/// Applies the same lockout policy as `unlock_vault` — otherwise a malicious
-/// script could brute-force the password by repeatedly calling this command,
-/// since it used to bypass the failure counter entirely.
-#[tauri::command]
-fn verify_password(passphrase: String) -> Result<bool, String> {
+/// Verify the master password (KDF + verifier) with the shared lockout
+/// policy. Shared by the `verify_password` UI command and the atomic reveal
+/// commands below. Ok(()) = password correct; Err = wrong password (after
+/// lockout accounting) or lockout active.
+fn verify_master_password_inner(passphrase: &str) -> Result<(), String> {
     let mut lockout = vault::LockoutState::load();
     if let Some(remaining) = lockout.check_lockout() {
         return Err(format!("密码错误次数过多，请等待 {} 秒后重试", remaining));
@@ -525,16 +536,50 @@ fn verify_password(passphrase: String) -> Result<bool, String> {
         Some(meta) => meta.iterations,
         None => crypto::LEGACY_PBKDF2_ITERATIONS,
     };
-    let master_key = crypto::derive_master_key_with_iterations(&passphrase, &salt, iterations);
-    let ok = crypto::check_verifier(&master_key, &verifier);
-    if ok {
+    let master_key = crypto::derive_master_key_with_iterations(passphrase, &salt, iterations);
+    if crypto::check_verifier(&master_key, &verifier) {
         lockout.record_success();
-        return Ok(true);
+        return Ok(());
     }
     // record_failure always returns Err with a friendly message — covers
     // both the "this attempt failed" case and the lockout / daily-limit
     // caps. We surface it so the UI can show "locked for N seconds".
     Err(lockout.record_failure().err().unwrap_or_else(|| "密码错误".to_string()))
+}
+
+/// Verify login password (for the UI's inline password-check dialog).
+#[tauri::command]
+fn verify_password(passphrase: String) -> Result<bool, String> {
+    verify_master_password_inner(&passphrase)?;
+    Ok(true)
+}
+
+/// SECURITY BOUNDARY: reveal a stored connection password. The master
+/// password re-verification happens HERE, in the backend, in the same
+/// command as the decryption — a compromised webview can no longer bypass
+/// the "confirm before reveal" step by calling a decrypt-only command
+/// (the old `get_connection_password` only required an unlocked vault).
+#[tauri::command]
+fn reveal_connection_password(
+    state: State<AppState>,
+    id: String,
+    passphrase: String,
+) -> Result<Option<String>, String> {
+    let key = require_dek(&state)?;
+    verify_master_password_inner(&passphrase)?;
+    secrets::get_password(&id, &key)
+}
+
+/// Reveal a stored proxy password after backend master-password verification.
+#[tauri::command]
+fn reveal_connection_proxy_password(
+    state: State<AppState>,
+    id: String,
+    passphrase: String,
+) -> Result<Option<String>, String> {
+    let key = require_dek(&state)?;
+    verify_master_password_inner(&passphrase)?;
+    secrets::get_proxy_password(&id, &key)
 }
 
 /// Get lockout status info for the UI
@@ -1560,6 +1605,59 @@ fn set_gpu_acceleration_disabled(disabled: bool) -> Result<(), String> {
 /// Path of the marker file that stores the user's chosen attachment directory.
 /// The FILE's location is fixed (always <config_dir>/myshell/attachment-dir);
 /// the FILE's *contents* are the user-chosen directory path.
+// ============ App settings (file-based JSON) ============
+//
+// Lightweight user preferences that must NOT live in the vault-locked DB
+// (they're read pre-unlock) — same file-backed pattern as the attachment dir
+// and GPU flag.
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct AppSettings {
+    /// When true the backend silently drops add_command_history calls —
+    /// a real privacy switch, not just a frontend cosmetic.
+    disable_command_history: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        AppSettings {
+            disable_command_history: false,
+        }
+    }
+}
+
+fn app_settings_path() -> Option<std::path::PathBuf> {
+    let mut path = dirs::config_dir()?;
+    path.push("myshell");
+    path.push("settings.json");
+    Some(path)
+}
+
+fn load_app_settings() -> AppSettings {
+    app_settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn get_app_settings() -> AppSettings {
+    load_app_settings()
+}
+
+#[tauri::command]
+fn set_app_settings(settings: AppSettings) -> Result<(), String> {
+    let path = app_settings_path().ok_or_else(|| "无法定位配置目录".to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("序列化设置失败: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("写入设置失败: {e}"))?;
+    Ok(())
+}
+
 fn attachment_dir_setting_path() -> Option<std::path::PathBuf> {
     let mut path = dirs::config_dir()?;
     path.push("myshell");
@@ -1687,6 +1785,39 @@ fn set_command_rules(rules: myshell_core::command_rules::CommandRules) -> Result
         .map_err(|e| format!("序列化命令规则失败: {e}"))?;
     std::fs::write(&path, json).map_err(|e| format!("写入命令规则失败: {e}"))?;
     Ok(())
+}
+
+/// Evaluate whether an MCP command needs human confirmation, using the SAME
+/// rules file and the SAME decision function as the headless MCP server
+/// (`command_rules::command_needs_confirmation`). The GUI's React confirm
+/// dialog must not re-implement the policy — a drifted client-side copy was
+/// the historical source of the whitelist bypass.
+#[tauri::command]
+fn check_command_confirmation(command: String) -> Result<bool, String> {
+    let path = command_rules_path().ok_or_else(|| "无法定位配置目录".to_string())?;
+    let rules = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(myshell_core::command_rules::CommandRules::default);
+    Ok(myshell_core::command_rules::command_needs_confirmation(
+        &command, &rules,
+    ))
+}
+
+/// Human-readable reasons why `command` was flagged (one per matched danger
+/// rule; empty ⇒ not flagged). **Display-only** — the confirm/deny verdict
+/// still comes from `check_command_confirmation`; this just lets the dialog
+/// explain WHICH rule matched and WHAT it can destroy.
+#[tauri::command]
+fn check_command_danger_reasons(command: String) -> Result<Vec<String>, String> {
+    let path = command_rules_path().ok_or_else(|| "无法定位配置目录".to_string())?;
+    let rules = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(myshell_core::command_rules::CommandRules::default);
+    Ok(myshell_core::command_rules::command_danger_reasons(
+        &command, &rules,
+    ))
 }
 
 /// Called by the frontend to deliver the result of an `exec_in_tab` request
@@ -1942,21 +2073,6 @@ fn read_file_base64(path: String) -> Result<String, String> {
     Ok(format!("data:{mime};base64,{b64}"))
 }
 
-/// Get the plaintext password for a connection (requires DEK).
-/// Used for viewing passwords in the UI after verification.
-#[tauri::command]
-fn get_connection_password(state: State<AppState>, id: String) -> Result<Option<String>, String> {
-    let key = require_dek(&state)?;
-    secrets::get_password(&id, &key)
-}
-
-/// Get the plaintext proxy password for a connection (requires DEK).
-#[tauri::command]
-fn get_connection_proxy_password(state: State<AppState>, id: String) -> Result<Option<String>, String> {
-    let key = require_dek(&state)?;
-    secrets::get_proxy_password(&id, &key)
-}
-
 // ============ Folder Management Commands ============
 
 #[tauri::command]
@@ -2127,12 +2243,17 @@ fn add_command_history(
     if trimmed.is_empty() || is_junk_command(trimmed) {
         return Ok(0);
     }
+    // User-facing privacy switch — backend-enforced, not just UI cosmetics.
+    if load_app_settings().disable_command_history {
+        return Ok(0);
+    }
+    let key = require_dek(&state)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string());
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db::add_command_history(&db, &connection_id, trimmed, &now).map_err(|e| e.to_string())
+    db::add_command_history(&db, &key, &connection_id, trimmed, &now).map_err(|e| e.to_string())
 }
 
 /// Whether a command should be silently dropped from history. Currently matches
@@ -2152,8 +2273,9 @@ fn list_command_history(
     state: State<AppState>,
     connection_id: String,
 ) -> Result<Vec<CommandHistoryItem>, String> {
+    let key = require_dek(&state)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let rows = db::list_command_history(&db, &connection_id).map_err(|e| e.to_string())?;
+    let rows = db::list_command_history(&db, &key, &connection_id).map_err(|e| e.to_string())?;
     Ok(rows
         .into_iter()
         .map(|(id, command, pinned, created_at)| CommandHistoryItem {
@@ -2219,8 +2341,9 @@ fn add_quick_command(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string());
+    let key = require_dek(&state)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let new_id = db::add_quick_command(&db, connection_id.as_deref(), label, command, &now)
+    let new_id = db::add_quick_command(&db, &key, connection_id.as_deref(), label, command, &now)
         .map_err(|e| e.to_string())?;
     log::info!(
         "[quick-cmd] added id={} label={:?} scope={:?}",
@@ -2234,8 +2357,10 @@ fn list_quick_commands(
     state: State<AppState>,
     connection_id: Option<String>,
 ) -> Result<Vec<QuickCommandItem>, String> {
+    let key = require_dek(&state)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let rows = db::list_quick_commands(&db, connection_id.as_deref()).map_err(|e| e.to_string())?;
+    let rows = db::list_quick_commands(&db, &key, connection_id.as_deref())
+        .map_err(|e| e.to_string())?;
     Ok(rows
         .into_iter()
         .map(|(id, cid, label, command, sort_order)| QuickCommandItem {
@@ -2253,8 +2378,9 @@ fn list_quick_commands_for_connection(
     state: State<AppState>,
     connection_id: String,
 ) -> Result<Vec<QuickCommandExecItem>, String> {
+    let key = require_dek(&state)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let rows = db::list_quick_commands_for_connection(&db, &connection_id)
+    let rows = db::list_quick_commands_for_connection(&db, &key, &connection_id)
         .map_err(|e| e.to_string())?;
     Ok(rows
         .into_iter()
@@ -2279,8 +2405,9 @@ fn update_quick_command(
     if label.is_empty() || command.is_empty() {
         return Err("名称和命令不能为空".to_string());
     }
+    let key = require_dek(&state)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db::update_quick_command(&db, id, label, command).map_err(|e| e.to_string())?;
+    db::update_quick_command(&db, &key, id, label, command).map_err(|e| e.to_string())?;
     log::info!("[quick-cmd] updated id={} label={:?}", id, label);
     Ok(())
 }
@@ -2403,7 +2530,9 @@ async fn ssh_connect(
         let key = require_dek(&state)?;
         config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
     }
-    let result = ssh::connect(&state, Arc::new(WindowSink(window)), config).await;
+    // hold_startup=true: GUI tab — the reader holds the login banner until
+    // the frontend's ssh_output listener is attached (see ssh_ready).
+    let result = ssh::connect(&state, Arc::new(WindowSink(window)), config, true).await;
     match &result {
         Ok(sid) => log::info!("[ssh:{}] connected to {}", sid, target),
         Err(e) => log::error!("[ssh] connect failed for {}: {}", target, e),
@@ -2432,6 +2561,14 @@ async fn ssh_resize(
     rows: u16,
 ) -> Result<(), String> {
     ssh::resize_terminal(&state, &session_id, cols, rows).await
+}
+
+/// Frontend → reader handshake: the tab attached its `ssh_output` listener,
+/// so release the startup hold and emit the connect-time banner (MOTD /
+/// "Last login"). No-op for unknown / already-gone sessions.
+#[tauri::command]
+async fn ssh_ready(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    ssh::frontend_ready(&state, &session_id).await
 }
 
 #[tauri::command]
@@ -2955,11 +3092,13 @@ struct ServerInfo {
     os_pretty: String,
     kernel: String,
     cpu_cores: u32,
-    /// MemTotal from `free -b`.
+    /// MemTotal from `/proc/meminfo` (kB × 1024); `free -b` fallback on
+    /// systems where /proc is unreadable.
     mem_total_bytes: u64,
     /// Used memory = `total − MemAvailable` (the kernel's usable-memory
-    /// estimate; matches htop 3.x / node_exporter). Falls back to procps's
-    /// corrected `used` on legacy systems without an available column.
+    /// estimate; matches htop 3.x / node_exporter). Falls back to the
+    /// old-kernel estimate (no MemAvailable), then to procps's corrected
+    /// `used`.
     mem_used_bytes: u64,
     cpu_usage_pct: f32,
     /// `mem_used_bytes / mem_total_bytes * 100`. 0 when total is 0.
@@ -2992,6 +3131,12 @@ struct ServerInfo {
 /// sleep between /proc/stat samples). All sections are delimited by `=TAG=`
 /// markers so the parser can slice without relying on line counts.
 ///
+/// Memory reads `/proc/meminfo` directly: the kernel generates it, so the
+/// keys are always English and the unit always kB regardless of the server's
+/// locale — `free` localizes its row labels (e.g. `内存：` on zh_CN.UTF-8),
+/// which the parser can't match. `LC_ALL=C free -b` stays as the fallback
+/// for systems where /proc is unreadable.
+///
 /// Disk uses two passes:
 /// - `=DT=` sums bytes across all `/dev/...` partitions for the aggregate
 ///   total + used (the user-facing "how full is this box" number).
@@ -3001,7 +3146,7 @@ struct ServerInfo {
 const SERVER_INFO_SCRIPT: &str = r#"echo "=OS="; (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -sr
 echo "=K="; uname -r
 echo "=C="; nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo
-echo "=M="; free -b
+echo "=M="; awk '/^(MemTotal|MemAvailable|MemFree|Buffers|Cached|SReclaimable):/' /proc/meminfo 2>/dev/null || LC_ALL=C free -b 2>/dev/null
 echo "=DT="; df -B1 2>/dev/null | awk 'NR>1 && $1 ~ /^\/dev\// {print $2,$3}'
 echo "=DM="; df -h 2>/dev/null | awk 'NR>1 && $1 ~ /^\/dev\// {sub(/%/,"",$5); print $1,$2,$3,$5,$6}'
 echo "=S1="; head -n1 /proc/stat
@@ -3076,43 +3221,93 @@ fn parse_server_info(raw: &str) -> ServerInfo {
         .and_then(|l| l.trim().parse::<u32>().ok())
         .unwrap_or(0);
 
-    // free -b Mem line (procps ≥ 3.3.10):
-    // "Mem:  total  used  free  shared  buff/cache  available"
-    // Usage is computed as `total − available`: MemAvailable is the kernel's
-    // own estimate of usable memory (what htop 3.x / node_exporter / k8s
-    // report), whereas procps's derived `used` column overstates pressure on
-    // shmem/tmpfs-heavy boxes. Old `free` output also has 7 tokens on the
-    // Mem: line (… buffers cached), so the available column must be detected
-    // from the header, not the token count.
+    // =M= carries /proc/meminfo lines (kernel-generated: keys always English,
+    // unit always kB — immune to the server's locale and to procps presence).
+    // Usage = MemTotal − MemAvailable, the kernel's own usable-memory estimate
+    // (what htop 3.x / node_exporter / k8s report). Kernels predating
+    // MemAvailable (< 3.14) estimate used as total − (MemFree + Buffers +
+    // Cached + SReclaimable). When no meminfo key parsed (e.g. /proc hidden),
+    // the section holds the `LC_ALL=C free -b` fallback output and is parsed
+    // the legacy way below.
     let mem_section = section(raw, "=M=");
-    let has_available = mem_section
-        .lines()
-        .next()
-        .map(|header| header.contains("available"))
-        .unwrap_or(false);
-    let (mem_total, mem_used) = mem_section
-        .lines()
-        .find(|l| l.starts_with("Mem:"))
-        .and_then(|l| {
-            let v: Vec<&str> = l.split_whitespace().collect();
-            let total = v.get(1)?.parse::<u64>().ok()?;
-            let used = if has_available && v.len() >= 7 {
-                // Saturate against accounting weirdness (available > total).
-                total.saturating_sub(v.get(6)?.parse::<u64>().ok()?)
-            } else {
-                // Legacy free (< procps 3.3.10): no available column, and the
-                // Mem: used there counts buffers/cache as consumed. Prefer the
-                // corrected "-/+ buffers/cache:" row when present.
-                mem_section
-                    .lines()
-                    .find(|l| l.starts_with("-/+ buffers/cache:"))
-                    .and_then(|l| l.split_whitespace().nth(2))
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .or_else(|| v.get(2).and_then(|s| s.parse::<u64>().ok()))?
-            };
-            Some((total, used))
-        })
-        .unwrap_or((0, 0));
+    let mut mi_total: u64 = 0;
+    let mut mi_available: Option<u64> = None;
+    let mut mi_free: u64 = 0;
+    let mut mi_buffers: u64 = 0;
+    let mut mi_cached: u64 = 0;
+    let mut mi_sreclaimable: u64 = 0;
+    for line in mem_section.lines() {
+        let (key, val) = match line.split_once(':') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        // "MemTotal:  15885113 kB" → first numeric token; meminfo is kB.
+        let bytes = match val
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(kb) => kb.saturating_mul(1024),
+            None => continue,
+        };
+        match key.trim() {
+            "MemTotal" => mi_total = bytes,
+            "MemAvailable" => mi_available = Some(bytes),
+            "MemFree" => mi_free = bytes,
+            "Buffers" => mi_buffers = bytes,
+            "Cached" => mi_cached = bytes,
+            "SReclaimable" => mi_sreclaimable = bytes,
+            _ => {}
+        }
+    }
+    let (mem_total, mem_used) = if mi_total > 0 {
+        // Saturate against accounting weirdness (available > total).
+        let used = match mi_available {
+            Some(av) => mi_total.saturating_sub(av),
+            None => mi_total.saturating_sub(
+                mi_free
+                    .saturating_add(mi_buffers)
+                    .saturating_add(mi_cached)
+                    .saturating_add(mi_sreclaimable),
+            ),
+        };
+        (mi_total, used)
+    } else {
+        // free -b fallback (procps ≥ 3.3.10):
+        // "Mem:  total  used  free  shared  buff/cache  available"
+        // procps's derived `used` column overstates pressure on shmem/tmpfs-
+        // heavy boxes, so prefer `total − available`. Old `free` output also
+        // has 7 tokens on the Mem: line (… buffers cached), so the available
+        // column must be detected from the header, not the token count.
+        let has_available = mem_section
+            .lines()
+            .next()
+            .map(|header| header.contains("available"))
+            .unwrap_or(false);
+        mem_section
+            .lines()
+            .find(|l| l.starts_with("Mem:"))
+            .and_then(|l| {
+                let v: Vec<&str> = l.split_whitespace().collect();
+                let total = v.get(1)?.parse::<u64>().ok()?;
+                let used = if has_available && v.len() >= 7 {
+                    // Saturate against accounting weirdness (available > total).
+                    total.saturating_sub(v.get(6)?.parse::<u64>().ok()?)
+                } else {
+                    // Legacy free (< procps 3.3.10): no available column, and
+                    // the Mem: used there counts buffers/cache as consumed.
+                    // Prefer the corrected "-/+ buffers/cache:" row.
+                    mem_section
+                        .lines()
+                        .find(|l| l.starts_with("-/+ buffers/cache:"))
+                        .and_then(|l| l.split_whitespace().nth(2))
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| v.get(2).and_then(|s| s.parse::<u64>().ok()))?
+                };
+                Some((total, used))
+            })
+            .unwrap_or((0, 0))
+    };
 
     // =DT= is two columns (total used) per partition in raw bytes; we sum
     // them for the aggregate disk usage number.
@@ -3221,10 +3416,53 @@ fn pct(used: u64, total: u64) -> f32 {
 mod server_info_tests {
     use super::*;
 
-    /// Modern procps (≥ 3.3.10): header has an `available` column, so
-    /// used = total − available, NOT the procps-derived `used` column.
+    /// /proc/meminfo is the primary source: kernel-generated English keys in
+    /// kB — immune to the server's locale (zh_CN `free` prints `内存：`,
+    /// which broke the old parser → 0 B / 0%). used = total − available.
     #[test]
-    fn mem_usage_prefers_total_minus_available() {
+    fn mem_usage_from_proc_meminfo() {
+        let raw = "=OS=\nUbuntu 26.04.1 LTS\n\
+                   =K=\n6.17.0-061700-generic\n\
+                   =C=\n24\n\
+                   =M=\nMemTotal:       15885113 kB\n\
+                   MemFree:         2047152 kB\n\
+                   MemAvailable:   11264000 kB\n\
+                   Buffers:          488000 kB\n\
+                   Cached:          8388608 kB\n\
+                   SReclaimable:     200000 kB\n\
+                   =DT=\n1000202043392 412345678901\n\
+                   =DM=\n/dev/sda1 916G 384G 45% /\n\
+                   =S1=\ncpu  10000 0 5000 80000 1000 0 500 0 0 0\n\
+                   =S2=\ncpu  10100 0 5100 80700 1010 0 510 0 0 0\n";
+        let info = parse_server_info(raw);
+        assert_eq!(info.mem_total_bytes, 15885113 * 1024);
+        assert_eq!(info.mem_used_bytes, (15885113 - 11264000) * 1024);
+        assert!((info.mem_usage_pct - 29.09).abs() < 0.1);
+    }
+
+    /// Kernel < 3.14: no MemAvailable line → used = total − (MemFree +
+    /// Buffers + Cached + SReclaimable), the htop/node_exporter estimate.
+    #[test]
+    fn mem_usage_meminfo_without_available_estimates() {
+        let raw = "=M=\nMemTotal:         8192000 kB\n\
+                   MemFree:          1164000 kB\n\
+                   Buffers:           488000 kB\n\
+                   Cached:           3417000 kB\n\
+                   SReclaimable:      200000 kB\n";
+        let info = parse_server_info(raw);
+        assert_eq!(info.mem_total_bytes, 8192000 * 1024);
+        assert_eq!(
+            info.mem_used_bytes,
+            (8192000 - 1164000 - 488000 - 3417000 - 200000) * 1024
+        );
+        assert!((info.mem_usage_pct - 35.68).abs() < 0.1);
+    }
+
+    /// free -b fallback (only when /proc/meminfo yields nothing): modern
+    /// procps (≥ 3.3.10) header has an `available` column, so used =
+    /// total − available, NOT the procps-derived `used` column.
+    #[test]
+    fn mem_usage_free_fallback_prefers_total_minus_available() {
         let raw = "=OS=\nDebian GNU/Linux 12 (bookworm)\n\
                    =K=\n6.1.0-18-amd64\n\
                    =C=\n8\n\
@@ -3483,6 +3721,93 @@ async fn ftp_disconnect(session_id: String, state: State<'_, AppState>) -> Resul
     ftp::disconnect(&mut session).await
 }
 
+/// Batch-upload local files to the FTP/FTPS server. Emits the SAME
+/// `sftp_transfer_progress` / `sftp_transfer_done` events as SFTP so the
+/// frontend overlay works unchanged. Runs sequentially (FTP has one control
+/// connection — parallel data commands are protocol-illegal).
+#[tauri::command]
+async fn ftp_upload(
+    session_id: String,
+    local_paths: Vec<String>,
+    remote_dest_dir: String,
+    request_id: String,
+    state: State<'_, AppState>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    let sink = Arc::new(WindowSink(window));
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state
+        .transfer_cancels
+        .lock()
+        .unwrap()
+        .insert(request_id.clone(), cancel.clone());
+    let result = ftp::upload(
+        &state,
+        &session_id,
+        local_paths,
+        &remote_dest_dir,
+        &request_id,
+        sink,
+        cancel,
+    )
+    .await;
+    state.transfer_cancels.lock().unwrap().remove(&request_id);
+    result
+}
+
+/// Batch-download remote files/folders from the FTP/FTPS server. Folders are
+/// expanded recursively; local targets go through the same path-safety checks
+/// as SFTP downloads. `concurrency` is accepted for API parity with SFTP but
+/// ignored — FTP forbids parallel data connections.
+#[tauri::command]
+async fn ftp_download(
+    session_id: String,
+    remote_paths: Vec<String>,
+    local_dest_dir: String,
+    request_id: String,
+    concurrency: Option<usize>,
+    state: State<'_, AppState>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    let sink = Arc::new(WindowSink(window));
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state
+        .transfer_cancels
+        .lock()
+        .unwrap()
+        .insert(request_id.clone(), cancel.clone());
+    let result = ftp::download(
+        &state,
+        &session_id,
+        remote_paths,
+        &local_dest_dir,
+        &request_id,
+        concurrency.unwrap_or(1),
+        sink,
+        cancel,
+    )
+    .await;
+    state.transfer_cancels.lock().unwrap().remove(&request_id);
+    result
+}
+
+/// Cancel an in-flight FTP transfer — same cancel table as SFTP transfers.
+#[tauri::command]
+async fn ftp_cancel_transfer(
+    request_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let cancels = state.transfer_cancels.lock().unwrap();
+    match cancels.get(&request_id) {
+        Some(flag) => {
+            flag.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        None => Err("传输不存在或已结束".to_string()),
+    }
+}
+
 /// Borrow the FTP session out of state for the duration of a single operation.
 /// The session is moved back into the map when the operation completes —
 /// `AsyncFtpStream` does not impl `Clone`, so we can't hold a shared ref.
@@ -3496,19 +3821,18 @@ fn take_ftp_session(
         .ok_or_else(|| "FTP session not found".to_string())
 }
 
-/// Put the session back. If the map no longer has a slot (e.g. the user
-/// disconnected concurrently), drop the session silently — the caller has
-/// already finished its operation, and `quit()` would race the disconnect.
+/// Put the session back. The transfer/op helpers ALWAYS return the session —
+/// an earlier `contains_key` guard here made the re-insert unreachable (take
+/// had already removed the slot), so every second FTP operation failed with
+/// "FTP session not found". If the user disconnected concurrently, dropping
+/// the returned session is fine — its Drop closes the control channel.
 fn return_ftp_session(
     state: &State<'_, AppState>,
     session_id: &str,
     session: ftp::FtpSession,
 ) -> Result<(), String> {
     let mut sessions = state.ftp_sessions.lock().map_err(|e| e.to_string())?;
-    // Only re-insert if not concurrently removed.
-    if sessions.contains_key(session_id) {
-        sessions.insert(session_id.to_string(), session);
-    }
+    sessions.insert(session_id.to_string(), session);
     Ok(())
 }
 
@@ -4374,8 +4698,8 @@ pub fn run() {
             change_master_password,
             read_text_file,
             read_file_base64,
-            get_connection_password,
-            get_connection_proxy_password,
+            reveal_connection_password,
+            reveal_connection_proxy_password,
             list_backups,
             rollback_backup,
             get_app_version,
@@ -4392,6 +4716,10 @@ pub fn run() {
             show_in_folder,
             get_command_rules,
             set_command_rules,
+            check_command_confirmation,
+            check_command_danger_reasons,
+            get_app_settings,
+            set_app_settings,
             mcp_exec_result,
             write_frontend_log,
             get_connections,
@@ -4425,6 +4753,7 @@ pub fn run() {
             ssh_connect,
             ssh_send,
             ssh_resize,
+            ssh_ready,
             ssh_disconnect,
             ssh_send_zmodem,
             ssh_send_zmodem_abort,
@@ -4452,6 +4781,9 @@ pub fn run() {
             ftp_remove,
             ftp_rename,
             ftp_disconnect,
+            ftp_upload,
+            ftp_download,
+            ftp_cancel_transfer,
             test_connection,
             rz_open_read,
             rz_read_chunk,
@@ -4605,6 +4937,14 @@ pub fn run() {
 
                     // Accept loop — one command per connection (the MCP server
                     // opens a fresh TCP connection for each tool call).
+                    //
+                    // Each connection is handled on its own thread with a
+                    // concurrency cap: a long exec_in_tab wait or a slow
+                    // client can no longer stall the accept loop (the old
+                    // inline handling let one request block every subsequent
+                    // IPC call for up to timeout+10s).
+                    const MAX_IPC_CONCURRENT: usize = 32;
+                    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     for stream in listener.incoming() {
                         let stream = match stream {
                             Ok(s) => s,
@@ -4614,37 +4954,83 @@ pub fn run() {
                             }
                         };
                         // Set a short timeout so a misbehaving client can't
-                        // hang the listener thread forever.
+                        // hang its handler thread forever.
                         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
 
-                        let mut reader = BufReader::new(stream.try_clone().unwrap_or(stream));
-                        let mut line = String::new();
-                        if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        // Shed excess connections fast — threads are bounded
+                        // so a local flood can't exhaust memory.
+                        if active_connections.load(std::sync::atomic::Ordering::SeqCst)
+                            >= MAX_IPC_CONCURRENT
+                        {
+                            let _ = writeln!(
+                                &stream,
+                                "{{\"ok\":false,\"error\":\"IPC busy, retry later\"}}"
+                            );
                             continue;
                         }
 
-                        // Parse the command JSON.
-                        let cmd: serde_json::Value = match serde_json::from_str(line.trim()) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"invalid JSON: {}\"}}", e);
-                                continue;
-                            }
+                        let reader = match stream.try_clone() {
+                            Ok(r) => BufReader::new(r),
+                            Err(_) => continue,
                         };
+                        let ipc_handle = ipc_handle.clone();
+                        let ipc_token = ipc_token.clone();
+                        let active = Arc::clone(&active_connections);
+                        std::thread::spawn(move || {
+                            active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            handle_ipc_connection(reader, &ipc_handle, &ipc_token);
+                            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        });
+                    }
+                });
+            }
 
-                        let action = cmd["action"].as_str().unwrap_or("");
+/// Handle ONE localhost IPC connection end-to-end: bounded request read,
+/// JSON parse, token auth, action dispatch. Runs on its own thread so a slow
+/// client or a long exec_in_tab wait never stalls the accept loop.
+fn handle_ipc_connection(
+    mut reader: std::io::BufReader<std::net::TcpStream>,
+    ipc_handle: &tauri::AppHandle,
+    ipc_token: &str,
+) {
+    use std::io::Write;
 
-                        // Auth gate: reject before dispatching ANY action.
-                        // Only the action name is logged — never the token.
-                        if !constant_time_eq(cmd["token"].as_str().unwrap_or(""), &ipc_token) {
-                            let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"unauthorized: IPC token 缺失或错误。请将 myshell-mcp.exe / myshell.exe 更新到同一版本后重试。\"}}");
-                            log::warn!("[ipc] rejected unauthorized command (action={})", action);
-                            continue;
-                        }
+    // SECURITY/ROBUSTNESS: the request line is read with a hard 1 MiB cap —
+    // the old `read_line` grew its buffer unboundedly, so any local process
+    // could balloon GUI memory (or drip-feed forever) BEFORE the token check.
+    let line = match read_ipc_line(&mut reader) {
+        IpcLine::Line(l) => l,
+        IpcLine::Oversize => {
+            let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"request too large\"}}");
+            return;
+        }
+        IpcLine::Closed => return,
+    };
+    if line.trim().is_empty() {
+        return;
+    }
 
-                        match action {
-                            // Single-instance restart path: a freshly started
+    // Parse the command JSON.
+    let cmd: serde_json::Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"invalid JSON: {}\"}}", e);
+            return;
+        }
+    };
+
+    let action = cmd["action"].as_str().unwrap_or("");
+
+    // Auth gate: reject before dispatching ANY action.
+    // Only the action name is logged — never the token.
+    if !constant_time_eq(cmd["token"].as_str().unwrap_or(""), ipc_token) {
+        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"unauthorized: IPC token 缺失或错误。请将 myshell-mcp.exe / myshell.exe 更新到同一版本后重试。\"}}");
+        log::warn!("[ipc] rejected unauthorized command (action={})", action);
+        return;
+    }
+
+    match action {
                             // MyShell asks us to exit so it can take over.
                             // app.exit(0) flows through RunEvent::ExitRequested
                             // (drain_all_sessions + port-file cleanup). Ack
@@ -4659,7 +5045,7 @@ pub fn run() {
                                 let conn_id = cmd["connection_id"].as_str().unwrap_or("").to_string();
                                 if conn_id.is_empty() {
                                     let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"missing connection_id\"}}");
-                                    continue;
+                                    return;
                                 }
                                 // Optional fields the frontend uses to pick tab
                                 // type and decide whether to focus an existing tab.
@@ -4699,7 +5085,7 @@ pub fn run() {
                                 let timeout_secs = cmd["timeout"].as_u64().unwrap_or(30);
                                 if conn_id.is_empty() || command.is_empty() {
                                     let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"missing connection_id or command\"}}");
-                                    continue;
+                                    return;
                                 }
 
                                 // Generate a unique request_id for this exec.
@@ -4735,7 +5121,7 @@ pub fn run() {
                                     let mut pending = PENDING_EXEC.lock().unwrap();
                                     pending.remove(&request_id);
                                     let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"emit failed: {}\"}}", e);
-                                    continue;
+                                    return;
                                 }
 
                                 // Detach the blocking wait into its own thread so
@@ -4774,7 +5160,7 @@ pub fn run() {
                                                 let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"exec timeout ({}s)\"}}", timeout_secs);
                                             }
                                         }
-                                        continue;
+                                        return;
                                     }
                                 };
                                 std::thread::spawn(move || {
@@ -4851,7 +5237,7 @@ pub fn run() {
                                 let conn_id = cmd["connection_id"].as_str().unwrap_or("").to_string();
                                 if conn_id.is_empty() {
                                     let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"missing connection_id\"}}");
-                                    continue;
+                                    return;
                                 }
                                 // Get AppState from the Tauri handle.
                                 let app_state = ipc_handle.state::<AppState>();
@@ -4860,14 +5246,14 @@ pub fn run() {
                                     Ok(g) => g,
                                     Err(e) => {
                                         let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"DEK 锁定: {}\"}}", e);
-                                        continue;
+                                        return;
                                     }
                                 };
                                 let key = match dek_guard.as_ref() {
                                     Some(k) => k,
                                     None => {
                                         let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"保险库未解锁，请在 MyShell GUI 中输入主密码解锁\"}}");
-                                        continue;
+                                        return;
                                     }
                                 };
                                 let db_guard = app_state.db.lock();
@@ -4875,7 +5261,7 @@ pub fn run() {
                                     Ok(db) => db,
                                     Err(e) => {
                                         let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"数据库锁定: {}\"}}", e);
-                                        continue;
+                                        return;
                                     }
                                 };
                                 match db::get_connection(&db_conn, key, &conn_id) {
@@ -4914,7 +5300,7 @@ pub fn run() {
                                 let conn_id = cmd["connection_id"].as_str().unwrap_or("").to_string();
                                 if conn_id.is_empty() {
                                     let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"missing connection_id\"}}");
-                                    continue;
+                                    return;
                                 }
                                 let request_id = uuid::Uuid::new_v4().to_string();
                                 let (tx, rx) = oneshot::channel::<serde_json::Value>();
@@ -4935,7 +5321,7 @@ pub fn run() {
                                     let mut pending = PENDING_EXEC.lock().unwrap();
                                     pending.remove(&request_id);
                                     let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"emit failed: {}\"}}", e);
-                                    continue;
+                                    return;
                                 }
                                 // Detach the wait into its own thread, matching the
                                 // exec_in_tab pattern, so a slow screenshot capture
@@ -4970,7 +5356,7 @@ pub fn run() {
                                                 let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"screenshot timeout ({}s)\"}}", timeout_secs_sc);
                                             }
                                         }
-                                        continue;
+                                        return;
                                     }
                                 };
                                 std::thread::spawn(move || {
@@ -5004,9 +5390,49 @@ pub fn run() {
                                 let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"unknown action: {}\"}}", action);
                             }
                         }
-                    }
-                });
+                }
+
+/// Result of the bounded IPC line read.
+enum IpcLine {
+    Line(String),
+    /// Line exceeded MAX_IPC_LINE_BYTES — respond 4xx-style and close.
+    Oversize,
+    /// Timeout / connection reset / clean EOF with no data.
+    Closed,
+}
+
+/// Read one newline-terminated request without ever buffering more than
+/// 1 MiB. Byte-at-a-time through the (already buffered) reader; a client
+/// that never terminates its line hits the 5s socket timeout and is dropped.
+fn read_ipc_line(reader: &mut std::io::BufReader<std::net::TcpStream>) -> IpcLine {
+    use std::io::Read;
+
+    const MAX_IPC_LINE_BYTES: usize = 1024 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => break, // EOF — process what we have (lenient)
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                buf.push(byte[0]);
+                if buf.len() > MAX_IPC_LINE_BYTES {
+                    return IpcLine::Oversize;
+                }
             }
+            Err(_) => return IpcLine::Closed, // timeout / reset
+        }
+    }
+    if buf.is_empty() {
+        return IpcLine::Closed;
+    }
+    match String::from_utf8(buf) {
+        Ok(s) => IpcLine::Line(s),
+        Err(_) => IpcLine::Closed,
+    }
+}
 
             Ok(())
         })

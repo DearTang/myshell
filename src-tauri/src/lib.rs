@@ -30,6 +30,7 @@ pub mod ai;
 pub mod redact;
 pub mod mcp_tools;
 pub mod command_rules;
+pub mod path_safety;
 
 // ============ Event Sink (emitter abstraction) ============
 

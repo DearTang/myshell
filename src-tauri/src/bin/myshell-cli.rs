@@ -487,7 +487,9 @@ async fn cmd_ssh(state: &AppState, name: &str) -> Result<(), String> {
     resolve_secrets(state, &mut config)?;
 
     let sink: Arc<dyn EventSink> = Arc::new(CliSink);
-    let session_id = ssh::connect(state, sink, config).await?;
+    // hold_startup=false: headless consumer — CliSink exists before the
+    // reader spawns, so there's no listener race to hold the banner for.
+    let session_id = ssh::connect(state, sink, config, false).await?;
 
     eprintln!("[已连接 session={}，Ctrl+D 退出]", session_id);
 

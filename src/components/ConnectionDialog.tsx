@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { FontField } from "./FontField";
 import { open } from "@tauri-apps/plugin-dialog";
-import { saveConnection, getConnectionPassword, getConnectionProxyPassword, readTextFile, testConnection } from "../api";
+import { saveConnection, revealConnectionPassword, revealConnectionProxyPassword, readTextFile, testConnection } from "../api";
 import type { ConnectionConfig, ConnType, FtpTls, ProxyType } from "../api";
 import { PasswordVerifyDialog } from "./PasswordVerifyDialog";
 import { ConnIcon } from "./ConnIcon";
@@ -995,10 +995,12 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
 
       {passwordVerifyTarget && (
         <PasswordVerifyDialog
-          onSuccess={async () => {
+          onSuccess={async (masterPassword) => {
+            // Atomic backend reveal: verify master password + decrypt in ONE
+            // command — the frontend can no longer be the only gate.
             if (passwordVerifyTarget === "password" && config?.id) {
               try {
-                const pw = await getConnectionPassword(config.id);
+                const pw = await revealConnectionPassword(config.id, masterPassword);
                 if (pw) {
                   setPassword(pw);
                   setShowPassword(true);
@@ -1008,7 +1010,7 @@ export function ConnectionDialog({ config, onClose, onSave, initialConnType, ini
               }
             } else if (passwordVerifyTarget === "proxy" && config?.id) {
               try {
-                const pw = await getConnectionProxyPassword(config.id);
+                const pw = await revealConnectionProxyPassword(config.id, masterPassword);
                 if (pw) {
                   setProxyPassword(pw);
                   setShowProxyPassword(true);

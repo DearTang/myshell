@@ -10,6 +10,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   sshSend,
   sshResize,
+  sshReady,
   localSend,
   localResize,
   onSshOutput,
@@ -659,6 +660,13 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
       .then((un) => {
         if (closed) un();
         else unlistenOutput = un;
+        // Listeners are attached — release the backend's startup hold so the
+        // login banner (MOTD / "Last login") captured during connect is
+        // delivered. Local tabs have no hold; ssh_ready is a no-op there but
+        // skip the IPC anyway.
+        if (connTypeRef.current !== "local") {
+          sshReady(sessionIdRef.current).catch(() => {});
+        }
       })
       .catch((e) => console.error("Failed to subscribe to ssh_output:", e));
 

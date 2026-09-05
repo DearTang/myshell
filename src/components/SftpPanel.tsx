@@ -15,6 +15,9 @@ import {
   ftpMkdir,
   ftpRemove,
   ftpRename,
+  ftpUpload,
+  ftpDownload,
+  ftpCancelTransfer,
 } from "../api";
 import type { FileEntry, SftpTransferProgressPayload } from "../api";
 import { getSftpDownloadConcurrency } from "../utils/transfer-settings";
@@ -313,6 +316,15 @@ export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDis
     }
   }
 
+  // Upload/download/cancel route by protocol — FTP sessions don't live in
+  // the SSH session map, and the backend FTP transfer emits the same
+  // progress/done events so the overlay below works unchanged.
+  const transferApi = {
+    upload: source === "ftp" ? ftpUpload : sftpUpload,
+    download: source === "ftp" ? ftpDownload : sftpDownload,
+    cancel: source === "ftp" ? ftpCancelTransfer : sftpCancelTransfer,
+  };
+
   async function handleUpload() {
     const picked = await open({ multiple: true, title: "选择要上传的文件" });
     if (!picked) return;
@@ -320,7 +332,7 @@ export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDis
     if (paths.length === 0) return;
     await runTransfer(
       "upload",
-      (rid) => sftpUpload(sessionId, paths, currentPath, rid),
+      (rid) => transferApi.upload(sessionId, paths, currentPath, rid),
       true
     );
   }
@@ -337,7 +349,7 @@ export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDis
     const paths = selectedFileEntries.map((e) => e.path);
     await runTransfer(
       "download",
-      (rid) => sftpDownload(sessionId, paths, destDir, rid, getSftpDownloadConcurrency()),
+      (rid) => transferApi.download(sessionId, paths, destDir, rid, getSftpDownloadConcurrency()),
       false
     );
   }
@@ -809,7 +821,7 @@ export function SftpPanel({ sessionId, source = "ssh", fullHeight = false, onDis
               </button>
             ) : (
               <button
-                onClick={() => sftpCancelTransfer(transfer.requestId).catch(() => {})}
+                onClick={() => transferApi.cancel(transfer.requestId).catch(() => {})}
                 style={{
                   background: "transparent",
                   color: "#f38ba8",
