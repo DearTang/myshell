@@ -137,7 +137,11 @@ export function ZmodemProgressOverlay({ status, onCancel }: Props) {
             width: `${percent}%`,
             height: "100%",
             background: "linear-gradient(90deg, #89b4fa, #b4befe)",
-            transition: "width 0.3s ease",
+            // Short + LINEAR: progress arrives at a fixed 10 Hz (Rust
+            // throttles zmodem_progress to 100ms). A long ease transition
+            // that keeps getting retargeted faster than it can finish made
+            // the bar crawl tens of percent behind the numbers.
+            transition: "width 120ms linear",
           }}
         />
       </div>

@@ -29,6 +29,7 @@ import {
   saveScreenshot,
   getAttachmentDir,
   showInFolder,
+  nudgeMouseCursor,
 } from "../api";
 import { open } from "@tauri-apps/plugin-dialog";
 import { captureTerminalToDataUrl } from "../utils/screenshot";
@@ -275,12 +276,14 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
   };
 
   const pickUploadFiles = async () => {
+    await nudgeMouseCursor().catch(() => {});
     const selected = await open({ multiple: true });
     const paths: string[] = !selected ? [] : Array.isArray(selected) ? selected : [selected];
     await commitNativeUpload(paths);
   };
 
   const pickUploadFolder = async () => {
+    await nudgeMouseCursor().catch(() => {});
     const selected = await open({ directory: true, multiple: true });
     const paths: string[] = !selected ? [] : Array.isArray(selected) ? selected : [selected];
     await commitNativeUpload(paths);
@@ -708,6 +711,10 @@ export function TerminalPanel({ tabId, sessionId, connType, connectionId, fontOv
     const promptNativeDir = async (): Promise<string | null> => {
       if (nativeCancelledRef.current) return null;
       if (nativeDirRef.current !== null) return nativeDirRef.current;
+      // The picker opens right after the user typed `sz …` — nudge the
+      // pointer visible first (WebView2 "hide pointer while typing" keeps
+      // it invisible over native dialogs, see nudgeMouseCursor docs).
+      await nudgeMouseCursor().catch(() => {});
       const dir = await open({ directory: true });
       if (typeof dir === "string" && dir.length > 0) {
         nativeDirRef.current = dir;

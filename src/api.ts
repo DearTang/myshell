@@ -1461,6 +1461,17 @@ export async function showInFolder(path: string): Promise<void> {
   await invoke("show_in_folder", { path });
 }
 
+/**
+ * Reveal the mouse pointer with an imperceptible 1px nudge. Call right
+ * before opening a native file/folder picker that follows keyboard input
+ * (e.g. typing `sz <file>`): WebView2 Runtime 152+ honors Windows' "hide
+ * pointer while typing" and keeps the pointer invisible over the dialog
+ * (MicrosoftEdge/WebView2Feedback#5687). Fire-and-forget safe.
+ */
+export async function nudgeMouseCursor(): Promise<void> {
+  await invoke("nudge_mouse_cursor");
+}
+
 // ============ MCP command confirmation rules ============
 //
 // Configurable whitelist + blacklist (regex) controlling which ssh_exec

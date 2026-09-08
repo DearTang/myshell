@@ -3104,3 +3104,33 @@
 | 什么可能导致偏离？ | ① 远端无 lrzsz 时每次首轮传输要等 ~20s 超时才回退，高频小文件场景体验变差（用户点名要此顺序的已知取舍）；② 已在运行的 MCP 会话仍缓存旧工具描述，直到重启；③ `myshell-mcp.exe.old` 待重启确认后手删。 |
 | 下一步最小可验证动作？ | 重启 MCP 会话后查看工具列表，`zmodem_download`/`zmodem_upload` 描述应含 "PREFERRED transfer method"；让 AI 传一个文件应先调 zmodem 工具。 |
 | 目标是什么？ | AI agent 的文件传输首选路径与用户真实环境匹配：先走受限环境可用性最好的 zmodem，SFTP 只做兜底。 |
+
+### 阶段 121 — ZMODEM sz 下载五连修：无权限无反馈、超时后输入卡死、进度条滞后、选文件夹鼠标不可见、取消偶发无反应（2026-09-08）
+
+**背景：** 用户实测 `sz` 下载报 5 个问题：① 无权限 sz 无任何反应；② 接收超时报错后无法继续输入命令；③ 进度条与数字对不上（截图实测：文本 98.9%，进度条填充仅 79.8%）；④ sz 弹出的文件夹选择对话框里鼠标指针不可见（悬停高亮正常）；⑤ 点取消偶发无反应。
+
+**根因与修复：**
+
+1. **①无权限 sz 无反馈 + ②超时后输入卡死（同一场景两个阶段）**：sz 打不开文件时把错误文本（如 "Permission denied"）直接打到 PTY 后退出，不发 CAN/ZFERR。我们已进入 Zmodem 模式 → `rx.feed()` 把文本当垃圾静默吞掉（用户 30 秒看不到任何东西）；30 秒 idle 超时只报错收场，**不发 CAN 突发**——若 sz 其实还挂着（hung 在 I/O 上、以 raw 模式占着 PTY），此后所有键入都被垂死的 sz 吃掉，表现为"无法继续输入命令"。
+   - `zmodem_rx.rs`：新增 `noise_text`/`noise_seen_at` 跟踪——`WaitingZfile` 态收到**不含 ZDLE 的纯文本块**（≥4 可见字符）即缓存；后续若解析出真实协议帧则清空（兼容 verbose 交错输出）。
+   - `ssh.rs` reader tick：新增**噪声超时快失败**——噪声出现 2 秒内无真实帧 → 把缓存的错误文本作为 `ssh_output` 打回终端 + 发 8×CAN+退格（敲掉挂死的 sz、让 shell 回前台）+ `zmodem_error`/`zmodem_end` 收场。不再干等 30 秒。
+   - `ssh.rs` 30s idle 超时路径同样升级：`drain_trailing()` 把被吞文本打回终端 + 发 CAN 突发（修复②的输入卡死）。
+
+2. **③进度条滞后 + ⑤取消偶发无反应（同根因：RX progress 事件洪水）**：RX 路径的 `zmodem_progress` 无节流（TX 早有 100ms 节流）——每 512KB 边界 + **每次 feed 收尾**都发，7 MB/s 时 200+ 事件/秒 → WebView 主线程被 React 重渲染淹没 → paint 掉帧。数字文本（无 transition）每次 paint 都最新，而进度条 `transition: width 0.3s ease` 在持续重定向下每次 paint 只追近 ~1-2% 剩余差距 → 滞后滚雪球到 ~20%；点击事件同样排队延迟（取消"无反应"）。
+   - `ssh.rs`：`dispatch_rx_actions` 增加 `last_progress_emit` 参数，与 TX 共用 `PROGRESS_THROTTLE`（100ms），final 事件（written≥total）恒放行保证 100%。
+   - `ZmodemProgressOverlay.tsx`：transition 从 `0.3s ease` 改为 `120ms linear`（10Hz 更新下线性追赶，滞后 ≤0.25%）。
+
+3. **④选文件夹鼠标不可见**：WebView2 Runtime 152+ 开始遵循 Windows「在键入时隐藏鼠标指针」设置（[WebView2Feedback #5687](https://github.com/MicrosoftEdge/WebView2Feedback/issues/5687)，未修复）。sz 的文件夹选择器恰好在用户**刚键入** `sz …` 后弹出，指针仍处隐藏态且原生对话框不恢复。新增 `nudge_mouse_cursor` Tauri 命令（Windows 下 SendInput 两次相对移动 +1/-1 像素，互抵不可感知，清除隐藏态），三个 ZMODEM 选择器（下载目录/上传文件/上传文件夹）打开前调用。
+
+**验证：** `cargo check` 通过（无新增警告）；`cargo test --lib zmodem_rx` 10/10 通过（新增 3 个：纯文本触发噪声超时、真实帧清除跟踪、非 WaitingZfile 态不跟踪）；`npx tsc --noEmit` 通过。进度条像素级实测：填充止于 x=1079、轨道 #313244 至 x=1343 → 79.8% vs 文本 98.9%，确认滞后根因。
+
+**改动文件：** `src-tauri/src/zmodem_rx.rs`、`src-tauri/src/ssh.rs`、`src-tauri/src/main.rs`、`src/api.ts`、`src/components/TerminalPanel.tsx`、`src/components/ZmodemProgressOverlay.tsx`、`progress.md`、`RELEASE_NOTES_STAGING.md`。
+
+## 五问重启检查（阶段 121）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 121 complete —— 五个 sz 问题全部修复，编译/测试/类型检查三绿，待用户实测确认。 |
+| 我要去哪里？ | 用户重新 `cargo tauri dev` 或打包后实测：无权限 sz 应 2 秒内显示错误并恢复输入；进度条应紧贴数字；选文件夹应见鼠标；取消应即时响应。 |
+| 什么可能导致偏离？ | ① 用户系统未开「在键入时隐藏鼠标指针」则 ④ 无法本机复现（修复仍无害）；② WebView2 后续版本若修 #5687，nudge 变冗余但无害；③ noise 误判风险：sz -v verbose 输出与帧分离到达且间隔 >2s 会误杀会话（罕见，错误文本会显示、可重试）。 |
+| 下一步最小可验证动作？ | 连一台装有 lrzsz 的服务器：`sz /root/无权限文件` → 终端应在 ~2 秒内出现 sz 的报错原文 + [ZMODEM 错误] 提示，且能立即继续敲命令。 |
+| 目标是什么？ | ZMODEM 下载全链路可观测、可恢复：失败看得见错误、终端永不卡死、进度真实、指针可见、取消即时。 |

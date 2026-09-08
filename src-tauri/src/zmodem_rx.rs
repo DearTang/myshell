@@ -156,6 +156,16 @@ pub struct ZmodemReceiver {
     /// `rz` sends ZRINIT). The caller should drain `buf` and hand the bytes to
     /// the JS zmodem.js path instead.
     passthrough: bool,
+    /// Plain terminal text (no ZDLE ⇒ no possible frame) seen while waiting
+    /// for the first ZFILE offer. A sz that fails to open its file prints the
+    /// error straight to the PTY and exits without CAN/ZFERR — the text lands
+    /// here so the reader can surface it and end the session quickly instead
+    /// of swallowing it until the 30s idle timeout.
+    noise_text: Vec<u8>,
+    /// When the first plain-text chunk was seen. Combined with a grace period
+    /// by the reader (noise_timeout) so interleaved verbose output that IS
+    /// followed by a real frame doesn't false-positive.
+    noise_seen_at: Option<std::time::Instant>,
     /// Whether the "native download started" signal has been taken by the caller
     /// (so zmodem_start is emitted exactly once).
     start_emitted: bool,
@@ -181,6 +191,8 @@ impl ZmodemReceiver {
             in_zdata: false,
             data_crc32: false,
             passthrough: false,
+            noise_text: Vec::new(),
+            noise_seen_at: None,
             start_emitted: false,
             last_feed: None,
         }
@@ -232,6 +244,34 @@ impl ZmodemReceiver {
             let made_progress = self.try_step(&mut actions);
             if !made_progress {
                 break;
+            }
+        }
+
+        // Dying-sender text: while waiting for the first ZFILE offer, any
+        // UNCONSUMED tail that contains no ZDLE byte cannot be a protocol
+        // frame (headers always carry ZDLE). sz that failed to open its
+        // file (permission denied, missing path) prints its error straight
+        // to the PTY and exits without a CAN burst or ZFERR — buffer the
+        // text so the reader can surface it and end the session instead of
+        // silently waiting out the 30s idle timeout with input blocked.
+        // Runs AFTER the parse loop so a ZRQINIT + error text landing in
+        // the same SSH packet is also caught. The tail is consumed (it is
+        // terminal text, not protocol) so a later feed can't re-track it.
+        if self.state == RxState::WaitingZfile && !self.in_zdata {
+            let start = self.scan_pos.min(self.buf.len());
+            let tail = &self.buf[start..];
+            if !tail.is_empty() && !tail.contains(&ZDLE) {
+                let printable = tail
+                    .iter()
+                    .filter(|&&b| (0x20..0x7f).contains(&b) || b >= 0x80)
+                    .count();
+                if printable >= 4 {
+                    self.noise_text.extend_from_slice(tail);
+                    if self.noise_seen_at.is_none() {
+                        self.noise_seen_at = Some(std::time::Instant::now());
+                    }
+                    self.scan_pos = self.buf.len();
+                }
             }
         }
         // Compact the buffer — drop already-consumed prefix.
@@ -302,6 +342,24 @@ impl ZmodemReceiver {
             Some(t) => t.elapsed() > limit,
             None => false,
         }
+    }
+
+    /// True when plain-text output was seen waiting for the first offer and
+    /// no protocol frame has arrived within `grace` — the sender is dead and
+    /// its error text should be shown to the user (see `noise_text`). The
+    /// reader passes a grace of ~2s so interleaved verbose output followed by
+    /// a real ZFILE (which clears the tracker) doesn't false-positive.
+    pub fn noise_timeout(&self, grace: std::time::Duration) -> bool {
+        match self.noise_seen_at {
+            Some(t) => t.elapsed() >= grace,
+            None => false,
+        }
+    }
+
+    /// Drain buffered dying-sender text so the reader can emit it as
+    /// terminal output when the noise timeout fires.
+    pub fn take_noise_text(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.noise_text)
     }
 
     /// Drain decoded payload accumulated since the last call. The caller writes
@@ -450,6 +508,11 @@ impl ZmodemReceiver {
                     None => return false, // incomplete — wait for more bytes
                     Some((header, consumed)) => {
                         self.scan_pos = abs_pos + consumed;
+                        // A real protocol frame parsed — the sender is alive.
+                        // Drop any buffered "dying sz" text (verbose-mode
+                        // output interleaved with frames would end up here).
+                        self.noise_text.clear();
+                        self.noise_seen_at = None;
                         if self.handle_header(header, actions) {
                             return true;
                         }
@@ -1231,6 +1294,75 @@ mod tests {
         // not even with a zero limit.
         let _ = rx.feed(&zfile_frame("a.txt", 1));
         assert!(!rx.idle_timeout(std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn plain_text_before_offer_trips_noise_timeout() {
+        // sz that can't read its file prints the error to the PTY and exits
+        // without CAN/ZFERR. The receiver must surface that text via
+        // take_noise_text() once the grace period passes.
+        let mut rx = ZmodemReceiver::new();
+        let _ = rx.feed(&hex_header(frame_type::ZRQINIT));
+        let actions = rx.feed(b"sz: postgresql-01.log: Permission denied\r\n");
+        assert!(
+            actions.events.is_empty(),
+            "text alone must not end the session instantly (grace period)"
+        );
+        assert!(rx.noise_timeout(std::time::Duration::ZERO));
+        assert_eq!(
+            rx.take_noise_text(),
+            b"sz: postgresql-01.log: Permission denied\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn noise_in_same_packet_as_zrqinit_is_tracked() {
+        // sz can fail so fast that ZRQINIT and its error text land in the
+        // same SSH packet — the post-parse tail scan must still catch the
+        // text once the header has been consumed.
+        let mut rx = ZmodemReceiver::new();
+        let mut data = hex_header(frame_type::ZRQINIT);
+        data.extend_from_slice(b"rz: /var/log/x.log: Permission denied\r\n");
+        let _ = rx.feed(&data);
+        assert!(rx.noise_timeout(std::time::Duration::ZERO));
+        assert_eq!(
+            rx.take_noise_text(),
+            b"rz: /var/log/x.log: Permission denied\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn real_frame_clears_noise_tracker() {
+        // Verbose sz may interleave text with real frames — a subsequent
+        // ZFILE must clear the noise tracker so the session continues.
+        let mut rx = ZmodemReceiver::new();
+        let _ = rx.feed(&hex_header(frame_type::ZRQINIT));
+        let _ = rx.feed(b"some verbose line\r\n");
+        assert!(rx.noise_timeout(std::time::Duration::ZERO));
+        let actions = rx.feed(&zfile_frame("ok.txt", 5));
+        assert!(actions.events.iter().any(|e| matches!(e, RxEvent::Offer { .. })));
+        assert!(
+            !rx.noise_timeout(std::time::Duration::from_secs(3600)),
+            "a parsed frame must clear the noise tracker"
+        );
+        assert!(rx.take_noise_text().is_empty());
+    }
+
+    #[test]
+    fn noise_not_tracked_in_other_states() {
+        // Text during a transfer (in_zdata) must not be buffered as noise.
+        let mut rx = ZmodemReceiver::new();
+        let _ = rx.feed(&hex_header(frame_type::ZRQINIT));
+        let _ = rx.feed(&zfile_frame("t.bin", 3));
+        let save_path = std::env::temp_dir().join("zmodem_rx_test_noise_states.bin");
+        let (_, file) = rx.accept_offer(&Some(save_path.to_string_lossy().to_string()));
+        assert!(file.is_some());
+        let _ = rx.feed(b"random mid-transfer text??");
+        assert!(
+            !rx.noise_timeout(std::time::Duration::ZERO),
+            "noise tracker only applies to WaitingZfile"
+        );
+        let _ = std::fs::remove_file(save_path);
     }
 
     #[test]

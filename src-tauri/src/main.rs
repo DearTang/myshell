@@ -1840,6 +1840,59 @@ fn mcp_exec_result(request_id: String, result: serde_json::Value) -> Result<(), 
     }
 }
 
+/// Reveal the mouse pointer with a 1px nudge-and-return (imperceptible).
+/// Workaround for WebView2 Runtime 152+ honoring Windows' "hide pointer
+/// while typing" (MicrosoftEdge/WebView2Feedback#5687): the ZMODEM pickers
+/// open right after the user TYPES `sz <file>`, so the pointer is still in
+/// the hidden-while-typing state and stays invisible over the native
+/// folder/file dialog even though hover highlighting keeps working. A
+/// synthetic relative mouse move clears that hidden state. No-op on
+/// non-Windows.
+#[tauri::command]
+fn nudge_mouse_cursor() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        // Minimal layout-compatible INPUT/MOUSEINPUT declarations so we
+        // don't pull the `windows` crate in as a direct dependency just for
+        // one call. MOUSEINPUT is the largest union member, so this struct
+        // is size/layout-identical to Win32 INPUT for mouse events.
+        #[repr(C)]
+        struct MouseInput {
+            dx: i32,
+            dy: i32,
+            mouse_data: u32,
+            dw_flags: u32,
+            time: u32,
+            dw_extra_info: usize,
+        }
+        #[repr(C)]
+        struct Input {
+            r#type: u32,
+            u: MouseInput,
+        }
+        extern "system" {
+            fn SendInput(c_inputs: u32, p_inputs: *const Input, cb_size: i32) -> u32;
+        }
+        const INPUT_MOUSE: u32 = 0;
+        const MOUSEEVENTF_MOVE: u32 = 0x0001;
+        let mk = |dx: i32, dy: i32| Input {
+            r#type: INPUT_MOUSE,
+            u: MouseInput {
+                dx,
+                dy,
+                mouse_data: 0,
+                dw_flags: MOUSEEVENTF_MOVE,
+                time: 0,
+                dw_extra_info: 0,
+            },
+        };
+        // +1 then -1: the two relative moves cancel out, but each generates
+        // a mouse-move event that clears the hidden-while-typing state.
+        let inputs = [mk(1, 0), mk(-1, 0)];
+        SendInput(2, inputs.as_ptr(), std::mem::size_of::<Input>() as i32);
+    }
+}
+
 /// Open a file or folder in the OS file manager. On Windows, selects the file
 /// in Explorer (like "Show in Folder"); on macOS, reveals in Finder; on Linux,
 /// opens the containing directory in xdg-open.
@@ -4714,6 +4767,7 @@ pub fn run() {
             set_attachment_dir,
             save_screenshot,
             show_in_folder,
+            nudge_mouse_cursor,
             get_command_rules,
             set_command_rules,
             check_command_confirmation,

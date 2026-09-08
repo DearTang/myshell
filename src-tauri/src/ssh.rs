@@ -949,6 +949,9 @@ async fn channel_reader(
     // underlying Receiver directly.
 
     let mut last_upload_error: Option<String> = None;
+    // Last zmodem_progress emit for the native DOWNLOAD path (throttle state
+    // for dispatch_rx_actions — symmetric to tx_state.last_progress_emit).
+    let mut rx_last_progress: Option<Instant> = None;
     loop {
         // Promote any deferred upload-error cleanup into actual side-effects
         // BEFORE the select, so all borrows are fresh.
@@ -1031,7 +1034,8 @@ async fn channel_reader(
                         if let Some(f) = file {
                             let _ = disk_tx.send(DiskJob::Open(f));
                         }
-                        let (send, ended, disk) = dispatch_rx_actions(&*sink, &session_id, actions);
+                        let (send, ended, disk) =
+                            dispatch_rx_actions(&*sink, &session_id, actions, &mut rx_last_progress);
                         if disk.flush {
                             let _ = disk_tx.send(DiskJob::Flush);
                         }
@@ -1172,7 +1176,7 @@ async fn channel_reader(
                         let to_send = handle_incoming_data(
                             &*sink, &session_id, data, &mut buffer, &mut last_flush,
                             &mut mode, &mut suppress_until, &mut zmodem_rx, &disk_tx,
-                            &mut tx_state, &upload_aborted,
+                            &mut tx_state, &upload_aborted, &mut rx_last_progress,
                         );
                         // Drain decoded payload from the receiver to the
                         // background disk task — this is just an unbounded
@@ -1465,9 +1469,76 @@ async fn channel_reader(
                             "[ssh:{}] zmodem rx idle timeout (30s without data), forcing end",
                             session_id
                         );
+                        // Surface whatever terminal text arrived while the
+                        // receiver still held the session in Zmodem mode —
+                        // the dying sz's error output (and the shell prompt
+                        // that followed) was swallowed into the rx buffer.
+                        if let Some(rx) = zmodem_rx.as_mut() {
+                            let tail = rx.drain_trailing();
+                            if !tail.is_empty() {
+                                sink.emit(
+                                    "ssh_output",
+                                    &SshOutputPayload {
+                                        session_id: session_id.clone(),
+                                        data: tail,
+                                    },
+                                );
+                            }
+                        }
+                        // Abort sequence (same as the user-facing Cancel):
+                        // if sz is still alive — hung on I/O, holding the PTY
+                        // in raw mode — the 8×CAN makes lrzsz exit and restore
+                        // the terminal. Without this the user cannot type
+                        // anything after the error because every keystroke
+                        // goes to the hung sz instead of the shell.
+                        send_data(&data_tx, &[CAN; 8]).await;
+                        send_data(&data_tx, b"\x08\x08\x08\x08\x08\x08\x08\x08").await;
                         sink.emit("zmodem_error", &serde_json::json!({
                             "sessionId": session_id,
                             "message": "ZMODEM 接收超时：远端 30 秒没有任何数据，会话已结束"
+                        }));
+                        let _ = disk_tx.send(DiskJob::Close);
+                        mode = TermMode::Normal;
+                        suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                        zmodem_rx = None;
+                        sink.emit("zmodem_end", &session_id.to_string());
+                    }
+                }
+                // ZMODEM download fast-fail on plain text: sz that fails to
+                // open its file (no read permission) prints the error straight
+                // to the PTY and exits without CAN/ZFERR. The receiver buffers
+                // that text (noise_text); if no real frame follows within the
+                // grace window the sender is dead — show the error text and
+                // end the session immediately instead of blocking the
+                // terminal for the full 30s idle timeout.
+                if mode == TermMode::Zmodem {
+                    let noise_timed_out = zmodem_rx
+                        .as_ref()
+                        .map(|rx| rx.noise_timeout(Duration::from_millis(2000)))
+                        .unwrap_or(false);
+                    if noise_timed_out {
+                        log::warn!(
+                            "[ssh:{}] zmodem rx noise timeout (plain text, no offer) — ending session",
+                            session_id
+                        );
+                        let text = zmodem_rx
+                            .as_mut()
+                            .map(|rx| rx.take_noise_text())
+                            .unwrap_or_default();
+                        if !text.is_empty() {
+                            sink.emit(
+                                "ssh_output",
+                                &SshOutputPayload {
+                                    session_id: session_id.clone(),
+                                    data: text,
+                                },
+                            );
+                        }
+                        send_data(&data_tx, &[CAN; 8]).await;
+                        send_data(&data_tx, b"\x08\x08\x08\x08\x08\x08\x08\x08").await;
+                        sink.emit("zmodem_error", &serde_json::json!({
+                            "sessionId": session_id,
+                            "message": "远端 sz 未发送文件即退出（常见原因：无读取权限），已退出 ZMODEM 模式"
                         }));
                         let _ = disk_tx.send(DiskJob::Close);
                         mode = TermMode::Normal;
@@ -1561,6 +1632,7 @@ fn handle_incoming_data(
     disk_tx: &tokio::sync::mpsc::UnboundedSender<DiskJob>,
     tx_state: &mut TxSession,
     upload_aborted: &std::sync::atomic::AtomicBool,
+    rx_last_progress: &mut Option<Instant>,
 ) -> Vec<u8> {
     match *mode {
         TermMode::Normal => {
@@ -1623,7 +1695,8 @@ fn handle_incoming_data(
                         },
                     );
                 }
-                let (send, ended, disk) = dispatch_rx_actions(sink, session_id, actions);
+                let (send, ended, disk) =
+                    dispatch_rx_actions(sink, session_id, actions, rx_last_progress);
                 if disk.flush || disk.close {
                     let pending = rx.take_pending_write();
                     if !pending.is_empty() {
@@ -1661,7 +1734,8 @@ fn handle_incoming_data(
                         },
                     );
                 }
-                let (send, ended, disk) = dispatch_rx_actions(sink, session_id, actions);
+                let (send, ended, disk) =
+                    dispatch_rx_actions(sink, session_id, actions, rx_last_progress);
                 // CRITICAL: drain any pending decoded payload BEFORE sending
                 // Flush/Close. ZEOF triggers disk.flush, but the last
                 // subpacket's bytes are still in pending_write — if we flush
@@ -2051,6 +2125,7 @@ fn dispatch_rx_actions(
     sink: &dyn EventSink,
     session_id: &str,
     actions: RxActions,
+    last_progress_emit: &mut Option<Instant>,
 ) -> (Vec<u8>, bool, DiskSignal) {
     let mut ended = false;
     let mut disk = DiskSignal::default();
@@ -2067,14 +2142,30 @@ fn dispatch_rx_actions(
                 );
             }
             RxEvent::Progress { written, total } => {
-                sink.emit_raw(
-                    "zmodem_progress",
-                    serde_json::json!({
-                        "sessionId": session_id,
-                        "bytesTransferred": written,
-                        "bytesTotal": total,
-                    }),
-                );
+                // Same 100ms throttle as uploads (see PROGRESS_THROTTLE): the
+                // receiver emits Progress per 512KB crossing AND once per
+                // feed() batch — at line rate that's 200+ IPC events/sec,
+                // which floods the WebView with React re-renders. The flood
+                // starved paint frames so the progress bar's CSS transition
+                // crawled tens of percent behind the numbers, and delayed
+                // UI clicks (cancel felt dead). The final progress event
+                // (written >= total) always passes so the bar reaches 100%.
+                let now = Instant::now();
+                let is_final = total > 0 && written >= total;
+                let due = last_progress_emit
+                    .map(|t| now.duration_since(t) >= PROGRESS_THROTTLE)
+                    .unwrap_or(true);
+                if is_final || due {
+                    sink.emit_raw(
+                        "zmodem_progress",
+                        serde_json::json!({
+                            "sessionId": session_id,
+                            "bytesTransferred": written,
+                            "bytesTotal": total,
+                        }),
+                    );
+                    *last_progress_emit = Some(now);
+                }
             }
             RxEvent::FileComplete { name, written } => {
                 // The file is done — flush the disk task so data lands before

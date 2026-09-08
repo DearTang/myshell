@@ -35,7 +35,7 @@
 - **命令历史栏**：最近 50 条命令 + 钉住置顶
 - **快捷命令**：全局快捷命令 + 服务器专属快捷命令，多行命令按行顺序一键执行（`#` 注释与空行自动跳过），支持广播到多终端；支持**行间延迟**——三档模式：`##delay:500`（或 `##delay:1s`）在两行之间精确等待、固定延迟、或「智能等待」（监听终端输出，等上一行输出静止后再发下一行，自动适配命令速度、能处理 `sudo`/`mysql` 密码提示）；在「设置 → 快捷命令」配置
 - **广播输入**：同时向多个终端发送相同命令
-- ZMODEM 协议支持（rz/sz 文件传输）：原生 Rust 收发（零 JS 数据路径），128 KB 子包批量直写 SSH channel，进度 IPC 事件 100ms 节流削减跨进程开销，传输期间进度条实时显示、取消可用；`sz -r 目录` 递归下载文件夹（接收端按 offer 相对路径自动建目录镜像子树，路径段清洗防 `..`/盘符逃逸），rz 上传可选文件夹递归（ZFILE offer 携带相对路径，lrzsz rz 在远端自动重建目录树）；远端中止（文件无权限 / 是目录 / 进程被杀）时自动识别 lrzsz 取消序列与 ZABORT 帧、30s 静默超时兜底，终端立即或 ≤30s 恢复可用并显示失败原因。协议为单流串行——多文件按顺序传输，无并发
+- ZMODEM 协议支持（rz/sz 文件传输）：原生 Rust 收发（零 JS 数据路径），128 KB 子包批量直写 SSH channel，双向进度 IPC 事件 100ms 节流削减跨进程开销（进度条紧贴实时数字），传输期间进度条实时显示、取消可用；`sz -r 目录` 递归下载文件夹（接收端按 offer 相对路径自动建目录镜像子树，路径段清洗防 `..`/盘符逃逸），rz 上传可选文件夹递归（ZFILE offer 携带相对路径，lrzsz rz 在远端自动重建目录树）；远端中止（文件无权限 / 是目录 / 进程被杀）时自动识别 lrzsz 取消序列与 ZABORT 帧，sz 无权限报错文本 2 秒内回显终端并快速退出，30s 静默超时兜底——超时/中止均发送 CAN 序列敲掉挂死的 sz 保证 shell 立即可用并显示失败原因；文件/文件夹选择器弹出前微移鼠标指针显形（绕过 WebView2「键入时隐藏指针」缺陷）。协议为单流串行——多文件按顺序传输，无并发
 - 服务器状态实时监控（CPU、内存、磁盘）
 - **本地终端**：直连本地 PowerShell / CMD / WSL / 自定义 shell，作为可保存的连接，体验等同 SSH 终端
 - **终端字体**：从系统已安装字体下拉选择（也可手输），默认字体栈 Nerd Font 优先，正确渲染 Powerline / 图标字形（Oh My Posh / Starship / powerlevel10k 等）；支持**按连接单独覆盖字体**
@@ -122,6 +122,19 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 暴露 15 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过；命令类确认（`ssh_exec` / `ssh_run`）会逐条列出命中的黑名单规则及具体危害说明，弹窗出现时 MyShell 窗口自动置顶、聚焦并闪烁任务栏，避免人工审核被遗漏；用户点「取消」拒绝时返回硬性停止（HARD STOP）错误——AI 必须立即停止当前任务的所有后续操作（不重试、不换工具绕过）、向用户输出任务进度说明，并等待用户明确确认是否继续（`ssh_run` 后台任务拒绝后经 `ssh_status` 同样处理）。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz -r`/`rz`（lrzsz）走 ZMODEM 协议传输文件，双向支持目录递归（zmodem_download 子树按相对路径镜像到 local_dir；zmodem_upload 目录展开后按相对路径 offer，远端 rz 重建目录树），用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 zmodem_*，技术性失败（如远端无 lrzsz）时再回退 sftp_*。
 
 ## 更新日志
+
+### v2.14.1（2026-09-08）
+
+#### 🛠️ 优化
+
+- **ZMODEM 传输中取消按钮偶发无响应**：下载方向进度事件此前无节流（高速传输时每秒 200+ IPC 事件淹没 WebView），现在与上传同样按 100ms 节流，点击即时生效，传输期间 CPU 占用同步下降。
+
+#### 🐛 修复
+
+- **ZMODEM 下载（sz）无权限时无任何反应**：sz 打不开文件时把报错直接打到终端后退出（不发取消序列），错误文本被 ZMODEM 接收器静默吞掉、终端假死 30 秒。现在 2 秒内回显远端报错原文并自动退出 ZMODEM 模式。
+- **ZMODEM 接收超时后无法继续输入命令**：超时/失败收场时补发 8×CAN 中止序列，敲掉仍挂在远端终端上的 sz、shell 立即恢复可用，同时回显此前被吞的输出。
+- **ZMODEM 下载进度条滞后于百分比数字**：进度事件节流（见上）+ 进度条动画由 0.3s ease 改为 120ms 线性，进度条紧贴实时数字。
+- **sz/rz 选择文件夹对话框中鼠标指针不可见**：绕过 WebView2「在键入时隐藏鼠标指针」缺陷（MicrosoftEdge/WebView2Feedback#5687），文件/文件夹选择器弹出前微移鼠标指针使其显形。
 
 ### v2.14.0（2026-09-05）
 
