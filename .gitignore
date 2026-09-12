@@ -31,3 +31,8 @@ desktop.ini
 *.key
 .gitee-token
 .github-token
+
+# ZCode scratch — local test build artifacts (regenerable via .zcode/build-c-test.bat)
+.zcode/*.exe
+.zcode/*.obj
+.zcode/*.pdb
