@@ -3204,3 +3204,109 @@
 | 什么可能导致偏离？ | 若后续导航项改为无 `.nav-text` 结构，Tooltip 将无法读取名称；组件化时应改为显式 label 属性。 |
 | 下一步最小可验证动作？ | 收缩左栏后依次悬浮各菜单图标，再切换英文确认对应名称同步变化。 |
 | 目标是什么？ | 收缩导航节省空间但不牺牲可发现性，并兼容鼠标和键盘用户。 |
+
+### 阶段 125 — 统一界面 Vue + MyUI（v0.7.0）参考实现（2026-09-13）
+
+**背景：** MyUI 组件库发布 v0.7.0，此前确认的组件能力缺口（MySignalTrack/MyNotificationBell/MyCommandPalette/可扩展图标）已在 0.4.0-0.6.0 补齐。基于 v0.7.0 产出统一界面的 Vue 3 参考实现，作为后续其他软件迁移 MyUI 的工程基线。
+
+**实现（当前位于 `F:\personalProject\MyUI\src\views\cases\unified-ui`；以下为首次实现时的记录）：**
+1. 工程：Vue 3.5 + TypeScript + Vite 8，`myui` 以 Gitee git tag 依赖引入；ElementPlusResolver 按需解析模板中的 EP 组件。
+2. 样式分层遵循 myui 分发契约：EP 基础样式 → EP 暗色变量 → `myui/styles` → `myui/element-theme` → 应用壳层 `app.css`（只写布局，颜色全部引用 MyUI 令牌）。
+3. 五区壳层：AppTopBar（品牌区/搜索触发/MyNotificationBell/主题/国际化/设置/用户菜单）、AppSidebar（el-menu collapse + 收缩态 el-tooltip 菜单名 + 版本/反馈入口）、主工作区（页头 + MySignalTrack 状态信号轨 + 会话/终端/传输面板）、UtilityRail（健康环/活动时间线/助手卡）、Overlay（MyCommandPalette/MyDrawer 设置/MyDialog 升级弹窗）。
+4. 全局交互：Ctrl+K 命令面板（页面 + 动作混合注册）、中英文切换（应用词 + `setupMyUII18n` 库词合并）、深/浅/跟随系统三态主题、品牌强调色（写 `--accent` 与 `--el-color-primary`）、偏好 localStorage 持久化。
+5. 遵循 v0.7.0 破坏性约定：升级弹窗显式 `dismissable=true`（含 Esc/遮罩关闭），其余确认路径走默认防误关语义；通过 `registerIcon()` 注册 EP 图标集没有的 Terminal/Moon/Sunny/Globe/Monitor。
+
+**验证：** 遵循本仓库"不运行构建"约定，未执行 pnpm install/build；逐文件静态走查：所有 SFC 的 template/script/style 配对、花括号平衡（脚本扫描 13 个文件全部平衡）、无残留占位代码；组件 props 均对照 myui-check v0.7.0 源码确认（SignalTrackItem/CommandItem/MySegmented 值语义/MyDialog props 等）；修复 el-segmented v-model 传值语义与 vue-i18n locale 同步两处逻辑问题。
+
+**当前参考实现：** `F:\personalProject\MyUI\src\views\cases\unified-ui`（`components/`、`icons.ts`、`index.vue`、`store.ts`、`styles.css`）；本阶段所述的独立工程目录已按迁移要求删除。
+
+## 五问重启检查（阶段 125）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 125 complete —— 统一界面的 Vue 3 + MyUI v0.7.0 参考实现已产出并通过静态走查。 |
+| 我要去哪里？ | 当前参考实现在 `F:\personalProject\MyUI\src\views\cases\unified-ui`，通过 MyUI 的「设计案例 → 统一应用界面」菜单查看和验证。 |
+| 什么可能导致偏离？ | ① myui dist 为预构建产物，若 lib 内部新增 el-* 组件而消费方未引全 EP 样式会缺样式（当前用全量 EP CSS 兜底）；② MyButton 等组件的 attrs 透传细节未经运行时验证，实际渲染可能有出入。 |
+| 下一步最小可验证动作？ | 在 MyUI 中打开「设计案例 → 统一应用界面」，依次验证收缩侧栏 tooltip、Ctrl+K、语言/主题切换、设置抽屉与升级弹窗。 |
+| 目标是什么？ | 让统一五区壳层在 MyUI 上可直接运行，作为其他软件迁移的复制起点。 |
+
+### 阶段 126 — ui-vue 启动验证与目录迁移（2026-09-13）
+
+**背景：** 用户要求启动旧 `docs/ui-vue` 实际查看页面；该历史实现后续已整体迁入 MyUI 设计案例，当前目录为 `F:\personalProject\MyUI\src\views\cases\unified-ui`。
+
+**问题与处置：**
+1. `myshell` 根存在 `pnpm-workspace.yaml`（含 allowBuilds 配置），pnpm 把 `docs/ui-vue` 当作 workspace 子包：依赖被提升到根 `node_modules`，devDependencies 未安装，且早前用户在根目录试装过 `myui@v0.5.0`（根 package.json 已含该条目，属用户自己的改动，未回退）。
+2. `pnpm install --ignore-workspace` 在 ui-vue 内仍出现顶层链接缺失与嵌套 `docs/ui-vue/docs/ui-vue` 孤儿 node_modules，判定为 workspace 阴影下的反复冲突。
+3. **历史处置：** 当时工程曾迁出至独立目录以避开 workspace 冲突；后续用户要求不保留独立工程，现已整体迁入 `F:\personalProject\MyUI\src\views\cases\unified-ui`。
+4. 已删除 `myshell/docs/ui-vue` 与旧独立工程；当前实现仅维护于 MyUI 的「设计案例 → 统一应用界面」。
+
+**运行时修复（两处，静态检查未能发现）：**
+1. `register.ts` 引用了 `@element-plus/icons-vue` 不存在的 `Globe` 导出，页面白屏；已改为自绘 SVG 注册 Globe/Terminal，Moon/Sunny/Monitor 确认存在保留。
+2. `app.css` 的 `.ui-shell` 使用命名 grid 区域但未给子元素分配 `grid-area`，且壳层误用三列（Utility Rail 实际渲染在 main 内部）；已修正为两列 + 显式 grid-area，隐藏右栏改为降级 `.ui-content-grid` 列数。
+
+**验证：** 浏览器 1440×900 实测渲染通过：顶栏（品牌/搜索/通知红点/主题/中英/设置/用户）、侧栏双分组菜单与底部版本反馈区、状态信号轨、会话表（筛选/状态点/进度）、快速终端、传输队列、健康环、活动时间线全部正常；`Ctrl+K` 命令面板组件挂载。
+
+**当前实现：** `F:\personalProject\MyUI\src\views\cases\unified-ui`（`components/`、`icons.ts`、`index.vue`、`store.ts`、`styles.css`）；旧 `myshell/docs/ui-vue/**` 与独立工程均已删除。
+
+## 五问重启检查（阶段 126）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 126 的独立工程已按后续迁移要求删除；统一界面现作为 MyUI 的设计案例维护。 |
+| 我要去哪里？ | 在 MyUI 中持续验证并演进「设计案例 → 统一应用界面」。 |
+| 什么可能导致偏离？ | 独立工程已不再存在，相关 workspace 约束不再适用于当前实现。 |
+| 下一步最小可验证动作？ | 在 MyUI 中依次收缩侧栏（看 tooltip）、Ctrl+K 搜索“设置”、切换语言与主题、打开设置抽屉与升级弹窗。 |
+| 目标是什么？ | 稳定可运行的 MyUI 五区壳层设计案例，可直接复制给新项目。 |
+
+
+### 阶段 127 — 前端整体迁移 Vue 3 + myui 0.7.0（界面更新分支）（2026-09-13）
+
+**背景：** 用户指令：以 myui 0.7.0（Gitee git 依赖）为准重构前端页面，参考 unified-ui-vue 模板作项目基础模板（布局观感大致参照），MyShell 自身结构优先；禁止修改 myui 框架；组件不满足时本地实现并在完成后反馈清单。myui 0.7.0 仍是 Vue 3 + Element Plus 组件库（peer：vue/element-plus/vue-i18n），MyShell 旧前端为 React 18——组件清单在 0.5.0→0.7.0 已补齐，故整体迁移技术栈至 Vue 3。
+
+**迁移架构：**
+- 后端与 IPC 契约零改动：src/api.ts（约 130 个 command 封装 + 类型）、zmodem-bridge.ts、themes.ts（33 套终端配色预设）、utils/、lib/usageStats.ts 原样保留。
+- 新增：store/（ui/connections/sessions/appearance 四域响应式单例）、composables/（useVault 保险库状态机+空闲自动锁、useMcpBridge MCP 桥 sentinel 机制逐行移植、useUpdateCheck、useRendererPref、useTerminalFont）、utils/ansi.ts（stripFromAnsiPosition + splitDangerSegments）、i18n、icons/register、styles/app.css（MyShell 令牌层 + myui 令牌桥 + 五区壳层布局）。
+- App.vue 五区壳层：顶栏（标签编排）| 连接树侧栏 | 工作区（终端/SFTP 页签绝对定位堆叠，保住 xterm 容器真实尺寸不变量）| AI 右栏 | 状态栏；保险库门禁前置；9+ 对话框浮层群。
+- 令牌桥：myui 组件消费的 --accent/--border-base/--surface-translucent 等映射到 MyShell 令牌，33 套配色预设与深浅主题对 myui 组件自动生效；html.dark/.light（myui/EP）与 html[data-theme]（MyShell）双轨同步。
+
+**9 组面板并行移植（全部 vue-tsc 零错误、语义零差异）：** AppTopBar+SessionDropdownPanel+ConnIcon；AppSidebar+useConnectionDrag；TerminalPanel+CommandBar+ZmodemProgressOverlay；SftpPanel；ConnectionDialog+PasswordVerifyDialog；SettingsDrawer+12 个 settings/* 分区（3734 行巨石拆解）+FontField；AiPanel+ServerInfoPanel；MasterPasswordGate+AboutDialog+UpdateNotification+StatsConsentDialog+BroadcastDupDialog+McpConfirmDialog；FeedbackDialog+RecycleDialog+QuickCommandsPanel+MultiWindowPicker+MultiWindowGrid。安全关键路径逐字保留：MCP 拒绝文案（与 myshell-mcp.rs denied_by_user_text 同步）、命令确认置顶闪烁、保险库门禁、OSC 52 屏蔽、主机密钥变更恢复。
+
+**验证：** npx vue-tsc --noEmit 全项目 0 错误；npx vite build 成功（1967 模块，45.7s）。React 源码移至 src-legacy/ 供对照（不参与编译）。构建链切换 vue-tsc（package.json build/test:ts）。
+
+**已知待办：** src-legacy/ 待后续清理删除；dev/打包在真实 Tauri 环境回归（终端数据流、ZMODEM、MCP 确认、保险库）；myui 缺失组件清单已汇总反馈用户（Popover 锚定浮层、MyInput 密码模式/size、MyTabs 标签头插槽、Combobox、MyProgress 令牌化/自定义高度、MySelect 分组/泛型、MyDialog #header 插槽/confirmDisabled 等）。
+
+## 五问重启检查（阶段 127）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 127 complete —— 前端已整体迁移 Vue 3 + myui 0.7.0，vue-tsc 零错误、vite build 通过。 |
+| 我要去哪里？ | 真实 Tauri 环境回归主路径（连接/终端/SFTP/设置/MCP 确认），清理 src-legacy/。 |
+| 什么可能导致偏离？ | myui 0.7.0 组件默认值与旧实现的观感差异（如 MySelect 默认 filterable）；主题桥在非 Carbon 预设下的细节；React 残留引用（已全部移出 src/）。 |
+| 下一步最小可验证动作？ | cargo tauri dev 启动 → 解锁保险库 → 连接一台 SSH → 终端交互/广播/SFTP 上传下载 → 设置切换主题与配色预设。 |
+| 目标是什么？ | 以 myui 统一组件体系为底座的 MyShell 前端，功能与旧版完全等价，后续迭代走令牌+Base 组件分层。 |
+
+
+### 阶段 128 — myui 0.10.1 深度采纳 + 门禁界面修缮（2026-09-13）
+
+**背景：** 依据阶段 127 反馈清单，用户将 myui 升级到 0.10.0/0.10.1（组件 42→49：新增 MyPopover/MyNav/MyTooltip/MySkeleton/MyColorField/MyInlineEdit/MyDualRing/MySparkline；内置图标 52→99+，原缺失的 26 个全部内置；MyDialog 增加 #header 插槽/confirmDisabled/error 横幅/size 档位/dismissable+showClose/closeOnClickModal/closeOnPressEscape 三开关；MyInput 增加 size/unit/bare + prefix/suffix/prepend/append 插槽；MySelect 支持 groups 分组；MyToggle 支持 size）。本轮把上一阶段"本地替身实现"全面切换到框架组件。
+
+**替换清单：**
+- 图标：删除 src/icons/register.ts（内置注册表已全覆盖，main.ts 不再注册）；应用组件直接 import EP 图标渲染。
+- 对话框壳统一 MyDialog（8 个）：ConnectionDialog（#header 类型徽标 + #footer 测试/取消/保存）、AppSidebar 两个删除确认（danger + 富文本默认插槽）、QuickCommandsPanel（size=lg + 作用域 MySelect groups 分组）、BroadcastDupDialog、StatsConsentDialog、RecycleDialog、FeedbackDialog、AboutDialog。
+- 表单/导航：SettingsDrawer 类目导航 → MyNav（内置图标名 + activeKey）；AppSidebar 搜索框、CommandRulesEditor 搜索框 → MyInput（small + #prefix 前缀 + clearable）；CustomPaletteDialog 原生取色器 → MyColorField；AiSupplierList 开关 → MyToggle size=small。
+- 壳层：App.vue 错误态按钮 → MyButton；MultiWindowPicker 超容量本地浮层 → confirmDialog。
+- 安全边界保持：ConnectionDialog 密码框不迁 show-password（避免绕过主密码原子揭示门禁）；MCP 确认/保险库/IPC 契约零改动。
+
+**登录门禁修缮（用户反馈）：** 顶部锁形图标替换为 MyShell 品牌 Logo 方块（渐变圆角方块 + `>` 光标标，呼应统一框架登录页样式）；两个密码框显式 width:100% + 锁形前缀图标保证严格等宽对齐（DOM 实测均 354px@同起点）；index.html 补内联 SVG favicon。
+
+**过程修复：** myui 升级后 vite 依赖预构建缓存陈旧导致运行时缺导出（白屏）→ 清 node_modules/.vite；MultiWindowPicker 脚本化重构造成模板闭合标签错位 → 修正；AppSidebar 误用 // CSS 注释 → 改 /* */。
+
+**验证：** npx vue-tsc --noEmit 全项目 0 错误；1425 预览端口浏览器实测：门禁渲染正常、控制台无报错、对话框/HMR 编译通过。
+
+**剩余反馈（myui 后续版本可选）：** MyTabs TabItem 无 badge/trailing 插槽（终端标签条保持自绘）；MyStatusDot 无 size/glow；MyIconButton 无 badge 插槽；MyCombobox 缺失（FontField 保持本地）；promptDialog 与 toast 动作按钮缺失；MyTree 无节点插槽转发/长按拖拽（连接树保持本地）；MyColorField showAlpha 恒产 rgba 非 hex、无 clearable 开关；MyProgress 阈值仅 >= 且被 status 短路；MyInlineEdit 无 dblclick 触发与空值守卫；MyDialog 无 hideHeader/footerAlign/confirmAutofocus/body 滚动档位；MyNav 无密度档位；若干能力依赖 $attrs 透传未进类型契约。
+
+## 五问重启检查（阶段 128）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 128 complete —— myui 0.10.1 深度采纳完成，本地替身基本清零，vue-tsc 零错误。 |
+| 我要去哪里？ | 真实 Tauri 环境回归主路径；按剩余反馈决定 myui 0.11.0 内容。 |
+| 什么可能导致偏离？ | MyDialog 默认 footer 的按钮观感与旧 ghost 按钮的细微差异；EP 2.14 padding 模型下分隔线细节。 |
+| 下一步最小可验证动作？ | cargo tauri dev → 门禁设密码 → 主界面全量走查（连接/终端/SFTP/设置各对话框）。 |
+| 目标是什么？ | UI 原语全面统一到 myui，业务只保留框架确实承载不了的定制（树/标签条/命令栏浮层）。 |

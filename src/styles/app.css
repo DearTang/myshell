@@ -1,0 +1,274 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   MyShell 壳层样式（Vue + myui 版）
+   分层：MyShell 令牌（themes.ts 预设可覆盖）→ myui 令牌桥 → 布局 → 基础样式
+   颜色一律引用令牌，禁止硬编码色值。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* iconfont（iconfont.cn）— 连接类型图标（ssh/sftp/ftp/local），保留旧资源 */
+@import "../assets/iconfont/iconfont.css";
+
+/* ─── MyShell 令牌层：默认（暗色 Carbon） ─── */
+:root,
+[data-theme="dark"] {
+  --bg-base: #0d1117;
+  --bg-elevated: #161b22;
+  --bg-surface: #21262d;
+  --bg-surface-hover: #292e36;
+  --bg-surface-active: #323841;
+  --bg-input: #1a1f26;
+  --bg-input-hover: #242930;
+  --bg-overlay: rgba(0, 0, 0, 0.75);
+
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --text-tertiary: #6e7681;
+  --text-muted: #484f58;
+  --text-inverse: #0d1117;
+
+  --accent-primary: #58a6ff;
+  --accent-primary-hover: #79c0ff;
+  --accent-primary-muted: rgba(88, 166, 255, 0.12);
+  --accent-secondary: #39d2c0;
+  --accent-secondary-muted: rgba(57, 210, 192, 0.12);
+
+  --success: #3fb950;
+  --success-muted: rgba(63, 185, 80, 0.12);
+  --warning: #d29922;
+  --warning-muted: rgba(210, 153, 34, 0.12);
+  --error: #f85149;
+  --error-muted: rgba(248, 81, 73, 0.12);
+  --info: #58a6ff;
+  --info-muted: rgba(88, 166, 255, 0.12);
+
+  --border-default: rgba(255, 255, 255, 0.08);
+  --border-subtle: rgba(255, 255, 255, 0.05);
+  --border-emphasis: rgba(255, 255, 255, 0.14);
+  --border-accent: rgba(88, 166, 255, 0.4);
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.6);
+  --shadow-glow: 0 0 20px rgba(88, 166, 255, 0.2);
+
+  --glass-bg: rgba(22, 27, 34, 0.88);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-blur: 12px;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-back: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --duration-fast: 120ms;
+  --duration-normal: 200ms;
+  --duration-slow: 320ms;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-full: 9999px;
+
+  /* 连接类型色（ssh 主蓝 / sftp 副青 / ftp 黄 / local 灰） */
+  --conn-ssh: var(--accent-primary);
+  --conn-sftp: var(--accent-secondary);
+  --conn-ftp: #d29922;
+  --conn-local: #8b949e;
+
+  /* 终端工作区背景图（设置 → 外观 可选） */
+  --app-bg-opacity: 0.85;
+}
+
+/* ─── MyShell 令牌层：浅色 Carbon ─── */
+[data-theme="light"] {
+  --bg-base: #ffffff;
+  --bg-elevated: #f6f8fa;
+  --bg-surface: #f0f2f5;
+  --bg-surface-hover: #e8eaed;
+  --bg-surface-active: #dfe1e5;
+  --bg-input: #ffffff;
+  --bg-input-hover: #f6f8fa;
+  --bg-overlay: rgba(0, 0, 0, 0.4);
+
+  --text-primary: #1f2328;
+  --text-secondary: #59636e;
+  --text-tertiary: #8c959f;
+  --text-muted: #afb8c1;
+  --text-inverse: #ffffff;
+
+  --accent-primary: #0969da;
+  --accent-primary-hover: #218bff;
+  --accent-primary-muted: rgba(9, 105, 218, 0.1);
+  --accent-secondary: #1b7c83;
+  --accent-secondary-muted: rgba(27, 124, 131, 0.1);
+
+  --success: #1a7f37;
+  --success-muted: rgba(26, 127, 55, 0.1);
+  --warning: #9a6700;
+  --warning-muted: rgba(154, 103, 0, 0.1);
+  --error: #cf222e;
+  --error-muted: rgba(207, 34, 46, 0.1);
+  --info: #0969da;
+  --info-muted: rgba(9, 105, 218, 0.1);
+
+  --border-default: rgba(0, 0, 0, 0.08);
+  --border-subtle: rgba(0, 0, 0, 0.04);
+  --border-emphasis: rgba(0, 0, 0, 0.15);
+  --border-accent: rgba(9, 105, 218, 0.4);
+
+  --shadow-glow: 0 0 20px rgba(9, 105, 218, 0.15);
+  --glass-bg: rgba(255, 255, 255, 0.88);
+  --glass-border: rgba(0, 0, 0, 0.06);
+
+  --conn-ftp: #9a6700;
+  --conn-local: #59636e;
+}
+
+/* ─── myui 令牌桥：把 myui 组件消费的名字映射到 MyShell 令牌上，
+       让 33 套配色预设与深浅主题自动生效于 myui 组件 ─── */
+:root {
+  --accent: var(--accent-primary);
+  --accent-hover: var(--accent-primary-hover);
+  --accent-active: var(--accent-primary);
+  --accent-subtle: var(--accent-primary-muted);
+  --accent-fg: var(--text-inverse);
+  --border-base: var(--border-default);
+  --border-strong: var(--border-emphasis);
+  --text-disabled: var(--text-muted);
+  --surface-translucent: var(--glass-bg);
+  --surface-translucent-hover: var(--bg-surface-hover);
+  --danger: var(--error);
+  --ui-topbar-h: 44px;
+  /* 状态栏已移除；此变量仅为 UpdateNotification 等浮层的底部偏移保留 */
+  --ui-statusbar-h: 0px;
+  --ui-sidebar-w: 264px;
+  --ui-ai-w: 380px;
+  --ui-gap: 0px;
+}
+
+/* ═══════════════ 基础样式 ═══════════════ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: var(--font-sans, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif);
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-emphasis);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ═══════════════ App Shell 布局 ═══════════════
+   TabBar 横贯顶部；左侧连接树；中央工作区；右侧 AI 面板（可选）；底部状态栏 */
+.app-shell {
+  display: grid;
+  grid-template:
+    "topbar topbar topbar" var(--ui-topbar-h)
+    "side   work   ai" 1fr
+    / var(--ui-sidebar-w) minmax(0, 1fr) auto;
+  height: 100%;
+  transition: grid-template-columns 0.2s var(--ease-in-out);
+  overflow: hidden;
+}
+
+.app-shell.sidebar-collapsed {
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+}
+
+.app-shell.no-ai {
+  grid-template:
+    "topbar topbar" var(--ui-topbar-h)
+    "side   work" 1fr
+    / var(--ui-sidebar-w) minmax(0, 1fr);
+}
+
+.app-shell.sidebar-collapsed.no-ai {
+  grid-template-columns: 44px minmax(0, 1fr);
+}
+
+.app-shell > .shell-side {
+  grid-area: side;
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+  z-index: 2; /* 侧栏不透明，压在壳层背景图之上 */
+}
+
+.app-shell > .shell-work {
+  grid-area: work;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  /* 高于壳层背景图层（.app-shell::before），透明区域透出背景图 */
+  z-index: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-shell > .shell-ai {
+  grid-area: ai;
+  min-height: 0;
+  overflow: hidden;
+  border-left: 1px solid var(--border-subtle);
+  position: relative;
+  z-index: 2;
+}
+
+/* 工作区背景图（外观设置可选） */
+.app-shell.has-bg-image::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: var(--app-bg-image);
+  background-size: cover;
+  background-position: center;
+  opacity: var(--app-bg-opacity, 0.85);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* 终端/SFTP 页签堆叠：绝对定位 + visibility（xterm 容器必须保持真实尺寸，
+   display:none 会让 FitAddon 读到 0 列导致广播同步出 COLUMNS=0 的换行 bug） */
+.tab-stack {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.tab-stack.is-hidden {
+  visibility: hidden;
+}

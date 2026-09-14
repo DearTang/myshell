@@ -8,7 +8,7 @@
 
 ![Version](https://img.shields.io/badge/version-1.10.1-blue)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-green)
-![React](https://img.shields.io/badge/React-18-blue)
+![Vue](https://img.shields.io/badge/Vue-3-42b883)
 ![Rust](https://img.shields.io/badge/Rust-1.70+-orange)
 
 ## 功能特性
@@ -684,7 +684,7 @@ AI 助手集成。
 
 | 层级 | 技术 |
 |------|------|
-| 前端框架 | React 18 + TypeScript |
+| 前端框架 | Vue 3 + TypeScript + Element Plus + myui（统一界面框架） |
 | 桌面框架 | Tauri v2 |
 | 终端模拟 | xterm.js + FitAddon + WebLinksAddon |
 | 后端语言 | Rust |
@@ -698,7 +698,7 @@ AI 助手集成。
 
 ```
 myShell/
-├── src/                      # React 前端
+├── src/                      # Vue 3 前端（myui 组件库）
 │   ├── components/           # UI 组件
 │   │   ├── App.tsx           # 主应用入口
 │   │   ├── Sidebar.tsx       # 连接管理侧边栏
@@ -730,6 +730,7 @@ myShell/
 
 - [统一界面架构设计](docs/统一界面架构设计.md)：前端分层、状态域、设计令牌、浮层系统与渐进迁移方案。
 - [统一应用主界面原型](docs/ui-prototype/index.html)：可直接打开的高保真交互原型，包含收缩侧栏、全局顶栏、版本升级提示、亮暗主题、国际化、设置抽屉、右侧辅助区与响应式布局。
+- [统一界面 Vue + MyUI 实现](F:/personalProject/MyUI/src/views/cases/unified-ui)：MyUI 中的统一界面参考实现（五区壳层、命令面板、设置抽屉、升级弹窗、i18n、主题持久化）。
 - [原型使用说明](docs/ui-prototype/README.md)：区域职责、交互清单及复用到其他软件的方法。
 
 ## 快速开始

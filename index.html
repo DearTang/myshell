@@ -3,11 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%2358a6ff'/%3E%3Cstop offset='1' stop-color='%2339d2c0'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Cpath d='M35 19 L16 32 L35 45' stroke='%23fff' stroke-width='6.5' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3Crect x='37' y='42' width='13' height='5' rx='2.5' fill='%23fff'/%3E%3C/svg%3E"
+    />
     <title>MyShell</title>
     <style>
       /* ── Boot splash (inlined so it paints before any CSS @import / JS runs).
          The Tauri window starts hidden; when it shows, this dark surface +
-         spinner is already on screen — no white flash ever. #root is empty
+         spinner is already on screen — no white flash ever. #app is empty
          only until React mounts, so the splash auto-vanishes on first render. ── */
       html,
       body {
@@ -15,10 +19,10 @@
         height: 100%;
         background: #0d1117; /* matches --bg-base (dark default theme) */
       }
-      #root {
+      #app {
         height: 100%;
       }
-      #root:empty::after {
+      #app:empty::after {
         content: "";
         position: fixed;
         top: 50%;
@@ -39,7 +43,7 @@
     </style>
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
