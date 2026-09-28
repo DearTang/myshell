@@ -37,6 +37,8 @@ interface UiState {
     connectionName: string;
     reasons: string[];
   } | null;
+  /** 本轮会话已授权自动放行高危命令（MCP 确认框「本轮会话均允许」的结果反馈） */
+  mcpSessionAllowed: boolean;
 }
 
 const PERSIST_KEY = "myshell.ui.prefs";
@@ -73,6 +75,7 @@ export const ui = reactive<UiState>({
   statsPrompt: null,
   mwOverflowPrompt: null,
   mcpConfirm: null,
+  mcpSessionAllowed: false,
   ...persisted,
 });
 
@@ -108,20 +111,34 @@ export function applyTheme(): void {
   root.lang = ui.locale;
 }
 
-/** MCP 确认框的 Promise resolver（非响应式，模块内持有）。 */
-let mcpConfirmResolver: ((ok: boolean) => void) | null = null;
+/** MCP 确认框的 Promise resolver（非响应式，模块内持有）。
+ *  结果为 "allow"（本次放行）/ "session"（本轮会话均允许）/ "deny"（拒绝）。 */
+export type McpConfirmDecision = "allow" | "session" | "deny";
 
-export function showMcpConfirm(command: string, connectionName: string, reasons: string[]): Promise<boolean> {
+let mcpConfirmResolver: ((decision: McpConfirmDecision) => void) | null = null;
+
+export function showMcpConfirm(
+  command: string,
+  connectionName: string,
+  reasons: string[],
+): Promise<McpConfirmDecision> {
   return new Promise((resolve) => {
     mcpConfirmResolver = resolve;
     ui.mcpConfirm = { command, connectionName, reasons };
   });
 }
 
-export function resolveMcpConfirm(ok: boolean): void {
+export function resolveMcpConfirm(decision: McpConfirmDecision): void {
   ui.mcpConfirm = null;
-  mcpConfirmResolver?.(ok);
+  if (decision === "session") ui.mcpSessionAllowed = true;
+  mcpConfirmResolver?.(decision);
   mcpConfirmResolver = null;
+}
+
+/** 会话授权在 MCP 服务器进程内生效，此标志仅用于 GUI 侧的状态展示与
+ *  「本轮会话均允许」后的再次确认抑制（MCP 自己也会跳过确认请求）。 */
+export function setMcpSessionAllowed(v: boolean): void {
+  ui.mcpSessionAllowed = v;
 }
 
 export function setThemeChoice(choice: ThemeChoice): void {

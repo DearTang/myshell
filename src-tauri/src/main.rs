@@ -5169,6 +5169,10 @@ fn handle_ipc_connection(
                                     "connection_id": conn_id,
                                     "command": command,
                                     "timeout": timeout_secs,
+                                    // Forwarded from the MCP server: the user already
+                                    // granted "allow this session" — the frontend
+                                    // skips its confirmation dialog.
+                                    "session_allowed": cmd["session_allowed"].as_bool().unwrap_or(false),
                                 });
                                 if let Err(e) = ipc_handle.emit("mcp-gui-command", payload) {
                                     // Clean up the pending entry on emit failure.

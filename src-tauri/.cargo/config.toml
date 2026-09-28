@@ -1,3 +1,9 @@
+[build]
+# 20 线程全开并发编译会瞬间吃满 CPU/内存导致整机卡死；留一半给系统和杀软。
+# 6 而非 10：release 全量构建（LTO + 多 bin）在 10 并发下曾于链接/单测编译阶段
+# 触发 Windows commit limit 耗尽（exit 0xc000026b）整轮失败，6 并发稳定通过。
+jobs = 6
+
 [source.crates-io]
 replace-with = "rsproxy-sparse"
 

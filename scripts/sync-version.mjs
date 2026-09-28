@@ -3,10 +3,9 @@
  * Single-source-of-truth version sync.
  *
  * `Cargo.toml` `[package] version` is the ONLY place the version is authored.
- * This script reads it and propagates it to the npm-side files
- * (`package.json` + `package-lock.json`) so they stay consistent without manual
- * edits. `tauri.conf.json` needs no version field at all — Tauri v2 reads it
- * straight from `Cargo.toml` when the field is omitted.
+ * This script reads it and propagates it to `package.json` so they stay
+ * consistent without manual edits. `tauri.conf.json` needs no version field at
+ * all — Tauri v2 reads it straight from `Cargo.toml` when the field is omitted.
  *
  * Wired into `npm run build` (which `tauri build` runs via beforeBuildCommand),
  * so a release build always carries the Cargo.toml version everywhere. Also
@@ -47,23 +46,8 @@ if (pkg.version !== version) {
   touched = true;
 }
 
-// 3. package-lock.json root version (the "" entry + top-level).
-const lockPath = join(root, "package-lock.json");
-const lock = readJSON(lockPath);
-let lockChanged = false;
-if (lock.version !== version) {
-  lock.version = version;
-  lockChanged = true;
-}
-if (lock.packages && lock.packages[""] && lock.packages[""].version !== version) {
-  lock.packages[""].version = version;
-  lockChanged = true;
-}
-if (lockChanged) {
-  writeJSON(lockPath, lock);
-  console.log(`[sync-version] package-lock.json -> ${version}`);
-  touched = true;
-}
+// 3. pnpm-lock.yaml stores no project version of its own (its `version:` lines
+//    are per-dependency resolutions), so there is nothing else to sync.
 
 if (!touched) {
   console.log(`[sync-version] already at ${version} (Cargo.toml is the source)`);

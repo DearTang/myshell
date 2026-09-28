@@ -3310,3 +3310,117 @@
 | 什么可能导致偏离？ | MyDialog 默认 footer 的按钮观感与旧 ghost 按钮的细微差异；EP 2.14 padding 模型下分隔线细节。 |
 | 下一步最小可验证动作？ | cargo tauri dev → 门禁设密码 → 主界面全量走查（连接/终端/SFTP/设置各对话框）。 |
 | 目标是什么？ | UI 原语全面统一到 myui，业务只保留框架确实承载不了的定制（树/标签条/命令栏浮层）。 |
+
+
+### 阶段 129 — myui 0.12.0 采纳 + 侧栏毛玻璃（2026-09-14）
+
+**背景：** 用户反馈左侧菜单栏背景与框架观感不一致，应为毛玻璃；同轮 myui 发布 v0.12.0（新增 MyCombobox，回应阶段 128 反馈第 4 项）。
+
+**改动：**
+1. myui 0.10.1 → 0.12.0（+MyCombobox；既有 API 兼容）。
+2. 左侧连接树侧栏与 AI 右栏改为框架毛玻璃配方：background var(--surface-translucent) + backdrop-filter blur(var(--glass-blur)) saturate(var(--glass-saturation)) + 描边 var(--glass-border)（与顶栏同源令牌，用户设置背景图后透出模糊底图）。
+3. FontField 由本地自绘下拉（约 180 行）迁移到 MyCombobox：fetchSuggestions 供源 + 默认插槽命中高亮 + footer 渲染上限注记 + 自由文本；"重新聚焦已选字体显示完整列表"语义经 query===modelValue 特例保留。对外 props/事件契约不变。
+
+**验证：** vue-tsc 全项目 0 错误；1425 预览三改动模块编译 200、vite 日志无报错。毛玻璃观感与 FontField 下拉交互待 Tauri 窗口人工复核。
+
+**剩余反馈更新：** MyCombobox 已落地后，阶段 128 反馈第 4 项（Combobox 缺失）关闭；其余（MyTabs 插槽、StatusDot size/glow、promptDialog 等）维持待适配。
+
+## 五问重启检查（阶段 129）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 129 complete —— 0.12.0 采纳 + 侧栏/AI 栏毛玻璃 + FontField 换 MyCombobox。 |
+| 我要去哪里？ | Tauri 窗口人工复核毛玻璃观感与字体下拉；随后可发正式版。 |
+| 什么可能导致偏离？ | 毛玻璃在无背景图时对比度弱（属预期）；MyCombobox 无匹配文案为 EP 默认"无匹配数据"（旧版为"无匹配字体，可自定义输入"）。 |
+| 下一步最小可验证动作？ | cargo tauri dev → 设置→外观→终端字体下拉键入过滤；看侧栏透出背景图的模糊效果。 |
+| 目标是什么？ | UI 观感与 myui 框架完全同源，反馈清单只收敛到框架确实承载不了的项。 |
+
+### 阶段 130 — myui 0.18.0 升级（2026-09-19）
+
+**背景：** myui 上游发布 v0.14.0 ~ v0.18.0 共 6 个版本（全部向后兼容），按最新版本跟进。
+
+**改动：**
+1. myui 0.12.0 → 0.18.0（git tag 升级 + pnpm-lock 同步）。版本面：v0.13 媒体子入口、v0.14 MyDropdown/MyCollapse/-subtle 令牌/AI 图标/tooltip 观感、v0.15 MyUpload/长尾控件、v0.16 MyForm/输入件 focus()/blur()/ghost 语义变体、v0.17 MySettingsPanel fill + Terminal 图标重绘、v0.17.1 线性图标实心块修复、v0.18 MyDataTable expose/类型出口收口/拖拽吞点监听泄漏修复。
+2. 影响面核对：本项目实际使用 14 个 myui 组件（MyButton/MyInput/MySelect/MyDialog/MySection/MyToggle/MyCheckbox/MyProgress/MySlider/MySegmented/MySpinner/MyColorField/MyCombobox/MyNav），全部只收到增量改动，零行为变化；未使用 MyIcon/MyIconButton（v0.17.1 修复不涉及），未使用 -subtle 令牌 fallback 写法。
+
+**验证：** vue-tsc 全项目 0 错误；vite build 成功（chunk 警告为迁移前既有问题）；node_modules/myui package.json 确认 0.18.0；dist 特征检查 8/8 命中（MyForm/MyUpload/my-dropdown/--danger-subtle/Gpt/clearSelection/my-settings-panel--fill/el-popper.is-dark），排除 tag 缓存/缺 dist 风险。启动测试补记：dev 预览首跑卡加载页，报 "myui.js does not provide an export named MyCombobox"——Vite 依赖预打包缓存（node_modules/.vite）停留在 v0.11.3 时代（该版本无 MyCombobox），删缓存重启即愈；git 依赖升级后须清 .vite 缓存。cargo tauri dev 启动成功（21m57s 冷编译，32 条既有 FFI 命名警告无错误），CDP 连 WebView2 验证：真实窗口渲染解锁门禁正常，控制台 0 错误 0 异常。
+
+## 五问重启检查（阶段 130）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 130 complete —— myui 0.18.0 升级完成，纯依赖升级零代码改动。 |
+| 我要去哪里？ | Tauri 窗口人工复核一轮界面观感（tooltip/下拉已换框架观感）；随后按需采纳新组件（MyForm/MySettingsPanel fill/MyDataTable）。 |
+| 什么可能导致偏离？ | 设置页 tooltip/Popover 观感在 v0.11.2+ 变为统一深色底（首次可见的观感变化）；新令牌接管 fallback 无本项使用。 |
+| 下一步最小可验证动作？ | cargo tauri dev → 悬浮设置项 tooltip 与下拉菜单看观感；连接树/对话框/表单全量过一遍。 |
+| 目标是什么？ | 界面框架保持最新，消费方升级成本维持在「只动锁文件」水平。 |
+
+### 阶段 131 — 服务器监控条与终端文字重叠修复（2026-09-20）
+
+**背景：** 用户实测反馈：连接 SSH 后底部设备信息条（系统/CPU/内存/磁盘）被终端文字遮住。要求放到页面最底部且不与文字重叠。
+
+**根因（两层）：**
+1. .tab-stack 为 position:absolute inset:0，定位上下文是整个 .shell-work——终端铺满工作区全高，包括底部 36px 监控条底下的区域。
+2. .server-info 引用的 --bg-sidebar/--border 令牌在两版主题里均未定义（旧版迁移时逐字保留的已知缺陷）→ 背景透明、无上边框，终端文字直接透过监控条。
+
+**改动：**
+1. App.vue：tab 堆叠外新增 .work-panes 包装层（flex:1 + min-height:0 + position:relative），tab-stack 的 inset:0 改以其为定位基准；ServerInfoPanel 作为流式布局最后一行位于其下、窗口最底部。状态栏出现/消失时 work-panes 高度变化由 TerminalPanel 既有 ResizeObserver 捕获自动重新 fit（其注释本就列明 ServerInfoPanel mount 过渡场景）。
+2. app.css：新增 .work-panes 规则（紧邻 .tab-stack 定义）。
+3. ServerInfoPanel.vue：监控条背景改 var(--bg-elevated) 实底 + 上边框 var(--border-subtle)；分组分隔线 --border 同步换 --border-subtle。
+
+**验证：** vue-tsc 0 错误；vite build 成功。视觉复核：监控条现位于窗口最底部、终端区域止于其上方，实底不再透字。（发布版人工复核。）
+
+## 五问重启检查（阶段 131）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 131 complete —— 监控条重叠修复落地。 |
+| 我要去哪里？ | 打包发布 v2.15.0（含 Vue3 迁移 + myui 0.18.0 + 本修复）。 |
+| 什么可能导致偏离？ | 状态栏出现时终端会少一行（fit 重排）——预期行为，广播同步依赖既有 ResizeObserver 防抖。 |
+| 下一步最小可验证动作？ | 发布后连接一台 SSH：看监控条贴底、终端文字不再穿透。 |
+| 目标是什么？ | 监控条稳定占据窗口最底一行，与终端内容互不侵入。 |
+
+### 阶段 132 — MCP 高危确认新增「本轮会话均允许」+ 顶栏撤销胶囊（2026-09-20）
+
+**背景：** 用户反馈：AI 连续执行高危命令时每次都弹窗，审查成本高。需求：确认框加一个「本轮会话均允许」按钮，点击后本轮会话内所有高危命令直接执行不再确认。
+
+**设计（授权生命周期 = MCP 服务器进程生命周期 = 一轮 AI 会话）：**
+- 授权标志是 MCP 服务器进程内的全局原子量（SESSION_ALLOWED）。AI 客户端每次会话启动一个新的 myshell-mcp 进程，进程退出即授权自然失效——无需持久化，也不会跨会话泄漏。
+- GUI 为权威判定方：用户在顶栏点撤销后，即使 MCP 仍持有标志，GUI 也会忽略其 session_allowed 字段、照常弹窗，并回带 session_revoked 让 MCP 清除自己的标志（GUI 无法反向连接 MCP——它由 AI 客户端以 stdio 启动）。
+
+**改动（7 个文件）：**
+1. src-tauri/src/bin/myshell-mcp.rs：新增 SESSION_ALLOWED 原子标志 + session_allowed()/grant_session_allowed()/revoke_session_allowed()；新增统一确认门 confirm_or_session_allowed()，8 处危险确认点全部改走它（headless ssh_exec、ssh_run、sftp_upload/remove/rename、upload_project/download_project、zmodem_upload——zmodem_upload 的 GUI 弹窗路径经 ssh_run 无头分支同一门）；exec_in_gui_tab 发送时带 session_allowed、响应解析 session_allowed/session_revoked；ssh_exec 的 GUI→headless 回退判断在会话授权下不再因「防重复弹窗」拒绝回退（此时两条路径都无弹窗）。
+2. src-tauri/src/main.rs：IPC exec_in_tab 转发 session_allowed 字段。
+3. src/store/ui.ts：McpConfirmDecision 三态（allow/session/deny）+ mcpSessionAllowed 标志 + setMcpSessionAllowed()。
+4. src/components/McpConfirmDialog.vue：自定义 #footer 三按钮（取消 / 本轮会话均允许 / 确认执行），文案同步说明授权范围。
+5. src/composables/useMcpBridge.ts：三态决策处理 + session_allowed/session_revoked 双向协议；会话授权下跳过 checkCommandConfirmation。
+6. src/api.ts：mcpExecResult 文档补 session_allowed 字段。
+7. src/components/AppTopBar.vue：顶栏「已放行高危」警示胶囊（Unlock 图标，常驻显示授权状态，点击撤销）。
+8. src-tauri/.cargo/config.toml：jobs 10 → 6（release 全量构建在 10 并发下曾触发 Windows commit limit 耗尽 exit 0xc000026b）。
+
+**验证：** vue-tsc 0 错误；vite build 成功；cargo check --bin myshell-mcp 通过。真机弹窗与授权链路待发布版人工复核。
+
+## 五问重启检查（阶段 132）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 132 complete —— 会话级授权贯通 GUI/主进程/MCP 三端，含撤销回路。 |
+| 我要去哪里？ | 打包 v2.15.0（含本功能）→ 真机验证弹窗三按钮与授权后免确认。 |
+| 什么可能导致偏离？ | 用户在授权期间启动新的 AI 会话不会继承授权（进程隔离，预期行为）；撤销需等下一次 exec 请求才同步到 MCP（GUI 侧已即时恢复弹窗）。 |
+| 下一步最小可验证动作？ | 连接 SSH，让 AI 用 MCP 执行一条 rm 命令 → 点「本轮会话均允许」→ 再执行一条 → 应无弹窗直接执行；点顶栏胶囊撤销 → 再执行 → 应恢复弹窗。 |
+| 目标是什么？ | 用户在了解风险后能一次性放行整轮会话，且随时可撤销、授权状态可见。 |
+
+### 阶段 133 — 发布构建遇 cargo 指纹缓存不一致（2026-09-20）
+
+**现象：** 阶段 132 后执行 scripts/build-release.bat，Rust 库编译 19m51s 成功后进入 myshell-mcp 编译，构建链在无任何 error 输出的情况下静默中止；target/release 下无任何 exe 产物，.fingerprint 下 4 个 myshell-* 目录为空，deps 无 myshell 二进制。重跑 cargo build --bin myshell-mcp --profile release 仅 2.66s 完成、全部依赖 Fresh，但同样不产出 exe——cargo 指纹记录认为产物已最新，而产物在中断时已丢失，构成经典 fingerprint/artifact 不一致。
+
+**根因（决定性证据）：** cargo JSON 消息显示编译器产物路径为 G:/Rust/cargo_target/release/myshell-mcp.exe——CARGO_HOME=G:\\Rust\\cargo_cache，其 config.toml 设了 target-dir = "G:/Rust/cargo_target"，因此所有 release 产物一直写在 G 盘，src-tauri/target/release 只是残留空壳（该目录的 20 分钟构建实际一直在 G 盘正常产出，从未真正失败）。--target-dir target/cert-check 之所以成功，是因为显式参数覆盖了该配置。指纹清理亦无效（指纹也在 G 盘）。
+
+**结论：** 构建链无需修复；找产物要到 G:/Rust/cargo_target/release/。三个二进制（myshell.exe 23.4MB / myshell-mcp.exe 10MB / myshell-cli.exe 8.9MB）与 NSIS 安装包 MyShell_2.15.0_x64-setup.exe（12.3MB，makensis 正常、PE 头 4D5A 有效、0 错误）均已在 G 盘产出。若希望产物留在项目内，可在 src-tauri/.cargo/config.toml 显式设置 target-dir（本轮未改动，避免影响既有流程）。
+
+**教训：** release 全量构建在 Windows 上应避免中途打断（中断会留下指纹与产物不一致，且不报错）；构建并发已降至 jobs=6。
+
+## 五问重启检查（阶段 133）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 133 complete —— 构建产物之谜定位为 CARGO_HOME config 的 target-dir 指向 G 盘，安装包已产出。 |
+| 我要去哪里？ | 提交 release: v2.15.0 → 推送双远端 → 双平台发布 → 清空暂存。 |
+| 什么可能导致偏离？ | 后续查找产物需记住 G:/Rust/cargo_target（不是项目内 target/）；发布脚本若引用项目内路径可能取不到安装包。 |
+| 下一步最小可验证动作？ | 用 G:/Rust/cargo_target/release/bundle/nsis/MyShell_2.15.0_x64-setup.exe 路径执行发布脚本。 |
+| 目标是什么？ | 产出 v2.15.0 安装包并完成双平台发布。 |

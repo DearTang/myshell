@@ -12,8 +12,9 @@ import {
   Grid,
   Lightning,
   Setting,
+  Unlock,
 } from "@element-plus/icons-vue";
-import { persistUi, ui } from "@/store/ui";
+import { persistUi, setMcpSessionAllowed, ui } from "@/store/ui";
 import {
   broadcastAll,
   closeDisconnected,
@@ -182,6 +183,14 @@ function openQuickCommands(): void {
   ui.qcInitialConnectionId = null;
   ui.showQuickCommands = true;
 }
+
+/** 撤销会话放行：仅清除 GUI 侧标志。MCP 服务器仍持有自己的授权标志，
+ *  但它每次 exec 请求都带 session_allowed，GUI 是权威判定方——被撤销后
+ *  GUI 忽略该字段、照常弹窗，并在响应里回带 session_revoked 让 MCP
+ *  同步清除标志。因此无需反向连接 MCP（它由 AI 客户端以 stdio 启动）。 */
+function revokeSessionAllowed(): void {
+  setMcpSessionAllowed(false);
+}
 </script>
 
 <template>
@@ -307,6 +316,18 @@ function openQuickCommands(): void {
 
     <!-- 右：壳层动作钮 -->
     <div class="topbar-actions">
+      <!-- 会话放行指示器：MCP 高危命令「本轮会话均允许」授权期间常驻显示，
+           点击即可撤销（撤销后下一次高危命令重新弹窗确认） -->
+      <button
+        v-if="ui.mcpSessionAllowed"
+        type="button"
+        class="session-allowed-chip"
+        title="本轮会话已放行全部高危命令（点击撤销，撤销后重新弹窗确认）"
+        @click="revokeSessionAllowed"
+      >
+        <el-icon :size="13"><Unlock /></el-icon>
+        <span>已放行高危</span>
+      </button>
       <button type="button" class="icon-btn" title="多窗口" @click="ui.showMultiWindowPicker = true">
         <el-icon :size="16"><Grid /></el-icon>
       </button>
@@ -625,5 +646,28 @@ function openQuickCommands(): void {
   padding: 0 8px;
   flex-shrink: 0;
   border-left: 1px solid var(--border-subtle);
+}
+
+/* 会话放行指示器：警示色胶囊，点击撤销 */
+.session-allowed-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  margin-right: 4px;
+  padding: 0 8px;
+  background: var(--warning-muted);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-full, 999px);
+  color: var(--warning);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.session-allowed-chip:hover {
+  background: var(--warning);
+  color: var(--text-inverse);
 }
 </style>

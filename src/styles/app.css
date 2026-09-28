@@ -241,7 +241,10 @@ body {
   grid-area: ai;
   min-height: 0;
   overflow: hidden;
-  border-left: 1px solid var(--border-subtle);
+  background: var(--surface-translucent);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  border-left: 1px solid var(--glass-border);
   position: relative;
   z-index: 2;
 }
@@ -257,6 +260,14 @@ body {
   opacity: var(--app-bg-opacity, 0.85);
   pointer-events: none;
   z-index: 0;
+}
+
+/* 标签页堆叠层：占据底部监控条以上的全部空间，作为 .tab-stack 的定位
+   上下文（inset:0 以此为基准），终端不会铺到监控条底下 */
+.work-panes {
+  position: relative;
+  flex: 1;
+  min-height: 0;
 }
 
 /* 终端/SFTP 页签堆叠：绝对定位 + visibility（xterm 容器必须保持真实尺寸，

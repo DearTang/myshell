@@ -20,3 +20,9 @@
 - ✨ 统一界面 Vue 3 参考实现已迁入 `F:\personalProject\MyUI\src\views\cases\unified-ui`：包含五区壳层、状态信号轨、命令面板、设置抽屉、升级弹窗与中英文/主题持久化。
 - ✨ 前端整体重构为 Vue 3 + myui v0.7.0 统一界面框架：五区壳层（顶栏/连接树/工作区/AI 右栏/状态栏）+ 全部面板与对话框迁移，后端 IPC 契约零改动。
 - 🛠️ 升级 myui v0.10.1 并深度采纳框架组件：8 个对话框统一 MyDialog 壳、设置导航 MyNav、搜索框 MyInput、取色器 MyColorField、内置图标注册表全覆盖；登录门禁换品牌 Logo 并修正输入框对齐。
+- 🛠️ 升级 myui v0.12.0：连接树侧栏与 AI 右栏改为框架毛玻璃背景（半透明面 + 模糊 + 玻璃描边），字体选择器迁移 MyCombobox（模糊过滤 + 命中高亮 + 自由输入）。
+- 🛠️ 升级 myui v0.12.0 → v0.18.0（六个版本均为向后兼容增量：MyDropdown/MyCollapse/MyForm/MyUpload 等新组件、tooltip/下拉统一观感、输入件 focus()/blur()、线性图标实心块修复），本项目零代码改动。
+- 🐛 修复服务器监控条被终端文字遮挡：终端区域止于监控条上方（新增 work-panes 定位层），监控条改为实底色+上边框（原引用未定义令牌导致背景透明透字）。
+- 🛠️ 构建链迁移 pnpm：移除 package-lock.json，版本同步脚本适配（pnpm lock 不含项目自身版本，仅同步 package.json）。
+- ✨ MCP 高危命令确认框新增「本轮会话均允许」按钮：点击后本轮 AI 会话内所有高危命令（ssh_exec/ssh_run/文件传输等）直接执行不再弹窗；顶栏新增「已放行高危」警示胶囊常驻显示授权状态并支持一键撤销。
+- 🛠️ 发布脚本（Gitee/GitHub）自动感知 cargo 自定义 target-dir：产物目录不在项目内（CARGO_HOME 配置了其他磁盘）时也能正确定位安装包。

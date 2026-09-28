@@ -31,6 +31,42 @@ const OWNER = "DearTang";
 const REPO = "myshell";
 const API = `https://api.github.com/repos/${OWNER}/${REPO}`;
 
+/**
+ * Locate the NSIS bundle dir. Cargo may write the target dir OUTSIDE the
+ * project tree: CARGO_TARGET_DIR env, or `target-dir` in the cargo config
+ * under CARGO_HOME (this machine sets it to another drive). Check the
+ * conventional in-project location first, then the configured one.
+ */
+function resolveNsisDir() {
+  const candidates = [
+    join(ROOT, "src-tauri", "target", "release", "bundle", "nsis"),
+  ];
+
+  const fromEnv = (process.env.CARGO_TARGET_DIR || "").trim();
+  if (fromEnv) candidates.push(join(fromEnv, "release", "bundle", "nsis"));
+
+  const cargoHome = (process.env.CARGO_HOME || "").trim();
+  for (const configPath of [
+    cargoHome ? join(cargoHome, "config.toml") : null,
+    join(ROOT, "src-tauri", ".cargo", "config.toml"),
+  ]) {
+    if (!configPath || !existsSync(configPath)) continue;
+    try {
+      const m = readFileSync(configPath, "utf8").match(
+        /^\s*target-dir\s*=\s*["']([^"']+)["']/m
+      );
+      if (m) candidates.push(join(m[1], "release", "bundle", "nsis"));
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return candidates[0];
+}
+
 const MAX_ATTEMPTS = 4;
 async function fetchWithRetry(url, init, label) {
   let lastErr;
@@ -80,7 +116,7 @@ async function resolveAsset() {
     }
     return assetOverride;
   }
-  const nsisDir = join(ROOT, "src-tauri/target/release/bundle/nsis");
+  const nsisDir = resolveNsisDir();
   if (!existsSync(nsisDir)) {
     throw new Error(
       `未找到安装包目录 ${nsisDir}。请先运行打包 (cargo tauri build)。`

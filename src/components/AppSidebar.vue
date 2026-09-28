@@ -828,11 +828,13 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 </template>
 
 <style scoped>
-/* ── 容器 ── */
+/* ── 容器：毛玻璃（与框架顶栏同配方——半透明面 + backdrop 模糊 + 玻璃描边） ── */
 .side {
   position: relative;
-  background: var(--bg-surface);
-  border-right: 1px solid var(--border-subtle);
+  background: var(--surface-translucent);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  border-right: 1px solid var(--glass-border);
   display: flex;
   flex-direction: column;
 }

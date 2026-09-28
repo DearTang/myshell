@@ -15,7 +15,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Warning } from "@element-plus/icons-vue";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
-import { MyDialog } from "myui";
+import { MyButton, MyDialog } from "myui";
 import { resolveMcpConfirm, ui } from "@/store/ui";
 import { getCommandRules } from "@/api";
 import type { CommandRules } from "@/api";
@@ -65,11 +65,15 @@ onUnmounted(() => {
 });
 
 function onConfirm(): void {
-  resolveMcpConfirm(true);
+  resolveMcpConfirm("allow");
+}
+
+function onAllowSession(): void {
+  resolveMcpConfirm("session");
 }
 
 function onCancel(): void {
-  resolveMcpConfirm(false);
+  resolveMcpConfirm("deny");
 }
 </script>
 
@@ -108,10 +112,21 @@ function onCancel(): void {
         </ul>
       </div>
       <div class="note">
-        点击「确认执行」允许，点击「取消」拒绝。取消后 AI
+        点击「确认执行」仅允许本次，点击「本轮会话均允许」后本会话内所有高危命令
+        将不再弹窗、直接执行；点击「取消」拒绝。取消后 AI
         会立即停止当前任务、向你说明任务进度，并等待你的指示。
       </div>
     </div>
+
+    <!-- 自定义 footer：三按钮（取消 / 本轮会话均允许 / 确认执行）。
+         MyDialog 默认 footer 仅两按钮，故整体接管。 -->
+    <template #footer>
+      <div class="mcp-footer">
+        <MyButton variant="secondary" @click="onCancel">取消</MyButton>
+        <MyButton variant="ghost-warning" @click="onAllowSession">本轮会话均允许</MyButton>
+        <MyButton variant="danger" @click="onConfirm">确认执行</MyButton>
+      </div>
+    </template>
   </MyDialog>
 </template>
 
@@ -181,5 +196,14 @@ function onCancel(): void {
 .note {
   margin-top: 8px;
   color: var(--text-muted);
+}
+
+/* 三按钮 footer：窄面板下「本轮会话均允许」文案较长，允许换行不挤压 */
+.mcp-footer {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 </style>

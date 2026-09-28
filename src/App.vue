@@ -188,79 +188,84 @@ function onAiWidthChange(w: number): void {
         <div class="welcome-hint">点击左侧连接列表开始新会话</div>
       </div>
 
-      <!-- 标签页堆叠：保持所有 tab 面板挂载（xterm 尺寸不变量） -->
+      <!-- 标签页堆叠：保持所有 tab 面板挂载（xterm 尺寸不变量）。
+           work-panes 占据状态栏以上的全部空间；tab-stack 的 inset:0 以它为
+           定位基准，终端不再铺到底部监控条底下与之重叠 -->
       <template v-else>
-        <div
-          v-for="tab in sessions.tabs"
-          :key="tab.id"
-          class="tab-stack"
-          :class="{ 'is-hidden': tab.id !== sessions.activeTabId }"
-        >
-          <!-- 连接失败态 -->
-          <div v-if="tab.status === 'error'" class="error-state">
-            <div class="error-icon">❌</div>
-            <div class="error-title">连接失败</div>
-            <div class="error-message">
-              请确认下ip端口等是否填写错误!
-              <br />
-              {{ tab.errorMessage }}
+        <div class="work-panes">
+          <div
+            v-for="tab in sessions.tabs"
+            :key="tab.id"
+            class="tab-stack"
+            :class="{ 'is-hidden': tab.id !== sessions.activeTabId }"
+          >
+            <!-- 连接失败态 -->
+            <div v-if="tab.status === 'error'" class="error-state">
+              <div class="error-icon">❌</div>
+              <div class="error-title">连接失败</div>
+              <div class="error-message">
+                请确认下ip端口等是否填写错误!
+                <br />
+                {{ tab.errorMessage }}
+              </div>
+              <div class="error-actions">
+                <MyButton variant="secondary" @click="closeTabAction(tab.id)">关闭</MyButton>
+                <MyButton variant="primary" @click="tab.hostKeyMismatch ? resetHostKeyAndReconnect(tab.id) : reconnectTab(tab.id)">
+                  {{ tab.hostKeyMismatch ? "重置密钥并重连" : "重新连接" }}
+                </MyButton>
+              </div>
             </div>
-            <div class="error-actions">
-              <MyButton variant="secondary" @click="closeTabAction(tab.id)">关闭</MyButton>
-              <MyButton variant="primary" @click="tab.hostKeyMismatch ? resetHostKeyAndReconnect(tab.id) : reconnectTab(tab.id)">
-                {{ tab.hostKeyMismatch ? "重置密钥并重连" : "重新连接" }}
-              </MyButton>
+
+            <!-- 连接中态 -->
+            <div v-else-if="!tab.sessionId" class="connecting-state">
+              <div class="connecting-icon">⏳</div>
+              <div>正在连接...</div>
             </div>
+
+            <!-- SFTP/FTP 面板 -->
+            <SftpPanel
+              v-else-if="tab.type !== 'terminal'"
+              :session-id="tab.sessionId"
+              :source="tab.type === 'ftp' ? 'ftp' : 'ssh'"
+              full-height
+              :status="tab.status"
+              @reconnect="reconnectTab(tab.id)"
+              @disconnected="tab.status = 'disconnected'"
+            />
+
+            <!-- 终端面板 -->
+            <TerminalPanel
+              v-else
+              :tab-id="tab.id"
+              :session-id="tab.sessionId"
+              :connection-id="tab.connectionId ?? ''"
+              :conn-type="tab.connType"
+              :font-override="tab.config?.terminal_font"
+              :renderer-backend="rendererBackend"
+              :active="tab.id === sessions.activeTabId"
+              :status="tab.status"
+              :connection-name="tab.name"
+              :reconnect-snapshot="tab.reconnectSnapshot"
+              :broadcast-targets="getBroadcastTargets(tab)"
+              @terminal-ready="registerTerminal"
+              @terminal-gone="unregisterTerminal"
+              @open-ai="ui.showAiPanel = !ui.showAiPanel"
+              @open-multiwindow="ui.showMultiWindowPicker = true"
+              @reconnect="reconnectTab(tab.id)"
+              @snapshot-consumed="clearReconnectSnapshot(tab.id)"
+              @disconnected="tab.status = 'disconnected'"
+              @open-quick-commands-manage="
+                (cid: string) => {
+                  ui.qcInitialConnectionId = cid;
+                  ui.showQuickCommands = true;
+                }
+              "
+            />
           </div>
-
-          <!-- 连接中态 -->
-          <div v-else-if="!tab.sessionId" class="connecting-state">
-            <div class="connecting-icon">⏳</div>
-            <div>正在连接...</div>
-          </div>
-
-          <!-- SFTP/FTP 面板 -->
-          <SftpPanel
-            v-else-if="tab.type !== 'terminal'"
-            :session-id="tab.sessionId"
-            :source="tab.type === 'ftp' ? 'ftp' : 'ssh'"
-            full-height
-            :status="tab.status"
-            @reconnect="reconnectTab(tab.id)"
-            @disconnected="tab.status = 'disconnected'"
-          />
-
-          <!-- 终端面板 -->
-          <TerminalPanel
-            v-else
-            :tab-id="tab.id"
-            :session-id="tab.sessionId"
-            :connection-id="tab.connectionId ?? ''"
-            :conn-type="tab.connType"
-            :font-override="tab.config?.terminal_font"
-            :renderer-backend="rendererBackend"
-            :active="tab.id === sessions.activeTabId"
-            :status="tab.status"
-            :connection-name="tab.name"
-            :reconnect-snapshot="tab.reconnectSnapshot"
-            :broadcast-targets="getBroadcastTargets(tab)"
-            @terminal-ready="registerTerminal"
-            @terminal-gone="unregisterTerminal"
-            @open-ai="ui.showAiPanel = !ui.showAiPanel"
-            @open-multiwindow="ui.showMultiWindowPicker = true"
-            @reconnect="reconnectTab(tab.id)"
-            @snapshot-consumed="clearReconnectSnapshot(tab.id)"
-            @disconnected="tab.status = 'disconnected'"
-            @open-quick-commands-manage="
-              (cid: string) => {
-                ui.qcInitialConnectionId = cid;
-                ui.showQuickCommands = true;
-              }
-            "
-          />
         </div>
 
-        <!-- 服务器监控（仅活动 SSH 终端） -->
+        <!-- 服务器监控（仅活动 SSH 终端）：流式布局中的最后一行，
+             位于 work-panes 之下、窗口最底部，与终端内容互不重叠 -->
         <ServerInfoPanel
           v-if="
             activeTab &&

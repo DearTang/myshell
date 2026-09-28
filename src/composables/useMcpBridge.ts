@@ -13,7 +13,7 @@ import {
 } from "../api";
 import { connectionsStore } from "../store/connections";
 import { sessions, connect, reconnectOne, getTab } from "../store/sessions";
-import { showMcpConfirm } from "../store/ui";
+import { showMcpConfirm, ui } from "../store/ui";
 import { stripFromAnsiPosition } from "../utils/ansi";
 
 interface McpGuiCommand {
@@ -24,6 +24,8 @@ interface McpGuiCommand {
   request_id?: string;
   command?: string;
   timeout?: number;
+  /** MCP 侧已获会话授权（用户此前选过「本轮会话均允许」）→ 跳过确认弹窗 */
+  session_allowed?: boolean;
 }
 
 // 每连接执行锁：连接 id → 加锁时刻。交互式 PTY 串行执行，上一条没跑完时
@@ -72,10 +74,23 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
       }
       mcpExecLocks.set(connection_id, Date.now());
 
+      // 会话级授权标记：用户在本次确认框点了「本轮会话均允许」时为 true，
+      // 随执行结果回传 MCP（其进程内记住，后续所有确认点直接放行）。
+      let sessionAllowedGranted = false;
+      // MCP 侧传入的会话授权（Rust 进程内标志）。GUI 是权威判定方：用户在顶栏
+      // 撤销后（mcpSessionAllowed=false），此字段被忽略并回带 session_revoked。
+      const mcpClaimsSessionAllowed = event.payload.session_allowed === true;
+      const sessionAllowedByMcp = mcpClaimsSessionAllowed && ui.mcpSessionAllowed;
+      // 撤销信号：MCP 声称已授权但 GUI 已撤销 → 让 MCP 清除自己的标志
+      const sessionRevoked = mcpClaimsSessionAllowed && !ui.mcpSessionAllowed;
+
       // 所有完成路径都要释放锁 + 回传结果
       const finishExec = (result: { ok: boolean; stdout?: string; exit_code?: number; error?: string }) => {
         mcpExecLocks.delete(connection_id);
-        mcpExecResult(requestId, result);
+        const payload: Record<string, unknown> = { ...result };
+        if (sessionAllowedGranted) payload.session_allowed = true;
+        if (sessionRevoked) payload.session_revoked = true;
+        mcpExecResult(requestId, payload);
       };
 
       const existingTab = sessions.tabs.find((t) => t.connectionId === connection_id && t.type === "terminal");
@@ -85,12 +100,18 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
         let rules: CommandRules | undefined;
         try {
           rules = await getCommandRules();
-          const needsConfirm = await checkCommandConfirmation(command);
+          // 会话已授权（本次点选，或 MCP 告知此前已授权）→ 不再弹窗
+          const needsConfirm = !sessionAllowedGranted && !sessionAllowedByMcp && (await checkCommandConfirmation(command));
           if (needsConfirm) {
             const connectionName = config.name || connection_id;
             const reasons = await checkCommandDangerReasons(command).catch(() => [] as string[]);
-            const confirmed = await showMcpConfirm(command, connectionName, reasons);
-            if (!confirmed) {
+            const decision = await showMcpConfirm(command, connectionName, reasons);
+            if (decision === "session") {
+              // 本轮会话均允许：标记本次结果带 session_allowed，并立即执行本条命令。
+              // MCP 服务器收到该标记后在自身进程内记住授权（进程生命周期 = 一轮
+              // AI 会话），后续所有高危命令跳过确认直接执行。
+              sessionAllowedGranted = true;
+            } else if (decision === "deny") {
               finishExec({
                 ok: false,
                 // 与 myshell-mcp.rs 的 denied_by_user_text() 保持同步——

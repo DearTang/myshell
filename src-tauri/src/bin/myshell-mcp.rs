@@ -26,7 +26,61 @@ use std::sync::{Arc, Mutex};
 // MCP is driven by AI agents — they can request destructive operations
 // (rm -rf,-format, overwrite files, etc.). We MUST get an explicit human
 // "yes" via a native OS dialog before executing any high-risk tool. The AI
-// cannot bypass this: clicking Cancel / closing the dialog returns an error
+// cannot bypass this: clicking Cancel / closing the dialog returns an error.
+//
+// SESSION-LEVEL ALLOWANCE. The GUI confirmation dialog offers a third choice
+// besides confirm/deny: "本轮会话均允许" — the user, seeing what the AI wants
+// to do, decides to stop being asked for the rest of THIS session. The GUI
+// reports it back as `session_allowed: true` on the exec result; we then flip
+// the process-wide flag below and every subsequent confirmation point (GUI
+// path, headless ssh_exec, ssh_run, and the always-confirm file tools) is
+// short-circuited. The MCP server process lifetime IS one AI session, so the
+// grant naturally expires with it — no persistence, no cross-session leak.
+// Denials are unaffected: a deny remains a hard stop.
+
+/// Session-wide "allow all dangerous operations" grant. Flipped once by a GUI
+/// "allow this session" click; never reset (the process exits with the session).
+static SESSION_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the user has granted session-wide confirmation bypass.
+fn session_allowed() -> bool {
+    SESSION_ALLOWED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Grant session-wide bypass (called when the GUI reports `session_allowed`).
+fn grant_session_allowed() {
+    if !session_allowed() {
+        SESSION_ALLOWED.store(true, std::sync::atomic::Ordering::SeqCst);
+        log("已授权：本轮会话内所有高危操作不再确认（用户在确认框中选择了「本轮会话均允许」）");
+    }
+}
+
+/// Revoke session-wide bypass. The GUI is the authoritative party: when the
+/// user clicks the topbar chip to revoke, the next exec request carries
+/// `session_revoked: true` and we clear our flag so the following dangerous
+/// operation confirms again as usual.
+fn revoke_session_allowed() {
+    if session_allowed() {
+        SESSION_ALLOWED.store(false, std::sync::atomic::Ordering::SeqCst);
+        log("已撤销会话放行：后续高危操作恢复确认弹窗");
+    }
+}
+
+/// Central confirmation gate: returns true when the operation may proceed.
+///
+/// - Session grant active → immediately true (no dialog, no question).
+/// - Otherwise pops the GUI/OS confirmation and returns the user's answer.
+///
+/// EVERY dangerous-operation confirmation goes through this function so the
+/// session grant cannot be bypassed by omission at any call site.
+fn confirm_or_session_allowed(tool: &str, detail: &str) -> bool {
+    if session_allowed() {
+        log(&format!("会话已授权，跳过确认: {}", tool));
+        return true;
+    }
+    confirm_dangerous_operation(tool, detail)
+}
+
 /// Pop a Windows MessageBox asking the user to confirm a dangerous operation.
 /// Returns true only when the user explicitly clicks Yes.
 #[cfg(windows)]
@@ -840,7 +894,12 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 match exec_in_gui_tab(conn_name, command, timeout, &state).await {
                     Ok(result_json) => return Ok(result_json),
                     Err(e) => {
-                        let needs_confirm = command_rules::command_needs_confirmation(command, &rules);
+                        // A session grant means NO dialog is shown on either path
+                        // (GUI skips it, headless short-circuits), so the
+                        // double-popup concern below does not apply — treat the
+                        // command as no-confirm and let the headless fallback run.
+                        let needs_confirm = !session_allowed()
+                            && command_rules::command_needs_confirmation(command, &rules);
                         // Detect whether the GUI was actually reachable. If
                         // ensure_gui_running failed (GUI not installed / won't
                         // start), the error message mentions myshell.exe or
@@ -879,7 +938,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                     command,
                     danger_reasons_text(command)
                 );
-                if !confirm_dangerous_operation("ssh_exec（远程命令执行）", &detail) {
+                if !confirm_or_session_allowed("ssh_exec（远程命令执行）", &detail) {
                     return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("ssh_exec", &detail) }], "isError": true }));
                 }
             } else {
@@ -1169,7 +1228,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             // 高危操作：上传可能覆盖远程文件
             let detail = format!("上传本地文件 [{}] → 服务器 [{}] 路径: {}", local, conn_name, remote);
-            if !confirm_dangerous_operation("sftp_upload（上传文件）", &detail) {
+            if !confirm_or_session_allowed("sftp_upload（上传文件）", &detail) {
                 return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("sftp_upload", &detail) }], "isError": true }));
             }
 
@@ -1201,7 +1260,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             // 高危操作：删除不可恢复
             let detail = format!("删除服务器 [{}] 上的: {}", conn_name, path);
-            if !confirm_dangerous_operation("sftp_remove（删除文件/目录）", &detail) {
+            if !confirm_or_session_allowed("sftp_remove（删除文件/目录）", &detail) {
                 return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("sftp_remove", &detail) }], "isError": true }));
             }
 
@@ -1223,7 +1282,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             // 高危操作：重命名/移动可能覆盖目标
             let detail = format!("服务器 [{}] 上: {} → {}", conn_name, old, new);
-            if !confirm_dangerous_operation("sftp_rename（重命名/移动）", &detail) {
+            if !confirm_or_session_allowed("sftp_rename（重命名/移动）", &detail) {
                 return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("sftp_rename", &detail) }], "isError": true }));
             }
 
@@ -1246,7 +1305,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 "打包本地目录 [{}] → 服务器 [{}] 路径: {}",
                 local_dir, conn_name, remote_dir
             );
-            if !confirm_dangerous_operation("upload_project（上传项目目录）", &detail) {
+            if !confirm_or_session_allowed("upload_project（上传项目目录）", &detail) {
                 return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("upload_project", &detail) }], "isError": true }));
             }
 
@@ -1341,7 +1400,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             let local_dir = args["local_dir"].as_str().ok_or("缺少 local_dir 参数")?;
 
             let detail = format!("从服务器 [{}] 下载目录 {} → 本地 {}", conn_name, remote_dir, local_dir);
-            if !confirm_dangerous_operation("download_project（下载项目目录）", &detail) {
+            if !confirm_or_session_allowed("download_project（下载项目目录）", &detail) {
                 return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("download_project", &detail) }], "isError": true }));
             }
 
@@ -1932,17 +1991,30 @@ async fn exec_in_gui_tab(
         "connection_id": conn_id,
         "command": command,
         "timeout": timeout,
+        // Session grant: when the user already chose "allow this session",
+        // tell the GUI to skip its confirmation dialog entirely (the grant is
+        // authoritative in this process; the GUI dialog is advisory UX).
+        "session_allowed": session_allowed(),
     }));
     writeln!(stream, "{}", cmd).map_err(|e| format!("发送命令失败: {e}"))?;
     stream.flush().map_err(|e| format!("flush 失败: {e}"))?;
 
-    // Read the response — a JSON object with {ok, stdout?, exit_code?, error?}.
+    // Read the response — a JSON object with {ok, stdout?, exit_code?, error?,
+    // session_allowed?}. The GUI sets session_allowed when the user picked
+    // "本轮会话均允许" at its confirmation dialog; we honor it from here on.
     let mut reader = BufReader::new(stream);
     let mut resp_line = String::new();
     reader.read_line(&mut resp_line).map_err(|e| format!("读取响应失败: {e}"))?;
 
     let resp: Value = serde_json::from_str(resp_line.trim())
         .map_err(|e| format!("响应解析失败: {e} (raw: {})", resp_line.trim()))?;
+
+    if resp["session_allowed"].as_bool() == Some(true) {
+        grant_session_allowed();
+    }
+    if resp["session_revoked"].as_bool() == Some(true) {
+        revoke_session_allowed();
+    }
 
     if resp["ok"].as_bool() == Some(true) {
         let stdout = resp["stdout"].as_str().unwrap_or("");
@@ -2519,7 +2591,7 @@ async fn run_upload_task(
         "ZMODEM 上传本地文件 [{}] ({} 字节) → {}",
         local_path, size, remote_dir
     );
-    if !confirm_dangerous_operation("zmodem_upload（ZMODEM 上传）", &detail) {
+    if !confirm_or_session_allowed("zmodem_upload（ZMODEM 上传）", &detail) {
         fail(denied_by_user_text("zmodem_upload", &detail));
         return;
     }
@@ -2749,7 +2821,7 @@ async fn run_ssh_exec_task(
             command,
             danger_reasons_text(command)
         );
-        if !confirm_dangerous_operation("ssh_run（后台执行）", &detail) {
+        if !confirm_or_session_allowed("ssh_run（后台执行）", &detail) {
             fail(denied_by_user_text("ssh_run", &detail));
             return;
         }
@@ -3257,3 +3329,4 @@ async fn main() {
     }
     log("stdin loop ended — exiting");
 }
+ 

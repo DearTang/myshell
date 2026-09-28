@@ -170,11 +170,10 @@ function clampPct(pct: number): number {
 .server-info {
   height: 36px;
   min-height: 36px;
-  /* 旧版即引用未定义令牌（--bg-sidebar/--border 在两版主题里均未定义 →
-     背景透明、顶边框不渲染）。逐字保留以维持行为一致；若壳层日后补充
-     这些令牌则自动生效。 */
-  background: var(--bg-sidebar);
-  border-top: 1px solid var(--border);
+  /* 实底 + 上边框：旧版引用的 --bg-sidebar/--border 在两版主题里均未定义
+     （背景透明导致终端文字透过监控条），改用真实令牌。 */
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--border-subtle);
   display: flex;
   align-items: stretch;
   overflow-x: auto;
@@ -196,7 +195,7 @@ function clampPct(pct: number): number {
 }
 
 .group.is-divided {
-  border-right: 1px solid var(--border);
+  border-right: 1px solid var(--border-subtle);
 }
 
 .chip {
