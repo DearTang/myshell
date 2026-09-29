@@ -1,6 +1,6 @@
 [package]
 name = "myshell"
-version = "2.15.0"
+version = "2.15.1"
 edition = "2021"
 description = "A Rust-based SSH/SFTP shell tool"
 # Three binaries share this crate (myshell / myshell-cli / myshell-mcp). `tauri dev`
@@ -59,6 +59,11 @@ hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
+# Zeroize the master/DEK keys when they go out of scope. Without it, "lock
+# vault" only drops the `[u8; 32]` — the bytes stay in the freed heap page
+# until something reuses it. Already a transitive dep (via russh/rsa), so
+# this costs no extra compile.
+zeroize = "1.8"
 chrono = "0.4"
 # Local terminal: spawn a shell under a PTY (ConPTY on Windows, openpty on Unix).
 portable-pty = "0.8"

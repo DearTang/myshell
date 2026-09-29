@@ -4,14 +4,14 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## Project
 
-MyShell is a Tauri v2 desktop SSH/SFTP client inspired by FinalShell. Rust backend handles SSH/SFTP/SQLite; React + TypeScript frontend renders the UI and terminal via xterm.js.
+MyShell is a Tauri v2 desktop SSH/SFTP client inspired by FinalShell. Rust backend handles SSH/SFTP/SQLite; Vue 3 + myui frontend renders the UI and terminal via xterm.js.
 
 ## Commands
 
 Frontend (run from repo root):
 - `npm run dev` — Vite dev server on fixed port 1420 (Tauri convention; `strictPort: true`, do not change)
 - `npm run build` — `tsc && vite build` (type-check + bundle to `dist/`)
-- `npx tsc --noEmit` — type-check only
+- `npm run test:ts` — type-check only (`vue-tsc --noEmit`)
 - `npm run preview` — preview the production frontend bundle
 
 Full app (run from `src-tauri/`):
@@ -35,7 +35,7 @@ Building a release installer:
 Rust and TS are bridged exclusively through Tauri commands. The wire contract:
 
 ```
-React component → src/api.ts (typed wrapper) → invoke("snake_case_name", { camelCaseArgs })
+Vue component → src/api.ts (typed wrapper) → invoke("snake_case_name", { camelCaseArgs })
                                                        ↓
 src-tauri/src/main.rs #[tauri::command] fn snake_case_name(...) → myshell_core (ssh.rs / sftp.rs / db.rs)
 ```
@@ -91,7 +91,7 @@ Auto-configuration: The GUI settings panel (MCP → "一键配置全部") auto-d
 - Zcode: `<USERPROFILE>\.zcode\cli\config.json` → `mcp.servers.myshell.command`
 - Cursor: `<USERPROFILE>\.cursor\mcp.json` → `mcpServers.myshell.command`
 
-**Safety: dangerous operation confirmation.** `ssh_exec` / `ssh_run` use a configurable whitelist/blacklist (regex rules in `<config_dir>/myshell/mcp-command-rules.json`, editable in the GUI: 设置 → MCP 支持 → 命令确认规则): read-only commands (ps, ls, cat, ...) run without a dialog; dangerous ones (rm, kill, sudo, shutdown, write-redirects, ...) must be confirmed by a human. When `show_in_gui` is enabled (default) the confirmation is a React dialog in the GUI tab; headless fallback pops a native Windows `MessageBoxW`. The file tools `sftp_upload`, `sftp_remove`, `sftp_rename`, `upload_project`, `download_project`, and `zmodem_upload` ALWAYS confirm regardless of rules. "Cancel" returns a HARD STOP error (`denied_by_user_text` in `myshell-mcp.rs`; the GUI-path copy lives in `App.tsx` — keep the two in sync): the AI must immediately stop ALL further operations (no retry, no alternative tool/path/connection workaround, no next task step), output a summary of the current task for the user, and wait for the user to explicitly decide whether to continue. The AI agent cannot bypass the dialog; async denials (ssh_run / zmodem_upload) surface the same text via `ssh_status` / `zmodem_status`.
+**Safety: dangerous operation confirmation.** `ssh_exec` / `ssh_run` use a configurable whitelist/blacklist (regex rules in `<config_dir>/myshell/mcp-command-rules.json`, editable in the GUI: 设置 → MCP 支持 → 命令确认规则): read-only commands (ps, ls, cat, ...) run without a dialog; dangerous ones (rm, kill, sudo, shutdown, write-redirects, ...) must be confirmed by a human. When `show_in_gui` is enabled (default) the confirmation is a React/Vue dialog in the GUI tab; headless fallback pops a native Windows `MessageBoxW`. The file tools `sftp_upload`, `sftp_remove`, `sftp_rename`, `upload_project`, `download_project`, and `zmodem_upload` ALWAYS confirm regardless of rules. "Cancel" returns a HARD STOP error (`denied_by_user_text` in `myshell-mcp.rs`; the GUI-path copy lives in `App.vue` — keep the two in sync): the AI must immediately stop ALL further operations (no retry, no alternative tool/path/connection workaround, no next task step), output a summary of the current task for the user, and wait for the user to explicitly decide whether to continue. The AI agent cannot bypass the dialog; async denials (ssh_run / zmodem_upload) surface the same text via `ssh_status` / `zmodem_status`.
 
 ### Rust backend (`src-tauri/src/`)
 
@@ -114,13 +114,22 @@ Auto-configuration: The GUI settings panel (MCP → "一键配置全部") auto-d
 
 ### Frontend (`src/`)
 
-- `App.tsx` — top-level state: connections list, open tabs, active tab, SFTP panel visibility. Single source of truth for tab lifecycle.
-- `components/Sidebar.tsx` — connection manager with grouping + right-click context menu
-- `components/TabBar.tsx` — terminal tabs + SFP toggle
-- `components/TerminalPanel.tsx` — xterm.js + FitAddon + WebLinksAddon, Catppuccin Mocha colors hardcoded
-- `components/SftpPanel.tsx` — file browser with in-memory history stack
-- `components/ConnectionDialog.tsx` — create/edit connection form
-- `styles/global.css` — Catppuccin Mocha palette exposed as CSS custom properties (`--bg-dark`, `--accent`, etc.). Components use **inline styles + these vars** — no CSS-in-JS, no Tailwind.
+Vue 3 + myui 统一界面框架（v2.15.0 从 React 迁移；React 旧实现留在 `src-legacy/` 备查）。
+组件是 `.vue` 单文件组件，状态用 Pinia store，**不是** class 组件 / hooks。
+
+- `App.vue` — 应用外壳：顶栏 / 连接树 / 工作区 / AI 右栏 / 状态栏五区布局
+- `store/connections.ts` · `store/sessions.ts` · `store/ui.ts` — Pinia store，分别持有连接列表、会话与标签页生命周期、界面偏好
+- `components/AppSidebar.vue` — 连接树，分组 + 右键菜单 + 拖拽排序
+- `components/TerminalPanel.vue` — xterm.js + FitAddon + WebLinksAddon，配色由 appearance store 驱动
+- `components/SftpPanel.vue` — 文件浏览器
+- `components/ConnectionDialog.vue` — 新建/编辑连接表单
+- `components/settings/*.vue` — 设置抽屉各分区（外观 / 数据 / 安全 / AI / MCP / 命令规则）
+- `composables/*.ts` — 跨组件复用的组合式函数（`useVault` / `useMcpBridge` / `useConnectionDrag` …）
+- `styles/app.css` — 样式分层：Element Plus 基础 → EP 暗色变量 → myui 令牌 → 壳层覆盖
+
+> **类型检查用 `npm run test:ts`（即 `vue-tsc --noEmit`），不要用 `npx tsc`。**
+> 裸 `tsc` 不认识 `.vue` 单文件组件，会在 `src/main.ts` 报
+> `TS2307: Cannot find module './App.vue'` —— 那是工具选错，不是代码坏了。
 
 ### Known incomplete spots
 
@@ -133,7 +142,7 @@ Auto-configuration: The GUI settings panel (MCP → "一键配置全部") auto-d
 
 `findings.md`, `progress.md`, and `task_plan.md` at the repo root are the project's phase tracker and decision log. They are written and updated in Chinese. Per the docs' own instructions, update `progress.md` after each phase or error, and re-read `task_plan.md` before major decisions.
 
-**Doc-after-feature (standing rule):** every time a feature/fix/optimization is finished, update the docs **directly, without asking** — this is a built-in final step of "change done", same as running `npx tsc --noEmit`:
+**Doc-after-feature (standing rule):** every time a feature/fix/optimization is finished, update the docs **directly, without asking** — this is a built-in final step of "change done", same as running `npm run test:ts`:
 1. append a `### 阶段 N` entry (+ 五问重启检查) to `progress.md`;
 2. keep `README.md` in sync (功能特性 sections);
 3. **append one line to `RELEASE_NOTES_STAGING.md`** under "待发布条目" — format `- <emoji> <one-sentence desc>` (✨新增 / 🛠️优化 / 🐛修复 / 🔒安全). This staging file is the primary source for the next release's changelog (see the `打包` rule) and is cleared after each release. Pure discussion / Q&A with no code change → don't append.
@@ -162,7 +171,7 @@ Git remotes: `origin` = Gitee (`gitee.com/argustang/myshell`), `github` = GitHub
 2. **Bump the version** — edit `src-tauri/Cargo.toml` `version = "..."` ONLY (single source of truth), then run `npm run version:sync`.
 3. **Generate the release notes** — **`RELEASE_NOTES_STAGING.md` is the PRIMARY source**: turn its "待发布条目" into the new `## vX.Y.Z（YYYY-MM-DD）` CHANGELOG section (group by ✨新增 / 🛠️优化 / 🐛修复 / 🔒安全). Then run a **completeness check**: `git diff --stat <baseline>..HEAD` (baseline = the `baseline:` line in the staging file) — if changed files aren't covered by any staging entry, surface them and add entries (catches un-logged / out-of-session work). Keep CHANGELOG's existing header comment intact. Mirror into `README.md` 更新日志. Write the new section to the temp notes file used by publish.
 3.5. **⚠️ CONFIRMATION GATE — STOP here.** Present: (a) chosen version + rationale, (b) full text of the new CHANGELOG section. **Do NOT build/commit/push/publish until the user confirms.** If they edit, revise and re-present. On confirm, steps 4–9 run autonomously.
-4. **Pre-check** — `npx tsc --noEmit` and `cargo check` (in `src-tauri/`). Both must pass.
+4. **Pre-check** — `npm run test:ts` (vue-tsc) and `cargo check` (in `src-tauri/`). Both must pass.
 5. **Build the installer** — `npm run tauri:build` from repo root. Long (~10+ min first time); background it. Output: `src-tauri/target/release/bundle/nsis/MyShell_X.Y.Z_x64-setup.exe`.
 6. **Commit + push (both remotes)** — stage `Cargo.toml`, `package.json`, `package-lock.json`, `CHANGELOG.md`, `README.md`, `progress.md`, `RELEASE_NOTES_STAGING.md` (and feature code), commit `release: vX.Y.Z`, then push to **both** `origin` (Gitee) and `github`. Don't commit `.gitee-token` / `.github-token`. The host classifier may gate push-to-default-branch → ask the user to authorize or run `! git push origin main && git push github main`.
 7. **Publish releases (both platforms)** — run both scripts (sequentially, either order):

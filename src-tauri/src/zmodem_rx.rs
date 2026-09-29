@@ -65,8 +65,16 @@ fn zrinit_data() -> [u8; 4] {
 }
 
 /// Pack a file offset as 4 little-endian bytes (ZMODEM ZACK/ZRPOS/ZEOF field).
+///
+/// The cast used to be a bare `off as u32`, silently discarding the top 32
+/// bits. This is the ONLY encoder for the position field in both directions
+/// (the transmitter emits it for ZDATA and ZEOF; the peer's ZRPOS handler reads
+/// back 4 bytes), so a 5 GiB transfer would advertise a 1 GiB offset and no
+/// resume/retransmit above the 4 GiB boundary was representable — with no
+/// error anywhere. Clamping keeps the field self-consistent (the peer sees an
+/// offset it can act on) instead of advertising a wrong one.
 pub(crate) fn offset_bytes(off: u64) -> [u8; 4] {
-    let o = off as u32;
+    let o = off.min(u32::MAX as u64) as u32;
     [
         (o & 0xff) as u8,
         ((o >> 8) & 0xff) as u8,
@@ -420,11 +428,65 @@ impl ZmodemReceiver {
             }
             Some(p) => {
                 // `sz -r` offers carry relative subpaths ("dir/sub/file.txt")
-                // — create the parent hierarchy so tree downloads mirror
-                // intact. The caller is responsible for sanitizing the path
-                // (no `..`/absolute escape) before handing it to us.
+                // — create the parent hierarchy so tree downloads mirror intact.
+                //
+                // The offer name comes from the REMOTE host, and this function
+                // is the only filesystem sink in the ZMODEM receiver. It used
+                // to carry a comment saying "the caller is responsible for
+                // sanitizing the path" — but nothing enforced that: the module
+                // never referenced `path_safety` at all (only sftp.rs / ftp.rs
+                // do), and `ZmodemReceiver::accept_offer` is `pub`, reachable
+                // straight from the Tauri command `zmodem_accept_offer`, which
+                // forwards a webview-supplied path untouched. Enforce the
+                // invariant HERE, where the bytes actually land, rather than
+                // trusting every caller to remember.
+                for comp in std::path::Path::new(p).components() {
+                    use std::path::Component;
+                    match comp {
+                        // `..` is the one component that climbs out of the
+                        // directory the user picked. Everything else is fine:
+                        // the path IS an absolute location chosen in a native
+                        // folder dialog, so RootDir / Prefix / CurDir are the
+                        // normal case, not an attack.
+                        Component::ParentDir => {
+                            actions.events.push(RxEvent::Error(
+                                "拒绝含上级引用(..)的保存路径".to_string(),
+                            ));
+                            actions.send = self.build_hex_header(frame_type::ZSKIP, [0, 0, 0, 0]);
+                            self.state = RxState::WaitingZfile;
+                            return (actions, None);
+                        }
+                        Component::Normal(s) => {
+                            if let Some(name) = s.to_str() {
+                                if let Err(e) = crate::path_safety::validate_component(name) {
+                                    actions.events.push(RxEvent::Error(format!(
+                                        "拒绝非法路径 {}: {}",
+                                        name, e
+                                    )));
+                                    actions.send =
+                                        self.build_hex_header(frame_type::ZSKIP, [0, 0, 0, 0]);
+                                    self.state = RxState::WaitingZfile;
+                                    return (actions, None);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(parent) = std::path::Path::new(p).parent() {
                     if !parent.as_os_str().is_empty() {
+                        // No symlink/junction redirection out of the destination.
+                        if let Err(e) =
+                            crate::path_safety::ensure_no_symlink_components_sync(parent)
+                        {
+                            actions
+                                .events
+                                .push(RxEvent::Error(format!("拒绝写入: {}", e)));
+                            actions.send =
+                                self.build_hex_header(frame_type::ZSKIP, [0, 0, 0, 0]);
+                            self.state = RxState::WaitingZfile;
+                            return (actions, None);
+                        }
                         if let Err(e) = std::fs::create_dir_all(parent) {
                             actions
                                 .events
@@ -532,16 +594,37 @@ impl ZmodemReceiver {
     /// relative to `remaining` of the ZDLE byte (so caller knows the header
     /// format byte is at offset+1).
     fn find_header_start(&self, remaining: &[u8]) -> Option<usize> {
-        let i = 0;
-        // We scan for ZDLE preceded by ZPAD(s).
-        let mut i = i;
+        // The ZPAD prefix is MANDATORY, and the old code never checked it —
+        // it accepted any ZDLE followed by a format byte. That is ambiguous
+        // with escaped payload: a data byte `x` goes on the wire as
+        // `0x18, x ^ 0x40`, so payload bytes 0x01 / 0x02 / 0x03 appear as
+        // `0x18 0x41` (ZBIN), `0x18 0x42` (ZHEX), `0x18 0x43` (ZBIN32) — all
+        // three accepted. When such a pair lands where header parsing is
+        // active, `try_parse_header` returns None (the following bytes aren't
+        // hex), `scan_pos` never advances, and the receiver is wedged for the
+        // rest of the session: `feed` keeps refreshing `last_feed` so the idle
+        // timeout never trips, the terminal stays locked in Zmodem mode
+        // swallowing all shell output, and `buf` grows without bound.
+        //
+        // Requiring the ZPAD prefix removes the ambiguity entirely.
+        let mut i = 0usize;
         while i < remaining.len() {
             if remaining[i] == ZDLE && i + 1 < remaining.len() {
                 let next = remaining[i + 1];
                 if next == ZBIN || next == ZHEX || next == ZBIN32 {
-                    // Verify preceded by ZPAD (with possible preceding junk).
-                    // We accept it as a header start.
-                    return Some(i);
+                    // lrzsz emits "ZPAD ZDLE" or "ZPAD ZPAD ZDLE"; tolerate
+                    // leading noise by allowing ZPAD(s) immediately before.
+                    let preceded = if i >= 1 {
+                        remaining[i - 1] == ZPAD
+                    } else {
+                        // At the very start of the scan window there is no
+                        // preceding byte; the caller may have consumed the
+                        // ZPAD already, so accept position 0.
+                        true
+                    };
+                    if preceded {
+                        return Some(i);
+                    }
                 }
             }
             i += 1;
@@ -908,14 +991,35 @@ impl ZmodemReceiver {
 
                     // ZCRCE = end of ZDATA frame (a header follows, typically ZEOF).
                     // ZCRCG = firehose continues — keep scanning.
-                    // ZCRCQ = ack expected — we send ZACK.
-                    if marker == subpkt_end::ZCRCE {
+                    // ZCRCQ = ack expected — we send ZACK and keep scanning.
+                    // ZCRCW = end of frame AND ack expected. The control-frame
+                    //   path already honours it (`consume_zcrcw_subpacket`),
+                    //   but the DATA scanner did not, so a sender that ends a
+                    //   data frame with ZCRCW — which the module's own
+                    //   subpkt_end doc calls the correct semantic — had the
+                    //   FOLLOWING ZEOF header decoded as subpacket payload and
+                    //   appended to the file. Treat it as a frame end here too.
+                    if marker == subpkt_end::ZCRCE || marker == subpkt_end::ZCRCW {
+                        if marker == subpkt_end::ZCRCW {
+                            actions.send.extend_from_slice(
+                                &self.build_hex_header(
+                                    frame_type::ZACK,
+                                    offset_bytes(self.bytes_written),
+                                ),
+                            );
+                        }
                         self.in_zdata = false;
                         return true; // back to header-parsing mode
                     }
                     if marker == subpkt_end::ZCRCQ {
+                        // In the ZDATA phase the ZACK position is the count of
+                        // data bytes accepted so far — exactly `bytes_written`.
+                        // Hard-coding 0 told a stop-and-wait sender that nothing
+                        // arrived, so it either re-sent the whole window or
+                        // stalled; the counter was in scope and unused.
                         actions.send.extend_from_slice(
-                            &self.build_hex_header(frame_type::ZACK, [0, 0, 0, 0]),
+                            &self
+                                .build_hex_header(frame_type::ZACK, offset_bytes(self.bytes_written)),
                         );
                     }
                     continue;
@@ -1057,6 +1161,17 @@ pub(crate) fn hex_char(n: u8) -> u8 {
 }
 
 /// ZDLE decode: every 0x18 byte means XOR the next byte with 0x40.
+///
+/// XON/XOFF are stripped unconditionally — they are the classic modem flow
+/// control pair and a ZMODEM sender will never carry them as data.
+///
+/// 0x91 / 0x93 are a different matter: per the protocol those two may only be
+/// stripped when the sender negotiated ESCCTL. Our ZRINIT did NOT (see
+/// `ZRINIT_FLAGS`), so a conforming sender is free to transmit 0x90–0x9F
+/// literally. Stripping them unconditionally deleted real file bytes —
+/// unrecoverably, since the subpacket CRC is never verified either. Our own
+/// transmitter escapes the whole 0x80–0x9F range, which is why the bug was
+/// invisible in local testing.
 pub(crate) fn zdle_decode(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
@@ -1065,8 +1180,7 @@ pub(crate) fn zdle_decode(data: &[u8]) -> Vec<u8> {
             out.push(data[i + 1] ^ 0x40);
             i += 2;
         } else {
-            // Strip XON/XOFF
-            if !matches!(data[i], XON | XOFF | 0x91 | 0x93) {
+            if !matches!(data[i], XON | XOFF) {
                 out.push(data[i]);
             }
             i += 1;

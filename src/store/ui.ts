@@ -53,6 +53,35 @@ function readPersisted(): Partial<UiState> {
 
 const persisted = readPersisted();
 
+/**
+ * Only these keys may come back from localStorage.
+ *
+ * The blob was previously spread wholesale over the defaults, so ANY key it
+ * contained won — including `mcpSessionAllowed`, a security flag that
+ * `persistUi()` deliberately never writes. A stale blob from an older build,
+ * or one written by any other code path on the machine, would therefore grant
+ * "all dangerous MCP commands allowed for this session" at startup, silently
+ * suppressing the confirmation dialog.
+ *
+ * (Note: JSON.parse + spread cannot pollute Object.prototype, so this is
+ * untrusted-input acceptance rather than prototype pollution.)
+ */
+const PERSISTED_KEYS = [
+  "themeChoice",
+  "sidebarCollapsed",
+  "showAiPanel",
+  "locale",
+] as const;
+
+function pickPersisted(): Partial<UiState> {
+  const out: Record<string, unknown> = {};
+  for (const k of PERSISTED_KEYS) {
+    const v = (persisted as Record<string, unknown>)[k];
+    if (v !== undefined) out[k] = v;
+  }
+  return out as Partial<UiState>;
+}
+
 export const ui = reactive<UiState>({
   themeChoice: "dark",
   isDark: true,
@@ -76,7 +105,7 @@ export const ui = reactive<UiState>({
   mwOverflowPrompt: null,
   mcpConfirm: null,
   mcpSessionAllowed: false,
-  ...persisted,
+  ...pickPersisted(),
 });
 
 // 初始化持久化的数值字段（带边界钳制，沿用旧版语义）

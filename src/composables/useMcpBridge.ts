@@ -5,11 +5,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   checkCommandConfirmation,
   checkCommandDangerReasons,
-  getCommandRules,
   mcpExecResult,
   onSshOutput,
   sshSend,
-  type CommandRules,
 } from "../api";
 import { connectionsStore } from "../store/connections";
 import { sessions, connect, reconnectOne, getTab } from "../store/sessions";
@@ -84,10 +82,13 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
       // 撤销信号：MCP 声称已授权但 GUI 已撤销 → 让 MCP 清除自己的标志
       const sessionRevoked = mcpClaimsSessionAllowed && !ui.mcpSessionAllowed;
 
-      // 所有完成路径都要释放锁 + 回传结果
+      // 所有完成路径都要释放锁 + 回传结果。
+      // command_sent 必须如实反映「命令是否已经写进 PTY」——MCP 侧据此决定
+      // 能不能无头重跑：已经发出去的命令再跑一次，会在用户看不见的地方执行两遍。
+      let commandSent = false;
       const finishExec = (result: { ok: boolean; stdout?: string; exit_code?: number; error?: string }) => {
         mcpExecLocks.delete(connection_id);
-        const payload: Record<string, unknown> = { ...result };
+        const payload: Record<string, unknown> = { ...result, command_sent: commandSent };
         if (sessionAllowedGranted) payload.session_allowed = true;
         if (sessionRevoked) payload.session_revoked = true;
         mcpExecResult(requestId, payload);
@@ -97,14 +98,25 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
 
       const runExec = async (sessionId: string) => {
         // ── GUI 侧命令确认（黑名单命中时）──
-        let rules: CommandRules | undefined;
-        try {
-          rules = await getCommandRules();
-          // 会话已授权（本次点选，或 MCP 告知此前已授权）→ 不再弹窗
-          const needsConfirm = !sessionAllowedGranted && !sessionAllowedByMcp && (await checkCommandConfirmation(command));
+        // fail-closed：show_in_gui 模式下这个对话框是唯一的确认门（服务端的
+        // command_rules 分类在这条路径上根本不会被求值），因此规则加载或解析
+        // 失败时必须照常弹窗，绝不能因为一次 IPC/IO 错误就放行。
+        if (!sessionAllowedGranted && !sessionAllowedByMcp) {
+          let needsConfirm = true;
+          let policyError: string | null = null;
+          try {
+            needsConfirm = await checkCommandConfirmation(command);
+          } catch (e) {
+            policyError = e instanceof Error ? e.message : String(e);
+            console.warn("[mcp-gui] 命令规则校验失败，按需确认处理:", e);
+          }
+
           if (needsConfirm) {
             const connectionName = config.name || connection_id;
             const reasons = await checkCommandDangerReasons(command).catch(() => [] as string[]);
+            if (policyError) {
+              reasons.unshift(`⚠ 无法校验命令规则（${policyError}），已按需确认处理`);
+            }
             const decision = await showMcpConfirm(command, connectionName, reasons);
             if (decision === "session") {
               // 本轮会话均允许：标记本次结果带 session_allowed，并立即执行本条命令。
@@ -129,8 +141,6 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
               return;
             }
           }
-        } catch (e) {
-          console.warn("[mcp-gui] failed to check command rules:", e);
         }
 
         // sentinel 机制：命令后跟 `echo __MCP_DONE_<uuid>__:$?`，
@@ -216,6 +226,9 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
 
         // 监听挂好后再发命令（先订阅后发送，避免快命令输出丢失）
         await sshSend(sessionId, command + "\n");
+        // 从这一刻起命令已经在远端跑了——后续任何失败（硬超时、sentinel 丢失、
+        // IPC 断开）都必须在结果里如实标记，MCP 才知道不能无头重跑。
+        commandSent = true;
         await new Promise((r) => setTimeout(r, 80));
         await sshSend(sessionId, `echo ${sentinel}:$?\n`);
 

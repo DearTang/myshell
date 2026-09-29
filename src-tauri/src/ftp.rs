@@ -761,13 +761,21 @@ where
             if let Err(e) = crate::path_safety::ensure_no_symlink_components(&local_path).await {
                 return Err(format!("{}: {}", name, e));
             }
-            let mut local = tokio::fs::File::create(&local_path)
-                .await
-                .map_err(|e| format!("{}: 创建本地文件失败: {}", name, e))?;
+            // Open the REMOTE stream BEFORE creating the local file.
+            //
+            // `File::create` is CREATE|TRUNCATE, so the previous order destroyed
+            // a perfectly good local copy whenever RETR then failed (550 because
+            // the file was moved/deleted server-side, permission denied, or the
+            // data connection dropped). The SFTP path already gets this right
+            // (sftp.rs opens the remote handle first, then creates the file) —
+            // the two sides had drifted.
             let mut ds = s
                 .retr_as_stream(remote_path.as_str())
                 .await
                 .map_err(|e| format!("{}: 打开远端文件失败: {}", name, e))?;
+            let mut local = tokio::fs::File::create(&local_path)
+                .await
+                .map_err(|e| format!("{}: 创建本地文件失败: {}", name, e))?;
             let mut buf = vec![0u8; TRANSFER_CHUNK];
             let result: Result<(), String> = loop {
                 if cancel.load(Ordering::Relaxed) {
@@ -803,7 +811,13 @@ where
             s.finalize_retr_stream(ds)
                 .await
                 .map_err(|e| format!("{}: 结束下载失败: {}", name, e))?;
-            let _ = local.flush().await;
+            // ENOSPC / quota failures surface HERE, at flush, not during
+            // write_all — discarding this Result reported a short file as a
+            // completed transfer with the progress bar at 100%.
+            local
+                .flush()
+                .await
+                .map_err(|e| format!("{}: 落盘失败（磁盘空间不足?）: {}", name, e))?;
             Ok(())
         }
     }

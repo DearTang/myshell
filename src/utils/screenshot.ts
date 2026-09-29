@@ -29,9 +29,30 @@
  */
 import type { Terminal } from "@xterm/xterm";
 
-// Catppuccin Mocha — the app's hardcoded terminal theme. Used as the default
-// palette when a cell uses the 16-color "indexed" form rather than a direct
-// RGB. Must match styles/global.css and TerminalPanel's forceVisibleCursor.
+/** xterm `ITheme` key for each of the 16 ANSI palette indices. */
+const PALETTE_KEYS = [
+  "black",
+  "red",
+  "green",
+  "yellow",
+  "blue",
+  "magenta",
+  "cyan",
+  "white",
+  "brightBlack",
+  "brightRed",
+  "brightGreen",
+  "brightYellow",
+  "brightBlue",
+  "brightMagenta",
+  "brightCyan",
+  "brightWhite",
+] as const;
+
+// Catppuccin Mocha — FALLBACK palette for the 16-color "indexed" form, used
+// only when the live terminal theme doesn't define the slot. The file header
+// used to call this "the app's hardcoded terminal theme", which stopped being
+// true when the app gained 10 user-selectable palettes (themes.ts).
 // Source: https://github.com/catppuccin/catppuccin
 const PALETTE_16: string[] = [
   // 0-7 (normal)
@@ -387,6 +408,21 @@ function resolveColor(
     if (color < 16) {
       // 0-7 normal, 8-15 bright. Bold text "brightens" colors 0-7 to 8-15
       // (the SGR "bold also means bright" behavior).
+      //
+      // Prefer the LIVE terminal theme (`theme` is xterm's resolved ITheme,
+      // already the user's selected palette). PALETTE_16 is a frozen Catppuccin
+      // Mocha table left over from before the app had 10 selectable themes —
+      // for 9 of the 10 presets a screenshot came out in the wrong colors.
+      if (color < 8) {
+        const key = PALETTE_KEYS[color];
+        const fromTheme = normalizeColor(theme?.[key]);
+        if (fromTheme) {
+          return isBold && isForeground ? normalizeColor(theme?.[PALETTE_KEYS[color + 8]]) || fromTheme : fromTheme;
+        }
+      } else {
+        const fromTheme = normalizeColor(theme?.[PALETTE_KEYS[color]]);
+        if (fromTheme) return fromTheme;
+      }
       if (isBold && isForeground && color < 8) {
         return PALETTE_16[color + 8];
       }

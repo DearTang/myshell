@@ -80,12 +80,24 @@ pub fn scrub_log_text(text: &str) -> String {
 
     static IPV4: OnceLock<Regex> = OnceLock::new();
     static SSH_TARGET: OnceLock<Regex> = OnceLock::new();
+    static WIN_HOME: OnceLock<Regex> = OnceLock::new();
+    static UNIX_HOME: OnceLock<Regex> = OnceLock::new();
 
     let ipv4 = IPV4.get_or_init(|| {
         Regex::new(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b").unwrap()
     });
     let ssh_target =
         SSH_TARGET.get_or_init(|| Regex::new(r"\b([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)\b").unwrap());
+    // Home directories carry the local account name, which is exactly the PII
+    // this module exists to keep out of feedback uploads. Neither the IPv4 nor
+    // the user@host rule matches them: "C:\Users\alice\AppData\Roaming\myshell\logs"
+    // has no dotted quad and no '@'. The feedback path is not hypothetical
+    // either — `get_feedback_log` injects the log file's own path as a
+    // `===== {path} =====` header before scrubbing.
+    let win_home = WIN_HOME.get_or_init(|| {
+        Regex::new(r#"(?i)\\Users\\([^\\\s"']+)"#).unwrap()
+    });
+    let unix_home = UNIX_HOME.get_or_init(|| Regex::new(r#"/(?:home|Users)/([^/\s"']+)"#).unwrap());
 
     let mut out = text.to_string();
 
@@ -93,6 +105,20 @@ pub fn scrub_log_text(text: &str) -> String {
     out = ipv4
         .replace_all(&out, |c: &regex::Captures| {
             format!("{}.*.*.{}", &c[1], &c[4])
+        })
+        .to_string();
+
+    // Home directories first: a Windows profile path often contains an
+    // `@`-less account name, but running this before the user@host rule avoids
+    // partially masking `C:\Users\alice@corp` into something odd.
+    out = win_home
+        .replace_all(&out, |c: &regex::Captures| {
+            format!("\\Users\\{}", user(&c[1]))
+        })
+        .to_string();
+    out = unix_home
+        .replace_all(&out, |c: &regex::Captures| {
+            format!("/home/{}", user(&c[1]))
         })
         .to_string();
 
@@ -138,6 +164,25 @@ mod tests {
     fn user_masks_middle() {
         assert_eq!(user("admin"), "a***n");
         assert_eq!(user("root"), "r**t");
+    }
+
+    #[test]
+    fn scrub_masks_home_directory_account_names() {
+        // The feedback path injects the log file's own path
+        // (`===== {path} =====`), and on Windows that path contains the local
+        // account name. It used to survive scrubbing untouched.
+        let scrubbed = scrub_log_text(
+            r"===== C:\Users\alice\AppData\Roaming\myshell\logs\myshell-1.log =====",
+        );
+        assert!(
+            !scrubbed.contains("alice"),
+            "Windows account name leaked: {}",
+            scrubbed
+        );
+        assert!(scrubbed.contains("myshell-1.log"));
+
+        let unix = scrub_log_text("读取失败: /home/bob/project/a.txt");
+        assert!(!unix.contains("bob"), "unix account name leaked: {}", unix);
     }
 
     #[test]

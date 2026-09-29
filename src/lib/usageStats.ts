@@ -113,11 +113,19 @@ export async function reportVersion(version: string, os: string): Promise<void> 
   };
 
   try {
-    await fetch(UMAMI_ENDPOINT, {
+    const res = await fetch(UMAMI_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    // `fetch` only rejects on a network failure. A 4xx/5xx — proxy block, CSP
+    // 403, rate limit — resolves normally, and the old code stamped
+    // KEY_VERSION regardless, permanently losing the event for this version.
+    // That directly contradicted the contract documented right below.
+    if (!res.ok) {
+      console.debug(`[stats] 上报未成功 (${res.status})，下次启动重试`);
+      return;
+    }
     // Mark this version as reported so we don't re-send on next launch.
     try {
       localStorage.setItem(KEY_VERSION, version);

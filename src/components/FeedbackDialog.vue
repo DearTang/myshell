@@ -454,7 +454,7 @@ const logSizeText = (): string => {
               </div>
             </div>
             <div class="hint-text">
-              提交时截图会上传到免费图床并随邮件发送链接，同时也会保存在本地反馈包中作为备份。
+              截图仅打包进本地反馈包（zip），需你自己作为附件发送；MyShell 不会把它们上传到任何服务器。
             </div>
           </div>
 

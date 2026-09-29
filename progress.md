@@ -3424,3 +3424,607 @@
 | 什么可能导致偏离？ | 后续查找产物需记住 G:/Rust/cargo_target（不是项目内 target/）；发布脚本若引用项目内路径可能取不到安装包。 |
 | 下一步最小可验证动作？ | 用 G:/Rust/cargo_target/release/bundle/nsis/MyShell_2.15.0_x64-setup.exe 路径执行发布脚本。 |
 | 目标是什么？ | 产出 v2.15.0 安装包并完成双平台发布。 |
+
+### 阶段 134 — open-code-review 本地模式全量审计 + 第一批安全修复（2026-09-29）
+
+**审计方式：** `open-code-review` v1.12.10 的本地（委托）模式——ocr 自带 LLM 通道当时返回 429（周配额耗尽），本机也无本地推理运行时，故改由 `ocr delegate rule` 生成规则、按模块派发 host agent 审计，全程无外部 LLM、无数据外发。规则原文落盘于 `.zcode/ocr-rule-{rust,ts,vue}.md`。
+
+**审计范围：** 94 文件 / 44,166 行。排除 78 个文件：`src-legacy/`（35 个 React 文件约 3 万行——`tsconfig.json` 的 include 只有 `src`，vite 无引用，progress.md:3272 明写"不参与编译"，属死代码）、`.zcode/` 草稿脚本、图标二进制、设计稿与生成物。`src-tauri/src/main.rs`（5577 行）被 ocr 标记 `too_large` 跳过，已拆两段（1–2800 / 2800–5577）单独补审。
+
+**审计结论：** 原始 213 项，跨模块去重 15 项 → **198 项**（P0×7 / P1×28 / P2×76 / P3×87）。完整报告见 `.zcode/ocr-audit-report.md`，P2/P3 清单见 `.zcode/ocr-audit-p2p3.md`。最强信号：AI 代理的安全边界实际是敞开的——命令黑名单可被一个引号绕过、确认门 fail-open、私钥明文每帧都在 webview 里。
+
+**本阶段修复（第一批：安全边界，5 项全部完成）**
+
+1. **P0-1 命令黑名单分词器重写**（`command_rules.rs`）。全部约 100 条黑名单把命令名锚定在 `^` 或 `[;&|]` 之后并直接匹配**原始文本**，而 shell 接受去引号的命令名——`'rm' -rf /x`、`( rm -rf /x )`、`{ rm -rf /x; }`、`for f in *; do rm -rf "$f"; done`、`nohup 'rm' -rf /x`、`/bin/rm -rf /x` 此前**全部无确认执行**，一个引号即可击穿整套规则（正是 prompt injection 的形态）。新增 `token_spans` / `unquote` / `strip_grouping` / `command_position_view`：定位真实命令 token（跳过分组符、控制关键字、中性 wrapper 及其参数区），去引号、剥掉前导路径与分组标点，再把命令名归位到命令位；**仅重写头 token，参数逐字节保留**，因此 `git commit -m "fix; rm"` 不会凭空造出分段边界。约 100 条既有规则一字未改。
+2. **P0-1 附带**（P2）：`has_write_redirect` 原先把任何以 `&` 开头的重定向当安全 fd 复制，但 zsh 的 MULTIOS 默认开启、`>&file` 等价 `&>file`——`echo x >&/etc/crontab` 此前判定为安全并无确认执行。改为仅当 `&` 后是纯数字 fd（或 `-`）才豁免。
+3. **P0-3 确认门改 fail-closed**（`useMcpBridge.ts` + `main.rs`）。GUI 模式下该弹窗是**唯一**的门（服务端分类在此路径不被求值），而原实现的 `catch` 只 `console.warn` 就继续执行；后端又用 `unwrap_or_else(default)` 在规则文件损坏时静默回落到 `confirm_unknown: false` 的内置默认。现改为默认需确认、仅在评估成功返回 false 时降级，失败照常弹窗并在原因栏说明；后端三个命令统一走 `load_command_rules()`，区分"文件不存在"（首次启动，用默认）与"读/解析失败"（报错），并把规则文件写入改为 tmp+rename 原子替换。
+4. **P0-4 `read_file_base64` 收敛**（`main.rs`）。此前只收一个 path、无 `require_dek`、无内容约束，可读取任意 ≤8 MiB 文件——包括 `<config>/myshell/gui-ipc-port`（内容即 MCP IPC 令牌）、`dek.enc`、无扩展名的 `~/.ssh/id_rsa`，且**保险库锁定时照样可用**。现要求保险库已解锁、限定图片扩展名、且永不读取 MyShell 配置目录与 `~/.ssh`（规范化路径比较）。顺带关闭 SVG（内联 data URL 是 webview 的脚本执行面；设置面板的选图过滤器本就不提供 svg，该 MIME 分支原本即死代码）。
+5. **P0-2 私钥不再下发前端**（`lib.rs` / `db.rs` / `main.rs` / CLI / MCP IPC / `ConnectionDialog.vue`）。`private_key_pem` 标记 `skip_serializing`，`get_all_connections` 等查询不再解密它，只返回 `has_private_key` 布尔量；私钥在连接时由新增的 `db::get_private_key_pem` 从保险库取。**同时修掉两个连带问题**：① GUI `ssh_connect`、CLI `resolve_secrets`、MCP `get_connection_secrets` 三条凭据路径都必须补上取钥逻辑，否则私钥认证全线失效（MCP 的 IPC 响应因 `skip_serializing` 一并被剥掉，故改为显式拼装该字段——该响应走的是已认证的本地桥，不进渲染进程）；② 保存时省略 PEM 原先被映射为 NULL，**编辑任何私钥连接都会静默销毁私钥**——现改为"省略 = 保持不变"，删除必须是对话框里显式的 ✕（新增 `clear_private_key`），状态栏相应显示"保存后将删除已存储的私钥"。
+6. **P1-6 CLI 接上规则引擎**（`myshell-cli.rs`）。此前 CLI `exec` / `sftp rm` / `sftp put` / `sftp rename` **完全不查规则**，整套 MCP 安全层可被改调 `myshell-cli` 绕过（文档推荐的 `MYSHELL_PASSPHRASE` 一旦进入 agent 环境即成立）。现 `exec` 在解析凭据、拨号之前先过同一套 `command_rules`；文件类操作与 MCP 策略对齐（无条件确认）；终端上没有弹窗，故以显式 `--yes` 作为人工确认，规则文件读不出来时拒绝执行而非放行。
+
+**测试：** 新增 12 个回归用例（引号/分组/控制关键字/wrapper 后引号/绝对路径/无空格 `(rm`、zsh MULTIOS、以及"不得制造假分段边界"的反向用例）+ `unquote` / `command_position_view` 单元测试。`cargo test --lib` **85 passed / 0 failed**（原 74 项全部保持绿，无回归）。
+
+**验证：** `cargo check --all-targets` 通过（仅存量 warning）；`npm run test:ts`（vue-tsc）0 错误。
+
+**过程中的一次自纠：** 新增用例 `git commit -m "fix; rm"` / `python3 -c 'print("rm")'` 最初按"应放行"断言，实测失败——`git commit` 与 `python3` 本就是**按设计**在黑名单里（`command_rules.rs:578`、`interpreters_confirms`），与本次改动无关，属断言写错；`echo "drop; rm -rf /"` 仍会确认，原因同样是**存量**行为：原始文本正则看不见引号，会匹配到引号**内部**的 `; rm`。这是"多问一次"的安全方向，已改为如实断言并加注说明，未按"修掉"处理。
+
+**未修（留待后续批次）：** P0-5 改主密码非原子（保险库可被永久锁死）、P0-6 AI 模块可达 panic 与锁序倒置（可死锁整个应用）、P0-7 已存 AI 密钥发往任意 base_url，以及全部 P1/P2/P3。
+
+## 五问重启检查（阶段 134）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 134 complete —— 全量审计完成（198 项），第一批 5 项安全修复落地，85 测试全绿。 |
+| 我要去哪里？ | 第二批（数据安全）：P0-5 保险库单文件原子提交、P1-9 备份随改密失效、P1-11 导出凭据失败可见化、P1-12 rollback 改启动时恢复、P1-13/14 upload/download_project 校验退出码。 |
+| 什么可能导致偏离？ | 私钥改动横跨 GUI/CLI/MCP 三条凭据路径与 IPC 契约，改任一处都要同步复核另外两处；`skip_serializing` 会连带影响任何新增的 ConnectionConfig 序列化点。CLI 的 `--yes` 是行为破坏性变更（此前 sftp rm/put/rename 无需确认），需在 README 与更新日志中显式说明。 |
+| 下一步最小可验证动作？ | `myshell-cli exec <连接> "'rm' -rf /tmp/x"` 应被拒绝并列出命中规则；加 `--yes` 才执行。对比 `exec <连接> "uname -a"` 应正常放行。GUI 侧：让 AI 执行一条 rm，应正常弹窗；手工把 mcp-command-rules.json 改成非法 JSON 后再执行，应仍弹窗并在原因栏提示"无法校验命令规则"。 |
+| 目标是什么？ | 把"AI 能触达远端"这条链上的每个降级方向都改成显式的人工确认，而不是靠"正常情况下不失败"。 |
+
+### 阶段 135 — 第二批数据安全修复（open-code-review 审计项）（2026-09-29）
+
+承接阶段 134 的全量审计，处理"数据安全"一批 5 项。
+
+**1. P0-5 保险库改为单文件原子提交（`vault.bundle`）**
+
+salt / verifier / encrypted DEK / KDF meta 此前是 4 个独立文件、顺序写入。`change_master_password` 先写 dek.enc（已用新 master_key 加密）再写 verifier（仍是旧 key）——两次写之间崩溃/磁盘满/杀软占用 verifier 导致 rename 失败，落盘状态就是"DEK 用新 key、verifier 用旧 key"：输旧密码 `check_verifier` **通过**但 `decrypt_with_key` 失败，输新密码 verifier 不匹配，**两个密码都不对**，除删库重录外无恢复路径。`setup_vault` 同形（失败后 salt+verifier 已落盘，`is_initialized()` 永久挡住重新 setup）。
+
+现引入 `VaultBundle { version, salt, verifier, dek_enc: Option<String>, kdf }`，单文件 tmp+rename 一次提交，并**在写入成功后**才顺手清理旧的 4 个分文件（清理失败无害：bundle 已是权威且正确）。全部读路径（`read_salt` / `read_verifier` / `read_encrypted_dek` / `read_kdf_meta` / `is_initialized`）**先读 bundle、缺失才回落旧分文件**，因此存量 vault 无需迁移即可继续解锁；`unlock_vault` 的 KDF 迁移分支在重新派生后顺手把老 vault 升格为 bundle。
+
+关键取舍：`is_initialized()` 判的是 **bundle 文件是否存在**（不是能否解析）。这样即使 bundle 损坏到解析失败，应用也只会报"打不开"，**绝不会**退回"未初始化"并诱导用户去 setup 一个新 vault 覆盖掉读不出来的旧数据。
+
+`dek_enc` 用 `Option`：pre-DEK 老保险库（当年直接用 master_key 加密列、没有 dek.enc）迁移时写入 `null`，而不是空串——否则后续"解密空串"会失败，把一条本该成功的 legacy 解锁路径打断。
+
+**2. P1-9 改密码时重新加密 backups/**
+
+`backups/<version>/` 里存着 `dek.enc`（现含 `vault.bundle`）的**完整副本**，外加匹配的 salt/verifier 和整个 connections.db。改主密码只动现场文件，备份副本仍用**已退役的口令**加密且无限期有效——用户以为轮换了密码，实际上任何人拿到备份目录（被同步的配置目录、被盗 profile、旧镜像）都能用旧口令打开整个凭据库。现 `change_master_password` 在提交新 bundle 后调用 `backup::rekey_backups(old_key, new_key)` 逐个备份重加密（同时兼容老的 `dek.enc` 与新的 `vault.bundle` 两种布局）；失败则记 warn 并在日志里明确指出该目录仍可用旧口令打开、建议删除。顺带把 `vault.bundle` 纳入 `backup_files()`。
+
+**3. P1-11 导出凭据失败可见化**
+
+`export_connections` 此前用 `.ok().flatten()` 把**全部** keyring 错误（凭据管理器锁定、`Bad blob base64`、以及"主密码错误或数据已损坏"）压成 `None`，与"本就没存口令"无法区分，然后照常 `Ok(count)`，UI 只弹一句"已导出 N 个连接"。用户拿到一份显示成功、换机还原后无法认证的备份，且通常要等到还原时才发现。现返回 `ExportConnectionsResult { exported, missingCredentials }`，区分"未保存"与"读取失败（含原因）"，`DataSection.vue` 在有缺失时弹窗逐条列出并提示换机后将无法自动登录。对照：`import_connections` 本来就用 `?` fail closed，只有导出方向是静默的。
+
+**4. P1-12 rollback 改为"下次启动时恢复"**
+
+`rollback` 原是运行中的 Tauri 命令，`fs::copy` 直接覆盖被 GUI 持有的 `connections.db` 与保险库文件。GUI 持有一个长生命周期 SQLite 句柄（带 page cache）且 `AppState.dek` 在恢复后**从不重新派生**——进程会继续用改密码前的 DEK 去解密另一个时间点的数据库（整表解密失败），随后的写入又用旧 key 覆盖恢复回来的内容；`fs::copy` 也无原子性，中断即留下半截 db，下次启动直接 panic。现 `request_rollback(version)` 只写一个 `.pending_rollback` 标记并提示"重启后生效"，`apply_pending_rollback()` 在启动序列中 **`db::init_db()` 之前**执行——那是替换 `connections.db` 唯一安全的时机。标记先消费后执行，失败的回退不会每次启动重试。
+
+**5. P1-13/14 upload/download_project 真正校验远端结果**
+
+两处此前都是 `exec` → `sleep(3s)` → 丢弃通道，**退出码与命令自己打印的 `UPLOAD_OK` / `TAR_OK` 哨兵全部被扔掉**。后果：`upload_project` 在 sudo 要密码、只读文件系统、远端目录不存在时，依然返回"✅ 项目上传成功"，AI 会汇报一次从未发生的部署；`download_project` 更糟——远端 tar 失败时，`/tmp/_dl_project_<dir>` 这个**确定性**路径上还留着上一次的归档，SFTP 把它下载下来解压，得到一棵错误的目录树 + "✅ 下载成功"。
+
+新增 `exec_collect()`：真正读到 `ExitStatus` 与输出（带超时）。**缺少 ExitStatus 一律当错误，绝不当作 0**（连接断开/被信号终止 ≠ 成功）。两处改为 `exit_code == 0 && 输出含哨兵` 才放行，否则返回带远端输出与退出码的错误。`download_project` 的打包命令前置 `rm -f`，杜绝残留归档被当成新结果。
+
+**测试：** 新增 3 个 `vault.rs` 用例（bundle 序列化往返、pre-DEK 的 `dek_enc: null`、未知版本号必须被拒）。**刻意不落盘**——`vault_dir()` 指向真实的 `<config_dir>/myshell`，写盘测试会覆盖用户自己的保险库，只验证数据形状。`cargo test --lib` **88 passed / 0 failed**。
+
+**验证：** `cargo check --all-targets` 通过；`npm run test:ts`（vue-tsc）0 错误。
+
+**过程中的一次自纠：** 编辑 `vault.rs` 时 `record_success(&mut self)` 被工具误改成 `&self`，编译器立刻报 E0594（`self.consecutive_failures` 在 `&` 后面被赋值）。已还原为 `&mut self`。随后用 `git diff -U0` 逐文件核对了本批所有删除行，确认除该处外无其他意外漂移。
+
+**未修（留待后续批次）：** P0-6 AI 模块可达 panic 与 `state.dek`/`state.db` 锁序倒置（可死锁整个应用）、P0-7 已存 AI 密钥发往任意 base_url，以及大部分 P1/P2/P3。
+
+## 五问重启检查（阶段 135）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 135 complete —— 第二批数据安全 5 项落地，88 测试全绿；保险库已改为单文件原子提交。 |
+| 我要去哪里？ | 第三批（静默失败 → 显式错误）：`exit_code.unwrap_or(0)` 语义、task id 碰撞、ssh_exec 无头重跑、zmodem/ftp 传输正确性与数据完整性；以及 P0-6 / P0-7。 |
+| 什么可能导致偏离？ | 保险库存储格式已变（新增 `vault.bundle`）——任何新增的 vault 读取点都必须走 `read_vault_bundle()` 优先 + 旧分文件回落，且 `is_initialized()` 必须以"文件存在"而非"可解析"为准，否则会把读不出来的旧库当成未初始化并诱导用户覆盖。另 `export_connections` 返回类型变了（number → 对象），CLI/MCP 若有调用需同步。 |
+| 下一步最小可验证动作？ | ① 用旧版本（v2.15.0）建一个测试保险库 → 升级运行 → 确认可正常解锁且配置目录出现 `vault.bundle`、旧 4 文件消失 → 改密码 → 中途强杀进程 → 重启确认仍可用**旧或新密码之一**（不应出现"两个都不对"）。② 改密码后检查 `backups/*/` 里的 `vault.bundle` 已被重写。③ 让 AI 执行 `upload_project` 到一个需要 sudo 密码的目录 → 应返回失败而非"✅ 成功"。④ 设置里点"回退" → 应提示重启，重启后回退生效。 |
+| 目标是什么？ | 让"数据会悄悄丢失/悄悄没生效"的路径全部变成显式失败，而不是靠"正常情况下不失败"。 |
+
+### 阶段 136 — 第三批：AI 模块安全 + 静默失败转显式错误（2026-09-29）
+
+承接 134/135，处理剩余两个 P0 与一组"静默失败"缺陷。
+
+**1. P0-6 AI 模块：可达 panic + 锁序倒置 + Ollama 预设不可用**
+
+- `Provider::endpoint()` 改返回 `Result`。此前 compatible 供应商的 `base_url` 为 NULL 时直接 `panic!`，而 `save_ai_model_cmd`（ai.rs:1226）与 `save_ai_settings`（main.rs:2880）都把 `Option<String>` 原样绑进行、**没有任何一层校验**——async Tauri 命令里的 panic 会直接带走命令任务，且不给用户任何提示。
+- **锁序倒置（可冻结整个应用）**：`load_settings` 先 dek 后 db，`load_settings_for_supplier` 先 db 后 dek，而 db guard 是真实 `MutexGuard` 且活到块尾。一条聊天流与一次供应商测试并发即互相等待；`std::sync::Mutex` 死锁既不 unwind 也不被检测，两线程随后把 `state.db`（全应用唯一的 SQLite 句柄）永久占住，UI 直到杀进程才恢复。现两处统一为 **dek 先取、立即释放、再拿 db**。
+- **Ollama 预设永远无法对话**：`load_settings` 无条件 `decrypt_key(...)?`，而空值时该函数返回 `Err("未配置 API key")`——但 Ollama 本就免鉴权（`auth_headers` 返回空、`fetch_provider_models` 显式跳过 Authorization），且内置预设插入时 `api_key_enc` 留 NULL。现 `decrypt_key` 增加 provider 参数，`requires_api_key()` 为 false 时返回空串。
+
+**2. P0-7 已存 AI 密钥发往任意 base_url**
+
+设置面板编辑已有供应商时，key 输入框**本来就是空的**（标签写着"已保存，留空保持不变"），后端因此解密出**真实的保险库密钥**；而 `test_settings` 随后无条件用表单里的 base_url 覆盖端点——按一次"测试"，密钥就被 POST 到用户随手输入的任意主机（含明文 http），此后每次 `ai_chat` 也都继续往新主机发。
+
+现后端加闸：base_url 与已存值不同 + key 来自保险库 + 未显式确认 → 直接返回"🔒 安全确认"错误；前端捕获该错误后弹确认框，用户选"仍然发送"才带 `allowVaultKeyToNewHost: true` 重试。
+
+**3. P1-15/16/17 让 MCP 不再谎报成功**
+
+- **命令已发出后不再无头重跑（P1-15）**：GUI 侧新增 `command_sent` 字段，在 `sshSend(command + "\n")` 之后置真——从那一刻起命令已经在远端跑了。`exec_in_gui_tab` 改返回 `GuiExecError { message, command_sent }`；MCP 侧一旦看到 `command_sent = true` 就**直接返回原错误**，不再落到无头路径开第二个 SSH 会话重跑（此前用户只看到可见标签页里的一次执行，第二次完全隐形）。所有发送前的失败经 `From<String>` 归为 `command_sent = false`，保留 GUI 不可达时的合法回退。
+- **缺 ExitStatus 一律视为失败（P1-16）**：`code.unwrap_or(0)` 把"连接中断 / 远端被信号终止"连同截断的 stdout 报成 **exit_code 0 成功**。MCP 的 `ssh_exec` 改返回 `isError` + `exit_code: null` + 明确说明；`ssh_run` 改置 `TaskPhase::Failed`（这正是 `ssh_status` 文档里写了却永远产生不了的分支）；CLI 的 `--json` 同样返回 null 并以 255 退出。**非零退出码不算任务失败**（命令确实跑完了），只有"根本没有退出码"才算。
+- **task id 不再碰撞（P1-17）**：id 原为 `ssh-<秒>` / `zm-dl-<秒>`，AI 并行 fan-out 时同一秒内两个任务拿到同一个 id，后者 `insert` 覆盖前者；`ssh_run` 还会覆盖 `exec_controls` → `ssh_cancel` 只能取消新的，旧任务永远无法取消，且旧任务的清理会删掉新任务的控制句柄。现统一走 `unique_task_id(prefix)`（时间戳 + 进程内单调计数器）。
+
+**4. P1-24 迁移/清理路径不再静默丢行**
+
+`migrate_to_vault` 用 `filter_map(|r| r.ok())` 收集待迁移行：列无法解码的行（host 是 BLOB、v0.2 Linux 时期的非 UTF-8 路径、任何 `FromSqlConversionFailure`）被**静默丢弃**，随后函数照常对**整表** DROP 明文列——被跳过行的 host/username/私钥路径就此永久销毁，直接违反该函数自己的文档注释（"事务包裹，崩溃时明文完好"）。现改为 `collect::<Result<Vec<_>,_>>()?` 严格收集，并在 DROP 前比对 `COUNT(*)` 兜底。同一模式在 `purge_all_deleted` 与 `collect_overflow_deleted` 中也修了——那里跳过一条 id 意味着连接被硬删除而 **keyring 条目永不清理**，凭据永久残留。
+
+**验证：** `cargo test --lib` **88 passed / 0 failed**（本批未新增用例，改动集中在编排与错误语义，静态检查已覆盖）；`cargo check --all-targets` 通过；`npm run test:ts`（vue-tsc）0 错误。
+
+**未修（留待后续）：** 传输链路的数据完整性（zmodem 的 ZRPOS/CRC/偏移截断、FTP 先 truncate 后 RETR、SFTP 递归深度上限是死代码、ssh.rs 磁盘写错误被吞、磁盘队列无界）、`import_connections` 丢弃文件夹导入错误、以及其余 P2/P3。
+
+## 五问重启检查（阶段 136）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 136 complete —— 剩余两个 P0（AI 模块）已修，MCP 的三条"谎报成功"路径已改为显式失败，迁移丢行已堵。 |
+| 我要去哪里？ | 第四批：传输链路正确性与数据完整性（P1-18~23，zmodem/ftp/sftp/ssh），这是唯一还会**静默损坏文件或谎报传输成功**的一组。 |
+| 什么可能导致偏离？ | `command_sent` 是新的前后端契约字段——GUI 侧 `useMcpBridge.ts` 与 MCP 侧 `myshell-mcp.rs` 必须同步改；漏改一侧会让回退判断失准。AI 侧 `AiTestOverrides` 新增 `allowVaultKeyToNewHost`，前端不弹确认就直接调用会让密钥仍然外发（后端是硬闸，前端只是 UX）。 |
+| 下一步最小可验证动作？ | ① AI 设置里把某个供应商的 Base URL 改掉再点"测试" → 应弹安全确认框；选"仍然发送"才会真发。② 选内置 Ollama 预设 → "测试"应不再报"未配置 API key"。③ 让 AI 同时发起两个 ssh_exec（同一秒）→ 两个 task_id 应不同；其中一个执行中 ssh_cancel 应能真正取消。④ 手动断网后让 AI 执行一条 ssh_exec → 应报"未返回退出码"，不能是 exit_code 0。 |
+| 目标是什么？ | 让 AI 与自动化路径在任何情况下都不会把"没做/失败"报告成"成功"。 |
+
+### 阶段 137 — 第四批：传输链路的数据完整性（2026-09-29）
+
+这一组是全量审计里最后一类"**会静默损坏文件或谎报传输成功**"的问题。
+
+**1. ZMODEM 落盘错误不再被吞（ssh.rs）**
+
+接收端的 ACK/ZRPOS 路径由它自己的字节计数器驱动，**与磁盘完全独立**。所以磁盘写失败（ENOSPC、U 盘拔出、权限变更）时，`sz` 仍在收到"已收到"的 ack，会话正常结束，`zmodem_file_complete` 报的是计数器而非文件——**一个截断文件 + 100% 进度 + 成功提示**。落盘任务里 `write_all`/`flush` 的错误原本只是一行 `log::warn!`。
+
+新增 `DiskSink`（队列 + 首个错误槽 + 未落盘字节计数），落盘任务把首个失败记进去；`zmodem_file_complete` 分支先查这个槽，有失败就改发 `zmodem_error` 并注明"文件可能不完整"，绝不报成功。顺带修掉 `DiskJob::Close` 时同样被丢弃的 flush 错误。
+
+**2. 落盘队列加了字节上限（ssh.rs）**
+
+队列是无界的，网络快、磁盘慢（网络盘 / U 盘 / 机械盘）时以每秒数十 MB 增长且永不回落，最终 OOM——而该文件其余三处缓冲区（`MAX_BUFFER_SIZE` 256KB、`MAX_EXEC_BYTES` 4MB、`MAX_HOLD_BYTES` 1MB）都有上限，唯独磁盘路径没有。现在按未落盘字节计账，超过 64 MB 记为失败并中止传输（远好于 OOM）。
+
+**3. FTP 下载不再先毁掉本地文件（ftp.rs）**
+
+原顺序是 `File::create`（CREATE|TRUNCATE）→ `retr_as_stream`，RETR 随后失败（550 / 权限 / 数据连接断）时本地好文件已被清零。SFTP 侧顺序本就正确（先开远端句柄再建文件），两侧漂移了。现统一为先 RETR 再 create。
+
+**4. SFTP 递归深度上限从死代码变成真正的护栏（sftp.rs）**
+
+深度检查原本在 `expand_download_one`——只对顶层选择生效一次、且恒传 `depth = 0`；真正递归的 `expand_dir_recursive` 只做 `depth + 1` 透传，**从不比较上限**。远端 symlink 指向祖先即无界递归 + READDIR 洪水 + 内存耗尽。FTP 侧一直是对的（`ftp.rs` 在递归函数内检查），两侧同样漂移。现把常量提为模块级 `MAX_RECURSE_DEPTH`，两个 walker 共用同一个上限。
+
+**5. flush 错误不再丢弃（sftp.rs / ftp.rs）**
+
+ENOSPC / 配额类错误恰好在 flush 暴露，而不是 `write_all`。三处 `let _ = flush()` 全部改为传播：结果就是 `errors` 为空、进度 100%，而磁盘上的文件是短的。上传方向同理（远端 flush 失败 = 服务端根本没持久化）。
+
+**6. ZMODEM 协议两处（zmodem_rx.rs / zmodem_tx.rs）**
+
+- **ZRPOS 偏移未校验**：偏移直接从远端数据读取，不与 `size` 比较。seek 超过 EOF 是合法的 → 读回 `Ok(0)` → 走 EOF 分支 → 上报 `FileComplete { bytes: size }`，即"上传了一个零内容的文件"并显示 100%。恶意或异常的对端只需回一个 ≥ 文件大小的 ZRPOS 即可。现越界即报错中止。
+- **未协商 ESCCTL 却丢弃 0x91/0x93**：`zdle_decode` 无条件剥离 XON/XOFF **以及** 0x91/0x93，但按 ZMODEM 协议，后两者只有在协商了 ESCCTL 时才允许剥离——我们的 ZRINIT 并没有协商。合规的发送方有权原样发送 0x90–0x9F，于是**真实文件字节被无声删除**，且子包 CRC 从不校验，损坏不可检测。本地测试看不出来，是因为我们自己的发送器（`needs_zdle_escape`）转义了整个 0x80–0x9F。现只保留 XON/XOFF 剥离。
+
+**验证：** `cargo test --lib` **88 passed / 0 failed**（含 13 个 zmodem_rx 协议用例，无回归）；`cargo check --all-targets` 通过。
+
+**过程中的返工：** 引入 `DiskSink` 时批量改名把 `handle_incoming_data` 内部与 reader 循环里的 `disk` 一并替换，而后者是另一个 `DiskSignal`——同名变量互相遮蔽，编译期连续报了几轮错。最终解法是把解构出的信号改名 `disk_sig`，并把 sink 作为参数显式传给 `dispatch_rx_actions`。**教训：跨作用域的机械改名必须先确认同名符号的类型，编译器只能报类型不匹配、不能报"你改错了语义"。**
+
+**未修（留待后续）：** zmodem 接收端 `find_header_start` 缺 ZPAD 前缀校验、`ZCRCQ` 硬编码位置 0、`ZCRCW` 未当作帧尾、`offset_bytes` 的 u64→u32 静默截断（>4GiB 传输位置错误）、ZMODEM 写入路径未接 `path_safety`、以及其余 P2/P3。
+
+## 五问重启检查（阶段 137）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 137 complete —— 四批修复全部落地：7 个 P0 + 全部 P1 + 传输链路 P1。88 测试全绿。 |
+| 我要去哪里？ | 真机验证这一批（传输链路改动只在真实收发时才触发，静态检查覆盖不到）；之后可考虑打包 v2.15.1。 |
+| 什么可能导致偏离？ | ZMODEM 的 `zdle_decode` 行为变了（不再剥离 0x91/0x93）——与旧版对端互操作时需实测；`DiskSink` 的 64 MB 上限在极慢磁盘上会主动中止而非无限等待，属有意的失败方向。 |
+| 下一步最小可验证动作？ | ① 大文件 ZMODEM 下载时中途拔 U 盘 / 占满磁盘 → 应报"落盘失败"而非 100% 成功。② FTP 下载一个服务端 550 的文件 → 本地同名文件应保持原样不被清零。③ 构造指向祖先的 symlink 目录做 SFTP 递归下载 → 应在 64 层报"已跳过"而非挂死。④ 跨机互传二进制文件后比对 md5（此前含 0x91/0x93 的文件会静默损坏）。 |
+| 目标是什么？ | 让文件传输链路在任何失败模式下都显式报错，而不是产出损坏文件或谎报成功。 |
+
+### 阶段 138 — 第五批：P2 高价值项（安全 / 并发 / 数据）（2026-09-29）
+
+P0/P1 全部处理完毕后，按"是否影响安全、并发正确性或数据完整性"筛出的 P2。
+
+**1. vault.rs —— 三个 fail-open**
+
+- **KDF 迭代数不校验**：`vault.kdf` 是配置目录里的普通文件，其 `iterations` 原样喂进 PBKDF2 循环。`0` 会让派生跑零轮、直接返回 `HMAC-SHA256(pass, salt)`，把 600k 轮 KDF 塌缩成单次 HMAC；`4294967295` 会把主线程卡死数小时（解锁是同步 Tauri 命令，无取消路径）。现钳制在 100k..=10M 并记 warn。
+- **锁定计数 fail-open**：`LockoutState::load` 是 `read_to_string(..).ok().and_then(from_str.ok()).unwrap_or_default()`——空文件、截断文件、权限错误一律变成"零次失败"。讽刺的是该文件自己的写路径（`save`）就是为防这个才做成 tmp+rename 的，而读路径保持 fail-open；再加上它是**无认证**的明文 JSON，改写/删除即可复位。现区分 `NotFound`（首次运行的良性情况）与真实错误，后者进入**保守状态**（按已锁定处理）而不是清零。
+- **保险库目录创建失败被吞**：`.ok()` 让"目录建不出来"完全无诊断，后续读取返回 None，用户只被告知"Vault 未初始化"。现记 warn。
+
+**2. zmodem_rx.rs：落盘点接上 path_safety（此前完全没有）**
+
+`accept_offer` 是 ZMODEM 接收端**唯一**的文件系统 sink，函数上写着"调用方负责消毒路径"——但全模块从未引用 `path_safety`（只有 sftp.rs / ftp.rs 用），而它是 `pub` 且可经 `zmodem_accept_offer` 命令拿到 webview 传来的路径直接调用。现就地校验：拒绝 `..`、逐段 `validate_component`、并对父目录做 `ensure_no_symlink_components`。
+
+为此把 `path_safety::ensure_no_symlink_components` 拆出同步版本——原函数只是几次 `symlink_metadata` 元数据检查，没有可 await 的东西，而 `accept_offer` 必须同步（它要把 `std::fs::File` 直接交给落盘队列）。async 版改为委托。
+
+同文件另两处：`offset_bytes` 的 `off as u32` 静默截断（>4 GiB 传输的位置字段是错的且无处报错，改为钳制）；ZCRCQ 的 ZACK 位置硬编码 0（ZMODEM 该字段是"已接收字节数"，计数器就在作用域里却没用，改为 `offset_bytes(self.bytes_written)`）。
+
+**3. db.rs：三条 PRAGMA**
+
+GUI / CLI / MCP **三个进程**长期持有同一个 SQLite 文件（其中 MCP 是常驻 stdio 服务），而 `init_db` 自己每次启动都要写。默认 `busy_timeout = 0` 意味着立即 SQLITE_BUSY 且不重试：GUI 保存连接撞上 MCP 读 → 用户看到 "database is locked"；MCP 启动撞上写 → 同样错误后 `process::exit(1)`，**所有 agent 工具直接下线**。现设 `busy_timeout=5s` + `journal_mode=WAL` + `foreign_keys=ON`——最后一条顺带让 `ai_supplier_models` 上声明却从未生效的 `ON DELETE CASCADE` 真正起作用。
+
+另：端口列越界时 `unwrap_or(0)` 把数据损坏变成"连接被拒绝"这类看不懂的报错，改为具名转换错误；硬删除连接时连带删除 `command_history`——那批行正是**因为常内嵌 token 与口令才被加密**的，连接被硬删后既不可达又永不回收。
+
+**4. main.rs：三个并发/资源问题**
+
+- **单实例 mutex 从未被持有**：`CreateMutexW(..., bInitialOwner = FALSE, ...)` 之后，"首个实例"分支直接 return，从不调用 `WaitForSingleObject`。于是没人持有它，而未持有的 mutex 是有信号状态 → `wait_mutex_free` 首次等待即无条件返回。后果：优雅关闭旧实例从未被真正验证就启动了第二个 GUI（同一 SQLite / 配置目录 / 日志）；强杀兜底是死代码；而唯一一次成功的等待**反而把所有权授给了本进程**且句柄被泄漏仍持有 → 第三次启动阻塞 5 秒后强杀所有 myshell.exe。现 `bInitialOwner = TRUE` 并用 `WAIT_OBJECT_0` 确认真的拿到所有权。
+- **IPC accept 循环自旋**：任何 `accept` 错误只 log + continue。`WSAEMFILE`（正是下面那个并发上限要吸收的连接洪水导致的句柄耗尽）下会占满一个核并持续往日志追加，直到进程结束。现改为 10ms→200ms 退避，连续失败 20 次后停止监听。
+- **并发上限是 check-then-act**：先 load 比较、在线程里再 `fetch_add`，中间窗口内可被任意多个 accept 迭代穿过——洪水能起远超 32 个处理线程，正是该上限要防的。改为单次 `fetch_add` 抢占名额。
+- `rz_read_chunk` 用调用方给的 `len: u32` 直接 `vec![0u8; len]`（在主线程上），单次 invoke 可请求 4 GiB 分配。对称写命令早有 16 MiB 上限，读侧就是漏了。
+
+**5. command_rules.rs：非法正则不再静默丢弃**
+
+`compile_all` 用 `filter_map(|p| Regex::new(..).ok())`，编译失败的规则无痕消失。对一个**安全控制**来说这是 fail-open：用户把黑名单写错一个字符，规则集静默变弱，设置面板照常显示它已生效，而它本该拦的命令再无确认。现逐条记 warn（含序号、正则、错误）。
+
+**6. 前端四处**
+
+- `PasswordVerifyDialog`：`verify_password` 后端只会返回 `Ok(true)` 或 `Err`，所以 `valid === false` 分支是死代码，错误口令走 catch，而 **catch 不清空 `pass`**——主密码明文在每次失败后仍留在 ref 与输入框里，回车即可重提。补上清空。
+- `store/ui.ts`：localStorage 里的 prefs 被**整体展开**到状态上，于是 blob 里任何键都生效，包括 `persistUi()` 从不写入的 `mcpSessionAllowed`（为 true 时完全抑制危险命令确认弹窗）。一个陈旧或被外部写入的 blob 就能在启动时静默授予"本会话放行全部危险命令"。改为显式键白名单。
+- `useVault.ts`：`vaultStatus()` 抛错时设 `vault = "setup"`，把已初始化的保险库显示成"设置登录密码"页，提交后被后端拒绝且**没有任何东西会重新查询状态**，唯一出路是重启应用。IPC 失败 ≠ 保险库不存在，改为保持 checking。
+- `DataSection.vue`：导出对话框的取消按钮只是 `showExportDialog = false`，且该对话框**根本没有绑 `@cancel`**（导入的有）；面板由 v-show 常驻，于是导出/导入口令在整个会话里留在组件状态中——与文件里"无论哪条退出路径都清空密码"的注释相矛盾。补上。
+
+**7. CLI 与日志脱敏**
+
+- `myshell-cli vault status` 只输出 `{"initialized": bool}`、从不碰 DEK，却走完整解锁流程。无头场景下 `read_password()` 在 EOF 返回空串 → 解锁失败 → `record_failure()` 持久化——**三次无害的状态探测就把用户锁在自己的保险库外**。现跳过解锁。
+- `redact::scrub_log_text` 只处理点分四段 IPv4 与 `user@host`，而反馈路径**自己**就会注入日志文件路径（`===== {path} =====`），Windows 上那正是 `C:\Users\<账号>\...`——账号名原样外发。补 Windows/Unix 主目录规则并新增用例。
+
+**测试：** 新增 `redact` 主目录脱敏用例，**89 passed / 0 failed**。`cargo check --all-targets` 通过；`npm run test:ts`（vue-tsc）0 错误。
+
+**过程中的返工：** `accept_offer` 的路径校验初版把 RootDir/Prefix 一并拒绝，导致 3 个既有 zmodem 用例失败——而绝对路径本就是常态（用户在原生目录选择框里选的就是绝对路径），真正会逃出的是 `..`。改为只拒绝 `ParentDir` 后恢复全绿。
+
+**未修（留待后续）：** `crypto.rs` 的 AAD 绑定与 zeroize（需要数据迁移，风险最高，单独排期）、AEAD 密文可跨行/跨列搬移；其余并发项（落盘线程仍跑在 tokio worker 上、reader 无监管、send_data 在 select! 分支内可阻塞）；`zmodem_rx` 的 ZPAD 前缀与 ZCRCW 帧尾；以及大部分 P3。
+
+## 五问重启检查（阶段 138）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 138 complete —— P0/P1 全清 + 一批高价值 P2。五批合计 7×P0、28×P1、约 20 项 P2。89 测试全绿。 |
+| 我要去哪里？ | 剩 `crypto.rs` 的 zeroize 与 AAD（需迁移，单独排期）、其余并发项、以及 P3 清理；之后真机验证 + 打包。 |
+| 什么可能导致偏离？ | db.rs 启用 WAL 会改变数据库文件布局（新增 -wal/-shm），旧版 v2.15.0 回滚安装时需注意；单实例 mutex 改为真正持有后，第二次启动会真正阻塞等待旧实例退出，若旧实例卡死则走 5 秒后强杀——这是期望行为，但要真机确认一次。 |
+| 下一步最小可验证动作？ | ① 同时开 GUI 与 MCP，让 AI 反复增删连接，确认不再出现 "database is locked"。② 连续启动三次 MyShell，确认第二次弹"覆盖启动"、第三次不再强杀。③ 删掉 lockout.json 制造读取失败 → 应按已锁定处理而非清零。④ 反馈日志里确认本机账号名已被掩码。 |
+| 目标是什么？ | 让保险库与本地 IPC 的失败方向一律偏向"拒绝"而不是"默认放行"。 |
+
+### 阶段 139 — 第六批：P3 清理 + crypto 两项的取舍（2026-09-29）
+
+**先做评估，再动手**
+
+对审计里 `crypto.rs` 的两项做了风险评估，结论是**一项不做、一项单独排期**，都没有在本批动手：
+
+- **AEAD 缺 AAD（密文可跨行/跨列搬移）—— 建议不做。** 威胁面很窄：`connections.db` 在用户配置目录里，能写它的人按项目自己的判断就属于"同用户进程"这一档，而这一档早就能读 `gui-ipc-port` 拿 MCP 令牌、或趁解锁时直接从内存捞 DEK。而代价很高：所有加密列要重新加密（旧 blob 没有 AAD），且 `secrets.rs` 的条目**在 OS 钥匙串里、不在 DB 中**，用户不在场时无法重写，等于要设计一套带用户确认的迁移流程。为防一个已被文档明确接受为"在范围内"的暴露面而动全部凭据数据，风险收益比为负。**作为 v3 的产品决策（带正式迁移方案）单独排期。** 另：审计报告称存在 `encrypt_with_key_with_aad`，实际读代码确认**该函数并不存在**——AAD 此前完全没被考虑过，不是"有个函数忘了用"。
+- **zeroize —— 建议做，但单独一批。** 它不需要任何数据迁移，是纯类型改动的机械重构（`require_dek` 约 30 处调用点返回 `Zeroizing<[u8;32]>`、AppState 的 dek 字段类型、`derive_master_key*` 的返回类型）。唯一价值在语义：`lock_vault` 名为"丢弃内存中 DEK"但实际只是 drop，字节还在——也就是说**"锁定保险库"这个功能目前名不副实**。不与 P3 混在一批里做，单独验证。构建日志显示 `zeroize v1.9.0` 已是传递依赖，纳入 `[dependencies]` 无额外成本。
+
+**P3 —— 四个"UI 静默失效"的字段名不匹配（本次最值得的一组）**
+
+`api.ts` 声明 camelCase，而对应 Rust 结构体**都没有 `#[serde(rename_all = "camelCase")]`**（已逐个确认）。`invoke` 返回 `any`，所以 TypeScript 完全不报错，运行时字段恒为 `undefined`：
+
+- `LockoutInfo` → `dailyFailures` 恒 undefined → `undefined > 0` 恒 false → **"今日已错 N 次"提示永远不显示**（用户因此看不到自己正在逼近锁定）。
+- `DeletedConnection.deletedAt` → 回收站**每行的时间都是空白**。
+- `FeedbackLogInfo.logDir` → `v-if` 恒假 → **"打开日志文件夹"按钮从不渲染**。
+- `BackupInfoUi.timestampStr` → **每条备份的日期部分是空的**（旁边的文件数正常，所以很难被发现）。
+
+修法是给四个 Rust 结构体补 `rename_all`（前端零改动、IPC 名称不变）。同类中 `QuickCommandItem` / `CommandHistoryItem` 是带 `rename_all` 的，约定本身不一致。
+
+**P3 —— 死代码**
+
+- `fonts::list_system_fonts` 带着 `#[tauri::command]`，而 `lib.rs` 明文写着本 crate "Tauri-free"。这迫使 CLI / MCP 为列字体而链接 Tauri，并立了个侵蚀三二进制解耦边界的先例。已改为普通函数 +`main.rs` 里的薄适配器（与 `list_system_fonts` 同名，IPC 名称不变）。
+- `ssh.rs::detect_direction` 无任何调用点（方向实际由 `rx.take_passthrough()` 决定），注释描述的探针早已不存在。
+- `TxSession.native` 写了从读——真正的门控是 `sender.is_some()`，字段注释描述的语义与实际不符。
+- `zmodem_tx.rs` 中 `handle_header` 有一条 `else if typenum == ZRINIT` 永不可达分支（同臂首个条件已覆盖且末尾为 `true`），其日志永远不会出现。
+- `ConnectionDialog.vue` 的 `shakeNonce` 自增但无任何读取点。
+
+**P3 —— mutex 中毒从"崩溃循环"降级为"正常错误"（23 处）**
+
+`main.rs` 里 8 处 `transfer_cancels.lock().unwrap()` + 8 处 `PENDING_EXEC.lock().unwrap()`，`myshell-mcp.rs` 里 4 处 `tasks` + 3 处 `controls` 的 `.expect()`，而同文件其他锁一律用 `map_err`。一次 panic 中毒后**每个后续传输 / IPC 调用都 panic**；因为它们都是 `#[tauri::command]`，这在用户看来就是崩溃循环。更糟的是 MCP 的 `ssh_run` 后台驱动：任务自己的 `fail` 闭包也要抢同一把锁，一中毒就一起 panic，任务永远停在 `Confirming`——AI 轮询一个永不完成、永不解释原因的任务。现统一改为 `unwrap_or_else(|e| e.into_inner())`：数据在结构上仍然有效，返回错误远好过进程中毒。
+
+**P3 —— 其余**
+
+- **IME**：`CommandBar` 的 Enter 处理从不检查 `e.isComposing`，中文输入法用回车**确认候选词**时会被当成提交，把未合成的拼音原文发到远端并清空输入。已加 `isComposing` / `keyCode 229` 守卫。
+- **输入框清空时机**：`handleExecute` 在 `await` **之后**才清空，发送期间输入的下一条命令会被末尾的赋值抹掉。改为发送前同步清空。
+- **隐私开关误报**：`SecuritySection` 读取 `disable_command_history` 失败时被静默吞掉，开关停在声明默认值 `false`——于是**在后端其实已关闭记录时，界面显示"正在记录"**。这恰恰是用户依赖它来隐藏内联密钥的时刻。改为 `boolean | null` 三态，未读到就禁用开关并给出原因。
+- **回收站**：加载失败只 `console.error`，`items` 留在 `[]`，模板渲染成"回收站为空"——告知用户无可恢复，而软删除的连接可能就在。改为独立的失败态 + 重试按钮。
+- **反馈对话框的假文案**：原本写着"提交时截图会上传到免费图床并随邮件发送链接"，但全仓**没有任何图床上传代码**。用户被告知截图已发布给第三方服务，而该服务从未被联系过。改为如实描述（仅打包进本地 zip，需自行发送）。
+- **遥测**：`fetch` 只在网络失败时 reject，4xx/5xx（代理拦截、CSP 403、限流）会正常 resolve，而代码无条件写"已上报"标记 → 该版本事件**永久丢失**，且与其自身注释里的契约直接矛盾。改为检查 `res.ok`。
+- **SFTP 点条目**：`. / ..` 未过滤（FTP 侧过滤、前端不过滤），点下载报 `非法文件名: "."`、点删除对当前目录发 RMDIR。两侧已漂移，现统一过滤。
+- **SFTP remove 错误**：无条件丢弃 `remove_file` 的错误，只报 `remove_dir` 的——权限不足的文件报出来的是"删目录失败"，且掩盖真实原因。现两个错误都保留。
+- **AppSidebar**：两个逐字节相同的右键处理合并为一个；侧栏自身折叠现在会 `persistUi()`（此前只有顶栏那个会持久化，所以侧栏折叠重启就丢）。
+
+**验证：** `cargo test --lib` **89 passed / 0 failed**；`cargo check --all-targets` 通过；`npm run test:ts`（vue-tsc）0 错误。
+
+## 五问重启检查（阶段 139）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 139 complete —— P3 清理一批。审计的 7×P0 / 28×P1 / 一批 P2 / 本批 P3 已处理。 |
+| 我要去哪里？ | 单独一批做 zeroize（锁定保险库才名副其实）；真机验证；之后打包。 |
+| 什么可能导致偏离？ | 四个结构体补 `rename_all` 改变了 IPC 载荷的键名——若将来有其它消费者（MCP / CLI / 外部脚本）按 snake_case 读这些字段会失效，但它们只经 api.ts 访问。mutex 改为中毒恢复后，中毒不再中断进程，**掩盖了潜在的 panic 源**，应配合日志观察。 |
+| 下一步最小可验证动作？ | ① 回收站里删除一个连接，确认"多久之前删除"能正常显示；② 备份列表确认每行有日期；③ 反馈对话框确认"打开日志文件夹"按钮出现；④ 命令栏用中文输入法按回车选词，确认不误提交；⑤ 把 lockout.json 改成非法 JSON，确认按锁定处理而非清零。 |
+| 目标是什么？ | 把"看起来在工作但其实没生效"的界面与静默失败路径清干净。 |
+
+### 阶段 140 — 自行验证 + P3 收尾（2026-09-29）
+
+**先验证，再继续修。** 上一批的很多改动是"按文档推断正确"，这一批先把它们证明出来。
+
+#### 一、验证做了什么
+
+| 项 | 方法 | 结果 |
+|---|---|---|
+| 完整前端构建 | `npm run build`（vue-tsc + vite） | ✅ |
+| 完整 Rust 构建（三个二进制） | `cargo build` | ✅ |
+| 单元测试 | `cargo test --lib` | ✅ **93 passed / 0 failed** |
+| **SQLite PRAGMA 是否真的生效** | 新增 4 个 db 测试 | ✅ 见下 |
+| **CLI `vault status` 不再要密码** | 实际运行 `myshell-cli.exe vault status --json` | ✅ 直接输出 `{"initialized":true}`，无提示、不消耗锁定次数 |
+| CLI `--yes` 开关 | 实际运行 `--help` | ✅ 出现在全局选项中 |
+| **MCP ↔ GUI 拒绝文案同步** | `.zcode/check-deny-sync.mjs` | ✅ 10 项全过 |
+| **IPC 字段契约** | `.zcode/check-ipc-contract.mjs` | ✅ 4 个结构体全过 |
+| **契约检查器本身有效性** | `.zcode/verify-guard.mjs`（反向对照） | ✅ 去掉 `rename_all` 后检查确实失败，随后已还原 |
+
+其中最有价值的是**反向对照**：一个从未失败过的检查不算检查。临时移除 `LockoutInfo` 的 `rename_all`，检查如期报出 "Rust 产出 consecutive_failures, daily_failures, …，api.ts 未声明"，确认这个守卫真的会拦住回归。（首次尝试因 CRLF 行尾没匹配上而失败，顺手修成了容忍 \r\n。）
+
+**PRAGMA 是本批最需要证实的**：上一批我加的 WAL / busy_timeout / foreign_keys 全是照 SQLite 文档推断的。这次补了 `init_db_at(path)` 测试缝（`init_db` 硬编码用户真实库，测试绝不能碰），用临时库实测：
+
+- `PRAGMA journal_mode` == `wal` ✅
+- `PRAGMA foreign_keys` == 1 ✅
+- `PRAGMA busy_timeout` ≥ 1000ms ✅
+- `ON DELETE CASCADE` **真的触发**（删 `ai_models` 后 `ai_supplier_models` 归零）✅
+- 硬删除连接确实连带清掉 `command_history` ✅
+- 越界端口确实返回错误而不是端口 0 ✅
+
+#### 二、验证暴露并修掉的问题
+
+- **`evict_stale_tasks` 签名用错**：它接收 `&Mutex<HashMap>` 并自己加锁，我按"接收 guard"写，多套了一层锁 → E0308。已改为 `evict_stale_tasks(&state.tasks)`，与 `ssh_status` 的调用点一致。
+- **DiskSink 重构遗留三个未使用绑定**（`disk_tx` / `disk_rx` / `disk_sid`），完整构建才暴露（`cargo check` 阶段被增量缓存掩盖）。已清理。
+- **两个新测试的 INSERT 写错了列名**（`command_history.command` NOT NULL、`ai_supplier_models` 没有 `model_name` 列）。第一次跑就被 schema 打回来了——这正是测试该有的样子。
+
+#### 三、P3 收尾
+
+**ZMODEM 协议（数据损坏风险）**
+
+- **ZCRCW 未被当作数据帧的帧尾**：控制帧路径（`consume_zcrcw_subpacket`）认它，数据扫描器只认 ZCRCE，于是以 ZCRCW 结束数据帧的发送方，其后的 **ZEOF 帧头会被当作负载写进文件**。本模块自己的 `subpkt_end` 注释就写着 ZCRCW 是"k — end of frame, ack"，两条路径本该一致。
+- **`find_header_start` 不校验必需的 ZPAD 前缀**，与转义后的数据字节完全歧义：负载字节 0x01/0x02/0x03 在链路上是 `0x18 0x41/0x42/0x43`，正好是 ZBIN/ZHEX/ZBIN32。这类对一旦落在帧解析活跃的位置，`try_parse_header` 返回 None 且 `scan_pos` 不再前进，接收器**永久卡死**——而 `feed` 每次刷新 `last_feed` 使空闲超时永不触发，终端一直锁在 Zmodem 模式吞掉所有输出，`buf` 无界增长。现要求 ZPAD 前缀。
+- 发送侧：`record_zrinit_caps` 按**大端**读 ZBUFLEN，而同 crate 的 `zrinit_data` 明确按**小端**写（32768 被读成 128）；`find_header_start` 不接受 ZBIN32，导致对端用 binary32 应答控制头时上传挂到超时；完成事件上报 `self.size` 而非实际流出的字节数，文件中途被截断时会宣称对方收到了它从未收到的文件。
+
+**其余**
+
+- CLI `sftp rm` 与 `sftp.rs` 同步改为**保留两个错误**（此前丢弃文件错误，权限不足的文件报出来是"删目录失败"）。
+- `zmodem_status` 补上 `evict_stale_tasks`——其文档注释声称"每次 ssh_status/zmodem_status 调用时惰性执行"，但只有 ssh_status 真的调了，于是**只走 zmodem_*（文档推荐路径）的会话**会让全部已完成任务连同 result 常驻整个进程生命周期。
+- `EnumWindows` 的 FFI 块补 SAFETY 说明（周边其他 unsafe 块都有）。
+- **拖拽监听泄漏**：`useConnectionDrag` 卸载时无法触达 Phase-B 的闭包，注释写"acceptable for v1"——但后果不止样式泄漏：孤儿 `onUpB` 仍绑在 `document` 上，会在下一次任意位置的 pointerup 时执行 `moveConnection`。现把 detach 提升为可从 `onUnmounted` 触达的变量。
+- **确认框规则陈旧**：`McpConfirmDialog` 在 `onMounted` 拉一次规则，而该组件是 App 启动时无条件常驻的——一次失败或用户在设置里改过规则，之后整个会话的弹窗**都不再高亮**却仍声称"危害说明由规则驱动"。改为每次打开时重取 + 监听设置保存后派发的事件。
+- `FIELD_FOCUS_ORDER` 漏掉 `connectTimeout` / `keepaliveInterval`，而 `validate()` 会标记这两项 → 仅因它们失败时，字段标红却不聚焦任何输入框。
+- 快捷命令面板的删除与重排序补 try/catch：重排序是两条独立 UPDATE，第二次失败会让两行 `sort_order` 相同，之后永久错乱且无法修复。
+- 截图取色改为**优先用运行中终端的 `ITheme`**，`PALETTE_16`（Catppuccin Mocha）降级为回退——该文件头曾称其为"应用硬编码的终端主题"，而应用早已有 10 套可选配色，此前 10 套里有 9 套截图颜色是错的。
+
+#### 四、验证矩阵（可重跑）
+
+```
+npm run test:ts                              # 前端类型
+cd src-tauri && cargo test --lib             # 93 个单测
+cd src-tauri && cargo build                  # 三个二进制
+npm run build                                # 前端产物
+node .zcode/check-ipc-contract.mjs            # IPC 字段契约守卫
+node .zcode/check-deny-sync.mjs              # 拒绝文案同步守卫
+node .zcode/verify-guard.mjs                 # 守卫自身的反向对照
+```
+
+## 五问重启检查（阶段 140）
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 140 complete —— 审计发现已全部处理（P0/P1/P2 关键项 + P3 收尾），且关键项已从"推断正确"升级为"实测通过"。 |
+| 我要去哪里？ | 单独一批做 zeroize；之后真机验证与打包。 |
+| 什么可能导致偏离？ | 契约守卫目前只覆盖 4 个结构体，新增 IPC 返回结构时需同步扩展 `check-ipc-contract.mjs`。ZMODEM 的 ZPAD/ZCRCW 改动改变了帧解析，**必须跨机互传实测**（本地 13 个协议用例全绿，但它们喂的是构造帧，不覆盖真实 lrzsz 交互）。 |
+| 下一步最小可验证动作？ | ① 重跑上述验证矩阵（7 条命令）确认全绿；② 跨机 ZMODEM 传一个二进制文件并比对 md5；③ 让 AI 用 ssh_exec 跑一条 rm，确认弹窗高亮的是刚改过的规则。 |
+| 目标是什么？ | 让"我以为已经验证过"和"我确实验证过"之间不再有缺口。 |
+
+### 阶段 141 — zeroize：让"锁定保险库"名副其实（2026-09-29）
+
+**先验证上一批，再做这一批。** 阶段 140 的 7 条验证命令全部重跑通过之后，才动 zeroize。
+
+#### 一、重跑阶段 140 的验证矩阵（全部通过）
+
+| 命令 | 结果 |
+|---|---|
+| `npm run test:ts` | ✅ vue-tsc 无输出 |
+| `cd src-tauri && cargo test --lib` | ✅ **93 passed / 0 failed** |
+| `cd src-tauri && cargo build` | ✅ 三个二进制 |
+| `npm run build` | ✅ built in 17.97s |
+| `node .zcode/check-ipc-contract.mjs` | ✅ IPC 字段契约一致 |
+| `node .zcode/check-deny-sync.mjs` | ✅ 拒绝文案两侧同步 |
+| `node .zcode/verify-guard.mjs` | ✅ 反向对照如期失败（已还原） |
+
+顺带确认 `BufRead` 未使用告警是 **HEAD 就有的**，不是这轮改出来的（`git diff` 里不含该行，且 HEAD 上 import 1 处 / 使用 0 处），故未动。
+
+#### 二、zeroize 这一批到底修了什么
+
+**问题**：`AppState.dek` 是 `Option<[u8; 32]>`，`lock_vault` 只做 `*slot = None`。这是**单纯 drop**——32 字节密钥躺在已释放的堆页里，直到被下一次分配覆写。也就是说**"锁定保险库"这个功能名不副实**：它让 UI 回到锁定态，但密钥还在进程内存里。
+
+**改动**（纯类型重构，**无数据迁移**，旧库旧密文完全不受影响）：
+
+- `crypto.rs`：四个密钥派生函数（`derive_key` / `derive_key_with_iterations` / `derive_master_key` / `derive_master_key_with_iterations`）返回类型 `[u8; 32]` → `Zeroizing<[u8; 32]>`。PBKDF2 直接写进 `Zeroizing` 里，中间不落裸拷贝。
+- `lib.rs`：`AppState::dek` 字段与 `require_dek` 返回类型同步改为 `Zeroizing`。`require_dek` 改用 `.clone()` 取出——`Zeroizing` 不是 `Copy`，原先的 `ok_or_else` 无法从 guard 里移出。
+- `ai.rs`：3 处直接读 `state.dek` 的地方同样改 `.clone()`。
+- `main.rs`：setup / unlock / change_password 三个入口的 `master_key` 与 `dek` 全部 `Zeroizing`；`lock_vault` 的 `*slot = None` 现在会真的擦除。
+- **主密码本身**：8 个 Tauri 命令的 `passphrase: String` 在函数体第一行就 `Zeroizing::new(passphrase)` 包起来（`setup_vault` / `unlock_vault` / `verify_password` / `reveal_connection_password` / `reveal_connection_proxy_password` / `export_connections` / `import_connections` / `change_master_password`）。主密码是本进程价值最高的机密，比 DEK 更值得擦。
+- `myshell-cli.rs`：`resolve_passphrase` 返回 `Zeroizing<String>`——从 `MYSHELL_PASSPHRASE` 环境变量读的那份也一样（agent 的环境常常在进程退出后还留着）。
+- `Cargo.toml`：`zeroize = "1.8"`。它本来就是 russh/rsa 的传递依赖，纳入直接依赖**不增加任何编译量**。
+
+**边界（不要过度承诺）**：这是纵深防御，不是保证。密钥在走向磁盘的路上还会被复制进 AES cipher 自己的 key schedule、以及若干 `Vec<u8>`；JSON 反序列化阶段 serde 也做过临时拷贝——那些不受我们控制。真正被可靠擦掉的，只有被显式包成 `Zeroizing` 的那几份。
+
+#### 三、回归守卫（含反向对照）
+
+擦除效果本身没法在测试里观测（内存已释放），但**类型**可以。`lib.rs` 加了两个编译期断言：
+
+1. `AppState::dek` 字段类型必须是 `Option<Zeroizing<[u8; 32]>>`；
+2. `require_dek` **返回类型**必须是 `Result<Zeroizing<[u8; 32]>, String>`。
+
+第 2 条才是真正脆弱的：若有人把返回类型改回 `[u8; 32]`，main.rs 里三十多个 `let key = require_dek(&state)?;` 调用点靠 deref 转换**照样编译通过**，擦除语义却在最常见的路径上被静默丢掉。
+
+新增 `.zcode/verify-guard-zeroize.mjs` 做反向对照：把 `require_dek` 的返回类型改回裸 `[u8; 32]`，确认 `cargo test` 如期编译失败——
+
+```
+GUARD OK — require_dek 改回裸 [u8;32] 后检查失败：
+  src\lib.rs:306:5: error[E0308]: mismatched types:
+    expected `Result<[u8; 32], String>`, found `Result<Zeroizing<[u8; 32]>, String>`
+  (已还原 lib.rs)
+```
+
+另加 3 个测试：`require_dek` 在锁定时必须 fail-closed（不能退化成"返回全零密钥"）、解锁后可取回、锁定后立即失效；以及 `crypto.rs` 的派生→校验→加解密往返（此前 crypto.rs **一个测试都没有**，四个公开派生函数的返回值没有任何东西覆盖）。
+
+#### 四、验证过程中自己踩的坑
+
+- **`&Zeroizing<[u8;32]>` 不会自动 deref 到 `&[u8]`**：`Aes256Gcm::new_from_slice(&key)` 与 `encrypt_with_key(&master_key, &dek)` 共 5 处报 E0308，得显式写 `&key[..]` / `&dek[..]`。deref 转换只在"目标类型是内层类型"时成立，链到 `[u8]` 就不成立了。
+- **`*slot = Some(dek)` 之后 `dek` 还被用到**：`[u8; 32]` 是 `Copy` 所以原来没报错，`Zeroizing` 不是。setup / unlock / change_password 三处都改成 `*slot = Some(dek.clone())`，语义（先填槽再迁移）与原来完全一致。
+- **测试写完先别急着提交**：第一版往返测试用了真实 600k 轮数，单测从 20s 涨到 **53s**。密码学性质与 KDF 轮数无关，改用 `TEST_ITERATIONS = 1_000`，只保留一条走真实默认轮数的 `default_derivation_is_usable`。现在 98 个测试 **12.2s**。
+- `try_lock()` 返回的是**拥有所有权的 guard**，`&guard.try_lock().expect(..)` 引用临时值 → E0515。要先 `let guard = ...` 再取引用。
+
+#### 五、验证矩阵（可重跑）
+
+```
+npm run test:ts                              # 前端类型
+cd src-tauri && cargo test --lib             # 98 个单测
+cd src-tauri && cargo build                  # 三个二进制
+npm run build                                # 前端产物
+node .zcode/check-ipc-contract.mjs            # IPC 字段契约守卫
+node .zcode/check-deny-sync.mjs              # 拒绝文案同步守卫
+node .zcode/verify-guard.mjs                 # IPC 守卫自身的反向对照
+node .zcode/verify-guard-zeroize.mjs         # zeroize 守卫自身的反向对照
+```
+
+## 五问重启检查（阶段 141）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 141 complete —— zeroize 批次做完：DEK 与主密码在离开作用域时被擦除，"锁定保险库"名实相符；两个编译期守卫 + 一个反向对照脚本防止静默回退。 |
+| 我要去哪里？ | 真机验证（ZMODEM 跨机 md5、WAL 多进程、三实例启动），然后 `打包`。 |
+| 什么可能导致偏离？ | **AEAD 关联数据（AAD）仍是有意推迟到 v3 的**——它要连同凭据与 OS keyring 一起迁移，不是纯类型重构，威胁面也窄（攻击者已能改库文件的话，通常也能改密文本身）。别在打包前顺手"补上"它。另外 `decrypt_with_key` 返回的明文 `Vec<u8>`（含各连接的实际密码）**仍未擦除**，是本类问题里剩下的最大一块，可作为下一批。 |
+| 下一步最小可验证动作？ | ① 重跑上述 8 条命令；② 跨机 ZMODEM 传一个二进制并比对 md5；③ 启动 GUI 锁定/解锁一次，确认锁定后 `reveal_connection_password` 立刻报"未解锁"。 |
+| 目标是什么？ | 让"锁定保险库"真的把密钥从内存里拿走，而不是只把 UI 切回锁定态。 |
+
+### 阶段 142 — 明文擦除 + AAD 复评（2026-09-29）
+
+阶段 141 留下的最后一块：**`decrypt_with_key` 返回的明文 `Vec<u8>` 从来没被擦过**。那是全应用唯一一个所有凭据流出解密后的必经之路。
+
+#### 一、这一批改了什么
+
+**`crypto.rs`**
+
+- `decrypt_with_key` / `decrypt` 返回 `Zeroizing<Vec<u8>>`。前者是所有凭据的解密出口——连接密码、代理密码、命令历史、快捷命令、AI API key 全从这里流出来。
+- `check_verifier` 相应改成比较切片（`&pt[..] == VAULT_MAGIC`）。
+
+**`secrets.rs`** —— 真正的密码改用 `Zeroizing<String>`：
+
+- `get_password` / `get_proxy_password` 返回 `Option<Zeroizing<String>>`，并改用 `std::str::from_utf8(&pt)` 直接建 `String`，**不再`String::from_utf8(pt)` 消费掉缓冲**（那会留下一份无法擦除的裸 `Vec`）。
+- 选 `Zeroizing<String>` 而不是只靠 `Vec` 那层：这是本进程里**唯一一份不必跨越任何边界**的密码副本（要给 russh 的、给前端的那些另算）。白擦一次，成本为零。
+
+**`db.rs`** —— `decrypt_field` 改用 `std::str::from_utf8(&pt)`，同样避免多留一份裸 `Vec`。返回类型仍是 `Option<String>`：host / username / proxy_host 不是机密级，为它们改 15 处调用点收益不抵噪音。命令历史与快捷命令同理——它们的内容可能含密码，但整表改成 `Zeroizing` 属于结构调整而非安全修复，另议。
+
+**14 处调用点**（main.rs 12 + myshell-cli.rs 2）统一把 `Zeroizing` 拷进需要长期持有的 `String` 字段，原始那份随即被擦。跨边界的（reveal 命令的返回值、IPC 桥给 MCP 的凭据）显式 `.map(|s| s.to_string())`。
+
+**回归守卫** —— 和阶段 141 同一条纪律：擦除效果观测不到，**类型**可以。
+
+- `_assert_plaintext_is_zeroizing` 钉死 `decrypt_with_key` 的返回类型。这条**特别关键**：改回裸 `Vec<u8>` 不会让任何调用点报错（`&pt` 靠 deref 照样传得进 `encrypt_with_key(&[u8])`），但整库明文就重新留在堆上了。
+- `decrypted_plaintext_is_wrapped_and_intact`：含中文密码往返，确认包装没改语义、且明文是合法 UTF-8。
+
+#### 二、AAD：重新评估后确认**不能**安全落地
+
+上一批我说"AAD 推迟到 v3"。这一批认真推了一遍，确认这个判断是对的，而且理由比"要迁移"更硬：
+
+- **"先试 AAD，失败就退回无 AAD"是个降级 oracle，比不做更糟。** 能改库的攻击者可以把一份带正确 tag 的无 AAD 密文写进去，解密照样成功——AAD 的防篡改价值归零，却留下"我们有 AAD"的错觉。这正是 AAD 领域公认的反模式。
+- **不做降级就是硬迁移**：`connections` 每行的 host/user/password/proxy/private_key、`command_history`、`quick_commands`、`ai_models` 的 API key，外加 **OS keyring 里按连接 id 存的每一条**（它们各自持有一份密文，不在库里）。中途崩溃会留下一半能解一半不能解的库。
+- **收益也窄**：威胁模型是"能读库文件但没有主密码"。能改库的人通常也能把密文连同 tag 一起重算，AAD 挡不住他真正想做的事。
+
+所以这一批**没有**动 AAD，也没有做个看起来像的半成品。v3 要做的话，前置条件是：给密文加格式标记位（而非靠"解不开"来区分）、把 keyring 迁移纳入同一事务、写可重入的迁移 + 中断恢复、最后才在读取路径上拒绝无 AAD 密文。这不是一个纯类型重构。
+
+#### 三、真机验证：**被保险库锁阻塞，未完成**
+
+尝试用已存连接跑 ZMODEM 跨机 md5 比对。MCP 的 `list_connections` 如实 fail-fast 了：
+
+> 错误: 保险库未解锁：MyShell 窗口已置顶，请在其中输入主密码解锁保险库，解锁后重新调用此工具即可。
+
+这本身是 P0-1 那道门在正常工作。解锁需要主密码，**我不接触也不需要接触主密码**，所以这一步只能由用户完成。已解锁后可直接复跑：`zmodem_download` 取回 → 比对 md5 → `zmodem_upload` 送回 → 再比对。
+
+#### 四、验证过程中自己踩的坑
+
+- **补丁脚本漏了缩进**：第一版 `patch-plaintext.mjs` 的匹配串没带行首空格，6 处静默跳过；第二版改用 CRLF 容错，还是全跳过——真正的错因不是行尾而是缩进。第三版换成对缩进不敏感的正则才全部命中。**"跳过"而不报错是这个脚本最危险的地方**，所以每条都打印了 OK/SKIP。
+- `&Zeroizing<[u8;32]>` **不会**自动 deref 到 `&[u8]`（阶段 141 已记录），但 `&Zeroizing<Vec<u8>>` 走 `Vec → [u8]` 却可以。同一个类型，`Deref` 目标不同结果相反，`backup.rs` 的两处 rekey 因此没报错。
+- `check_verifier` 里 `pt == VAULT_MAGIC` 从比较 `Vec` 变成比较 `&[u8]`，顺手确认了语义没变。
+
+#### 五、验证矩阵（可重跑）
+
+```
+npm run test:ts                              # 前端类型
+cd src-tauri && cargo test --lib             # 100 个单测
+cd src-tauri && cargo build                  # 三个二进制
+npm run build                                # 前端产物
+node .zcode/check-ipc-contract.mjs            # IPC 字段契约守卫
+node .zcode/check-deny-sync.mjs              # 拒绝文案同步守卫
+node .zcode/verify-guard.mjs                 # IPC 守卫自身的反向对照
+node .zcode/verify-guard-zeroize.mjs         # zeroize 守卫自身的反向对照
+```
+
+## 五问重启检查（阶段 142）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 142 complete —— 明文擦除补齐（`decrypt_*` 返回 `Zeroizing`，真密码返回 `Zeroizing<String>`），AAD 复评后确认不可安全落地，真机验证被保险库锁阻塞。 |
+| 我要去哪里？ | 用户解锁保险库 → 跑 ZMODEM 跨机 md5 → `打包`。 |
+| 什么可能导致偏离？ | **别把 AAD 当"顺手就能补"的东西**——带降级 fallback 的 AAD 比没有更糟（降级 oracle），不带 fallback 就是含 keyring 的硬迁移。真要做必须按上面那四个前置条件走。另一处易被误删的是 `decrypted_plaintext_is_wrapped_and_intact` 这类"看着废话"的测试：它挡的是 `&pt` 能静默传进 `&[u8]` 参数这种不报错的退化。 |
+| 下一步最小可验证动作？ | ① 重跑上述 8 条命令；② 解锁保险库后 `zmodem_download` 一个二进制、比对 md5、再 `zmodem_upload` 回去、再比对；③ 在 GUI 里改一次主密码，确认改完后旧密码立刻失效且备份已被 re-key。 |
+| 目标是什么？ | 让"凭据只在必要时以明文存在"这件事，在代码层面真的成立，而不是只写在文档里。 |
+
+### 阶段 143 — 真机 ZMODEM 验证：数据对，但抓出一个进度 bug（2026-09-29）
+
+阶段 141/142 反复写"必须跨机实测"，这一批真做了。结论是**协议实现是对的，进度显示是错的**。
+
+#### 一、真机环境
+
+- 目标：`/自用/192.168.3.30`（用户自用 Ubuntu 24.04，`argus-SER9`，lrzsz 已装：`/usr/bin/sz`、`/usr/bin/rz`）
+- 用 `sz` 造了一个 **2 MiB 随机二进制**测试文件。选随机二进制是刻意的：里面含 **32665 个 `0x01/0x02/0x03/0x18` 字节**——它们经 ZMODEM 转义后正好变成 `0x18 0x41/0x42/0x43`（ZBIN/ZHEX/ZBIN32），**正是阶段 140 修的 ZPAD 前缀歧义和 ZCRCW 帧尾要防的场景**。本地单测喂的是构造帧，覆盖不到真实 lrzsz 的交互。
+
+#### 二、验证结果：数据完全正确 ✅
+
+| 环节 | md5 |
+|---|---|
+| 远端原始文件 | `c813e6bb4ecef8bcb105a1c66c4bf135` |
+| ZMODEM 下载到本地 | `c813e6bb4ecef8bcb105a1c66c4bf135` ✅ |
+| ZMODEM 上传回远端 | `c813e6bb4ecef8bcb105a1c66c4bf135` ✅ |
+
+外加远端 `cmp` 逐字节比对 → **IDENTICAL**。两轮传输（修复前后各一次）都是 2,097,152 字节整、md5 一次命中。**阶段 140 的 ZPAD 前缀校验与 ZCRCW 帧尾修复在真实 lrzsz 上成立。**
+
+#### 三、但抓出一个真 bug：下载进度永远是 0%
+
+第一次传输 `zmodem_status` 报：
+
+```
+状态：已完成（0% / 2097152 字节）
+```
+
+文件明明完整落地了，却报 0%。根因在 `myshell-mcp.rs` 的 `run_download_task`：
+
+```rust
+// 修复前
+ZmodemEvent::FileComplete { name, bytes } => {
+    ...
+    mark(TaskPhase::Transferring, bytes, 0);   // ← 把 bytes_total 写成字面量 0
+}
+```
+
+而完成回调只补了 `bytes_done`，**没补 `bytes_total`，于是完成时 `bytes_total` 停留在 0**。`zmodem_status` 的 `pct = if bytes_total > 0 {…} else { 0 }` 于是算出 **0%**，JSON 里的 `bytes_total` 也是错的 0。
+
+顺带查出**同一个函数的第二个 bug**：每个事件只代表*当前文件*，但代码直接把它写进任务字段。`sz -r` 传目录时会逐个文件发 Offer，**每来一个新文件进度就清零重来**，先传完的文件从分子里消失。上传路径没这个毛病（完成后不再动 `bytes_total`），这正是上传显示 100%、下载显示 0% 的原因。
+
+**修法**：抽出一个纯逻辑的 `TransferProgress`（`grand_total` 累加所有 offer，`done_bytes` 累已完成文件 + 当前文件进度），所有 `mark` 都报整个传输的进度；完成时 `bytes_total` 取 `grand_total`（offer 从未出现时退回实际字节数）。顺带把多文件的累加也修对了。
+
+#### 四、验证方式：单测 + 反向对照（端到端待重启 MCP）
+
+抽成纯类型是为了能脱离 SSH 会话测试，4 条新测试全过：
+
+- `single_file_download_reports_100_percent_when_done` —— 2 MiB 那一幕的最小复现
+- `multi_file_download_accumulates_across_offers` —— 新 offer 不能把已完成部分清零
+- `per_file_progress_total_cannot_shrink_the_total` —— per-file total 不得缩小总总量
+- `finish_without_any_offer_falls_back_to_actual` —— 无 offer 时不除零
+
+反向对照脚本 `.zcode/verify-guard-progress.mjs`：把 `file_complete` 退回"total 写成 0"，确认 `single_file_download_reports_100_percent_when_done` 如期失败——
+
+```
+GUARD OK — file_complete 退回"total 写成 0"后测试失败：
+  assertion `left == right` failed
+  失败用例: tests::single_file_download_reports_100_percent_when_done
+  (已还原 myshell-mcp.rs)
+```
+
+**端到端复测还没做，且原因要说清楚**：`zmodem_download` 的进度记账跑在 **MCP 进程**里。机器上有 3 个 `myshell-mcp.exe`（PID 2076 / 32716 / 18620），启动时间 **19:25 / 19:26 / 20:48**，全都早于我 21:02 的重新构建——MCP 只在 spawn 时加载代码，重编 `.exe` 不影响已在运行的进程。**重启 MCP 服务后才能复测**（重启 ZCode 或断开重连该 MCP 即可）。我不去 kill 别人的 MCP 进程。
+
+#### 五、验证矩阵（可重跑）
+
+```
+npm run test:ts                              # 前端类型
+cd src-tauri && cargo test --lib             # 100 个单测（lib）
+cd src-tauri && cargo test --bin myshell-mcp # 9 个（MCP 二进制，含 4 条进度新测）
+cd src-tauri && cargo build                  # 三个二进制
+npm run build                                # 前端产物
+node .zcode/check-ipc-contract.mjs            # IPC 字段契约守卫
+node .zcode/check-deny-sync.mjs              # 拒绝文案同步守卫
+node .zcode/verify-guard.mjs                 # IPC 守卫自身的反向对照
+node .zcode/verify-guard-zeroize.mjs         # zeroize 守卫自身的反向对照
+node .zcode/verify-guard-progress.mjs        # 进度守卫自身的反向对照
+```
+
+## 五问重启检查（阶段 143）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 143 complete —— ZMODEM 双向真机验证通过（2 MiB / 32665 转义字节 / md5 三方一致 / cmp 逐字节相同），并借此抓出并修掉下载进度恒为 0%、多文件进度被清零两个 bug。 |
+| 我要去哪里？ | 重启 MCP 服务后复测进度显示（应报 100%）；之后 `打包`。 |
+| 什么可能导致偏离？ | **ZMODEM 的进度记账跑在 MCP 进程里，不是 GUI**——所以 `cargo build` 之后正在跑的任务不会变，任何"MCP 侧改动"的真机复测都必须先重启 MCP。同样，阶段 141/142 的 zeroize 改动大多在 GUI 与 lib 里，也需要重启 GUI 才生效。另：`cargo test --lib` **不覆盖 bin 里的测试**，`myshell-mcp.rs` 的测试要用 `--bin myshell-mcp` 才会跑。 |
+| 下一步最小可验证动作？ | ① 重启 MCP 服务；② 传一个 2 MiB 文件，确认 `zmodem_status` 报 100%；③ `sz -r` 传一个含多文件的目录，确认进度条不中途清零。 |
+| 目标是什么？ | 把"本地单测全绿"和"真实 lrzsz 上也对"之间的缺口关掉——顺便证明真机测试确实能抓到单测抓不到的东西。 |

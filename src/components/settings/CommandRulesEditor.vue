@@ -53,6 +53,10 @@ async function saveCommandRules(): Promise<void> {
       show_in_gui: rulesShowInGui.value,
     };
     await setCommandRules(rules);
+    // Tell the confirm dialog to re-read. It used to fetch the rules once at
+    // mount, so a rule added here was not reflected in the highlighting for
+    // the rest of the session.
+    window.dispatchEvent(new Event("myshell-command-rules-changed"));
   } catch (e) {
     console.error("saveCommandRules failed:", e);
   } finally {

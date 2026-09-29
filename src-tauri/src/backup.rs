@@ -6,9 +6,12 @@
 //!
 //! Provides rollback functionality in case an upgrade breaks something.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::fs;
 use serde::{Deserialize, Serialize};
+
+use crate::crypto;
+use crate::vault::VaultBundle;
 
 /// Current app version (from Cargo.toml)
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -18,6 +21,9 @@ const MAX_BACKUPS: usize = 5;
 
 /// Backup manifest file name
 const MANIFEST_FILE: &str = "backup_manifest.json";
+
+/// Marker written when the user schedules a rollback from the running app.
+const PENDING_ROLLBACK_FILE: &str = ".pending_rollback";
 
 /// Get the base backup directory
 fn backup_base_dir() -> PathBuf {
@@ -53,6 +59,10 @@ fn config_dir() -> PathBuf {
 fn backup_files() -> Vec<&'static str> {
     vec![
         "connections.db",
+        // Current atomic vault record (salt + verifier + DEK + KDF).
+        "vault.bundle",
+        // Pre-bundle layout — still copied so an old vault can be restored and
+        // then migrated on first unlock.
         "vault.salt",
         "vault.verifier",
         "dek.enc",
@@ -85,10 +95,13 @@ impl BackupManifest {
     fn save(&self) -> Result<(), String> {
         let dir = backup_base_dir();
         fs::create_dir_all(&dir).map_err(|e| format!("创建备份目录失败: {}", e))?;
-        let path = dir.join(MANIFEST_FILE);
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("序列化备份清单失败: {}", e))?;
-        fs::write(&path, json).map_err(|e| format!("写入备份清单失败: {}", e))
+        // tmp + rename: a plain write that dies mid-way leaves truncated JSON,
+        // and `load()` collapses that into an empty manifest — silently erasing
+        // the entire backup history, exactly when the user most needs it.
+        write_atomic(&dir.join(MANIFEST_FILE), json.as_bytes())
+            .map_err(|e| format!("写入备份清单失败: {}", e))
     }
 }
 
@@ -288,4 +301,189 @@ pub fn get_previous_version() -> Option<String> {
         .filter(|b| b.version != current)
         .max_by_key(|b| b.timestamp)
         .map(|b| b.version.clone())
+}
+
+// ============ Atomic file write helper ============
+
+/// tmp + rename within the same directory. A plain `fs::write` that dies
+/// mid-write leaves a truncated file that parses as "default" or not at all.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("路径没有父目录: {}", path.display()))?;
+    let stem = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let tmp = dir.join(format!(".{}.{:016x}.tmp", stem, rand::random::<u64>()));
+    fs::write(&tmp, bytes).map_err(|e| format!("写入临时文件失败: {}", e))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("替换文件失败: {}", e)
+    })
+}
+
+// ============ Master-password re-keying ============
+
+/// Re-encrypt every backup's vault material under a new master key. Returns
+/// how many backup directories were re-keyed.
+///
+/// Backups copy the encrypted DEK (plus the matching salt/verifier, and a full
+/// `connections.db`) into `<config>/myshell/backups/<version>/`. Changing the
+/// master password re-keys the LIVE vault but used to leave those copies under
+/// the RETIRED password indefinitely — so anyone who obtained a backup
+/// directory (stolen profile, synced config dir, old container image) could
+/// still open the entire credential store with the old password long after the
+/// user believed they had rotated it.
+pub fn rekey_backups(old_key: &[u8; 32], new_key: &[u8; 32]) -> Result<usize, String> {
+    let manifest = BackupManifest::load();
+    let mut rekeyed = 0usize;
+    for info in &manifest.backups {
+        if !is_valid_version(&info.version) {
+            continue;
+        }
+        let dir = backup_dir(&info.version);
+        if !dir.exists() {
+            continue;
+        }
+        if rekey_backup_dir(&dir, old_key, new_key) {
+            rekeyed += 1;
+        }
+    }
+    Ok(rekeyed)
+}
+
+/// Re-key one backup directory. Handles both the current `vault.bundle` layout
+/// and the legacy `dek.enc` + `vault.verifier` pair.
+fn rekey_backup_dir(dir: &Path, old_key: &[u8; 32], new_key: &[u8; 32]) -> bool {
+    let mut touched = false;
+
+    // Legacy layout: the standalone encrypted DEK.
+    let legacy_dek = dir.join("dek.enc");
+    if legacy_dek.exists() {
+        match fs::read_to_string(&legacy_dek) {
+            Ok(blob) => match crypto::decrypt_with_key(old_key, &blob)
+                .and_then(|pt| crypto::encrypt_with_key(new_key, &pt))
+            {
+                Ok(new_blob) => match write_atomic(&legacy_dek, new_blob.as_bytes()) {
+                    Ok(()) => touched = true,
+                    Err(e) => log::warn!("[backup] 重写 {} 失败: {}", legacy_dek.display(), e),
+                },
+                Err(e) => log::warn!(
+                    "[backup] {} 无法用旧密码解密，跳过（可能已是新密码）: {}",
+                    legacy_dek.display(),
+                    e
+                ),
+            },
+            Err(_) => {}
+        }
+    }
+
+    // Current layout: salt + verifier + DEK + KDF in one atomic record.
+    let bundle_path = dir.join("vault.bundle");
+    if bundle_path.exists() {
+        match fs::read_to_string(&bundle_path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<VaultBundle>(&t).ok())
+        {
+            Some(mut bundle) => match bundle.dek_enc.clone() {
+                Some(blob) => {
+                    match crypto::decrypt_with_key(old_key, &blob)
+                        .and_then(|pt| crypto::encrypt_with_key(new_key, &pt))
+                    {
+                        Ok(new_blob) => {
+                            bundle.dek_enc = Some(new_blob);
+                            match serde_json::to_string_pretty(&bundle) {
+                                Ok(json) => match write_atomic(&bundle_path, json.as_bytes()) {
+                                    Ok(()) => touched = true,
+                                    Err(e) => log::warn!(
+                                        "[backup] 重写 {} 失败: {}",
+                                        bundle_path.display(),
+                                        e
+                                    ),
+                                },
+                                Err(e) => log::warn!("[backup] 序列化备份保险库失败: {}", e),
+                            }
+                        }
+                        Err(e) => log::warn!(
+                            "[backup] {} 无法用旧密码解密，跳过: {}",
+                            bundle_path.display(),
+                            e
+                        ),
+                    }
+                }
+                None => {}
+            },
+            None => log::warn!("[backup] {} 无法解析，跳过", bundle_path.display()),
+        }
+    }
+
+    touched
+}
+
+/// Display path of the backups root, for user-facing warnings.
+pub fn backup_root_display() -> String {
+    backup_base_dir().display().to_string()
+}
+
+// ============ Deferred rollback ============
+
+fn pending_rollback_path() -> PathBuf {
+    config_dir().join(PENDING_ROLLBACK_FILE)
+}
+
+/// Schedule a rollback to be applied at the NEXT launch.
+///
+/// Restoring `connections.db` and the vault files while the app holds them
+/// open is unsafe: the GUI keeps one long-lived SQLite handle with a warm page
+/// cache, and `AppState.dek` is never re-derived after a restore — so the
+/// running process would keep using the PRE-rollback DEK against a restored
+/// database (every row fails to decrypt), and subsequent writes would clobber
+/// the restored content with the old key. `fs::copy` is not atomic either, so
+/// an interrupted restore leaves a half-written database that turns the next
+/// startup into a panic.
+pub fn request_rollback(version: &str) -> Result<String, String> {
+    if !is_valid_version(version) {
+        return Err(format!("无效的备份版本: {}", version));
+    }
+    let manifest = BackupManifest::load();
+    if !manifest.backups.iter().any(|b| b.version == version) {
+        return Err(format!("找不到版本 {} 的备份信息", version));
+    }
+    if !backup_dir(version).exists() {
+        return Err(format!("备份版本 {} 不存在", version));
+    }
+    let dir = config_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("准备配置目录失败: {}", e))?;
+    write_atomic(&pending_rollback_path(), version.as_bytes())
+        .map_err(|e| format!("写入回退标记失败: {}", e))?;
+    Ok(format!(
+        "已安排回退到版本 {}。请重启 MyShell，回退会在下次启动、打开数据库之前生效。",
+        version
+    ))
+}
+
+/// Apply a scheduled rollback. MUST be called before the database is opened —
+/// it is the only point at which swapping `connections.db` is safe.
+pub fn apply_pending_rollback() -> Option<String> {
+    let path = pending_rollback_path();
+    let raw = fs::read_to_string(&path).ok()?;
+    let version = raw.trim().to_string();
+    // Consume the marker first: a rollback that fails must not be retried on
+    // every subsequent launch.
+    let _ = fs::remove_file(&path);
+    if !is_valid_version(&version) {
+        log::warn!("[backup] 忽略无效的回退标记: {}", version);
+        return None;
+    }
+    match rollback(&version) {
+        Ok(msg) => {
+            log::info!("[backup] {}", msg);
+            Some(msg)
+        }
+        Err(e) => {
+            log::warn!("[backup] 待执行的回退失败: {}", e);
+            None
+        }
+    }
 }

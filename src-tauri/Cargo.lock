@@ -3077,7 +3077,7 @@ dependencies = [
 
 [[package]]
 name = "myshell"
-version = "2.15.0"
+version = "2.15.1"
 dependencies = [
  "aes-gcm 0.10.3",
  "base64 0.22.1",
@@ -3114,6 +3114,7 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "winapi 0.3.9",
+ "zeroize",
 ]
 
 [[package]]

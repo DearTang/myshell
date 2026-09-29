@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, State};
 use rand::RngCore;
+use zeroize::Zeroizing;
 
 // ============ Tauri EventSink adapter ============
 
@@ -173,7 +174,7 @@ fn copy_connection(state: State<AppState>, src_id: String) -> Result<ConnectionC
     if cfg.auth_method == "password" {
         if let Some(pw) = secrets::get_password(&src_id, &key).map_err(|e| e.to_string())? {
             secrets::set_password(&new_id, &pw, &key)?;
-            cfg.password = Some(pw);
+            cfg.password = Some(pw.to_string());
         }
     }
     // Same treatment for the proxy password — copy it under the new id so
@@ -181,7 +182,7 @@ fn copy_connection(state: State<AppState>, src_id: String) -> Result<ConnectionC
     if cfg.proxy_type != "none" {
         if let Some(pw) = secrets::get_proxy_password(&src_id, &key).map_err(|e| e.to_string())? {
             secrets::set_proxy_password(&new_id, &pw, &key)?;
-            cfg.proxy_password = Some(pw);
+            cfg.proxy_password = Some(pw.to_string());
         }
     }
 
@@ -227,32 +228,66 @@ struct ConnectionDump {
     folders: Vec<String>,
 }
 
+/// Outcome of `export_connections`.
+///
+/// `missing_credentials` exists because the previous version collapsed every
+/// keyring failure into "no password stored": a locked credential manager, a
+/// corrupt entry, and a genuine decryption error all produced `None`, the
+/// command still returned `Ok(count)`, and the UI showed a success toast. The
+/// user believed they had a complete off-machine backup and only discovered
+/// otherwise at restore time, on a machine where the credentials were gone.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportConnectionsResult {
+    pub exported: usize,
+    /// Human-readable `name (host)` for each connection whose stored password
+    /// or proxy password could not be read. Empty in the happy path.
+    pub missing_credentials: Vec<String>,
+}
+
 /// Export every connection (with keyring-fetched passwords) and every folder
-/// to an encrypted JSON envelope written to `path`. Returns the connection
-/// count on success.
+/// to an encrypted JSON envelope written to `path`.
 #[tauri::command]
 fn export_connections(
     state: State<AppState>,
     passphrase: String,
     path: String,
-) -> Result<usize, String> {
+) -> Result<ExportConnectionsResult, String> {
+    let passphrase = Zeroizing::new(passphrase);
     let key = require_dek(&state)?;
-    let (connections, folders) = {
+    let (connections, folders, missing) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let mut conns = db::get_all_connections(&db, &key).map_err(|e| e.to_string())?;
+        let mut missing: Vec<String> = Vec::new();
         // Populate each config's transient password from the keyring so the
-        // dump is importable on a fresh machine. Missing entries leave the
-        // field None — acceptable for key-auth connections.
+        // dump is importable on a fresh machine. Anything other than a clean
+        // read is recorded so the UI can warn — the dump is written either way
+        // (a partial backup is better than none), but never silently.
         for c in conns.iter_mut() {
+            let label = format!("{} ({})", c.name, c.host);
             if c.auth_method == "password" {
-                c.password = secrets::get_password(&c.id, &key).ok().flatten();
+                match secrets::get_password(&c.id, &key) {
+                    Ok(Some(pw)) => c.password = Some(pw.to_string()),
+                    Ok(None) => missing.push(format!("{label} — 未保存密码")),
+                    Err(e) => {
+                        log::warn!("[export] 读取 {} 的密码失败: {}", label, e);
+                        missing.push(format!("{label} — 读取失败（{e}）"));
+                    }
+                }
             }
             if c.proxy_type != "none" {
-                c.proxy_password = secrets::get_proxy_password(&c.id, &key).ok().flatten();
+                match secrets::get_proxy_password(&c.id, &key) {
+                    Ok(Some(pw)) => c.proxy_password = Some(pw.to_string()),
+                    Ok(None) => missing.push(format!("{label} — 未保存代理密码")),
+                    Err(e) => {
+                        log::warn!("[export] 读取 {} 的代理密码失败: {}", label, e);
+                        missing.push(format!("{label} — 代理密码读取失败（{e}）"));
+                    }
+                }
             }
         }
         let folders = db::list_folders(&db).map_err(|e| e.to_string())?;
-        (conns, folders)
+        (conns, folders, missing)
     };
 
     let count = connections.len();
@@ -268,8 +303,19 @@ fn export_connections(
     let plaintext = serde_json::to_vec(&dump).map_err(|e| format!("JSON encode: {}", e))?;
     let envelope = crypto::encrypt(&plaintext, &passphrase)?;
     std::fs::write(&path, envelope).map_err(|e| format!("write {}: {}", path, e))?;
-    Ok(count)
+    if !missing.is_empty() {
+        log::warn!(
+            "[export] 导出完成，但 {} 项凭据未能读取：{}",
+            missing.len(),
+            missing.join("; ")
+        );
+    }
+    Ok(ExportConnectionsResult {
+        exported: count,
+        missing_credentials: missing,
+    })
 }
+
 
 /// Import connections + folders from an encrypted dump at `path`. Each
 /// imported connection gets a fresh UUID to avoid colliding with existing
@@ -282,6 +328,7 @@ fn import_connections(
     passphrase: String,
     path: String,
 ) -> Result<usize, String> {
+    let passphrase = Zeroizing::new(passphrase);
     let key = require_dek(&state)?;
     let envelope = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path, e))?;
     let plaintext = crypto::decrypt(&envelope, &passphrase)?;
@@ -373,6 +420,8 @@ fn vault_status(state: State<AppState>) -> VaultStatus {
 /// 6. Migrate any existing plaintext DB rows
 #[tauri::command]
 fn setup_vault(state: State<AppState>, passphrase: String) -> Result<(), String> {
+    // 主密码是本进程里价值最高的机密：命令一返回就把这份拷贝擦掉。
+    let passphrase = Zeroizing::new(passphrase);
     if passphrase.len() < 6 {
         return Err("主密码至少 6 个字符".into());
     }
@@ -387,24 +436,29 @@ fn setup_vault(state: State<AppState>, passphrase: String) -> Result<(), String>
     let master_key = crypto::derive_master_key(&passphrase, &salt);
 
     // Generate random DEK (32 bytes)
-    let mut dek = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut dek);
+    let mut dek = Zeroizing::new([0u8; 32]);
+    rand::thread_rng().fill_bytes(&mut dek[..]);
 
     // Encrypt DEK with master_key
-    let encrypted_dek = crypto::encrypt_with_key(&master_key, &dek)?;
+    let encrypted_dek = crypto::encrypt_with_key(&master_key, &dek[..])?;
 
     // Create verifier for password verification
     let verifier = crypto::make_verifier(&master_key)?;
 
-    // Persist salt + verifier + encrypted_dek + KDF metadata.
-    vault::write_vault_files(&salt, &verifier)?;
-    vault::write_encrypted_dek(&encrypted_dek)?;
-    vault::write_kdf_meta(&vault::default_kdf_meta())?;
+    // Persist salt + verifier + encrypted_dek + KDF metadata as ONE atomic
+    // record. Writing these as separate files could leave a partial vault that
+    // no passphrase can open (see `VaultBundle`).
+    vault::write_vault_bundle(
+        &salt,
+        &verifier,
+        Some(&encrypted_dek),
+        &vault::default_kdf_meta(),
+    )?;
 
     // Populate dek before triggering DB migration
     {
         let mut slot = state.dek.lock().map_err(|e| e.to_string())?;
-        *slot = Some(dek);
+        *slot = Some(dek.clone());
     }
 
     // Migrate any pre-vault DB content
@@ -421,6 +475,7 @@ fn setup_vault(state: State<AppState>, passphrase: String) -> Result<(), String>
 /// Unlock: verify passphrase and decrypt DEK
 #[tauri::command]
 fn unlock_vault(state: State<AppState>, passphrase: String) -> Result<(), String> {
+    let passphrase = Zeroizing::new(passphrase);
     // Check lockout status first
     let mut lockout = vault::LockoutState::load();
     if let Some(remaining) = lockout.check_lockout() {
@@ -457,13 +512,15 @@ fn unlock_vault(state: State<AppState>, passphrase: String) -> Result<(), String
     // pre-DEK vaults (dek.enc missing): master_key IS the dek — the old
     // build used it directly to encrypt columns, so reusing it preserves
     // existing rows without re-encrypting the whole DB.
-    let dek: [u8; 32] = match encrypted_dek_opt {
+    let dek: Zeroizing<[u8; 32]> = match encrypted_dek_opt {
         Some(blob) => {
             let bytes = crypto::decrypt_with_key(&master_key, &blob)?;
-            bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| "DEK 长度错误".to_string())?
+            Zeroizing::new(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "DEK 长度错误".to_string())?,
+            )
         }
         None => {
             eprintln!("[vault] legacy pre-DEK vault detected — reusing master_key as DEK");
@@ -481,22 +538,34 @@ fn unlock_vault(state: State<AppState>, passphrase: String) -> Result<(), String
     // metadata and goes straight to 600k.
     if !kdf_meta_present {
         let new_master_key = crypto::derive_master_key(&passphrase, &salt);
-        match crypto::encrypt_with_key(&new_master_key, &dek) {
-            Ok(new_encrypted_dek) => {
-                if let Err(e) = vault::write_encrypted_dek(&new_encrypted_dek) {
-                    eprintln!("[vault] KDF migration: failed to re-encrypt DEK: {}", e);
-                } else if let Ok(new_verifier) = crypto::make_verifier(&new_master_key) {
-                    let _ = vault::write_vault_files(&salt, &new_verifier);
-                    let _ = vault::write_kdf_meta(&vault::default_kdf_meta());
-                    eprintln!("[vault] KDF migration: re-derived at 600k iterations");
+        match crypto::encrypt_with_key(&new_master_key, &dek[..]) {
+            Ok(new_encrypted_dek) => match crypto::make_verifier(&new_master_key) {
+                Ok(new_verifier) => {
+                    // One atomic commit of the re-derived record. This is also
+                    // where a pre-bundle vault gets migrated to `vault.bundle`.
+                    match vault::write_vault_bundle(
+                        &salt,
+                        &new_verifier,
+                        Some(&new_encrypted_dek),
+                        &vault::default_kdf_meta(),
+                    ) {
+                        Ok(()) => eprintln!(
+                            "[vault] KDF migration: re-derived at 600k iterations, \
+                             migrated to the atomic bundle"
+                        ),
+                        Err(e) => {
+                            eprintln!("[vault] KDF migration: failed to persist: {}", e)
+                        }
+                    }
                 }
-            }
+                Err(e) => eprintln!("[vault] KDF migration: failed to build verifier: {}", e),
+            },
             Err(e) => eprintln!("[vault] KDF migration skipped: {}", e),
         }
     }
 
     let mut slot = state.dek.lock().map_err(|e| e.to_string())?;
-    *slot = Some(dek);
+    *slot = Some(dek.clone());
 
     // Encrypt any plaintext history rows left over from a pre-encryption
     // build (idempotent — only touches rows with NULL command_enc).
@@ -510,6 +579,10 @@ fn unlock_vault(state: State<AppState>, passphrase: String) -> Result<(), String
 }
 
 /// Lock: drop the in-memory DEK
+///
+/// The slot holds a `Zeroizing`, so assigning `None` actually scrubs the
+/// 32 key bytes instead of leaving them in freed memory. This is what makes
+/// the command honest — before, "lock" only released the allocation.
 #[tauri::command]
 fn lock_vault(state: State<AppState>) -> Result<(), String> {
     let mut slot = state.dek.lock().map_err(|e| e.to_string())?;
@@ -550,6 +623,7 @@ fn verify_master_password_inner(passphrase: &str) -> Result<(), String> {
 /// Verify login password (for the UI's inline password-check dialog).
 #[tauri::command]
 fn verify_password(passphrase: String) -> Result<bool, String> {
+    let passphrase = Zeroizing::new(passphrase);
     verify_master_password_inner(&passphrase)?;
     Ok(true)
 }
@@ -565,9 +639,10 @@ fn reveal_connection_password(
     id: String,
     passphrase: String,
 ) -> Result<Option<String>, String> {
+    let passphrase = Zeroizing::new(passphrase);
     let key = require_dek(&state)?;
     verify_master_password_inner(&passphrase)?;
-    secrets::get_password(&id, &key)
+    secrets::get_password(&id, &key).map(|p| p.map(|s| s.to_string()))
 }
 
 /// Reveal a stored proxy password after backend master-password verification.
@@ -577,13 +652,15 @@ fn reveal_connection_proxy_password(
     id: String,
     passphrase: String,
 ) -> Result<Option<String>, String> {
+    let passphrase = Zeroizing::new(passphrase);
     let key = require_dek(&state)?;
     verify_master_password_inner(&passphrase)?;
-    secrets::get_proxy_password(&id, &key)
+    secrets::get_proxy_password(&id, &key).map(|p| p.map(|s| s.to_string()))
 }
 
 /// Get lockout status info for the UI
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct LockoutInfo {
     /// Current consecutive failure count
     consecutive_failures: u32,
@@ -621,6 +698,10 @@ fn change_master_password(
     old_passphrase: String,
     new_passphrase: String,
 ) -> Result<(), String> {
+    // 两份主密码都擦：旧密码在轮换后就是废的，但它在本次调用里
+    // 同样是不该留在内存里的东西。
+    let old_passphrase = Zeroizing::new(old_passphrase);
+    let new_passphrase = Zeroizing::new(new_passphrase);
     if new_passphrase.len() < 6 {
         return Err("新密码至少 6 个字符".into());
     }
@@ -642,27 +723,56 @@ fn change_master_password(
 
     // Decrypt DEK with old master_key
     let dek_bytes = crypto::decrypt_with_key(&old_master_key, &encrypted_dek)?;
-    let dek: [u8; 32] = dek_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "DEK 长度错误".to_string())?;
+    let dek: Zeroizing<[u8; 32]> = Zeroizing::new(
+        dek_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "DEK 长度错误".to_string())?,
+    );
 
     // Derive new master_key at the current default iteration count (600k)
     // and re-encrypt DEK. This implicitly migrates an old 200k vault to
     // the new KDF when the user changes their password.
     let new_master_key = crypto::derive_master_key(&new_passphrase, &salt);
-    let new_encrypted_dek = crypto::encrypt_with_key(&new_master_key, &dek)?;
+    let new_encrypted_dek = crypto::encrypt_with_key(&new_master_key, &dek[..])?;
     let new_verifier = crypto::make_verifier(&new_master_key)?;
 
-    // Persist
-    vault::write_encrypted_dek(&new_encrypted_dek)?;
-    vault::write_vault_files(&salt, &new_verifier)?;
-    vault::write_kdf_meta(&vault::default_kdf_meta())?;
+    // Persist as ONE atomic record. The previous three-call sequence wrote
+    // dek.enc (now under the new key) BEFORE the verifier (still under the
+    // old key); a crash in between left the old password passing verification
+    // but failing to decrypt, and the new password failing verification —
+    // neither worked, and the vault was unrecoverable.
+    vault::write_vault_bundle(
+        &salt,
+        &new_verifier,
+        Some(&new_encrypted_dek),
+        &vault::default_kdf_meta(),
+    )?;
+
+    // P1-9: backups carry their own copy of dek.enc, encrypted under the OLD
+    // master key, together with the matching salt/verifier and a full
+    // connections.db. Leaving them means the retired passphrase still opens
+    // the entire credential store from a copied profile long after the user
+    // believes they rotated it. Re-key each backup under the new key; if that
+    // is impossible, purge.
+    match backup::rekey_backups(&old_master_key, &new_master_key) {
+        Ok(n) if n > 0 => log::warn!(
+            "[vault] master password changed — {} backup(s) re-keyed under the new password",
+            n
+        ),
+        Ok(_) => {}
+        Err(e) => log::warn!(
+            "[vault] master password changed, but backups could not be re-keyed \
+             ({}). They remain readable with the OLD password — delete {} to be safe.",
+            e,
+            backup::backup_root_display()
+        ),
+    }
 
     // Update in-memory DEK (should already be set, but ensure it's correct)
     {
         let mut slot = state.dek.lock().map_err(|e| e.to_string())?;
-        *slot = Some(dek);
+        *slot = Some(dek.clone());
     }
 
     Ok(())
@@ -672,6 +782,7 @@ fn change_master_password(
 
 /// Backup info for UI
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct BackupInfoUi {
     version: String,
     timestamp: u64,
@@ -696,10 +807,14 @@ fn list_backups() -> Result<Vec<BackupInfoUi>, String> {
     }).collect())
 }
 
-/// Rollback to a specific version
+/// Schedule a rollback to a specific version. The restore is applied at the
+/// NEXT launch, before the database is opened — swapping `connections.db` while
+/// the app holds it open (long-lived SQLite handle + warm page cache) would
+/// leave the running process using the pre-rollback DEK against a restored
+/// database. See `backup::request_rollback`.
 #[tauri::command]
 fn rollback_backup(version: String) -> Result<String, String> {
-    backup::rollback(&version)
+    backup::request_rollback(&version)
 }
 
 /// Get current app version
@@ -1051,6 +1166,7 @@ fn log_dir_path() -> std::path::PathBuf {
 /// Payload for `get_feedback_log` — what the feedback dialog needs to show
 /// the user their log content and to reveal the folder in the file explorer.
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct FeedbackLogInfo {
     /// Absolute path to the logs dir, for the "open folder" button.
     log_dir: String,
@@ -1197,6 +1313,13 @@ fn try_focus_existing_explorer(target: &std::path::Path) -> bool {
     }
 
     unsafe {
+        // SAFETY: `enum_proc`'s contract is that the `lparam` it receives is
+        // the pointer we pass here, and it casts it straight back to
+        // `*mut EnumCtx`. We pass `&mut ctx`, which is alive on this stack and
+        // outlives the call: `EnumWindows` enumerates synchronously and returns
+        // before `ctx` is read again below. The `ctx`/`found` pair is mutated
+        // only from inside the callback, and the callback is not invoked
+        // concurrently with this thread, so there is no aliasing.
         EnumWindows(
             Some(enum_proc),
             &mut ctx as *mut _ as winapi::shared::minwindef::LPARAM,
@@ -1759,19 +1882,27 @@ fn command_rules_path() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// Read the configured command rules. Returns the built-in defaults if the
-/// file doesn't exist yet (first launch) or fails to parse.
-#[tauri::command]
-fn get_command_rules() -> Result<myshell_core::command_rules::CommandRules, String> {
+/// Load the configured rules, distinguishing "file not written yet" (a
+/// legitimate first launch → built-in defaults) from a real read or parse
+/// failure. Failures are propagated so every caller fails CLOSED; silently
+/// reverting to the defaults would drop all user-added blacklist entries AND
+/// flip `confirm_unknown` back to false, i.e. a safety downgrade with no signal.
+fn load_command_rules() -> Result<myshell_core::command_rules::CommandRules, String> {
     let path = command_rules_path().ok_or_else(|| "无法定位配置目录".to_string())?;
     match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw)
-            .map_err(|e| format!("解析命令规则失败: {e}")),
-        Err(_) => {
-            // File doesn't exist — return defaults (not an error).
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("解析命令规则失败: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Ok(myshell_core::command_rules::CommandRules::default())
         }
+        Err(e) => Err(format!("读取命令规则失败: {e}")),
     }
+}
+
+/// Read the configured command rules. Returns the built-in defaults only when
+/// the file has never been written; a corrupt file surfaces as an error.
+#[tauri::command]
+fn get_command_rules() -> Result<myshell_core::command_rules::CommandRules, String> {
+    load_command_rules()
 }
 
 /// Persist the command rules to the JSON config file.
@@ -1783,22 +1914,24 @@ fn set_command_rules(rules: myshell_core::command_rules::CommandRules) -> Result
     }
     let json = serde_json::to_string_pretty(&rules)
         .map_err(|e| format!("序列化命令规则失败: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("写入命令规则失败: {e}"))?;
+    // tmp + rename: a crash mid-write must not leave truncated JSON behind,
+    // which would make every later load fail and (before this fix) silently
+    // downgrade to the built-in defaults.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| format!("写入命令规则失败: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("保存命令规则失败: {e}"))?;
     Ok(())
 }
 
 /// Evaluate whether an MCP command needs human confirmation, using the SAME
 /// rules file and the SAME decision function as the headless MCP server
-/// (`command_rules::command_needs_confirmation`). The GUI's React confirm
-/// dialog must not re-implement the policy — a drifted client-side copy was
-/// the historical source of the whitelist bypass.
+/// (`command_rules::command_needs_confirmation`). The GUI's confirm dialog must
+/// not re-implement the policy — a drifted client-side copy was the historical
+/// source of the whitelist bypass. A rules file that cannot be read is an
+/// error, so the caller fails closed and shows the dialog.
 #[tauri::command]
 fn check_command_confirmation(command: String) -> Result<bool, String> {
-    let path = command_rules_path().ok_or_else(|| "无法定位配置目录".to_string())?;
-    let rules = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(myshell_core::command_rules::CommandRules::default);
+    let rules = load_command_rules()?;
     Ok(myshell_core::command_rules::command_needs_confirmation(
         &command, &rules,
     ))
@@ -1810,11 +1943,7 @@ fn check_command_confirmation(command: String) -> Result<bool, String> {
 /// explain WHICH rule matched and WHAT it can destroy.
 #[tauri::command]
 fn check_command_danger_reasons(command: String) -> Result<Vec<String>, String> {
-    let path = command_rules_path().ok_or_else(|| "无法定位配置目录".to_string())?;
-    let rules = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(myshell_core::command_rules::CommandRules::default);
+    let rules = load_command_rules()?;
     Ok(myshell_core::command_rules::command_danger_reasons(
         &command, &rules,
     ))
@@ -2076,12 +2205,28 @@ fn read_text_file(path: String) -> Result<String, String> {
     Ok(text)
 }
 
-/// Read an image file from disk and return it as a base64 data URL suitable
-/// for use as a CSS `background-image`. Path is validated before IO.
+/// Read an image file from disk and return it as a base64 data URL. Used for
+/// the background image (设置 → 外观) and feedback screenshots (反馈对话框).
+///
+/// Security: this is reachable from the webview, so an unconstrained path is a
+/// full arbitrary-file-read primitive — it could exfiltrate
+/// `<config>/myshell/gui-ipc-port` (whose contents ARE the MCP IPC auth token),
+/// `dek.enc`, `vault.verifier` / `vault.salt`, or an extension-less
+/// `~/.ssh/id_rsa`, and it did so even while the vault was locked, bypassing
+/// `require_dek` entirely. Now constrained to:
+///   1. Vault must be unlocked — same gate the credential reveals use.
+///   2. Extension must be a real image type (blocks extension-less secrets).
+///   3. Never reads anything under the MyShell config dir or the user's `.ssh`,
+///      compared on canonicalized paths so `..` cannot escape the check.
+/// The extension check also closes SVG off from the background-image feature:
+/// an inlined `<svg>` data URL is a script-execution sink in a webview.
 #[tauri::command]
-fn read_file_base64(path: String) -> Result<String, String> {
+fn read_file_base64(state: State<AppState>, path: String) -> Result<String, String> {
     use base64::Engine as _;
     use std::io::Read;
+
+    // (1) Vault must be unlocked.
+    require_dek(&state)?;
 
     if path.bytes().any(|b| b == 0) {
         return Err("无效路径".to_string());
@@ -2089,6 +2234,36 @@ fn read_file_base64(path: String) -> Result<String, String> {
     if path.len() > 4096 {
         return Err("路径过长".to_string());
     }
+
+    // (2) Image extensions only.
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "avif"];
+    if !IMAGE_EXTS.contains(&ext.as_str()) {
+        return Err("仅支持图片文件（png/jpg/gif/webp/bmp/ico/avif）".to_string());
+    }
+
+    // (3) Never serve application secrets, whatever the caller names the file.
+    //     Uniform error so this cannot double as an existence oracle.
+    if let Ok(target) = std::fs::canonicalize(&path) {
+        let mut denied: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(cfg) = dirs::config_dir() {
+            denied.push(cfg.join("myshell"));
+        }
+        if let Some(home) = dirs::home_dir() {
+            denied.push(home.join(".ssh"));
+        }
+        for dir in denied {
+            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+            if target.starts_with(&dir) {
+                return Err("读取文件失败".to_string());
+            }
+        }
+    }
+
     // Open once + stat the handle: avoids the TOCTOU window between a
     // path-based metadata() and a separate read() (file could be swapped or
     // grown in between, defeating the size cap).
@@ -2108,22 +2283,34 @@ fn read_file_base64(path: String) -> Result<String, String> {
         .map_err(|_| "读取文件失败".to_string())?;
 
     // Simple extension-based MIME detection — avoids a dependency
-    let ext = std::path::Path::new(&path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    let mime = match ext.to_lowercase().as_str() {
+    let mime = match ext.as_str() {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
         "bmp" => "image/bmp",
-        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "avif" => "image/avif",
         _ => "application/octet-stream",
     };
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:{mime};base64,{b64}"))
+}
+
+// ============ Font Commands ============
+
+/// Thin Tauri adapter for `fonts::list_system_fonts`.
+///
+/// `myshell_core` states that it is Tauri-free ("no `State`, no
+/// `WebviewWindow`, no `AppHandle`; the GUI binary wraps these pure functions
+/// with thin `#[tauri::command]` adapters"). The core function used to carry
+/// the attribute itself, which forced every non-GUI consumer to link Tauri just
+/// to enumerate fonts. The IPC command name is unchanged, so the frontend
+/// needs no change.
+#[tauri::command]
+fn list_system_fonts() -> Vec<String> {
+    fonts::list_system_fonts()
 }
 
 // ============ Folder Management Commands ============
@@ -2177,6 +2364,7 @@ fn delete_folder(state: State<AppState>, path: String) -> Result<String, String>
 /// A connection in the recycle bin: its config + when it was soft-deleted.
 /// Used by the RecycleDialog so the user can see name/host and deletion time.
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeletedConnection {
     #[serde(flatten)]
     pub config: ConnectionConfig,
@@ -2561,7 +2749,19 @@ async fn ssh_connect(
     // which is already in the config (populated by get_connections).
     if config.auth_method != "key" && config.password.is_none() {
         let key = require_dek(&state)?;
-        config.password = secrets::get_password(&config.id, &key)?;
+        config.password = secrets::get_password(&config.id, &key)?.map(|p| p.to_string());
+    }
+    // Key auth: resolve the private key from the vault here too, mirroring the
+    // password above, so ssh.rs stays vault-agnostic. The frontend no longer
+    // receives the PEM (`ConnectionConfig::private_key_pem` is
+    // skip_serializing), so it can never arrive in the config we were handed.
+    if config.auth_method == "key" && config.private_key_pem.is_none() {
+        let key = require_dek(&state)?;
+        let pem = {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            db::get_private_key_pem(&db, &key, &config.id).map_err(|e| e.to_string())?
+        };
+        config.private_key_pem = pem;
     }
     // Refuse to authenticate with an empty password. A missing keyring entry
     // resolves to None (then ssh.rs would send "" via unwrap_or_default),
@@ -2581,7 +2781,8 @@ async fn ssh_connect(
     // vault.
     if config.proxy_type != "none" && config.proxy_password.is_none() {
         let key = require_dek(&state)?;
-        config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
+        config.proxy_password =
+        secrets::get_proxy_password(&config.id, &key)?.map(|p| p.to_string());
     }
     // hold_startup=true: GUI tab — the reader holds the login banner until
     // the frontend's ssh_output listener is attached (see ssh_ready).
@@ -2931,7 +3132,7 @@ async fn test_connection(
     if config.conn_type != "local" && config.auth_method != "key" && config.password.is_none() {
         if !config.id.is_empty() {
             let key = require_dek(&state)?;
-            config.password = secrets::get_password(&config.id, &key)?;
+            config.password = secrets::get_password(&config.id, &key)?.map(|p| p.to_string());
         }
         // Empty/missing password on password-auth: refuse to test. Sending an
         // empty password would be counted as a failed attempt by many servers
@@ -2952,7 +3153,8 @@ async fn test_connection(
         && !config.id.is_empty()
     {
         let key = require_dek(&state)?;
-        config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
+        config.proxy_password =
+        secrets::get_proxy_password(&config.id, &key)?.map(|p| p.to_string());
     }
 
     // ── 2. Dispatch under a 15s timeout ──
@@ -3611,7 +3813,10 @@ async fn sftp_upload(
 ) -> Result<(), String> {
     let sink = WindowSink(window);
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    state.transfer_cancels.lock().unwrap().insert(request_id.clone(), cancel.clone());
+    state
+                        .transfer_cancels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()).insert(request_id.clone(), cancel.clone());
     let result = sftp::upload(
         &state,
         &session_id,
@@ -3622,7 +3827,10 @@ async fn sftp_upload(
         cancel,
     )
     .await;
-    state.transfer_cancels.lock().unwrap().remove(&request_id);
+    state
+                        .transfer_cancels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()).remove(&request_id);
     result
 }
 
@@ -3641,7 +3849,10 @@ async fn sftp_download(
 ) -> Result<(), String> {
     let sink = Arc::new(WindowSink(window));
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    state.transfer_cancels.lock().unwrap().insert(request_id.clone(), cancel.clone());
+    state
+                        .transfer_cancels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()).insert(request_id.clone(), cancel.clone());
     let result = sftp::download(
         &state,
         &session_id,
@@ -3653,7 +3864,10 @@ async fn sftp_download(
         cancel,
     )
     .await;
-    state.transfer_cancels.lock().unwrap().remove(&request_id);
+    state
+                        .transfer_cancels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()).remove(&request_id);
     result
 }
 
@@ -3665,7 +3879,10 @@ async fn sftp_cancel_transfer(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
-    let cancels = state.transfer_cancels.lock().unwrap();
+    let cancels = state
+                        .transfer_cancels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
     match cancels.get(&request_id) {
         Some(flag) => {
             flag.store(true, Ordering::Relaxed);
@@ -3692,11 +3909,12 @@ async fn ftp_connect(mut config: ConnectionConfig, state: State<'_, AppState>) -
     // Resolve password from keyring here (same pattern as ssh_connect).
     if config.password.is_none() {
         let key = require_dek(&state)?;
-        config.password = secrets::get_password(&config.id, &key)?;
+        config.password = secrets::get_password(&config.id, &key)?.map(|p| p.to_string());
     }
     if config.proxy_type != "none" && config.proxy_password.is_none() {
         let key = require_dek(&state)?;
-        config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
+        config.proxy_password =
+        secrets::get_proxy_password(&config.id, &key)?.map(|p| p.to_string());
     }
     let target = format!("{}@{}:{}", config.username, config.host, port);
     let result = ftp::connect(&config).await;
@@ -3804,7 +4022,10 @@ async fn ftp_upload(
         cancel,
     )
     .await;
-    state.transfer_cancels.lock().unwrap().remove(&request_id);
+    state
+                        .transfer_cancels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()).remove(&request_id);
     result
 }
 
@@ -3840,7 +4061,10 @@ async fn ftp_download(
         cancel,
     )
     .await;
-    state.transfer_cancels.lock().unwrap().remove(&request_id);
+    state
+                        .transfer_cancels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()).remove(&request_id);
     result
 }
 
@@ -3851,7 +4075,10 @@ async fn ftp_cancel_transfer(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
-    let cancels = state.transfer_cancels.lock().unwrap();
+    let cancels = state
+                        .transfer_cancels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
     match cancels.get(&request_id) {
         Some(flag) => {
             flag.store(true, Ordering::Relaxed);
@@ -3967,6 +4194,21 @@ fn rz_read_chunk(
     let file = handle.reader.as_mut().ok_or("File closed")?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|e| format!("seek: {}", e))?;
+    // Cap the caller-supplied length. This allocates (and then zero-fills) a
+    // buffer of exactly `len` bytes BEFORE reading, and `len` is a u32 from
+    // the webview — so a single invoke could ask for a 4 GiB allocation, on the
+    // MAIN THREAD (this is a sync `#[tauri::command]`), and take the app down.
+    // The symmetric write command already carries an explicit 16 MiB cap with
+    // an "anything bigger is abuse" rationale; the read path simply lacked
+    // one. The frontend currently asks for 64 KiB, so this only ever rejects
+    // abuse.
+    const MAX_READ_BYTES: usize = 16 * 1024 * 1024;
+    if len as usize > MAX_READ_BYTES {
+        return Err(format!(
+            "单次读取长度过大（最大 {} MB）",
+            MAX_READ_BYTES / (1024 * 1024)
+        ));
+    }
     let mut buf = vec![0u8; len as usize];
     let n = file.read(&mut buf).map_err(|e| format!("read: {}", e))?;
     buf.truncate(n);
@@ -4330,15 +4572,38 @@ fn acquire_single_instance_lock() -> Result<bool, String> {
 
     unsafe {
         let name = wide(MUTEX_NAME);
-        let mutex = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+        // bInitialOwner = TRUE, and then verify we actually got it.
+        //
+        // This used to create the mutex with bInitialOwner = FALSE and, on the
+        // "first instance" path, return without ever calling
+        // WaitForSingleObject. Nobody therefore ever HELD the mutex, and an
+        // unheld mutex is signalled — so `wait_mutex_free` returned true on its
+        // very first 500 ms wait, unconditionally. Consequences: the graceful
+        // shutdown of the old instance was never actually verified before a
+        // second GUI started against the same SQLite file / config dir / log;
+        // the force-kill fallback below was dead code; and the one real
+        // WaitForSingleObject that did succeed silently GRANTED ownership to
+        // this process, whose handle was then leaked still holding it — so the
+        // third launch blocked for the full 5 s and then force-killed every
+        // myshell.exe.
+        let mutex = CreateMutexW(std::ptr::null_mut(), 1, name.as_ptr());
         if mutex.is_null() || mutex == winapi::um::handleapi::INVALID_HANDLE_VALUE {
             return Err("无法创建单实例互斥体（CreateMutexW 失败）".into());
         }
         // Intentionally leak the handle — it must stay alive for the whole
         // process lifetime so other starters can detect us. The kernel cleans
-        // it up on process exit.
+        // it up on process exit. Because we now own it, that is the POINT:
+        // other starters block in wait_mutex_free until this process dies.
         if GetLastError() != ERROR_ALREADY_EXISTS {
-            return Ok(true); // we are the first instance
+            // First instance: confirm we really acquired it (WAIT_OBJECT_0 =
+            // 0). A timeout here would mean someone created it without owning
+            // it, which is exactly the broken state this call path used to
+            // leave behind.
+            let acquired = WaitForSingleObject(mutex, 0);
+            if acquired != winapi::um::winbase::WAIT_OBJECT_0 {
+                return Err("单实例互斥体创建成功但未获得所有权".into());
+            }
+            return Ok(true); // we are the first instance, and we hold it
         }
 
         log::info!("[single-instance] 检测到已有实例，弹窗询问用户");
@@ -4715,6 +4980,13 @@ pub fn run() {
         log::warn!("[startup] backup check failed: {}", e);
     }
 
+    // Apply a rollback the user scheduled while the app was running. This MUST
+    // happen before the database is opened — it is the only point at which
+    // replacing `connections.db` and the vault files is safe.
+    if let Some(msg) = backup::apply_pending_rollback() {
+        log::info!("[startup] {}", msg);
+    }
+
     let conn = db::init_db().expect("Failed to initialize database");
     log::info!("[startup] database initialized");
     // v0.1 → v0.2 schema migration (group_name rename, conn_type/ftp_*
@@ -4818,7 +5090,7 @@ pub fn run() {
             local_send,
             local_resize,
             local_disconnect,
-            fonts::list_system_fonts,
+            list_system_fonts,
             is_elevated,
             restart_as_admin,
             ssh_get_server_info,
@@ -4999,11 +5271,38 @@ pub fn run() {
                     // IPC call for up to timeout+10s).
                     const MAX_IPC_CONCURRENT: usize = 32;
                     let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    // Bounded consecutive-failure backoff. `accept` used to log
+                    // any error and `continue` immediately: a persistent failure
+                    // (WSAEMFILE after a local connection flood — exactly what
+                    // the cap below exists to absorb — or a dead listener socket)
+                    // spun a core flat and appended a log line per iteration for
+                    // the remaining lifetime of the process.
+                    let mut accept_failures: u32 = 0;
                     for stream in listener.incoming() {
                         let stream = match stream {
-                            Ok(s) => s,
+                            Ok(s) => {
+                                accept_failures = 0;
+                                s
+                            }
                             Err(e) => {
-                                log::warn!("[ipc] accept error: {}", e);
+                                accept_failures = accept_failures.saturating_add(1);
+                                if accept_failures > 20 {
+                                    log::error!(
+                                        "[ipc] accept 连续失败 {} 次，停止 IPC 监听（最后错误: {}）",
+                                        accept_failures,
+                                        e
+                                    );
+                                    break;
+                                }
+                                // 10ms → 200ms, capped.
+                                let backoff = std::cmp::min(200, 10 * accept_failures as u64);
+                                std::thread::sleep(std::time::Duration::from_millis(backoff));
+                                log::warn!(
+                                    "[ipc] accept error ({}), {}ms 后重试: {}",
+                                    accept_failures,
+                                    backoff,
+                                    e
+                                );
                                 continue;
                             }
                         };
@@ -5012,11 +5311,18 @@ pub fn run() {
                         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
 
-                        // Shed excess connections fast — threads are bounded
-                        // so a local flood can't exhaust memory.
-                        if active_connections.load(std::sync::atomic::Ordering::SeqCst)
-                            >= MAX_IPC_CONCURRENT
-                        {
+                        // Claim the slot with ONE atomic operation. The previous
+                        // load-then-compare-then-increment-on-the-thread left a
+                        // window in which any number of accept iterations could
+                        // pass the check before the spawned thread bumped the
+                        // counter — so a flood could start well over 32 handler
+                        // threads, which is precisely what the cap is there to
+                        // prevent.
+                        let claimed = active_connections
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if claimed >= MAX_IPC_CONCURRENT {
+                            active_connections
+                                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             let _ = writeln!(
                                 &stream,
                                 "{{\"ok\":false,\"error\":\"IPC busy, retry later\"}}"
@@ -5026,13 +5332,19 @@ pub fn run() {
 
                         let reader = match stream.try_clone() {
                             Ok(r) => BufReader::new(r),
-                            Err(_) => continue,
+                            Err(_) => {
+                                // Slot was already claimed above; give it back.
+                                active_connections
+                                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                continue;
+                            }
                         };
                         let ipc_handle = ipc_handle.clone();
                         let ipc_token = ipc_token.clone();
                         let active = Arc::clone(&active_connections);
                         std::thread::spawn(move || {
-                            active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            // The slot was already claimed atomically before
+                            // spawn, so it is NOT incremented here.
                             handle_ipc_connection(reader, &ipc_handle, &ipc_token);
                             active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         });
@@ -5150,7 +5462,7 @@ fn handle_ipc_connection(
                                 // the result back to this waiting thread.
                                 let (tx, rx) = oneshot::channel::<serde_json::Value>();
                                 {
-                                    let mut pending = PENDING_EXEC.lock().unwrap();
+                                    let mut pending = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
                                     pending.insert(request_id.clone(), tx);
                                 }
 
@@ -5176,7 +5488,7 @@ fn handle_ipc_connection(
                                 });
                                 if let Err(e) = ipc_handle.emit("mcp-gui-command", payload) {
                                     // Clean up the pending entry on emit failure.
-                                    let mut pending = PENDING_EXEC.lock().unwrap();
+                                    let mut pending = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
                                     pending.remove(&request_id);
                                     let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"emit failed: {}\"}}", e);
                                     return;
@@ -5213,7 +5525,7 @@ fn handle_ipc_connection(
                                                 let _ = writeln!(reader.get_mut(), "{}", result);
                                             }
                                             None => {
-                                                let mut pending = PENDING_EXEC.lock().unwrap();
+                                                let mut pending = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
                                                 pending.remove(&request_id);
                                                 let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"exec timeout ({}s)\"}}", timeout_secs);
                                             }
@@ -5240,7 +5552,7 @@ fn handle_ipc_connection(
                                             let _ = writeln!(&writer, "{}", result);
                                         }
                                         None => {
-                                            let mut pending = PENDING_EXEC.lock().unwrap();
+                                            let mut pending = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
                                             pending.remove(&request_id);
                                             let _ = writeln!(&writer, "{{\"ok\":false,\"error\":\"exec timeout ({}s)\"}}", timeout_secs);
                                         }
@@ -5327,15 +5639,36 @@ fn handle_ipc_connection(
                                         // Resolve password + proxy password from keyring.
                                         if config.auth_method != "key" && config.password.is_none() {
                                             if let Ok(pw) = secrets::get_password(&config.id, key) {
-                                                config.password = pw;
+                                                config.password = pw.map(|s| s.to_string());
                                             }
                                         }
                                         if config.proxy_type != "none" && config.proxy_password.is_none() {
                                             if let Ok(pw) = secrets::get_proxy_password(&config.id, key) {
-                                                config.proxy_password = pw;
+                                                config.proxy_password = pw.map(|s| s.to_string());
                                             }
                                         }
-                                        let json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+                                        // Key auth: `db::get_connection` no longer returns
+                                        // the PEM — `skip_serializing` on
+                                        // `ConnectionConfig::private_key_pem` is what keeps
+                                        // it out of webview payloads, and it applies to
+                                        // this serialization too. This response goes to
+                                        // the MCP server over the authenticated local
+                                        // bridge (not to a renderer), so splice the key in
+                                        // explicitly rather than relaxing the attribute.
+                                        let private_key_pem = if config.auth_method == "key" {
+                                            db::get_private_key_pem(&db_conn, key, &config.id)
+                                                .ok()
+                                                .flatten()
+                                        } else {
+                                            None
+                                        };
+                                        let mut json_val = serde_json::to_value(&config)
+                                            .unwrap_or_else(|_| serde_json::json!({}));
+                                        if let Some(pem) = private_key_pem {
+                                            json_val["private_key_pem"] =
+                                                serde_json::Value::String(pem);
+                                        }
+                                        let json = json_val.to_string();
                                         let _ = writeln!(reader.get_mut(), "{{\"ok\":true,\"config\":{}}}", json);
                                     }
                                     Ok(None) => {
@@ -5363,7 +5696,7 @@ fn handle_ipc_connection(
                                 let request_id = uuid::Uuid::new_v4().to_string();
                                 let (tx, rx) = oneshot::channel::<serde_json::Value>();
                                 {
-                                    let mut pending = PENDING_EXEC.lock().unwrap();
+                                    let mut pending = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
                                     pending.insert(request_id.clone(), tx);
                                 }
                                 if let Some(window) = ipc_handle.get_webview_window("main") {
@@ -5376,7 +5709,7 @@ fn handle_ipc_connection(
                                     "connection_id": conn_id,
                                 });
                                 if let Err(e) = ipc_handle.emit("mcp-gui-command", payload) {
-                                    let mut pending = PENDING_EXEC.lock().unwrap();
+                                    let mut pending = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
                                     pending.remove(&request_id);
                                     let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"emit failed: {}\"}}", e);
                                     return;
@@ -5409,7 +5742,7 @@ fn handle_ipc_connection(
                                                 let _ = writeln!(reader.get_mut(), "{}", result);
                                             }
                                             None => {
-                                                let mut pending = PENDING_EXEC.lock().unwrap();
+                                                let mut pending = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
                                                 pending.remove(&request_id);
                                                 let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"screenshot timeout ({}s)\"}}", timeout_secs_sc);
                                             }
@@ -5436,7 +5769,7 @@ fn handle_ipc_connection(
                                             let _ = writeln!(&writer, "{}", result);
                                         }
                                         None => {
-                                            let mut pending = PENDING_EXEC.lock().unwrap();
+                                            let mut pending = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
                                             pending.remove(&request_id);
                                             let _ = writeln!(&writer, "{{\"ok\":false,\"error\":\"screenshot timeout ({}s)\"}}", timeout_secs_sc);
                                         }

@@ -17,9 +17,19 @@ export interface ConnectionConfig {
   username: string;
   auth_method: string;
   password?: string;
-  /** Private key PEM content (transient — encrypted at rest in the vault).
-   * ssh.rs loads from this string via decode_secret_key; no file IO. */
+  /** Private key PEM content. **The backend never returns this** — the Rust
+   * type marks it `skip_serializing`, so `getConnections` yields
+   * `has_private_key` instead and the renderer never holds a key. Send one
+   * only to REPLACE a stored key; leaving it undefined keeps the existing one
+   * (empty means "no new key", not "delete the stored key"). */
   private_key_pem?: string;
+  /** Whether a private key is stored for this connection. Stands in for the
+   * PEM on the wire so the dialog can render "已加密存储" without the secret. */
+  has_private_key?: boolean;
+  /** Explicit request to DELETE the stored private key (the dialog's ✕).
+   * Omitting `private_key_pem` does NOT delete it — that is the default, since
+   * an ordinary edit never carries a PEM. */
+  clear_private_key?: boolean;
   conn_type?: ConnType;
   group_path?: string;
   ftp_tls?: FtpTls;
@@ -244,7 +254,20 @@ export async function moveConnection(connId: string, newGroupPath: string): Prom
 // the OS keychain. The dump file contains NO plaintext credentials — opening
 // it in a text editor shows only base64 ciphertext + KDF params.
 
-export async function exportConnections(passphrase: string, path: string): Promise<number> {
+/** Outcome of an export. `missingCredentials` lists connections whose stored
+ *  password could not be read (keyring unavailable / corrupt / decrypt failed)
+ *  — the dump is still written, but those connections come back without a
+ *  working credential, so the UI MUST surface the list rather than claiming a
+ *  complete backup. */
+export interface ExportConnectionsResult {
+  exported: number;
+  missingCredentials: string[];
+}
+
+export async function exportConnections(
+  passphrase: string,
+  path: string,
+): Promise<ExportConnectionsResult> {
   return await invoke("export_connections", { passphrase, path });
 }
 
@@ -858,6 +881,13 @@ export interface AiTestOverrides {
   proxyUrl?: string;
   apiKey?: string;
   temperature?: number;
+  /** Set ONLY after the user explicitly confirms sending the vault-stored key
+   * to a different host. The backend refuses (with a "🔒 安全确认" error) when
+   * `baseUrl` differs from the stored one, the key resolves from the vault,
+   * and this flag is absent — editing an existing supplier leaves the key
+   * field blank, so without it one "测试" click would ship the real secret to
+   * whatever host was typed. */
+  allowVaultKeyToNewHost?: boolean;
 }
 
 /**

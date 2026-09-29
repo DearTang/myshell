@@ -194,9 +194,16 @@ watch(
 async function handleExecute(cmd: string): Promise<void> {
   if (!cmd.trim()) return;
 
+  // Clear the input SYNCHRONOUSLY, before awaiting the send. Clearing after
+  // the await meant a command typed while the send was in flight got wiped by
+  // the trailing `input.value = ""`, leaving the box out of sync with history
+  // (the first command was already recorded).
+
   // Determine broadcast destinations
   const destinations =
     props.broadcastTargets.length > 0 ? props.broadcastTargets : [props.sessionId];
+
+  input.value = "";
 
   // Send to all destinations (broadcast or single)
   await Promise.allSettled(destinations.map((sid) => sendFn(sid, cmd + "\r")));
@@ -207,10 +214,15 @@ async function handleExecute(cmd: string): Promise<void> {
       .then(() => reload())
       .catch(() => {});
   }
-  input.value = "";
 }
 
 function onInputKeyDown(e: KeyboardEvent): void {
+  // IME composition: pressing Enter to CONFIRM a Chinese/Japanese/Korean
+  // candidate also dispatches keydown with key === "Enter" and isComposing
+  // true. Treating that as a submit sent the raw pinyin to the host and then
+  // wiped the input, losing the text the user just composed. keyCode 229 is
+  // the legacy signal some IMEs emit instead.
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === "Enter" && input.value.trim()) {
     void handleExecute(input.value);
   }

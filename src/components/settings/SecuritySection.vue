@@ -25,8 +25,18 @@ onMounted(() => {
     .then((v) => (elevated.value = v))
     .catch(() => (elevated.value = false));
   getAppSettings()
-    .then((s) => (disableCommandHistory.value = s.disable_command_history))
-    .catch(() => {});
+    .then((s) => {
+      disableCommandHistory.value = s.disable_command_history;
+      historySettingLoaded.value = true;
+    })
+    .catch((e) => {
+      // Swallowing this left the toggle at its declared default of `false`,
+      // which renders as "history IS being recorded" even when the backend
+      // actually has it disabled — a misreport in a privacy control the user
+      // relies on precisely when running commands with inline secrets.
+      console.warn("[settings] 读取命令历史隐私设置失败:", e);
+      historySettingError.value = String(e);
+    });
 });
 
 async function handleRestartAdmin(): Promise<void> {
@@ -67,7 +77,11 @@ function onAutoLockChange(v: unknown): void {
 }
 
 // ── 隐私：后端强制的命令历史开关（settings.json）──
-const disableCommandHistory = ref(false);
+// `null` = 尚未读到后端真实值。和 `false` 区分开，避免读取失败时把
+// 「未知」渲染成「正在记录命令历史」这个相反的结论。
+const disableCommandHistory = ref<boolean | null>(null);
+const historySettingLoaded = ref(false);
+const historySettingError = ref<string | null>(null);
 
 async function onDisableHistoryChange(next: string | number | boolean): Promise<void> {
   const value = Boolean(next);
@@ -184,9 +198,13 @@ async function handleChangePassword(): Promise<void> {
       <div>
         <div class="privacy-title">不记录命令历史</div>
         <div class="privacy-desc">适合执行含临时令牌、内联密码等敏感命令的场景。立即生效。</div>
+        <div v-if="historySettingError" class="privacy-desc" style="color: var(--el-color-danger)">
+          ⚠ 无法读取后端设置（{{ historySettingError }}），开关状态未知，已暂时禁用以免误导。
+        </div>
       </div>
       <MyToggle
-        :model-value="disableCommandHistory"
+        :model-value="disableCommandHistory ?? false"
+        :disabled="!historySettingLoaded"
         @update:model-value="onDisableHistoryChange"
       />
     </div>

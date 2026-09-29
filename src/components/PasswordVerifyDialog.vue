@@ -50,6 +50,13 @@ async function submit(): Promise<void> {
     }
   } catch (e) {
     err.value = String(e);
+    // Clear the master password on a wrong attempt too. `verify_password`
+    // never returns Ok(false) — a wrong password arrives as an Err — so the
+    // `else` branch above is dead code and the only clearing paths were the
+    // success and dead ones. The plaintext master password was therefore left
+    // in the ref (and in the mounted input) after every failure, ready to be
+    // resubmitted with Enter.
+    pass.value = "";
   } finally {
     busy.value = false;
   }

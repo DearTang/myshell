@@ -194,8 +194,8 @@ async function handleSaveSupplier(): Promise<void> {
 // 通过覆盖参数测试当前供应商配置 — 不先保存。
 async function handleTestSupplier(): Promise<void> {
   editTesting.value = true;
-  try {
-    const msg = await aiTestSettings({
+  const run = async (allowVaultKeyToNewHost: boolean): Promise<string> =>
+    aiTestSettings({
       supplierId: creating.value ? undefined : selectedSupplierId.value ?? undefined,
       provider: editProvider.value,
       model: editModels.value[0]?.modelId ?? "default",
@@ -203,7 +203,31 @@ async function handleTestSupplier(): Promise<void> {
       proxyUrl: editProxy.value.trim() || undefined,
       apiKey: editKey.value,
       temperature: editTemp.value,
+      allowVaultKeyToNewHost,
     });
+  try {
+    let msg: string;
+    try {
+      msg = await run(false);
+    } catch (e) {
+      // 后端拒绝把「已保存的 API Key」发往新主机（见 ai.rs test_settings 的
+      // 安全确认）。这里显式确认后才带 allow=true 重试——编辑已有供应商时
+      // key 输入框本来就是空的，用户看不到自己正在发送什么。
+      if (!String(e).includes("安全确认")) throw e;
+      const confirmed = await confirmDialog({
+        message:
+          `${String(e)}\n\n` +
+          "继续将把你已保存的 API Key 发送到上面这个地址。若该地址不是你预期的，请取消并检查。",
+        title: "确认发送到新主机",
+        type: "warning",
+      });
+      if (!confirmed) {
+        showToast("err", "已取消测试：未向新主机发送 API Key");
+        testedOk.value = false;
+        return;
+      }
+      msg = await run(true);
+    }
     showToast("ok", msg);
     testedOk.value = true;
   } catch (e) {

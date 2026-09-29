@@ -28,8 +28,8 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::zmodem_rx::{
-    crc16_xmodem, frame_type, hex_char, hex_val, offset_bytes, subpkt_end, ZBIN, ZDLE, ZHEX, XOFF,
-    XON,
+    crc16_xmodem, frame_type, hex_char, hex_val, offset_bytes, subpkt_end, ZBIN, ZBIN32, ZDLE, ZHEX,
+    XOFF, XON,
 };
 
 /// ZPAD byte (also reused from rx constants conceptually; redefined locally to
@@ -282,8 +282,22 @@ impl ZmodemSender {
             self.state = TxState::WaitingZrinit2;
             if !self.file_complete_emitted {
                 self.file_complete_emitted = true;
-                actions.events.push(TxEvent::Progress { sent: self.size, total: self.size });
-                actions.events.push(TxEvent::FileComplete { name: self.name.clone(), bytes: self.size });
+                // Report what was ACTUALLY streamed, not the size the file had
+                // when the transfer started. If the file was truncated in
+                // between, or a ZRPOS rewind moved `file_offset`, the two
+                // diverge — and reporting `size` told the receiver a file
+                // arrived that it never received.
+                let sent = self.file_offset.max(self.bytes_sent);
+                if sent != self.size {
+                    log::warn!(
+                        "[zmodem_tx] {} 实际发送 {} 字节，与声明大小 {} 不符",
+                        self.name,
+                        sent,
+                        self.size
+                    );
+                }
+                actions.events.push(TxEvent::Progress { sent, total: self.size });
+                actions.events.push(TxEvent::FileComplete { name: self.name.clone(), bytes: sent });
             }
             return actions;
         }
@@ -416,11 +430,6 @@ impl ZmodemSender {
                         log::info!("[zmodem_tx] ZRPOS off=0 in WaitingZrinit2 — letting reader handle (multi-file or timeout)");
                     }
                     true
-                } else if header.typenum == frame_type::ZRINIT {
-                    // Same reasoning as ZRPOS above — let the reader's multi-
-                    // file swap drive the next file (or end the session).
-                    log::info!("[zmodem_tx] ZRINIT in WaitingZrinit2 — letting reader handle");
-                    true
                 } else if header.typenum == frame_type::ZFIN {
                     // Receiver may send ZFIN directly after ZEOF.
                     actions.send = self.build_hex_header(frame_type::ZFIN, [0, 0, 0, 0]);
@@ -459,6 +468,21 @@ impl ZmodemSender {
                             header.data[2],
                             header.data[3],
                         ]) as u64;
+                        // ZRPOS is remote-controlled input. A value past EOF is
+                        // not a rewind we can honour: `seek` beyond the end is
+                        // legal, so the next `read` returns Ok(0), the sender
+                        // takes its EOF branch, and it reports
+                        // FileComplete { bytes: size } — announcing a complete
+                        // upload of a file that carried ZERO bytes, with the
+                        // progress bar at 100%. Refuse instead.
+                        if off > self.size {
+                            actions.events.push(TxEvent::Error(format!(
+                                "接收方请求的偏移 {} 超出文件大小 {}，已中止（远端可能异常）",
+                                off, self.size
+                            )));
+                            self.state = TxState::Done;
+                            return true;
+                        }
                         self.file_offset = off;
                         self.bytes_sent = off;
                         self.zdata_header_sent = false;
@@ -559,11 +583,17 @@ impl ZmodemSender {
 
     /// Extract receiver capabilities from a ZRINIT's data bytes.
     ///
-    /// Layout matches zmodem.js's ZRINIT header (which interoperates with
-    /// lrzsz): buffer size is data[0..2] big-endian (0 = unlimited), and the
-    /// capability flags (CANFDX/CANOVIO/CANFC32/ESCCTL/...) are in data[3].
+    /// Layout matches the ZRINIT this crate itself writes (`zrinit_data` in
+    /// zmodem_rx.rs, which documents the field as **little-endian**), so a
+    /// MyShell receiver advertising 32768 was being read back as 128. The
+    /// two halves of the same protocol disagreed.
+    ///
+    /// Currently harmless only because `recv_window` is `#[allow(dead_code)]`
+    /// and `subpacket_size()` ignores it — but the field is kept for
+    /// diagnostics and is one edit away from driving flow control, where the
+    /// mismatch would silently clamp the stream to 1 KiB.
     fn record_zrinit_caps(&mut self, data: [u8; 4]) {
-        let bufsz = ((data[0] as u16) << 8) | (data[1] as u16);
+        let bufsz = (data[0] as u16) | ((data[1] as u16) << 8);
         if bufsz > 0 {
             self.recv_window = (bufsz as usize).max(1024);
         }
@@ -697,7 +727,13 @@ fn find_header_start(remaining: &[u8]) -> Option<usize> {
     while i < remaining.len() {
         if remaining[i] == ZDLE && i + 1 < remaining.len() {
             let next = remaining[i + 1];
-            if next == ZBIN || next == ZHEX {
+            // ZBIN32 as well: the near-identical receiver-side helper accepts
+            // it, and a peer that answers a control header in binary32 was
+            // therefore never recognised — `try_step` returned false on every
+            // feed, `scan_pos` never advanced, and the upload hung until the
+            // reader's timeout forced a finish. The parser must accept what
+            // the PEER emits, not only what we emit.
+            if next == ZBIN || next == ZHEX || next == ZBIN32 {
                 return Some(i);
             }
         }

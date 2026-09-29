@@ -18,6 +18,7 @@ use crate::{crypto, ssh, AppState};
 use crate::{EventSink, EventSinkExt};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use zeroize::Zeroizing;
 
 // ───────────────────────────── payloads (Rust → frontend) ─────────────────────────────
 
@@ -159,7 +160,14 @@ impl Provider {
         }
     }
 
-    fn endpoint(&self, base_url: &Option<String>) -> String {
+    /// Build the request endpoint for this provider.
+    ///
+    /// Returns a `Result` rather than panicking: a compatible provider with a
+    /// NULL `base_url` is reachable (both `save_ai_model_cmd` and
+    /// `save_ai_settings` bind `Option<String>` straight into the row with no
+    /// validation), and a `panic!` inside an async Tauri command takes the
+    /// command task down with no user-visible message.
+    fn endpoint(&self, base_url: &Option<String>) -> Result<String, String> {
         // The base URL is the versioned root; we append only the provider's
         // final path segment. Defaults carry "/v1"; a compatible provider
         // like Zhipu fills its own version (e.g. ".../v4"). If the user
@@ -174,20 +182,28 @@ impl Provider {
         let base = base_url
             .as_deref()
             .map(|s| s.trim_end_matches('/'))
-            .unwrap_or_else(|| match self {
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(match self {
                 Self::Claude => "https://api.anthropic.com/v1",
                 Self::OpenAi => "https://api.openai.com/v1",
                 Self::Ollama => "http://localhost:11434/api",
                 // Compatible providers MUST have a base_url — no sensible default.
                 Self::OpenAiCompatible | Self::AnthropicCompatible => {
-                    panic!("OpenAiCompatible/AnthropicCompatible require a base_url")
+                    return Err("OpenAI 兼容 / Anthropic 兼容供应商必须填写 Base URL".to_string())
                 }
             });
         if base.ends_with(suffix) {
-            base.to_string()
+            Ok(base.to_string())
         } else {
-            format!("{}/{}", base, suffix)
+            Ok(format!("{}/{}", base, suffix))
         }
+    }
+
+    /// Whether this provider needs an API key at all. Ollama runs locally
+    /// and is auth-free (`auth_headers` returns nothing for it), so requiring
+    /// a key for it makes the shipped preset unusable.
+    fn requires_api_key(&self) -> bool {
+        !matches!(self, Self::Ollama)
     }
 
     /// Auth headers per provider. Claude uses `x-api-key` + a version header;
@@ -322,11 +338,20 @@ enum LineToken {
 /// DEK. Prefers the multi-model `ai_models` table (via `active_model_id`);
 /// falls back to the legacy single-row `ai_settings` for backward compat.
 fn load_settings(state: &AppState) -> Result<LoadedSettings, String> {
-    let dek = state
-        .dek
-        .lock()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Vault 未解锁，请先解锁主密码库后再使用 AI".to_string())?;
+    // Copy the DEK out and RELEASE the guard before touching the database.
+    // Holding `state.dek` across `state.db.lock()` while
+    // `load_settings_for_supplier` does the reverse is a lock-order
+    // inversion: a chat stream and a supplier test running concurrently
+    // deadlock, and a `std::sync::Mutex` deadlock neither unwinds nor is
+    // detected — both threads then pin `state.db`, the single handle used by
+    // every command in the app, so the whole UI freezes until the process is
+    // killed.
+    let dek: Zeroizing<[u8; 32]> = {
+        let guard = state.dek.lock().map_err(|e| e.to_string())?;
+        guard
+            .clone()
+            .ok_or_else(|| "Vault 未解锁，请先解锁主密码库后再使用 AI".to_string())?
+    };
 
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
@@ -357,7 +382,7 @@ fn load_settings(state: &AppState) -> Result<LoadedSettings, String> {
         ) {
             let (provider_id, primary_model, base_url, api_key_enc, proxy_url, temperature) = row;
             let provider = Provider::parse(&provider_id)?;
-            let api_key = decrypt_key(&dek, api_key_enc.as_deref())?;
+            let api_key = decrypt_key(&dek, provider, api_key_enc.as_deref())?;
             // Resolve the specific model: active_model_string overrides the
             // supplier's primary model_id.
             let model = db
@@ -410,7 +435,7 @@ fn load_settings(state: &AppState) -> Result<LoadedSettings, String> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| provider.default_model().to_string());
 
-    let api_key = decrypt_key(&dek, api_key_enc.as_deref())?;
+    let api_key = decrypt_key(&dek, provider, api_key_enc.as_deref())?;
 
     Ok(LoadedSettings {
         provider,
@@ -422,12 +447,26 @@ fn load_settings(state: &AppState) -> Result<LoadedSettings, String> {
     })
 }
 
-fn decrypt_key(dek: &[u8; 32], api_key_enc: Option<&str>) -> Result<String, String> {
+/// Decrypt a stored API key.
+///
+/// `provider` is needed because keyless local providers are legitimate:
+/// Ollama's `auth_headers` returns nothing and `init_ai_presets_cmd` seeds it
+/// with `api_key_enc` left NULL, so demanding a key unconditionally made the
+/// shipped "Ollama (本地)" preset fail on every `ai_chat` — before any HTTP
+/// request was even made.
+fn decrypt_key(
+    dek: &[u8; 32],
+    provider: Provider,
+    api_key_enc: Option<&str>,
+) -> Result<String, String> {
     match api_key_enc.filter(|s| !s.trim().is_empty()) {
         Some(enc) => {
             let bytes = crypto::decrypt_with_key(dek, enc)?;
-            String::from_utf8(bytes).map_err(|e| format!("API key 解码失败: {}", e))
+            std::str::from_utf8(&bytes)
+                .map(|s| s.to_string())
+                .map_err(|e| format!("API key 解码失败: {}", e))
         }
+        None if !provider.requires_api_key() => Ok(String::new()),
         None => Err("未配置 API key，请在「设置 → AI 助手」填写".to_string()),
     }
 }
@@ -440,6 +479,14 @@ fn load_settings_for_supplier(
     supplier_id: i64,
     override_key: Option<&str>,
 ) -> Result<LoadedSettings, String> {
+    // DEK first, released immediately. Taking it AFTER the db lock (as this
+    // used to) while `load_settings` did the reverse was a lock-order
+    // inversion that could freeze the entire application.
+    let dek: Zeroizing<[u8; 32]> = {
+        let guard = state.dek.lock().map_err(|e| e.to_string())?;
+        guard.clone().ok_or_else(|| "Vault 未解锁".to_string())?
+    };
+
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
     let (provider_id, primary_model, base_url, api_key_enc, proxy_url, temperature) = db
@@ -462,16 +509,12 @@ fn load_settings_for_supplier(
 
     let provider = Provider::parse(&provider_id)?;
 
-    // Resolve API key: override > vault-stored > error.
+    // Resolve API key: override > vault-stored > error (or empty for a
+    // keyless local provider).
     let api_key = if let Some(key) = override_key.filter(|k| !k.is_empty()) {
         key.to_string()
     } else {
-        let dek = state
-            .dek
-            .lock()
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "Vault 未解锁".to_string())?;
-        decrypt_key(&dek, api_key_enc.as_deref())?
+        decrypt_key(&dek, provider, api_key_enc.as_deref())?
     };
 
     Ok(LoadedSettings {
@@ -655,7 +698,7 @@ async fn run_chat_stream(
     let body = s
         .provider
         .build_body(&s.model, &params.messages, &system, s.temperature);
-    let endpoint = s.provider.endpoint(&s.base_url);
+    let endpoint = s.provider.endpoint(&s.base_url)?;
 
     // Optional network proxy (http/https/socks5/socks5h; auth may be embedded
     // as user:pass@host). Lets users reach Claude/OpenAI behind a corporate or
@@ -762,6 +805,10 @@ pub struct AiTestOverrides {
     pub proxy_url: Option<String>,
     pub api_key: Option<String>,
     pub temperature: Option<f64>,
+    /// Set by the UI only AFTER the user has explicitly confirmed sending the
+    /// stored API key to a different host. See the guard in `test_settings`.
+    #[serde(default)]
+    pub allow_vault_key_to_new_host: bool,
 }
 
 /// Probe the AI config with a minimal non-streaming request. Used by the
@@ -799,6 +846,32 @@ pub async fn test_settings(
         s.model = m.to_string();
     }
     if let Some(b) = overrides.base_url.as_deref().filter(|b| !b.is_empty()) {
+        // P0-7: the Settings dialog deliberately leaves the key field BLANK
+        // when editing an existing supplier ("已保存，留空保持不变"), so
+        // `load_settings_for_supplier` hands back the REAL vault-stored
+        // secret. Overriding the host here would POST that secret to whatever
+        // the typed URL names — a typo, a blog-posted base URL, or an attacker
+        // supplied one — with no warning of any kind.
+        let stored = s
+            .base_url
+            .as_deref()
+            .map(|u| u.trim_end_matches('/'))
+            .unwrap_or("");
+        let incoming = b.trim_end_matches('/');
+        if stored != incoming
+            && s.provider.requires_api_key()
+            && !s.api_key.is_empty()
+            && overrides.api_key.as_deref().filter(|k| !k.is_empty()).is_none()
+            && !overrides.allow_vault_key_to_new_host
+        {
+            return Err(format!(
+                "🔒 安全确认：已保存的 API Key 不会自动发送到新主机。\n\
+                 原地址: {}\n新地址: {}\n\
+                 如果你确认要发送，请在确认弹窗中选择「仍然发送」后重试。",
+                if stored.is_empty() { "（默认）" } else { stored },
+                incoming
+            ));
+        }
         s.base_url = Some(b.to_string());
     }
     if let Some(p) = overrides.proxy_url.as_deref().filter(|p| !p.is_empty()) {
@@ -826,7 +899,7 @@ pub async fn test_settings(
         obj.insert("max_tokens".to_string(), serde_json::json!(16));
     }
 
-    let endpoint = s.provider.endpoint(&s.base_url);
+    let endpoint = s.provider.endpoint(&s.base_url)?;
 
     // reqwest client + optional proxy — same builder as run_chat_stream.
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
@@ -1239,6 +1312,7 @@ pub fn save_ai_model_cmd(
         .dek
         .lock()
         .map_err(|e| e.to_string())?
+        .clone()
         .ok_or_else(|| "Vault 未解锁".to_string())?;
 
     let api_key_enc: Option<String> = match api_key.filter(|s| !s.is_empty()) {

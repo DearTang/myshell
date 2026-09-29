@@ -12,7 +12,7 @@
      危险片段高亮：splitDangerSegments（黑名单正则 + $()、反引号、写重定向字面模式），
      规则经 getCommandRules 拉取一次缓存；拉取失败时不高亮、仅展示原文。 -->
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from "vue";
 import { Warning } from "@element-plus/icons-vue";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { MyButton, MyDialog } from "myui";
@@ -24,13 +24,42 @@ import type { DangerSegment } from "@/utils/ansi";
 
 defineOptions({ name: "McpConfirmDialog" });
 
-// 命令确认规则缓存（黑名单正则用于高亮）。挂载时拉一次；失败置 null → 不高亮仅展示原文。
+// 命令确认规则（黑名单正则用于高亮）。
+//
+// This used to be fetched ONCE in onMounted. The component is mounted
+// unconditionally at app start (App.vue), so a single failure — or a rule set
+// edited later in 设置 → MCP 支持, which writes the same file — left the
+// dialog rendering every command with NO red highlighting, silently, for the
+// rest of the session while still claiming 危害说明 is rules-driven.
+// Refetch whenever the dialog opens, and re-fetch on the same event the
+// settings panel dispatches after a save.
 const rules = ref<CommandRules | null>(null);
+const rulesFailed = ref(false);
+
+async function refreshRules(): Promise<void> {
+  try {
+    rules.value = await getCommandRules();
+    rulesFailed.value = false;
+  } catch (e) {
+    rules.value = null;
+    rulesFailed.value = true;
+    console.warn("[mcp-confirm] 读取命令规则失败，本次不高亮:", e);
+  }
+}
+
+watch(
+  () => ui.mcpConfirm,
+  (v) => {
+    if (v) void refreshRules();
+  },
+  { immediate: true },
+);
 
 onMounted(() => {
-  getCommandRules()
-    .then((r) => (rules.value = r))
-    .catch(() => (rules.value = null));
+  window.addEventListener("myshell-command-rules-changed", refreshRules);
+});
+onBeforeUnmount(() => {
+  window.removeEventListener("myshell-command-rules-changed", refreshRules);
 });
 
 /** 把命令串按危险片段切分（匹配黑名单正则 + 危险字面模式）；

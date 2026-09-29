@@ -16,7 +16,38 @@ fn db_path() -> PathBuf {
 /// [`migrate_legacy_schema`] (v0.1 → v0.2) and [`migrate_to_vault`]
 /// (v0.2 → vault) on subsequent launches.
 pub fn init_db() -> Result<Connection> {
-    let conn = Connection::open(db_path())?;
+    init_db_at(&db_path())
+}
+
+/// Same as [`init_db`] but against an explicit path.
+///
+/// Exists so the pragmas and the schema can be exercised on a throwaway
+/// database by the tests below — `init_db` hardcodes the user's real
+/// `connections.db`, which a test must never touch.
+pub fn init_db_at(path: &std::path::Path) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let conn = Connection::open(path)?;
+    // PRAGMAs. These were never set, and SQLite's defaults are hostile to
+    // this app's topology: THREE processes (GUI, CLI, MCP) hold the same file
+    // open for the entire session — the MCP server is a long-lived stdio
+    // server — while `init_db` itself WRITES on every start (CREATE TABLE IF
+    // NOT EXISTS + the ALTER probes below).
+    //
+    //   * busy_timeout = 0 (the default) means an immediate SQLITE_BUSY with
+    //     no retry. Saving a connection while the MCP server happened to be
+    //     reading surfaced to the user as "database is locked", and an MCP
+    //     server starting mid-write hit the same error and died at
+    //     `std::process::exit(1)`, taking every agent tool offline.
+    //   * WAL lets readers and one writer coexist instead of serialising, and
+    //     survives the multi-process layout.
+    //   * foreign_keys is OFF by default in SQLite, which meant the
+    //     `ON DELETE CASCADE` declared on ai_supplier_models was a constraint
+    //     that silently did not exist.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
     // IF NOT EXISTS: existing tables are left alone. The vault migration
     // (run after unlock) is responsible for transforming an existing
     // connections table from plaintext to encrypted columns.
@@ -383,6 +414,16 @@ pub fn migrate_to_vault(conn: &mut Connection, key: &[u8; 32]) -> Result<usize> 
     let mut select = tx.prepare(
         "SELECT id, host, username, private_key_path FROM connections",
     )?;
+    // Collect strictly: a row whose columns cannot be decoded (a BLOB host, a
+    // non-UTF-8 path from a Linux-era v0.2 install, any FromSqlConversionFailure)
+    // must ABORT the migration, not be skipped.
+    //
+    // This used to be `filter_map(|r| r.ok())`, which dropped such rows
+    // silently — and the function then went on to DROP the plaintext columns for
+    // the WHOLE table. The skipped row's host, username and key path were
+    // therefore permanently destroyed, directly contradicting this function's
+    // own doc comment ("wrapped in a transaction so a mid-migration crash leaves
+    // the plaintext intact").
     let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = select
         .query_map([], |row| {
             Ok((
@@ -392,9 +433,15 @@ pub fn migrate_to_vault(conn: &mut Connection, key: &[u8; 32]) -> Result<usize> 
                 row.get::<_, Option<String>>(3)?,
             ))
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     drop(select);
+
+    // Sanity check against the table itself: if we somehow read fewer rows than
+    // exist, do NOT proceed to drop the plaintext columns.
+    let total: i64 = tx.query_row("SELECT COUNT(*) FROM connections", [], |r| r.get(0))?;
+    if rows.len() as i64 != total {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
 
     let mut migrated = 0;
     for (id, host, username, key_path) in rows {
@@ -560,9 +607,21 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
              suppress_tmout_i) = row?;
         let host = decrypt_field(key, host_enc)?.unwrap_or_default();
         let username = decrypt_field(key, user_enc)?.unwrap_or_default();
-        let private_key_pem = decrypt_field(key, pem_enc)?;
+        // Deliberately NOT decrypted: this feeds `get_connections`, whose result
+        // is serialized straight to the webview. Presence is all the UI needs —
+        // the PEM itself is loaded at connect time (see `get_private_key_pem`).
+        let has_private_key = pem_enc.is_some();
         let proxy_host = decrypt_field(key, proxy_host_enc)?;
-        let port: u16 = port_i.try_into().unwrap_or(0);
+        let port: u16 = port_i.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "端口号超出 0..=65535 范围",
+                )),
+            )
+        })?;
         let proxy_port = proxy_port_i.and_then(|p| p.try_into().ok());
         let connect_timeout_secs = connect_timeout_i.and_then(|v| v.try_into().ok());
         let keepalive_interval_secs = keepalive_interval_i.and_then(|v| v.try_into().ok());
@@ -575,7 +634,9 @@ pub fn get_all_connections(conn: &Connection, key: &[u8; 32]) -> Result<Vec<Conn
             username,
             auth_method,
             password: None,
-            private_key_pem,
+            private_key_pem: None,
+            has_private_key,
+            clear_private_key: false,
             conn_type,
             group_path,
             ftp_tls,
@@ -633,6 +694,8 @@ pub fn get_all_connections_plaintext(conn: &Connection) -> Result<Vec<Connection
             auth_method: String::new(),
             password: None,
             private_key_pem: None,
+            has_private_key: false,
+            clear_private_key: false,
             conn_type,
             group_path,
             ftp_tls: String::new(),
@@ -661,12 +724,33 @@ pub fn save_connection(conn: &Connection, key: &[u8; 32], config: &ConnectionCon
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
     let user_enc = crypto::encrypt_with_key(key, config.username.as_bytes())
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
-    let pem_enc = match config.private_key_pem.as_ref() {
-        Some(p) if !p.is_empty() => Some(
-            crypto::encrypt_with_key(key, p.as_bytes())
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?,
-        ),
-        _ => None,
+    // A missing PEM means "the caller didn't send one", NOT "delete the stored
+    // key". The frontend no longer receives the PEM
+    // (`ConnectionConfig::private_key_pem` is `skip_serializing`), so an
+    // ordinary edit of a key-auth connection arrives with an empty PEM — the
+    // previous mapping wrote NULL and silently destroyed the user's key on
+    // every save. Keeping the existing blob is strictly the safe direction: a
+    // leftover key stays encrypted at rest and unused, a deleted one is gone.
+    let pem_enc = if config.clear_private_key {
+        // Explicit ✕ in the dialog — the only path that deletes a key.
+        None
+    } else {
+        match config.private_key_pem.as_ref() {
+            Some(p) if !p.is_empty() => Some(
+                crypto::encrypt_with_key(key, p.as_bytes())
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?,
+            ),
+            _ if !config.id.is_empty() => {
+                let mut stmt =
+                    conn.prepare("SELECT private_key_pem_enc FROM connections WHERE id = ?1")?;
+                let existing: Option<String> = stmt
+                    .query_row(params![config.id], |r| r.get(0))
+                    .ok()
+                    .flatten();
+                existing
+            }
+            _ => None,
+        }
     };
     // Proxy host encryption — same scheme as host. Empty proxy_host is stored
     // as NULL (proxy_type='none' case usually).
@@ -759,9 +843,20 @@ pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Opt
                  address_family, connect_timeout_i, keepalive_interval_i, suppress_tmout_i))) => {
             let host = decrypt_field(key, host_enc)?.unwrap_or_default();
             let username = decrypt_field(key, user_enc)?.unwrap_or_default();
-            let private_key_pem = decrypt_field(key, pem_enc)?;
+            // Same as get_all_connections: a read path that can reach the
+            // frontend must not decrypt the key.
+            let has_private_key = pem_enc.is_some();
             let proxy_host = decrypt_field(key, proxy_host_enc)?;
-            let port: u16 = port_i.try_into().unwrap_or(0);
+            let port: u16 = port_i.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "端口号超出 0..=65535 范围",
+                )),
+            )
+        })?;
             let proxy_port = proxy_port_i.and_then(|p| p.try_into().ok());
             let connect_timeout_secs = connect_timeout_i.and_then(|v| v.try_into().ok());
             let keepalive_interval_secs = keepalive_interval_i.and_then(|v| v.try_into().ok());
@@ -774,7 +869,9 @@ pub fn get_connection(conn: &Connection, key: &[u8; 32], id: &str) -> Result<Opt
                 username,
                 auth_method,
                 password: None,
-                private_key_pem,
+                private_key_pem: None,
+                has_private_key,
+                clear_private_key: false,
                 conn_type,
                 group_path,
                 ftp_tls,
@@ -834,10 +931,20 @@ pub fn delete_connection(conn: &Connection, id: &str) -> Result<Vec<String>> {
 }
 
 /// Hard-delete a single connection by id (used by purge_connection). Also drops
-/// its per-server quick_commands. Does NOT touch the keyring — the caller owns
-/// that cleanup (it needs the keyring crate, not the db module).
+/// its per-server quick_commands and command history. Does NOT touch the
+/// keyring — the caller owns that cleanup (it needs the keyring crate, not the
+/// db module).
+///
+/// command_history is included deliberately: the history is encrypted exactly
+/// because it commonly embeds tokens and passwords, and a hard-deleted
+/// connection left its rows unreachable (the clear-history action requires a
+/// live connection) yet never reclaimed.
 pub fn hard_delete_connection(conn: &Connection, id: &str) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM command_history WHERE connection_id = ?1",
+        params![id],
+    )?;
     tx.execute("DELETE FROM quick_commands WHERE connection_id = ?1", params![id])?;
     tx.execute("DELETE FROM connections WHERE id = ?1", params![id])?;
     tx.commit()?;
@@ -851,9 +958,17 @@ pub fn purge_all_deleted(conn: &Connection) -> Result<Vec<String>> {
     let ids: Vec<String> = tx
         .prepare("SELECT id FROM connections WHERE deleted_at IS NOT NULL")?
         .query_map([], |row| row.get::<_, String>(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     for id in &ids {
+        // command_history too. These rows are encrypted precisely because the
+        // history often embeds tokens and passwords; leaving them behind after
+        // a hard delete made them unreachable (the per-connection clear action
+        // needs a live connection) yet never reclaimed — retained forever with
+        // no way to erase them.
+        tx.execute(
+            "DELETE FROM command_history WHERE connection_id = ?1",
+            params![id],
+        )?;
         tx.execute("DELETE FROM quick_commands WHERE connection_id = ?1", params![id])?;
     }
     tx.execute("DELETE FROM connections WHERE deleted_at IS NOT NULL", [])?;
@@ -926,9 +1041,18 @@ pub fn get_deleted_connections(
              suppress_tmout_i, deleted_at) = row?;
         let host = decrypt_field(key, host_enc)?.unwrap_or_default();
         let username = decrypt_field(key, user_enc)?.unwrap_or_default();
-        let private_key_pem = decrypt_field(key, pem_enc)?;
+        let has_private_key = pem_enc.is_some();
         let proxy_host = decrypt_field(key, proxy_host_enc)?;
-        let port: u16 = port_i.try_into().unwrap_or(0);
+        let port: u16 = port_i.try_into().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "端口号超出 0..=65535 范围",
+                )),
+            )
+        })?;
         let proxy_port = proxy_port_i.and_then(|p| p.try_into().ok());
         let connect_timeout_secs = connect_timeout_i.and_then(|v| v.try_into().ok());
         let keepalive_interval_secs = keepalive_interval_i.and_then(|v| v.try_into().ok());
@@ -941,7 +1065,9 @@ pub fn get_deleted_connections(
             username,
             auth_method,
             password: None,
-            private_key_pem,
+            private_key_pem: None,
+            has_private_key,
+            clear_private_key: false,
             conn_type,
             group_path,
             ftp_tls,
@@ -984,10 +1110,12 @@ fn collect_overflow_deleted(tx: &Connection, cap: usize) -> Result<Vec<String>> 
     let mut stmt = tx.prepare(
         "SELECT id FROM connections WHERE deleted_at IS NOT NULL ORDER BY deleted_at ASC",
     )?;
+    // Collect strictly: a silently-skipped id here would let the caller
+    // hard-delete that connection's DB row without ever purging its keyring
+    // entry, leaving an orphaned credential behind forever.
     let all: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(all.into_iter().skip(cap).collect())
 }
 
@@ -1535,6 +1663,25 @@ pub fn migrate_plaintext_history(conn: &mut Connection, key: &[u8; 32]) -> Resul
     Ok(migrated)
 }
 
+/// Decrypt the stored private key for one connection.
+///
+/// Connect-time only. The list/get queries deliberately return
+/// `private_key_pem: None` so the PEM never crosses into the webview; this is
+/// the one place that materializes it, and callers must already have gone
+/// through `require_dek`.
+pub fn get_private_key_pem(
+    conn: &Connection,
+    key: &[u8; 32],
+    id: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT private_key_pem_enc FROM connections WHERE id = ?1")?;
+    let blob: Option<String> = stmt
+        .query_row(params![id], |r| r.get(0))
+        .ok()
+        .flatten();
+    decrypt_field(key, blob)
+}
+
 /// Decrypt an encrypted column value. None → None (NULL column or fresh row
 /// not yet populated). Error surfaces as a rusqlite failure so the caller's
 /// `?` propagates it cleanly.
@@ -1548,13 +1695,149 @@ fn decrypt_field(key: &[u8; 32], blob: Option<String>) -> Result<Option<String>>
                     rusqlite::types::Type::Text,
                     Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 ))?;
-            String::from_utf8(pt)
-                .map(Some)
+            // 借 `pt` 的切片直接建 String：不为同一份明文多留一个
+            // 裸 Vec，原始解密缓冲在离开作用域时被擦除。
+            std::str::from_utf8(&pt)
+                .map(|s| Some(s.to_string()))
                 .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
                     0,
                     rusqlite::types::Type::Text,
                     Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
                 ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway database path under the OS temp dir, removed on drop.
+    struct TempDb(PathBuf);
+    impl TempDb {
+        fn new(tag: &str) -> Self {
+            let mut p = std::env::temp_dir();
+            p.push(format!("myshell-dbt-{}-{}", tag, rand::random::<u64>()));
+            TempDb(p)
+        }
+    }
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // The three pragmas added in阶段 138 were asserted from documentation, not
+    // observed. These tests are what actually proves they take effect.
+
+    #[test]
+    fn pragmas_are_actually_applied() {
+        let tmp = TempDb::new("pragmas");
+        let conn = init_db_at(&tmp.0).expect("init");
+
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .expect("journal_mode");
+        assert_eq!(
+            journal.to_lowercase(),
+            "wal",
+            "WAL not enabled — GUI/CLI/MCP readers will still block each other"
+        );
+
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .expect("foreign_keys");
+        assert_eq!(fk, 1, "foreign_keys OFF: declared cascades do nothing");
+
+        // `PRAGMA busy_timeout` echoes the value back, in milliseconds.
+        let busy: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .expect("busy_timeout pragma");
+        assert!(
+            busy >= 1000,
+            "busy_timeout too low ({}ms): a concurrent writer still surfaces \
+             'database is locked' immediately",
+            busy
+        );
+    }
+
+    #[test]
+    fn foreign_key_cascade_actually_fires() {
+        let tmp = TempDb::new("fk");
+        let conn = init_db_at(&tmp.0).expect("init");
+        conn.execute(
+            "INSERT INTO ai_models (id, name, provider, model_id, created_at)
+             VALUES (1, 'p', 'openai', 'gpt', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ai_supplier_models (supplier_id, model_id, label)
+             VALUES (1, 'gpt-4', 'gpt-4')",
+            [],
+        )
+        .unwrap();
+
+        // Without PRAGMA foreign_keys=ON this is a no-op and the child row is
+        // orphaned forever — which is exactly what the audit found.
+        conn.execute("DELETE FROM ai_models WHERE id = 1", []).unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ai_supplier_models WHERE supplier_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "ON DELETE CASCADE did not fire");
+    }
+
+    #[test]
+    fn hard_delete_also_removes_command_history() {
+        let tmp = TempDb::new("hist");
+        let conn = init_db_at(&tmp.0).expect("init");
+        conn.execute(
+            "INSERT INTO connections (id, name, auth_method, created_at)
+             VALUES ('c1', 'n', 'password', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO command_history (connection_id, command, created_at)
+             VALUES ('c1', 'whoami', 'now')",
+            [],
+        )
+        .unwrap();
+
+        hard_delete_connection(&conn, "c1").unwrap();
+
+        let hist: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM command_history WHERE connection_id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hist, 0, "encrypted command history survived a hard delete");
+    }
+
+    #[test]
+    fn out_of_range_port_is_an_error_not_port_zero() {
+        let tmp = TempDb::new("port");
+        let conn = init_db_at(&tmp.0).expect("init");
+        // Bypass save_connection's typing by writing the column directly —
+        // this is the corrupt-row case the conversion now has to reject.
+        conn.execute(
+            "INSERT INTO connections (id, name, auth_method, port, created_at)
+             VALUES ('c1', 'n', 'password', 99999, 'now')",
+            [],
+        )
+        .unwrap();
+
+        let key = [7u8; 32];
+        let res = get_connection(&conn, &key, "c1");
+        assert!(
+            res.is_err(),
+            "out-of-range port silently became 0 → a confusing connection error"
+        );
     }
 }

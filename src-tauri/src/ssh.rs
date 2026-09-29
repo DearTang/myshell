@@ -22,6 +22,96 @@ enum DiskJob {
     /// Flush and release the file handle.
     Close,
 }
+
+/// Hard ceiling on bytes handed to the disk task but not yet written.
+///
+/// The channel is unbounded, so a fast link feeding a slow disk (network
+/// share, USB stick, spinning rust) used to grow the queue without limit —
+/// tens of MB per second, never draining, until the process died. Exceeding
+/// the ceiling is reported as a failed transfer, which is far better than an
+/// OOM, and is orders of magnitude above any legitimate in-flight backlog.
+const DISK_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// The reader's handle to the background disk task: the job queue plus the two
+/// pieces of shared state the task writes back.
+#[derive(Clone)]
+struct DiskSink {
+    tx: tokio::sync::mpsc::UnboundedSender<DiskJob>,
+    /// The FIRST disk failure (write / flush / queue overflow).
+    ///
+    /// The receiver's ACK/ZRPOS path is driven by its own byte counter and is
+    /// completely independent of the disk, so a write failure used to be a bare
+    /// `log::warn!` while `sz` kept receiving acknowledgements for data that
+    /// never reached the platter. The session then finished "successfully" and
+    /// `zmodem_file_complete` reported the counter — not the file — so a
+    /// truncated (ENOSPC, yanked USB, permission change) file looked perfect.
+    err: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Bytes queued but not yet written, for the ceiling above.
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl DiskSink {
+    fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<DiskJob>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DiskJob>();
+        (
+            DiskSink {
+                tx,
+                err: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                queued: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+            rx,
+        )
+    }
+
+    /// Queue a job, accounting for Write payloads against the ceiling.
+    /// Returns false once the transfer has been marked failed — callers stop
+    /// feeding the queue.
+    fn send(&self, job: DiskJob) -> bool {
+        use std::sync::atomic::Ordering;
+        if let DiskJob::Write(ref buf) = job {
+            let now = self.queued.fetch_add(buf.len(), Ordering::AcqRel) + buf.len();
+            if now > DISK_QUEUE_MAX_BYTES {
+                self.queued.fetch_sub(buf.len(), Ordering::AcqRel);
+                self.fail(format!(
+                    "写入队列积压超过 {} MB（磁盘写入速度跟不上网络），已中止传输以避免内存耗尽",
+                    DISK_QUEUE_MAX_BYTES / (1024 * 1024)
+                ));
+                return false;
+            }
+        }
+        if self.tx.send(job).is_err() {
+            return false;
+        }
+        true
+    }
+
+    /// Record the first failure only — later ones are usually consequences.
+    fn fail(&self, msg: String) {
+        log::warn!("[zmodem] disk sink: {}", msg);
+        if let Ok(mut slot) = self.err.lock() {
+            if slot.is_none() {
+                *slot = Some(msg);
+            }
+        }
+    }
+
+    fn failed(&self) -> Option<String> {
+        self.err.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Called by the disk task once a Write payload has actually landed.
+    fn written(&self, n: usize) {
+        use std::sync::atomic::Ordering;
+        self.queued.fetch_sub(n, Ordering::AcqRel);
+    }
+
+    /// Clear a failure before a new file starts.
+    fn reset(&self) {
+        if let Ok(mut slot) = self.err.lock() {
+            *slot = None;
+        }
+    }
+}
 use russh::client::{self, Handle, Msg};
 use russh::{Channel, ChannelMsg, Disconnect};
 use std::net::SocketAddr;
@@ -278,19 +368,10 @@ fn strip_zmodem_autostart_noise(buf: &mut Vec<u8>) {
 }
 
 /// Best-effort direction hint derived from the first frame's type byte.
-/// Both rz and sz open with ZRINIT, so this is unreliable on the first frame —
-/// the frontend's zmodem.js will figure out the real role from the full
-/// handshake. We send "auto" by default and only commit to a direction when
-/// the leading frame is unambiguous (ZFILE → download).
-fn detect_direction(tail: &[u8]) -> &'static str {
-    for &b in tail.iter().take(32) {
-        match b {
-            0x04 | 0x02 => return "download", // ZFILE / ZSINIT — sender (sz) talking
-            _ => continue,
-        }
-    }
-    "auto"
-}
+// `detect_direction` was removed: it had no call site. The direction is decided
+// by the receiver's own handshake (`rx.take_passthrough()` /
+// `rx.take_start_signal()`), and the ZMODEM start payload always carries an
+// explicit direction. The old doc comment described a probe that no longer ran.
 
 /// Detect end-of-ZMODEM signals: a burst of 5+ CAN bytes (lrzsz abort).
 ///
@@ -890,14 +971,13 @@ async fn channel_reader(
     // straight to channel.data() with zero IPC. Bundled in TxSession to keep
     // the handle_incoming_data signature manageable.
     let mut tx_state = TxSession::new();
-    // Channel carrying write jobs to the background disk task.
-    // Each job is either a new file handle (FileOpen) or a data buffer (Write).
-    let (disk_tx, mut disk_rx): (
-        tokio::sync::mpsc::UnboundedSender<DiskJob>,
-        tokio::sync::mpsc::UnboundedReceiver<DiskJob>,
-    ) = mpsc::unbounded_channel();
+    // Queue for the background ZMODEM disk task. `DiskSink` owns the sender
+    // plus the shared first-error slot and the in-flight byte count; the
+    // receiver stays with the task.
+    let (diskq, mut disk_rx) = DiskSink::new();
     let disk_sink = Arc::clone(&sink);
-    let disk_sid = session_id.clone();
+    let disk_errs = diskq.clone();
+    let disk_queue = diskq.clone();
     tokio::spawn(async move {
         use std::io::Write;
         let mut file: Option<std::fs::File> = None;
@@ -907,24 +987,33 @@ async fn channel_reader(
                     file = Some(f);
                 }
                 DiskJob::Write(buf) => {
+                    let n = buf.len();
                     if let Some(ref mut f) = file {
-                        // This runs on its OWN task, not the reader loop, so a
-                        // blocking write only stalls THIS task — the reader
-                        // keeps draining russh's queue and emitting
-                        // WINDOW_ADJUST at line rate.
+                        // A failure here is NOT recoverable for this file and must
+                        // not be swallowed: the receiver keeps ACKing on its own
+                        // byte counter, so the session would otherwise complete
+                        // "successfully" over a truncated file. Record it and let
+                        // the reader abort.
                         if let Err(e) = f.write_all(&buf) {
-                            log::warn!("[ssh:{}] disk write failed: {}", disk_sid, e);
+                            disk_errs.fail(format!("写入文件失败（磁盘满 / 权限变更 / 设备拔出?）: {}", e));
                         }
+                    } else {
+                        disk_errs.fail("收到写入数据但没有打开的文件".to_string());
                     }
+                    disk_queue.written(n);
                 }
                 DiskJob::Flush => {
                     if let Some(ref mut f) = file {
-                        let _ = f.flush();
+                        if let Err(e) = f.flush() {
+                            disk_errs.fail(format!("落盘失败（磁盘空间不足?）: {}", e));
+                        }
                     }
                 }
                 DiskJob::Close => {
                     if let Some(ref mut f) = file {
-                        let _ = f.flush();
+                        if let Err(e) = f.flush() {
+                            disk_errs.fail(format!("落盘失败（磁盘空间不足?）: {}", e));
+                        }
                     }
                     file = None;
                 }
@@ -1000,7 +1089,7 @@ async fn channel_reader(
                     let cleanup: &[u8] = b"\x08\x08\x08\x08\x08\x08\x08\x08";
                     send_data(&data_tx, cleanup).await;
                     // Close the disk task so any pending file is flushed.
-                    let _ = disk_tx.send(DiskJob::Close);
+                    let _ = diskq.send(DiskJob::Close);
                     // Immediately switch to Normal + suppress post-abort noise
                     // (CAN bursts, error text, ZFERR, OO) for 500 ms.
                     mode = TermMode::Normal;
@@ -1020,7 +1109,7 @@ async fn channel_reader(
                         suppress_until = Some(Instant::now() + Duration::from_millis(500));
                         sink.emit("zmodem_end", &session_id);
                     }
-                    let _ = disk_tx.send(DiskJob::Close);
+                    let _ = diskq.send(DiskJob::Close);
                     zmodem_rx = None;
                     tx_state.sender = None;
                     tx_state.file = None;
@@ -1032,19 +1121,19 @@ async fn channel_reader(
                         let (actions, file) = rx.accept_offer(&path);
                         // Hand the file handle to the background disk task.
                         if let Some(f) = file {
-                            let _ = disk_tx.send(DiskJob::Open(f));
+                            let _ = diskq.send(DiskJob::Open(f));
                         }
-                        let (send, ended, disk) =
-                            dispatch_rx_actions(&*sink, &session_id, actions, &mut rx_last_progress);
-                        if disk.flush {
-                            let _ = disk_tx.send(DiskJob::Flush);
+                        let (send, ended, disk_sig) =
+                            dispatch_rx_actions(&*sink, &session_id, actions, &mut rx_last_progress, &diskq);
+                        if disk_sig.flush {
+                            let _ = diskq.send(DiskJob::Flush);
                         }
                         if !send.is_empty() {
                             send_data(&data_tx, &send[..]).await;
                         }
                         if ended {
-                            if disk.close {
-                                let _ = disk_tx.send(DiskJob::Close);
+                            if disk_sig.close {
+                                let _ = diskq.send(DiskJob::Close);
                             }
                             mode = TermMode::Normal;
                             suppress_until = Some(Instant::now() + Duration::from_millis(500));
@@ -1067,7 +1156,6 @@ async fn channel_reader(
                     if paths.is_empty() {
                         log::warn!("[ssh:{}] zmodem_start_upload with empty paths", session_id);
                     } else {
-                        tx_state.native = true;
                         let (mut files, walk_errors) = collect_upload_files(&paths);
                         for e in &walk_errors {
                             log::warn!("[ssh:{}] upload expansion: {}", session_id, e);
@@ -1175,7 +1263,7 @@ async fn channel_reader(
                     if !data.is_empty() {
                         let to_send = handle_incoming_data(
                             &*sink, &session_id, data, &mut buffer, &mut last_flush,
-                            &mut mode, &mut suppress_until, &mut zmodem_rx, &disk_tx,
+                            &mut mode, &mut suppress_until, &mut zmodem_rx, &diskq,
                             &mut tx_state, &upload_aborted, &mut rx_last_progress,
                         );
                         // Drain decoded payload from the receiver to the
@@ -1184,7 +1272,7 @@ async fn channel_reader(
                         if let Some(ref mut rx) = zmodem_rx {
                             let pending = rx.take_pending_write();
                             if !pending.is_empty() {
-                                let _ = disk_tx.send(DiskJob::Write(pending));
+                                let _ = diskq.send(DiskJob::Write(pending));
                             }
                         }
                         // Native receiver protocol responses (ZRINIT/ZRPOS/ZACK/
@@ -1497,7 +1585,7 @@ async fn channel_reader(
                             "sessionId": session_id,
                             "message": "ZMODEM 接收超时：远端 30 秒没有任何数据，会话已结束"
                         }));
-                        let _ = disk_tx.send(DiskJob::Close);
+                        let _ = diskq.send(DiskJob::Close);
                         mode = TermMode::Normal;
                         suppress_until = Some(Instant::now() + Duration::from_millis(500));
                         zmodem_rx = None;
@@ -1540,7 +1628,7 @@ async fn channel_reader(
                             "sessionId": session_id,
                             "message": "远端 sz 未发送文件即退出（常见原因：无读取权限），已退出 ZMODEM 模式"
                         }));
-                        let _ = disk_tx.send(DiskJob::Close);
+                        let _ = diskq.send(DiskJob::Close);
                         mode = TermMode::Normal;
                         suppress_until = Some(Instant::now() + Duration::from_millis(500));
                         zmodem_rx = None;
@@ -1584,8 +1672,6 @@ struct TxSession {
     queue: std::collections::VecDeque<UploadFile>,
     /// rz bytes received before the sender was created (buffered ZRINIT etc.).
     pending: Vec<u8>,
-    /// True once the frontend has committed to the native upload path.
-    native: bool,
     /// When the sender entered WaitingZrinit2 (post-ZEOF). Used by the
     /// reader to force a ZFIN timeout when rz fails to acknowledge (e.g.
     /// its PTY went into an error state and is streaming garbage instead
@@ -1605,7 +1691,6 @@ impl TxSession {
             file: None,
             queue: std::collections::VecDeque::new(),
             pending: Vec::new(),
-            native: false,
             waiting_zrinit2_since: None,
             last_progress_emit: None,
         }
@@ -1629,7 +1714,7 @@ fn handle_incoming_data(
     mode: &mut TermMode,
     suppress_until: &mut Option<Instant>,
     zmodem_rx: &mut Option<ZmodemReceiver>,
-    disk_tx: &tokio::sync::mpsc::UnboundedSender<DiskJob>,
+    disk: &DiskSink,
     tx_state: &mut TxSession,
     upload_aborted: &std::sync::atomic::AtomicBool,
     rx_last_progress: &mut Option<Instant>,
@@ -1695,20 +1780,20 @@ fn handle_incoming_data(
                         },
                     );
                 }
-                let (send, ended, disk) =
-                    dispatch_rx_actions(sink, session_id, actions, rx_last_progress);
-                if disk.flush || disk.close {
+                let (send, ended, disk_sig) =
+                    dispatch_rx_actions(sink, session_id, actions, rx_last_progress, disk);
+                if disk_sig.flush || disk_sig.close {
                     let pending = rx.take_pending_write();
                     if !pending.is_empty() {
-                        let _ = disk_tx.send(DiskJob::Write(pending));
+                        let _ = disk.send(DiskJob::Write(pending));
                     }
                 }
-                if disk.flush {
-                    let _ = disk_tx.send(DiskJob::Flush);
+                if disk_sig.flush {
+                    let _ = disk.send(DiskJob::Flush);
                 }
                 if ended {
-                    if disk.close {
-                        let _ = disk_tx.send(DiskJob::Close);
+                    if disk_sig.close {
+                        let _ = disk.send(DiskJob::Close);
                     }
                     *mode = TermMode::Normal;
                     *suppress_until = Some(Instant::now() + Duration::from_millis(500));
@@ -1734,25 +1819,25 @@ fn handle_incoming_data(
                         },
                     );
                 }
-                let (send, ended, disk) =
-                    dispatch_rx_actions(sink, session_id, actions, rx_last_progress);
+                let (send, ended, disk_sig) =
+                    dispatch_rx_actions(sink, session_id, actions, rx_last_progress, disk);
                 // CRITICAL: drain any pending decoded payload BEFORE sending
-                // Flush/Close. ZEOF triggers disk.flush, but the last
+                // Flush/Close. ZEOF triggers disk_sig.flush, but the last
                 // subpacket's bytes are still in pending_write — if we flush
                 // before draining, the file is truncated and the transfer
                 // hangs because sz never sees its ZEOF acknowledged correctly.
-                if disk.flush || disk.close {
+                if disk_sig.flush || disk_sig.close {
                     let pending = rx.take_pending_write();
                     if !pending.is_empty() {
-                        let _ = disk_tx.send(DiskJob::Write(pending));
+                        let _ = disk.send(DiskJob::Write(pending));
                     }
                 }
-                if disk.flush {
-                    let _ = disk_tx.send(DiskJob::Flush);
+                if disk_sig.flush {
+                    let _ = disk.send(DiskJob::Flush);
                 }
                 if ended {
-                    if disk.close {
-                        let _ = disk_tx.send(DiskJob::Close);
+                    if disk_sig.close {
+                        let _ = disk.send(DiskJob::Close);
                     }
                     *mode = TermMode::Normal;
                     *suppress_until = Some(Instant::now() + Duration::from_millis(500));
@@ -2126,6 +2211,7 @@ fn dispatch_rx_actions(
     session_id: &str,
     actions: RxActions,
     last_progress_emit: &mut Option<Instant>,
+    disk_sink: &DiskSink,
 ) -> (Vec<u8>, bool, DiskSignal) {
     let mut ended = false;
     let mut disk = DiskSignal::default();
@@ -2171,14 +2257,30 @@ fn dispatch_rx_actions(
                 // The file is done — flush the disk task so data lands before
                 // we move to the next file or session end.
                 disk.flush = true;
-                sink.emit_raw(
-                    "zmodem_file_complete",
-                    serde_json::json!({
-                        "sessionId": session_id,
-                        "fileName": name,
-                        "bytesWritten": written,
-                    }),
-                );
+                // Did the bytes actually REACH the disk? The receiver's counter
+                // is independent of the file, so a completed transfer over a
+                // failed write used to be announced as a success with a
+                // truncated file on disk. Report the disk error instead.
+                if let Some(e) = disk_sink.failed() {
+                    disk_sink.reset();
+                    log::warn!("[ssh:{}] zmodem file {} 落盘失败: {}", session_id, name, e);
+                    sink.emit_raw(
+                        "zmodem_error",
+                        serde_json::json!({
+                            "sessionId": session_id,
+                            "message": format!("文件 {} 传输失败：{}（文件可能不完整）", name, e),
+                        }),
+                    );
+                } else {
+                    sink.emit_raw(
+                        "zmodem_file_complete",
+                        serde_json::json!({
+                            "sessionId": session_id,
+                            "fileName": name,
+                            "bytesWritten": written,
+                        }),
+                    );
+                }
             }
             RxEvent::SessionEnd => {
                 disk.close = true;

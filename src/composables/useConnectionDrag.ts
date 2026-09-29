@@ -59,6 +59,12 @@ export function useConnectionDrag({ onMoved, onMoveError }: UseConnectionDragOpt
   let active = false;
   // Guards a move already in flight so a rapid second drop can't double-fire.
   let isMoving = false;
+  // Hoisted so `onUnmounted` can reach the Phase-B teardown. The listeners it
+  // installs live in closures only reachable from inside `activate()`'s body,
+  // so without this the component could not remove them — and an orphaned
+  // `onUpB` would keep firing `moveConnection` on the next pointerup anywhere
+  // in the window, long after the drag UI and the component were gone.
+  let detachB: (() => void) | null = null;
 
   function beginDrag(conn: ConnectionConfig, e: PointerEvent): void {
     // Only primary button; ignore right/middle/synthetic.
@@ -167,7 +173,7 @@ export function useConnectionDrag({ onMoved, onMoveError }: UseConnectionDragOpt
         }
       };
 
-      const detachB = (): void => {
+      const detachActive = (): void => {
         document.removeEventListener("pointermove", onMoveB);
         document.removeEventListener("pointerup", onUpB);
         document.removeEventListener("pointercancel", onCancelB);
@@ -177,17 +183,18 @@ export function useConnectionDrag({ onMoved, onMoveError }: UseConnectionDragOpt
         document.body.style.userSelect = prevUserSelect;
         dragState.value = null;
         active = false;
+        detachB = null;
       };
 
-      const onCancelB = (): void => detachB();
-      const onBlurB = (): void => detachB();
+      const onCancelB = (): void => detachActive();
+      const onBlurB = (): void => detachActive();
       const onKeyB = (ke: KeyboardEvent): void => {
-        if (ke.key === "Escape") detachB();
+        if (ke.key === "Escape") detachActive();
       };
 
       const onUpB = async (ev: PointerEvent): Promise<void> => {
         const targetPath = hitTestFolderPath(ev);
-        detachB();
+        detachActive();
         // Empty area or the connection's own current folder → no-op.
         if (!targetPath || targetPath === connGroupPath) return;
         isMoving = true;
@@ -206,6 +213,8 @@ export function useConnectionDrag({ onMoved, onMoveError }: UseConnectionDragOpt
       document.addEventListener("pointercancel", onCancelB);
       document.addEventListener("keydown", onKeyB);
       window.addEventListener("blur", onBlurB);
+      // Publish the teardown so `onUnmounted` can run it.
+      detachB = detachActive;
     };
 
     el.addEventListener("pointermove", onMoveA);
@@ -217,11 +226,15 @@ export function useConnectionDrag({ onMoved, onMoveError }: UseConnectionDragOpt
     timerId = window.setTimeout(activate, LONG_PRESS_MS);
   }
 
-  // Safety net: if the component unmounts mid-drag (e.g. tree reload swapped
-  // the ConnRow), the document listeners leak. We can't easily reach the
-  // closures from here, so this only clears the state; the body style
-  // is restored by the next pointerup/cancel in practice. Acceptable for v1.
+  // Unmounting mid-drag (e.g. the tree reload swapped the ConnRow) must tear
+  // the Phase-B listeners down. The old comment admitted they leaked "acceptable
+  // for v1" — but the consequence was worse than a style leak: the orphaned
+  // `onUpB` stayed bound to `document` and would still call `moveConnection`
+  // on the next pointerup anywhere in the window, and `onMoveB` kept running
+  // `elementFromPoint` on every pointermove, with `document.body` left in its
+  // drag styling.
   onUnmounted(() => {
+    detachB?.();
     dragState.value = null;
     active = false;
     isMoving = false;

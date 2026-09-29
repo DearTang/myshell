@@ -74,6 +74,12 @@ const FIELD_FOCUS_ORDER = [
   "shellPath",
   "proxyHost",
   "proxyPort",
+  // `validate()` can flag these two (range checks), but they were missing here
+  // — so a Save that failed ONLY on them shook the fields red and then focused
+  // nothing, contradicting this file's own header promise to "drop the cursor
+  // into the first empty required field".
+  "connectTimeout",
+  "keepaliveInterval",
 ] as const;
 
 const initialType: ConnType = props.config?.conn_type ?? props.initialConnType ?? "ssh";
@@ -85,9 +91,14 @@ const port = ref(String(props.config?.port || (initialType === "ftp" ? 21 : 22))
 const username = ref(props.config?.username || "");
 const authMethod = ref(props.config?.auth_method || "password");
 const password = ref(props.config?.password || "");
-const privateKeyPem = ref<string | undefined>(props.config?.private_key_pem);
+// 私钥永远不会从后端回到这里（Rust 侧 skip_serializing）——打开编辑时一律为空，
+// 「已存储」状态由 has_private_key 这个布尔量表达。
+const privateKeyPem = ref<string | undefined>(undefined);
 const privateKeyName = ref<string | undefined>(undefined);
-const hadExistingKey = ref(!!props.config?.private_key_pem);
+const hadExistingKey = ref(!!props.config?.has_private_key);
+// ✕ 对「已存储的私钥」是显式删除请求——因为省略 private_key_pem 现在表示
+// 「保持不变」而不是「删除」，删除必须是一个单独的、用户主动做出的信号。
+const clearPrivateKey = ref(false);
 const groupPath = ref(
   props.config?.group_path
     ? (props.config.group_path || "/").slice(1)
@@ -143,7 +154,6 @@ function focusField(key: string): void {
 // validation failure so the shake animation replays even if the same field
 // was already in the error set.
 const fieldErrors = ref<Record<string, boolean>>({});
-const shakeNonce = ref(0);
 
 /** Mark a field as valid again as soon as the user touches/edits it. */
 function clearFieldError(key: string): void {
@@ -152,9 +162,9 @@ function clearFieldError(key: string): void {
   }
 }
 
-// Replay the shake whenever a new validation failure (shakeNonce bump) lands
-// on a flagged field. Removing + re-adding the class (with a forced reflow)
-// restarts the CSS animation without remounting (which would lose focus).
+// Replay the shake whenever a new validation failure lands on a flagged field.
+// Removing + re-adding the class (with a forced reflow) restarts the CSS
+// animation without remounting (which would lose focus).
 function replayShake(key: string): void {
   const wrap = fieldRefs[key];
   if (!wrap) return;
@@ -320,6 +330,7 @@ function buildConfig(): ConnectionConfig | null {
     auth_method: authMethod.value,
     password: passwordToSend,
     private_key_pem: authMethod.value === "key" ? privateKeyPem.value : undefined,
+    clear_private_key: clearPrivateKey.value,
     conn_type: connType.value,
     group_path: group,
     ftp_tls: connType.value === "ftp" ? ftpTls.value : "none",
@@ -355,7 +366,6 @@ function showValidationErrors(): boolean {
   const next: Record<string, boolean> = {};
   for (const k of Object.keys(errs)) next[k] = true;
   fieldErrors.value = next;
-  shakeNonce.value += 1;
   for (const k of Object.keys(next)) replayShake(k);
   const firstKey = FIELD_FOCUS_ORDER.find((k) => next[k]);
   if (firstKey) focusField(firstKey);
@@ -432,7 +442,9 @@ function closePasswordVerify(): void {
 const keyBusy = ref(false);
 const keyErr = ref<string | null>(null);
 const hasNewKey = computed(() => !!privateKeyPem.value);
-const hasExistingKey = computed(() => !hasNewKey.value && hadExistingKey.value);
+const hasExistingKey = computed(
+  () => !hasNewKey.value && hadExistingKey.value && !clearPrivateKey.value,
+);
 
 async function pickKeyFile(): Promise<void> {
   keyErr.value = null;
@@ -452,6 +464,7 @@ async function pickKeyFile(): Promise<void> {
     privateKeyPem.value = content;
     privateKeyName.value = keyName;
     hadExistingKey.value = false;
+    clearPrivateKey.value = false; // 新导入的密钥取代「删除」意图
   } catch (e) {
     keyErr.value = String(e);
   } finally {
@@ -462,7 +475,11 @@ async function pickKeyFile(): Promise<void> {
 function clearKey(): void {
   privateKeyPem.value = undefined;
   privateKeyName.value = undefined;
+  // 只是丢弃本次刚导入的文件 → 不动已存储的私钥；
+  // 清的是已存储的私钥 → 标记显式删除。
+  if (!hadExistingKey.value) return;
   hadExistingKey.value = false;
+  clearPrivateKey.value = true;
 }
 
 // ── 派生值与下拉选项 ──
@@ -792,7 +809,9 @@ function onKeepaliveInput(v: string): void {
                     ? `✓ 已导入：${privateKeyName}`
                     : hasExistingKey
                       ? "✓ 已加密存储"
-                      : "未选择"
+                      : clearPrivateKey
+                        ? "⚠ 保存后将删除已存储的私钥"
+                        : "未选择"
                 }}
               </span>
             </div>

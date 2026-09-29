@@ -93,13 +93,26 @@ impl Default for CommandRules {
     }
 }
 
-/// Compile all regexes; invalid ones are silently dropped (a broken user regex
-/// shouldn't crash the MCP server). Case-insensitive.
+/// Compile all regexes; invalid ones are dropped so a broken user regex can't
+/// crash the MCP server — but each one is LOGGED. They used to vanish without
+/// a trace, which is fail-open for a safety control: a user who mistyped a
+/// blacklist entry (a stray `*`, an unbalanced paren) got a silently weaker
+/// rule set, the Settings panel still showed the pattern as active, and the
+/// command it was meant to guard then ran with no confirmation.
 fn compile_all(patterns: &[String]) -> Vec<Regex> {
-    patterns
-        .iter()
-        .filter_map(|p| Regex::new(&format!("(?i){}", p)).ok())
-        .collect()
+    let mut compiled = Vec::with_capacity(patterns.len());
+    for (i, p) in patterns.iter().enumerate() {
+        match Regex::new(&format!("(?i){}", p)) {
+            Ok(re) => compiled.push(re),
+            Err(e) => log::warn!(
+                "[command_rules] 第 {} 条规则正则无效，已忽略（该命令将不会被这条规则拦截）: {} — {}",
+                i + 1,
+                p,
+                e
+            ),
+        }
+    }
+    compiled
 }
 
 /// Decide whether `command` requires human confirmation under `rules`.
@@ -142,13 +155,15 @@ pub fn command_needs_confirmation(command: &str, rules: &CommandRules) -> bool {
             continue;
         }
         any_segment = true;
-        // Blacklist matches the raw segment AND the wrapper-stripped view:
-        // `nohup rm -rf /` keeps `rm` away from command position, the
-        // stripped view puts it back. Non-wrapper segments return unchanged
-        // from wrapper_stripped_view, so this is a no-op for them.
+        // Blacklist matches the raw segment, the wrapper-stripped view, AND the
+        // command-position view. The last one is what closes the quoting /
+        // grouping / control-keyword bypass: `'rm' -rf /x` and `( rm -rf /x )`
+        // both put `rm` at a position no raw-text regex could see.
         let stripped = wrapper_stripped_view(seg);
+        let positioned = command_position_view(seg);
         if blacklist_re.iter().any(|re| re.is_match(seg))
             || (stripped != seg && blacklist_re.iter().any(|re| re.is_match(stripped)))
+            || (positioned != seg && blacklist_re.iter().any(|re| re.is_match(&positioned)))
         {
             return true;
         }
@@ -282,10 +297,171 @@ fn wrapper_stripped_view(seg: &str) -> &str {
     }
 }
 
+/// Tokens that occupy the command position without being the command:
+/// shell grouping and control-structure keywords. A dangerous command sitting
+/// behind one of these was previously invisible to the blacklist.
+const CONTROL_TOKENS: &[&str] = &[
+    "(", ")", "{", "}", "((", "))", "{;", ";}", "{{", "}}", "do", "then", "else", "elif", "if", "while",
+    "until", "!",
+];
+
+/// Byte spans of whitespace-separated tokens, honoring quotes and backslash
+/// escapes so `'a b'` stays one token.
+fn token_spans(seg: &str) -> Vec<(usize, usize)> {
+    let b = seg.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut quote: Option<u8> = None;
+        while i < b.len() {
+            let c = b[i];
+            match quote {
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    } else if c == b'\\' && q == b'"' {
+                        i += 1;
+                    }
+                }
+                None => {
+                    if c == b'\'' || c == b'"' {
+                        quote = Some(c);
+                    } else if c == b'\\' {
+                        i += 1;
+                    } else if c.is_ascii_whitespace() {
+                        break;
+                    }
+                }
+            }
+            i += 1;
+        }
+        spans.push((start, i.min(b.len())));
+    }
+    spans
+}
+
+/// Strip shell quoting from one token so `'rm'`, `"rm"` and `r''m` all become
+/// `rm`. Operates on chars (not bytes) so non-ASCII tokens survive intact.
+fn unquote(tok: &str) -> String {
+    let mut out = String::with_capacity(tok.len());
+    let mut it = tok.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = it.next() {
+                    out.push(n);
+                }
+            }
+            '\'' | '"' => {
+                let q = c;
+                while let Some(&n) = it.peek() {
+                    it.next();
+                    if n == q {
+                        break;
+                    }
+                    if n == '\\' && q == '"' {
+                        if let Some(&esc) = it.peek() {
+                            it.next();
+                            out.push(esc);
+                        }
+                    } else {
+                        out.push(n);
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Grouping punctuation welded onto a command token: `(rm`, `rm)`, `{rm}`.
+/// Stripped from the ends so `( rm )`, `(rm)` and `{ rm; }` all put the real
+/// command name at command position. A subshell `$(...)` is already caught by
+/// the command-substitution floor before any of this runs.
+fn strip_grouping(tok: &str) -> &str {
+    tok.trim_start_matches(['(', '{', ')', '}'])
+        .trim_end_matches([')', '}'])
+}
+
+/// Rewrite a segment into the form the command-position-anchored blacklist
+/// patterns expect.
+///
+/// The rules match `(^|[;&|]\s*)rm\b` against raw text, but a shell happily
+/// accepts a command name that is quoted (`'rm' -rf /x`), sits inside a group
+/// (`( rm -rf /x )`), follows a control keyword (`do rm -rf "$f"`), or is
+/// written through a path (`/bin/rm`). Every one of those slipped past the
+/// ENTIRE ruleset — a single quote character was enough to defeat it, which is
+/// exactly the shape of a prompt-injected command.
+///
+/// This walks to the real command token (skipping control tokens and neutral
+/// wrappers plus their argument zone), unquotes it, drops any leading
+/// directory, and rebuilds the segment with that token at command position.
+/// **Only the head token is rewritten** — arguments stay byte-identical, so
+/// `git commit -m "fix; rm"` does not gain a fake `;` boundary and match.
+///
+/// `( rm -rf /x )` → `rm -rf /x )` · `'rm' -rf /x` → `rm -rf /x` ·
+/// `/bin/rm -rf /x` → `rm -rf /x` · `echo rm` and `git commit -m "fix; rm"`
+/// → unchanged.
+fn command_position_view(seg: &str) -> String {
+    let s = seg.trim_start();
+    for (start, end) in token_spans(s) {
+        let unq = unquote(&s[start..end]);
+        // basename first, then grouping punctuation: `(rm`, `rm)` and
+        // `/bin/rm)` all have to reduce to the bare command name.
+        let mut base = unq.rsplit('/').next().unwrap_or(&unq);
+        base = strip_grouping(base);
+        base = base.trim_start_matches(['(', '{', ')', '}']);
+        if base.is_empty() {
+            continue;
+        }
+        if CONTROL_TOKENS.contains(&base) {
+            continue;
+        }
+        // Still inside a wrapper's argument zone (further wrapper names, flags,
+        // VAR=v assignments, bare numbers/durations) — keep walking.
+        if is_wrapper_zone_token(base) {
+            continue;
+        }
+        let rest = s[end..].trim_start();
+        return if rest.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base} {rest}")
+        };
+    }
+    s.to_string()
+}
+
 /// Detect command substitution: `$(...)` or backticks → arbitrary nested
 /// execution, always confirm.
 fn has_command_substitution(cmd: &str) -> bool {
     cmd.contains("$(") || cmd.contains('`')
+}
+
+/// `>&N` / `>&-` (and the `2>&1` form, where the scanner hands us `&1`) is
+/// descriptor duplication, not a write. Returns the descriptor target when the
+/// text after `&` really is one.
+///
+/// zsh's MULTIOS is on by default and reads `>&file` as `&>file`, so the old
+/// "starts with `&` is therefore safe" test let `echo x >&/etc/crontab`
+/// through unconfirmed while truncating crontab. Only a bare fd number (or
+/// `-`) is exempt.
+fn fd_dup_target(rest: &str) -> Option<&str> {
+    let t = rest.strip_prefix('&')?;
+    let t = t.trim_start_matches('>').trim_start();
+    if t == "-" {
+        return Some(t);
+    }
+    if !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit()) {
+        return Some(t);
+    }
+    None
 }
 
 /// Detect a write-redirect to a real file (`> file` / `>> file`).
@@ -303,7 +479,7 @@ fn has_write_redirect(cmd: &str) -> bool {
                 j += 1;
             }
             let rest = &cmd[j..];
-            let safe = rest.starts_with("/dev/null") || rest.starts_with('&');
+            let safe = rest.starts_with("/dev/null") || fd_dup_target(rest).is_some();
             if !safe {
                 return true;
             }
@@ -1193,5 +1369,131 @@ mod tests {
         assert!(command_needs_confirmation("helm uninstall prod", &r()));
         assert!(command_needs_confirmation("aws s3 rm s3://bucket --recursive", &r()));
         assert!(command_needs_confirmation("gcloud compute instances delete x", &r()));
+    }
+
+    // ── The command-position bypass: quoting / grouping / control keywords ──
+    //
+    // Every blacklist pattern anchors at command position and was matched
+    // against the RAW segment. A shell accepts a command name that is quoted,
+    // grouped, or preceded by a control keyword, so a single quote character
+    // used to defeat the ENTIRE ruleset — precisely the shape of a
+    // prompt-injected command. `command_position_view` closes that.
+
+    #[test]
+    fn quoted_command_name_confirms() {
+        assert!(command_needs_confirmation("'rm' -rf /var/lib/postgresql", &r()));
+        assert!(command_needs_confirmation("\"rm\" -rf /var/lib/postgresql", &r()));
+        // quote concatenation produces the same token as the shell sees it
+        assert!(command_needs_confirmation("r''m -rf /var/lib/postgresql", &r()));
+        assert!(command_needs_confirmation("'systemctl' stop nginx", &r()));
+        assert!(command_needs_confirmation("'dd' if=/dev/zero of=/dev/sda", &r()));
+        assert!(command_needs_confirmation("'shred' -u secrets.txt", &r()));
+    }
+
+    #[test]
+    fn grouped_command_confirms() {
+        assert!(command_needs_confirmation("( rm -rf /var/data )", &r()));
+        assert!(command_needs_confirmation("(rm -rf /var/data)", &r()));
+        assert!(command_needs_confirmation("{ rm -rf /x; }", &r()));
+        assert!(command_needs_confirmation("( dd if=/dev/zero of=/dev/sda )", &r()));
+    }
+
+    #[test]
+    fn control_keyword_command_confirms() {
+        assert!(command_needs_confirmation("for f in /data/*; do rm -rf \"$f\"; done", &r()));
+        assert!(command_needs_confirmation("if true; then rm -rf /x; fi", &r()));
+        assert!(command_needs_confirmation("while read p; do rm -f \"$p\"; done < /tmp/list", &r()));
+    }
+
+    #[test]
+    fn quoted_command_behind_wrapper_confirms() {
+        // wrapper stripping stops at a quoted token; the position view walks past it
+        assert!(command_needs_confirmation("nohup 'rm' -rf /x", &r()));
+        assert!(command_needs_confirmation("timeout 30 'rm' -rf /x", &r()));
+        assert!(command_needs_confirmation("env FOO=1 'rm' -rf /x", &r()));
+        assert!(command_needs_confirmation("nice -n 5 'rm' -rf /x", &r()));
+    }
+
+    #[test]
+    fn absolute_path_command_confirms() {
+        assert!(command_needs_confirmation("/bin/rm -rf /x", &r()));
+        assert!(command_needs_confirmation("/usr/bin/systemctl stop nginx", &r()));
+        assert!(command_needs_confirmation("/usr/bin/nohup /bin/rm -rf /x", &r()));
+    }
+
+    #[test]
+    fn position_view_does_not_create_false_positives() {
+        // The dangerous word is an ARGUMENT, not the command — still free.
+        // (NB: `git commit` and `python3` are themselves blacklisted by design,
+        // so they are not usable subjects here — see git_narrowing /
+        // interpreters_confirm.)
+        assert!(!command_needs_confirmation("echo rm", &r()));
+        assert!(!command_needs_confirmation("grep 'rm' script.sh", &r()));
+        assert!(!command_needs_confirmation("cat notes.txt", &r()));
+        assert!(!command_needs_confirmation("tail -n 50 /var/log/app.log", &r()));
+    }
+
+    #[test]
+    fn quoted_semicolon_inside_an_argument_confirms_conservatively() {
+        // The raw-text blacklist match is NOT quote-aware (a known, pre-existing
+        // over-confirmation): `(^|[;&|]\s*)rm\b` sees the `; rm` *inside* these
+        // double quotes and matches. That errs toward asking the user, which is
+        // the safe direction, so it is documented rather than "fixed" here.
+        //
+        // What matters for the fix is that `command_position_view` does not
+        // MANUFACTURE such a boundary — see the unit test below, which asserts
+        // the view is returned byte-identical for this input.
+        assert!(command_needs_confirmation("echo \"drop; rm -rf /\"", &r()));
+        assert_eq!(
+            command_position_view("echo \"drop; rm -rf /\""),
+            "echo \"drop; rm -rf /\""
+        );
+        // ...and a real chain confirms too
+        assert!(command_needs_confirmation("echo x; rm -rf /", &r()));
+    }
+
+    // ── zsh MULTIOS: `>&file` is `&>file`, not descriptor duplication ──
+
+    #[test]
+    fn amp_redirect_to_a_real_file_confirms() {
+        assert!(command_needs_confirmation("echo x >&/etc/crontab", &r()));
+        assert!(command_needs_confirmation("echo x >&/tmp/f", &r()));
+    }
+
+    #[test]
+    fn fd_duplication_stays_free() {
+        assert!(!command_needs_confirmation("ls 2>&1", &r()));
+        assert!(!command_needs_confirmation("cat f 2>&1", &r()));
+        assert!(!command_needs_confirmation("ps aux > /dev/null", &r()));
+        assert!(!command_needs_confirmation("cat f 2>/dev/null", &r()));
+    }
+
+    // ── Unit tests for the tokenizer itself ──
+
+    #[test]
+    fn unquote_strips_shell_quoting() {
+        assert_eq!(unquote("'rm'"), "rm");
+        assert_eq!(unquote("\"rm\""), "rm");
+        assert_eq!(unquote("r''m"), "rm");
+        assert_eq!(unquote(r"\$HOME"), "$HOME");
+        assert_eq!(unquote("plain"), "plain");
+        // unbalanced quote must not panic or lose the rest
+        assert_eq!(unquote("'rm"), "rm");
+        // non-ASCII survives (operates on chars, not bytes)
+        assert_eq!(unquote("'删除'"), "删除");
+    }
+
+    #[test]
+    fn command_position_view_normalizes_head_only() {
+        assert_eq!(command_position_view("'rm' -rf /x"), "rm -rf /x");
+        assert_eq!(command_position_view("\"rm\" -rf /x"), "rm -rf /x");
+        assert_eq!(command_position_view("( rm -rf /x )"), "rm -rf /x )");
+        assert_eq!(command_position_view("do rm -rf \"$f\""), "rm -rf \"$f\"");
+        assert_eq!(command_position_view("nohup 'rm' -rf /x"), "rm -rf /x");
+        assert_eq!(command_position_view("timeout 30 rm -rf /x"), "rm -rf /x");
+        assert_eq!(command_position_view("/bin/rm -rf /x"), "rm -rf /x");
+        // untouched when the head is already the command
+        assert_eq!(command_position_view("rm -rf /x"), "rm -rf /x");
+        assert_eq!(command_position_view("git commit -m \"fix; rm\""), "git commit -m \"fix; rm\"");
     }
 }

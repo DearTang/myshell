@@ -96,6 +96,15 @@ pub async fn list_dir(
     for entry in entries {
         let file_type = entry.file_type();
         let name = entry.file_name().to_string();
+        // Skip the dot entries. The FTP listing already filters these
+        // (`ftp.rs` checks for "." and ".."), and the frontend does not filter
+        // either — so any SFTP server whose READDIR returns them showed rows
+        // that cannot be acted on: downloading one failed with
+        // `非法文件名: "."`, and removing one issued an RMDIR against the
+        // current directory. The two protocols simply drifted.
+        if name == "." || name == ".." {
+            continue;
+        }
         // Build child paths from the resolved absolute path (not the raw `~`
         // the frontend sent) so navigation uses real paths from here on.
         let full_path = if resolved.ends_with('/') {
@@ -149,11 +158,14 @@ pub async fn remove(
     let sftp = get_sftp_session(state, session_id).await?;
     let resolved = resolve_path(&sftp, path).await?;
 
-    // Try removing as file first, then as directory
-    if sftp.remove_file(resolved.as_str()).await.is_err() {
-        sftp.remove_dir(resolved.as_str())
-            .await
-            .map_err(|e| format!("Remove failed: {}", e))?;
+    // Try removing as file first, then as directory. Keep BOTH errors: the old
+    // code discarded the file error unconditionally, so a permission-denied
+    // file surfaced as the RMDIR failure instead — a message describing an
+    // operation that was never intended, and one that hid the real cause.
+    if let Err(file_err) = sftp.remove_file(resolved.as_str()).await {
+        sftp.remove_dir(resolved.as_str()).await.map_err(|dir_err| {
+            format!("Remove failed: 删文件失败({file_err})，删目录失败({dir_err})")
+        })?;
     }
     Ok(())
 }
@@ -387,7 +399,13 @@ async fn upload_one(
     // server before we release the handle. The SFTP close-handle packet itself
     // is sent by `File`'s Drop impl (close_nowait) — there is no explicit
     // close() method on russh-sftp 2.3's File.
-    let _ = remote.flush().await;
+    // A server-side flush failure means the remote never durably stored the
+    // data (disk full, quota); the caller would otherwise be told the upload
+    // succeeded.
+    remote
+        .flush()
+        .await
+        .map_err(|e| format!("{}: 远端落盘失败（磁盘空间或配额?）: {}", name, e))?;
     Ok(())
 }
 
@@ -414,7 +432,7 @@ async fn expand_download_one(
     errors: &mut Vec<String>,
     depth: usize,
 ) {
-    const MAX_DEPTH: usize = 64;
+    const MAX_DEPTH: usize = MAX_RECURSE_DEPTH;
     if depth > MAX_DEPTH {
         errors.push(format!(
             "{}: 目录层级过深（>{}，可能存在符号链接循环）",
@@ -470,6 +488,13 @@ fn local_components(dest: &str, relative: &str) -> Result<std::path::PathBuf, St
     Ok(crate::path_safety::build_path(Path::new(dest), &parts))
 }
 
+/// Maximum directory depth for a recursive download.
+///
+/// Module-level so BOTH the single-entry expansion and the recursive walker
+/// enforce the SAME cap — they had drifted, and the check that lived only in
+/// the single-entry path never guarded the recursion.
+const MAX_RECURSE_DEPTH: usize = 64;
+
 /// Walk one remote folder level, appending file tasks and relative sub-dirs.
 async fn expand_dir_recursive(
     sftp: &SftpSession,
@@ -480,6 +505,21 @@ async fn expand_dir_recursive(
     errors: &mut Vec<String>,
     depth: usize,
 ) {
+    // The depth guard belongs HERE, in the function that actually recurses.
+    // It used to sit in `expand_download_one`, which is only entered once per
+    // top-level selection and always with depth = 0 — so the cap never applied
+    // to the recursive walk at all. A remote symlink pointing at an ancestor
+    // (or simply a very deep tree) therefore recursed without bound, flooding
+    // READDIR requests and memory. The FTP sibling checks at the top of its
+    // recursive `expand_download` (ftp.rs) and has always been correct; the two
+    // walkers had drifted apart.
+    if depth > MAX_RECURSE_DEPTH {
+        errors.push(format!(
+            "{}: 目录层级超过 {} 层，已跳过（可能是符号链接成环）",
+            rel_prefix, MAX_RECURSE_DEPTH
+        ));
+        return;
+    }
     let entries = match sftp.read_dir(remote_dir).await {
         Ok(e) => e,
         Err(e) => {
@@ -743,7 +783,13 @@ async fn download_one(
             *last_emit = Instant::now();
         }
     }
-    let _ = local.flush().await;
+    // ENOSPC / quota failures surface HERE, at flush, not during write_all.
+    // Discarding this Result ended the transfer with `errors` empty and the
+    // progress bar at 100% while the file on disk was short.
+    local
+        .flush()
+        .await
+        .map_err(|e| format!("{}: 落盘失败（磁盘空间不足?）: {}", name, e))?;
     // `remote` (SFTP read handle) is closed by its Drop impl on scope exit —
     // a read-only handle has no pending writes to drain.
     Ok(())

@@ -127,8 +127,16 @@ async function handleDelete(id: number): Promise<void> {
     type: "warning",
   });
   if (!ok) return;
-  await deleteQuickCommand(id);
-  await reload();
+  // Guarded, unlike the sibling `handleSave`. Unguarded, a failure left the
+  // row on screen with no explanation (reload never ran) and surfaced as an
+  // unhandled rejection — the user is then likely to click 删除 again.
+  try {
+    await deleteQuickCommand(id);
+    await reload();
+  } catch (e) {
+    toast(`删除失败: ${String(e)}`, { type: "error" });
+    await reload();
+  }
 }
 
 /** Swap sort_order with the adjacent item (items are pre-sorted by it). */
@@ -136,9 +144,18 @@ async function handleMove(index: number, direction: -1 | 1): Promise<void> {
   const current = items.value[index];
   const target = items.value[index + direction];
   if (!current || !target) return;
-  await updateQuickCommandOrder(current.id, target.sortOrder);
-  await updateQuickCommandOrder(target.id, current.sortOrder);
-  await reload();
+  // Two independent UPDATEs: if the second fails, both rows keep the same
+  // sort_order and `list_quick_commands` then falls back to `id ASC` as the
+  // tiebreaker — permanently scrambled, and a later move cannot repair it.
+  // Always reload so the UI reflects the real persisted order either way.
+  try {
+    await updateQuickCommandOrder(current.id, target.sortOrder);
+    await updateQuickCommandOrder(target.id, current.sortOrder);
+  } catch (e) {
+    toast(`调整顺序失败: ${String(e)}`, { type: "error" });
+  } finally {
+    await reload();
+  }
 }
 
 const scopeName = (): string =>

@@ -81,9 +81,20 @@ async function handleExport(): Promise<void> {
   exportBusy.value = true;
   ioErr.value = null;
   try {
-    const n = await exportConnections(exportPass.value, path);
+    const result = await exportConnections(exportPass.value, path);
     showExportDialog.value = false;
-    alert(`已导出 ${n} 个连接到\n${path}`);
+    // 凭据读不出来时不能报成功——那是一份换机后无法认证的备份。
+    const missing = result.missingCredentials ?? [];
+    if (missing.length > 0) {
+      alert(
+        `已导出 ${result.exported} 个连接到\n${path}\n\n` +
+          `⚠ 其中 ${missing.length} 项凭据未能读取，这份备份在换机后将无法自动登录：\n` +
+          missing.map((m) => `  - ${m}`).join("\n") +
+          `\n\n可改用「连接管理」逐个检查这些连接的密码，或在原机器上重新保存一次密码。`,
+      );
+    } else {
+      alert(`已导出 ${result.exported} 个连接到\n${path}`);
+    }
   } catch (e) {
     ioErr.value = String(e);
   } finally {
@@ -133,6 +144,18 @@ async function handleImport(): Promise<void> {
 function closeImportDialog(): void {
   showImportDialog.value = false;
   importPath.value = null;
+  // The comments on the import/export handlers both claim "无论哪条退出路径都
+  // 清空密码", but the CANCEL paths didn't: this handler cleared the path
+  // only, and the export dialog's cancel button was a bare
+  // `showExportDialog = false`. These panels are kept mounted by v-show, so
+  // the export/import passphrase survived in component state for the rest of
+  // the session.
+  importPass.value = "";
+}
+
+function closeExportDialog(): void {
+  showExportDialog.value = false;
+  exportPass.value = "";
 }
 
 async function handleRollback(version: string): Promise<void> {
@@ -263,6 +286,7 @@ async function handleRollback(version: string): Promise<void> {
     title="加密导出"
     :width="400"
     :dismissable="false"
+    @cancel="closeExportDialog"
     hide-footer
   >
     <div class="dialog-intro">设置加密密码，导入时需要此密码才能解密</div>
@@ -276,7 +300,7 @@ async function handleRollback(version: string): Promise<void> {
       />
     </div>
     <div class="dialog-actions">
-      <MyButton variant="secondary" @click="showExportDialog = false">取消</MyButton>
+      <MyButton variant="secondary" @click="closeExportDialog">取消</MyButton>
       <MyButton
         variant="primary"
         :disabled="exportPass.length < MIN_LEN || exportBusy"

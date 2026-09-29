@@ -42,7 +42,7 @@ import {
 } from "@/api";
 import { connectionsStore, reloadConnections } from "@/store/connections";
 import { connect } from "@/store/sessions";
-import { openConnectionDialog, setThemeChoice, ui } from "@/store/ui";
+import { openConnectionDialog, persistUi, setThemeChoice, ui } from "@/store/ui";
 import { updateInfo } from "@/composables/useUpdateCheck";
 import { useConnectionDrag } from "@/composables/useConnectionDrag";
 
@@ -395,13 +395,9 @@ async function confirmDeleteFolder(): Promise<void> {
 function closeMenu(): void {
   menu.value = null;
 }
-function onRootContext(e: MouseEvent): void {
-  if ((e.target as HTMLElement) === e.currentTarget) {
-    e.preventDefault();
-    menu.value = { x: e.clientX, y: e.clientY, kind: "blank" };
-  }
-}
-function onListContext(e: MouseEvent): void {
+// Bound to both the sidebar root and the list container; the two were
+// byte-identical duplicates, so one handler serves both.
+function onBlankContext(e: MouseEvent): void {
   if ((e.target as HTMLElement) === e.currentTarget) {
     e.preventDefault();
     menu.value = { x: e.clientX, y: e.clientY, kind: "blank" };
@@ -490,6 +486,10 @@ function rowMenuDelete(): void {
 // ── 壳层入口 ────────────────────────────────────────────────────────────────
 function toggleCollapsed(): void {
   ui.sidebarCollapsed = !ui.sidebarCollapsed;
+  // Persist. The equivalent toggle in the top bar calls persistUi()
+  // (AppTopBar.vue), so collapsing from the sidebar's own ✕ button did not
+  // survive a restart while collapsing from the top bar did.
+  persistUi();
 }
 function openQuickCommands(): void {
   ui.qcInitialConnectionId = null;
@@ -571,7 +571,7 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
     class="side"
     :style="{ width: `${ui.sidebarWidth}px`, minWidth: `${ui.sidebarWidth}px`, overflow: 'visible' }"
     @click="closeMenu"
-    @contextmenu="onRootContext"
+    @contextmenu="onBlankContext"
   >
     <!-- 头部：动作图标行（myui/EP 单色图标体系） -->
     <div class="side-header">
@@ -616,7 +616,7 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
     </div>
 
     <!-- 连接树列表 -->
-    <div class="list" @contextmenu="onListContext">
+    <div class="list" @contextmenu="onBlankContext">
       <!-- 拖拽横幅：说明手势语义 + 当前落点，用户永远不必猜 -->
       <div v-if="isDragging" class="drag-hint">
         <span class="drag-hint-title">正在移动「{{ dragState?.connName ?? "" }}」</span>

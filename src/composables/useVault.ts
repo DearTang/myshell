@@ -21,8 +21,17 @@ export async function refreshVaultStatus(): Promise<void> {
     if (!s.initialized) vault.value = "setup";
     else if (s.unlocked) vault.value = "ready";
     else vault.value = "unlock";
-  } catch {
-    vault.value = "setup";
+  } catch (e) {
+    // An IPC failure is NOT "the vault does not exist". `vault_status` is a
+    // synchronous command that cannot fail logically, so this only fires on a
+    // transient IPC error — yet the old code set "setup", which renders
+    // MasterPasswordGate in setup mode ("设置登录密码") for a vault that
+    // already exists. Submitting then hits setup_vault's guard and returns
+    // "Vault 已初始化，请使用解锁", and nothing re-queries the state, so the
+    // only escape was restarting the app. Stay in "checking" and let the
+    // caller retry.
+    console.warn("[vault] 查询保险库状态失败，保持现状并重试:", e);
+    vault.value = "checking";
   }
 }
 

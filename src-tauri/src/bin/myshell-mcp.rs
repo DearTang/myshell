@@ -591,6 +591,60 @@ struct TransferTask {
     started_at: std::time::Instant,
 }
 
+/// Running byte accounting for one ZMODEM transfer.
+///
+/// `sz -r` on a directory emits one `Offer` per file, and each file's
+/// `Progress` / `FileComplete` events only speak for *that* file. Reporting
+/// an event's own numbers straight into `TransferTask` therefore resets the
+/// bar to 0 at every new offer, and the last event to arrive decides what
+/// `bytes_total` ends up as. That is not hypothetical: the per-file-complete
+/// branch used to pass a literal `0` as the total, so a **successful** 2 MiB
+/// download reported "0% / 2097152 bytes" forever.
+///
+/// This type keeps the two accumulators and is deliberately pure so the
+/// behaviour can be unit-tested without a live SSH session.
+#[derive(Default, Debug, PartialEq)]
+struct TransferProgress {
+    /// Sum of every offer's declared size (the whole transfer's total).
+    grand_total: u64,
+    /// Completed files + the current file's progress.
+    done_bytes: u64,
+}
+
+impl TransferProgress {
+    /// A new file was offered at `size` bytes.
+    fn offer(&mut self, size: u64) -> (u64, u64) {
+        self.grand_total = self.grand_total.saturating_add(size);
+        (self.done_bytes, self.grand_total)
+    }
+
+    /// `transferred` bytes of the current file are done; `total` is that
+    /// file's own size. It may only *widen* the transfer total — replacing
+    /// it would drop every previously-seen file back out of the denominator.
+    fn progress(&mut self, transferred: u64, total: u64) -> (u64, u64) {
+        if total > self.grand_total {
+            self.grand_total = total;
+        }
+        (
+            self.done_bytes.saturating_add(transferred),
+            self.grand_total,
+        )
+    }
+
+    /// The current file finished with `bytes` bytes actually written.
+    fn file_complete(&mut self, bytes: u64) -> (u64, u64) {
+        self.done_bytes = self.done_bytes.saturating_add(bytes);
+        (self.done_bytes, self.grand_total)
+    }
+
+    /// Final (done, total). `actual` is the summed size of everything that
+    /// really landed, which wins over the offer-derived total so a file that
+    /// arrived short still reports truthfully.
+    fn finish(&self, actual: u64) -> (u64, u64) {
+        (actual, if self.grand_total > 0 { self.grand_total } else { actual })
+    }
+}
+
 impl TransferTask {
     fn new(direction: &str, description: String, bytes_total: u64) -> Self {
         Self {
@@ -906,10 +960,24 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                         // startup timeout — in that case the GUI dialog was
                         // never shown, so headless fallback (with its own OS
                         // confirm) is legitimate.
-                        let gui_unreachable = e.contains("未找到 myshell.exe")
-                            || e.contains("GUI 启动超时")
-                            || e.contains("无法定位");
+                        let gui_unreachable = e.message.contains("未找到 myshell.exe")
+                            || e.message.contains("GUI 启动超时")
+                            || e.message.contains("无法定位");
                         let gui_attempted = !gui_unreachable;
+
+                        // P1-15: the command may ALREADY have run in the visible
+                        // tab — the GUI writes it to the PTY first and only then
+                        // reports a hard timeout / lost sentinel / IPC teardown.
+                        // Falling back to headless would run the SAME command a
+                        // second time on a fresh SSH session, invisibly to the
+                        // user. Surface the original error instead.
+                        if e.command_sent {
+                            log(&format!(
+                                "GUI 已把命令送入终端后才报错，不再无头重跑（避免同一命令执行两次）: {}",
+                                e.message
+                            ));
+                            return Err(e.message);
+                        }
 
                         if gui_attempted && needs_confirm {
                             // GUI was reachable but the exec failed (user didn't
@@ -918,14 +986,17 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                             // second confirmation dialog. Surface the error.
                             log(&format!(
                                 "show_in_gui 失败且命令需确认，不再回退 headless（避免重复弹窗）: {}",
-                                e
+                                e.message
                             ));
-                            return Err(e);
+                            return Err(e.message);
                         }
                         // Either the GUI was unreachable (legitimate fallback)
                         // or the command doesn't need confirmation (headless
                         // won't pop anything). Fall through.
-                        log(&format!("show_in_gui 失败，回退到静默模式: {}", e));
+                        log(&format!(
+                            "show_in_gui 失败，回退到静默模式: {}",
+                            e.message
+                        ));
                     }
                 }
             }
@@ -994,8 +1065,27 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
+            // A missing ExitStatus is NOT exit code 0. It means the channel
+            // ended without one: the connection dropped, or the remote process
+            // was terminated by a signal. `code.unwrap_or(0)` reported those —
+            // along with whatever truncated stdout we managed to capture — as a
+            // clean success, which is exactly how an AI ends up building on a
+            // result that never happened.
+            let Some(code) = code else {
+                let result = json!({
+                    "error": "远端未返回退出码：连接中断或进程被信号终止，结果未知（不能视为成功）",
+                    "exit_code": serde_json::Value::Null,
+                    "stdout": String::from_utf8_lossy(&stdout),
+                    "stderr": String::from_utf8_lossy(&stderr),
+                });
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }],
+                    "isError": true,
+                }));
+            };
+
             let result = json!({
-                "exit_code": code.unwrap_or(0),
+                "exit_code": code,
                 "stdout": String::from_utf8_lossy(&stdout),
                 "stderr": String::from_utf8_lossy(&stderr),
             });
@@ -1036,7 +1126,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // need confirmation, we still leave it in Confirming briefly (the
             // bg task flips to Connecting immediately) — keeping the model
             // consistent means the AI sees the same phases either way.
-            let task_id = format!("ssh-{}", chrono_like_ts());
+            let task_id = unique_task_id("ssh");
             // Cancel control plane: created here so the task_id is bound to
             // a cancel handle BEFORE the background task starts. If the user
             // hits `ssh_cancel` before the task gets to its select!, the
@@ -1062,7 +1152,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // cheap to clone, and the receiver stays valid for the bg task's
             // entire lifetime.
             let cancel_rx = {
-                let controls = state.exec_controls.lock().expect("controls mutex");
+                let controls = state.exec_controls.lock().unwrap_or_else(|e| e.into_inner());
                 controls.get(&task_id).expect("just inserted").cancel_tx.subscribe()
             };
             let app = state.app.clone();
@@ -1373,21 +1463,27 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // mean arbitrary command execution as root.
             let ssh_config2 = state.resolve_via_gui(conn_name, Some("ssh"))?;
             let ssh_handle2 = ssh::dial_and_authenticate(&state.app, &ssh_config2, false).await?;
-            {
-                let channel = ssh_handle2.channel_open_session().await.map_err(|e| format!("打开通道失败: {}", e))?;
-                let extract_cmd = format!(
-                    "sudo mkdir -p {} && sudo mv {} {} && cd {} && sudo tar -xzf {} && sudo rm -f {} && echo 'UPLOAD_OK'",
-                    shell_quote(&remote_target),
-                    shell_quote(&remote_tar_path),
-                    shell_quote(&remote_target),
-                    shell_quote(&remote_target),
-                    shell_quote(&remote_tar_name),
-                    shell_quote(&remote_tar_name),
-                );
-                channel.exec(true, extract_cmd).await.map_err(|e| format!("解压失败: {}", e))?;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let extract_cmd = format!(
+                "sudo mkdir -p {} && sudo mv {} {} && cd {} && sudo tar -xzf {} && sudo rm -f {} && echo 'UPLOAD_OK'",
+                shell_quote(&remote_target),
+                shell_quote(&remote_tar_path),
+                shell_quote(&remote_target),
+                shell_quote(&remote_target),
+                shell_quote(&remote_tar_name),
+                shell_quote(&remote_tar_name),
+            );
+            // Read the exit status AND the sentinel the command prints. The old
+            // sleep(3)-and-drop-channel version reported success even when
+            // sudo was waiting for a password or the filesystem was read-only,
+            // so the AI would report a deployment that never happened.
+            let (code, out) = exec_collect(&ssh_handle2, &extract_cmd, "远端解压", 300).await?;
             let _ = ssh_handle2.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+            if code != 0 || !out.contains("UPLOAD_OK") {
+                return Err(format!(
+                    "远端解压失败（退出码 {code}）——项目**未**部署到 {remote_target}。\n远端输出：\n{}",
+                    out.trim()
+                ));
+            }
 
             log(&format!("[upload_project] 完成! {} → {}", local_dir, remote_target));
 
@@ -1425,7 +1521,13 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // double quotes so it can sit inside a single-quoted shell string.
             let tmp_tar = format!("/tmp/_dl_project_{}.tar.gz", dir_name);
             let tar_cmd = format!(
-                "MYTAR={} MYDIR={} python3 -c '{}' 2>&1",
+                // Delete any leftover from a previous run FIRST. The temp path
+                // is deterministic, so without this a failed tar leaves the
+                // previous run's archive in place — and since the download step
+                // simply fetches whatever sits at that path, the user silently
+                // gets a stale directory tree with a success message.
+                "rm -f {} && MYTAR={} MYDIR={} python3 -c '{}' 2>&1",
+                shell_quote(&tmp_tar),
                 shell_quote(&tmp_tar),
                 shell_quote(remote_dir),
                 "import tarfile, os\n\
@@ -1445,12 +1547,18 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // 用 ssh_exec 执行打包
             let ssh_config = state.resolve_via_gui(conn_name, Some("ssh"))?;
             let ssh_handle = ssh::dial_and_authenticate(&state.app, &ssh_config, false).await?;
-            {
-                let channel = ssh_handle.channel_open_session().await.map_err(|e| format!("打开通道失败: {}", e))?;
-                channel.exec(true, tar_cmd).await.map_err(|e| format!("打包命令执行失败: {}", e))?;
+            // Verify the remote tar actually succeeded before downloading it.
+            // The old code slept 3s and moved on, so a missing python3, an
+            // unreadable directory, or a tar slower than 3s still produced a
+            // "✅ 下载成功" — over a stale or absent archive.
+            let (code, out) = exec_collect(&ssh_handle, &tar_cmd, "远端打包", 600).await?;
+            if code != 0 || !out.contains("TAR_OK") {
+                let _ = ssh_handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+                return Err(format!(
+                    "远端打包失败（退出码 {code}）——已中止下载，未解压任何内容。\n远端输出：\n{}",
+                    out.trim()
+                ));
             }
-            // 等待打包完成
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let _ = ssh_handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
             // 3. 用 SFTP 下载 tar.gz 到本地临时文件
@@ -1500,6 +1608,13 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
         "zmodem_status" => {
             let task_id = args["task_id"].as_str().ok_or("缺少 task_id 参数")?;
+            // The doc on `evict_stale_tasks` says it runs "lazily on each
+            // ssh_status/zmodem_status call", but only ssh_status actually
+            // called it. A session that used ONLY zmodem_* — the documented
+            // preferred transfer path — therefore kept every completed task,
+            // including its full result payload, resident for the whole
+            // process lifetime. Mirrors the ssh_status call site.
+            evict_stale_tasks(&state.tasks);
             let task = {
                 let tasks = state.tasks.lock().map_err(|e| e.to_string())?;
                 tasks.get(task_id).cloned().ok_or_else(|| {
@@ -1959,7 +2074,7 @@ async fn exec_in_gui_tab(
     command: &str,
     timeout: u64,
     state: &McpState,
-) -> Result<Value, String> {
+) -> Result<Value, GuiExecError> {
     // Resolve the connection id via plaintext lookup — NO DEK needed.
     // The actual SSH connection + credential use happens inside the GUI
     // process (the user has unlocked the vault there).
@@ -2029,10 +2144,40 @@ async fn exec_in_gui_tab(
         let err_msg = resp["error"].as_str().unwrap_or("未知错误");
         // If there's partial stdout, include it.
         let stdout = resp["stdout"].as_str().unwrap_or("");
-        if !stdout.is_empty() {
-            Err(format!("{}（部分输出: {}）", err_msg, stdout))
+        let message = if !stdout.is_empty() {
+            format!("{}（部分输出: {}）", err_msg, stdout)
         } else {
-            Err(err_msg.to_string())
+            err_msg.to_string()
+        };
+        Err(GuiExecError {
+            message,
+            command_sent: resp["command_sent"].as_bool() == Some(true),
+        })
+    }
+}
+
+/// Failure from the GUI-side exec path, carrying whether the command had
+/// ALREADY been written to the terminal when it failed.
+///
+/// This distinction is load-bearing: the GUI sends `sshSend(command + "\n")`
+/// first and only then can report failure (hard timeout, lost sentinel, IPC
+/// teardown). Re-running the command headlessly in that case executes it a
+/// SECOND time, invisibly — the user watches one command in the visible tab
+/// while an identical one runs behind their back.
+struct GuiExecError {
+    message: String,
+    command_sent: bool,
+}
+
+impl From<String> for GuiExecError {
+    /// Every `?` inside `exec_in_gui_tab` fails BEFORE the command can reach
+    /// the terminal (connection lookup, GUI auto-start, TCP connect, write,
+    /// response read). `command_sent` therefore stays false — which is exactly
+    /// what keeps a headless retry legitimate for those paths.
+    fn from(message: String) -> Self {
+        GuiExecError {
+            message,
+            command_sent: false,
         }
     }
 }
@@ -2184,6 +2329,64 @@ fn sanitize_relative_path(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::sanitize_relative_path;
+    use super::TransferProgress;
+
+    /// 真机验证抓到的那个 bug 的最小复现：单文件、2 MiB，走
+    /// Offer → Progress → FileComplete → End。
+    ///
+    /// 修复前，FileComplete 分支把 `bytes_total` 写成字面量 0，完成后又
+    /// 没有补回，于是 zmodem_status 按 0/0 算出 **0%**——一次成功的下载
+    /// 被报成"传输 0%"。2 MiB / 32665 个转义字节，真机双向 md5 一致，
+    /// 但进度是 0。
+    #[test]
+    fn single_file_download_reports_100_percent_when_done() {
+        let mut p = TransferProgress::default();
+
+        assert_eq!(p.offer(2_097_152), (0, 2_097_152));
+        assert_eq!(p.progress(1_048_576, 2_097_152), (1_048_576, 2_097_152));
+        // 关键：FileComplete 之后 total 仍然是 2 MiB，不能变成 0。
+        assert_eq!(p.file_complete(2_097_152), (2_097_152, 2_097_152));
+        assert_eq!(p.finish(2_097_152), (2_097_152, 2_097_152));
+    }
+
+    /// 多文件（`sz -r` 传目录）：第二个 offer 不能把进度条清零。
+    /// 修复前每个 Offer 都会 `mark(0, size)`，于是每来一个新文件，
+    /// 已完成的前一个文件就从分子里消失了。
+    #[test]
+    fn multi_file_download_accumulates_across_offers() {
+        let mut p = TransferProgress::default();
+
+        p.offer(100);
+        p.progress(50, 100);
+        p.file_complete(100);
+        // 文件 B 到来 —— 进度应保留 A 的 100 字节。
+        assert_eq!(p.offer(200), (100, 300), "新 offer 不能把已完成的部分清零");
+        p.progress(200, 200);
+        p.file_complete(200);
+
+        assert_eq!(p.finish(300), (300, 300));
+    }
+
+    /// 每个文件的 Progress 只代表**它自己**，所以 total 只能用来**放大**
+    /// 总量，绝不能替换——否则先传的大文件会被后传的小文件挤出分母。
+    #[test]
+    fn per_file_progress_total_cannot_shrink_the_total() {
+        let mut p = TransferProgress::default();
+        p.offer(5_000);
+        // 第二个文件的 total 只有 10，若直接替换总量就会变成 10。
+        let (d, t) = p.progress(10, 10);
+        assert_eq!(t, 5_000, "per-file total 不得缩小整个传输的总量");
+        assert_eq!(d, 10);
+    }
+
+    /// 从没收到过 offer（对端一个文件都没发）时不能除零——`finish`
+    /// 退回到实际字节数。
+    #[test]
+    fn finish_without_any_offer_falls_back_to_actual() {
+        let p = TransferProgress::default();
+        assert_eq!(p.finish(0), (0, 0));
+        assert_eq!(p.finish(42), (42, 42));
+    }
 
     fn sep() -> char {
         std::path::MAIN_SEPARATOR
@@ -2282,7 +2485,7 @@ async fn zmodem_download_tool(state: &McpState, args: &Value) -> Result<Value, S
     // mid-flight) and reports failures via the task table.
 
     // Create the task entry.
-    let task_id = format!("zm-dl-{}", chrono_like_ts());
+    let task_id = unique_task_id("zm-dl");
     let description = format!("下载 {} 的 {} → {}", conn_name, remote_path, local_dir);
     {
         let mut tasks = state.tasks.lock().map_err(|e| e.to_string())?;
@@ -2383,6 +2586,9 @@ async fn run_download_task(
     let mut saved: Vec<(String, String, u64)> = Vec::new();
     let mut terminal_noise = Vec::<u8>::new();
     let mut got_offer = false;
+    // 见 TransferProgress 的文档：sz -r 会逐个文件发 Offer，每个文件的
+    // Progress/FileComplete 只代表自己，必须自己累加。
+    let mut prog = TransferProgress::default();
 
     let result: Result<(), String> = loop {
         let next = if !got_offer {
@@ -2405,9 +2611,10 @@ async fn run_download_task(
             Some(ev) => match ev {
                 ZmodemEvent::Offer { name, size } => {
                     got_offer = true;
-                    mark(TaskPhase::Transferring, 0, size);
+                    let (d, t) = prog.offer(size);
+                    mark(TaskPhase::Transferring, d, t);
                     let local_name = sanitize_relative_path(&name).unwrap_or_else(|| {
-                        format!("zmodem_download_{}", chrono_like_ts())
+                        unique_task_id("zmodem_download")
                     });
                     let local_path = join_local_path(local_dir, &local_name);
                     log(&format!(
@@ -2424,10 +2631,12 @@ async fn run_download_task(
                     let local_name = sanitize_relative_path(&name).unwrap_or_default();
                     let local_path = join_local_path(local_dir, &local_name);
                     saved.push((name, local_path, bytes));
-                    mark(TaskPhase::Transferring, bytes, 0);
+                    let (d, t) = prog.file_complete(bytes);
+                    mark(TaskPhase::Transferring, d, t);
                 }
                 ZmodemEvent::Progress { transferred, total } => {
-                    mark(TaskPhase::Transferring, transferred, total);
+                    let (d, t) = prog.progress(transferred, total);
+                    mark(TaskPhase::Transferring, d, t);
                 }
                 ZmodemEvent::End => break Ok(()),
                 ZmodemEvent::Error(m) => break Err(m),
@@ -2463,10 +2672,15 @@ async fn run_download_task(
                 .map(|(name, path, bytes)| json!({ "name": name, "local_path": path, "bytes": bytes }))
                 .collect();
             let total: u64 = saved.iter().map(|(_, _, b)| *b).sum();
+            let (done, full) = prog.finish(total);
             let _ = tasks.lock().map(|mut t| {
                 if let Some(task) = t.get_mut(task_id) {
                     task.phase = TaskPhase::Done;
-                    task.bytes_done = total;
+                    task.bytes_done = done;
+                    // 完成后把 bytes_total 也钉成实际总量。少这一步，
+                    // zmodem_status 会按 0/0 算出 0%，把一次**成功**的
+                    // 下载报成"传输 0%"——这正是真机验证抓到的那个 bug。
+                    task.bytes_total = full;
                     task.result = Some(json!({ "files": files }));
                 }
             });
@@ -2514,7 +2728,7 @@ async fn zmodem_upload_tool(state: &McpState, args: &Value) -> Result<Value, Str
 
     // Create the task entry (starts in Confirming — the OS dialog is popped
     // inside the background task so the tool call returns instantly).
-    let task_id = format!("zm-ul-{}", chrono_like_ts());
+    let task_id = unique_task_id("zm-ul");
     let description = format!("上传 {} → {}:{}/{}", local_path, conn_name, remote_dir, basename);
     {
         let mut tasks = state.tasks.lock().map_err(|e| e.to_string())?;
@@ -2762,6 +2976,26 @@ fn chrono_like_ts() -> String {
     format!("{}", secs)
 }
 
+/// Process-wide monotonic counter, used to make task ids collision-proof.
+static TASK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Build a task id that CANNOT collide within this process.
+///
+/// The ids used to be `ssh-<unix_seconds>` / `zm-dl-<unix_seconds>`, and the
+/// task table is keyed by that string. AI clients routinely fan out parallel
+/// tool calls, so two tasks starting inside the same wall-clock second got the
+/// SAME id: the second `insert` destroyed the first task's entry while both
+/// background drivers kept writing phase/progress/result into one record. For
+/// `ssh_run` the collision also clobbered `exec_controls`, so `ssh_cancel`
+/// could only reach the newer task and the older remote command became
+/// uncancellable — and the older task's cleanup then deleted the newer
+/// task's control handle.
+fn unique_task_id(prefix: &str) -> String {
+    use std::sync::atomic::Ordering;
+    let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{}-{seq}", chrono_like_ts())
+}
+
 // ============ ssh_run / ssh_status (async exec) ============
 //
 // Long-running commands (apt upgrade, git clone, docker pull, etc.) can't fit
@@ -2801,7 +3035,7 @@ async fn run_ssh_exec_task(
     // result field of the task entry, updated by the streaming loop.
     let fail = |msg: String| {
         log(&format!("ssh_run [{}] failed: {}", task_id, msg));
-        let mut tasks = tasks.lock().expect("tasks mutex");
+        let mut tasks = tasks.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = tasks.get_mut(task_id) {
             t.phase = TaskPhase::Failed;
             t.error = Some(msg);
@@ -2809,7 +3043,7 @@ async fn run_ssh_exec_task(
         // Always release the cancel control plane so a subsequent
         // ssh_cancel on this task_id (or a stale one) doesn't try to
         // touch a dropped watch::Sender.
-        let mut controls = controls.lock().expect("controls mutex");
+        let mut controls = controls.lock().unwrap_or_else(|e| e.into_inner());
         controls.remove(task_id);
     };
 
@@ -2838,7 +3072,7 @@ async fn run_ssh_exec_task(
 
     // Phase 3: dial + exec.
     {
-        let mut tasks = tasks.lock().expect("tasks mutex");
+        let mut tasks = tasks.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = tasks.get_mut(task_id) {
             t.phase = TaskPhase::Connecting;
         }
@@ -2872,7 +3106,7 @@ async fn run_ssh_exec_task(
     // not responding to cancel falls back to closing the SSH channel which
     // makes channel.wait() return Eof/Close.
     {
-        let mut tasks = tasks.lock().expect("tasks mutex");
+        let mut tasks = tasks.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = tasks.get_mut(task_id) {
             t.phase = TaskPhase::Transferring;
         }
@@ -2932,7 +3166,7 @@ async fn run_ssh_exec_task(
     // completion; just returned non-zero). Cancelled tasks DO get an error
     // because the work didn't complete.
     {
-        let mut tasks = tasks.lock().expect("tasks mutex");
+        let mut tasks = tasks.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = tasks.get_mut(task_id) {
             if cancelled {
                 t.phase = TaskPhase::Failed;
@@ -2946,11 +3180,27 @@ async fn run_ssh_exec_task(
                     "stdout": String::from_utf8_lossy(&stdout).into_owned(),
                     "stderr": String::from_utf8_lossy(&stderr).into_owned(),
                 }));
-            } else {
-                let code = exit_code.unwrap_or(0);
+            } else if let Some(code) = exit_code {
                 t.phase = TaskPhase::Done;
                 t.result = Some(json!({
                     "exit_code": code,
+                    "stdout": String::from_utf8_lossy(&stdout).into_owned(),
+                    "stderr": String::from_utf8_lossy(&stderr).into_owned(),
+                }));
+            } else {
+                // No ExitStatus: the channel ended without one — connection
+                // dropped or the remote was signal-terminated. Reporting
+                // phase=Done with exit_code 0 told the AI the long job
+                // succeeded. `ssh_status` documents a Failed state for exactly
+                // this ("the connection died") which the old code could never
+                // actually produce.
+                t.phase = TaskPhase::Failed;
+                t.error = Some(
+                    "远端未返回退出码：连接中断或进程被信号终止，任务结果未知（不能视为成功）"
+                        .to_string(),
+                );
+                t.result = Some(json!({
+                    "exit_code": serde_json::Value::Null,
                     "stdout": String::from_utf8_lossy(&stdout).into_owned(),
                     "stderr": String::from_utf8_lossy(&stderr).into_owned(),
                 }));
@@ -2963,7 +3213,7 @@ async fn run_ssh_exec_task(
     // (effectively never — but harmless). Putting it here under the
     // non-cancelled branch means a cancelled task still cleans up.
     {
-        let mut controls = controls.lock().expect("controls mutex");
+        let mut controls = controls.lock().unwrap_or_else(|e| e.into_inner());
         controls.remove(task_id);
     }
     log(&format!(
@@ -3052,6 +3302,66 @@ fn evict_stale_tasks(tasks: &Mutex<HashMap<String, TransferTask>>) {
     if before != after {
         log(&format!("evict_stale_tasks: removed {} stale tasks ({} → {})", before - after, before, after));
     }
+}
+
+// ============ Remote exec helpers ============
+
+/// Run `cmd` on a fresh channel over `handle` and collect stdout + exit status.
+///
+/// The project-transfer tools used to `exec`, `sleep(3s)`, then drop the
+/// channel — so BOTH the exit status and the `UPLOAD_OK` / `TAR_OK` sentinel
+/// the command itself printed were thrown away. Every failure mode (sudo
+/// prompting for a password, a read-only filesystem, python3 missing, a tar
+/// that simply took longer than 3 seconds) was therefore reported to the AI
+/// as a success. This returns both so the caller can actually check.
+///
+/// A missing `ExitStatus` is an error, never `0`: it means the connection
+/// dropped or the remote process was signal-terminated, which is not a
+/// successful run.
+async fn exec_collect(
+    handle: &russh::client::Handle<ssh::SshClient>,
+    cmd: &str,
+    what: &str,
+    timeout_secs: u64,
+) -> Result<(u32, String), String> {
+    use russh::ChannelMsg;
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("{what}: 打开通道失败: {}", e))?;
+    channel
+        .exec(true, cmd)
+        .await
+        .map_err(|e| format!("{what}: 执行失败: {}", e))?;
+
+    let collect = async {
+        let mut out = String::new();
+        let mut exit: Option<u32> = None;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { ref data } => out.push_str(&String::from_utf8_lossy(data)),
+                ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    out.push_str(&String::from_utf8_lossy(data))
+                }
+                ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status as u32),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        (out, exit)
+    };
+
+    let (out, exit) = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        collect,
+    )
+    .await
+    .map_err(|_| format!("{what}: 远端命令超时（{timeout_secs}秒），已中止。"))?;
+
+    let code = exit.ok_or_else(|| {
+        format!("{what}: 远端未返回退出码（连接中断或进程被信号终止），结果未知。")
+    })?;
+    Ok((code, out))
 }
 
 // ============ SFTP helpers (same as CLI) ============
@@ -3329,4 +3639,3 @@ async fn main() {
     }
     log("stdin loop ended — exiting");
 }
- 

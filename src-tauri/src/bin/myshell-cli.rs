@@ -13,6 +13,7 @@
 use clap::{Parser, Subcommand};
 use myshell_core::*;
 use std::sync::{Arc, Mutex};
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "myshell-cli", version, about = "MyShell CLI — SSH/SFTP from the command line")]
@@ -24,6 +25,15 @@ struct Cli {
     /// Output as JSON (machine-readable, AI-friendly)
     #[arg(long, global = true)]
     json: bool,
+
+    /// Acknowledge a dangerous operation and run it anyway.
+    ///
+    /// `exec`, `sftp rm`, `sftp put` and `sftp rename` are checked against the
+    /// same command-confirmation rules the GUI and MCP server use. A hit is
+    /// REFUSED without this flag — there is no dialog on a terminal, so the
+    /// opt-in has to be explicit and greppable.
+    #[arg(long, global = true, short = 'y')]
+    yes: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -158,19 +168,25 @@ impl EventSink for CliSink {
 
 // ============ Vault unlock ============
 
-fn resolve_passphrase(cli_passphrase: Option<&str>) -> Result<String, String> {
+/// Resolve the master password. Returns `Zeroizing` so the copy the CLI
+/// holds between here and `unlock` is scrubbed when the command ends —
+/// including the one read straight out of `MYSHELL_PASSPHRASE`, which an
+/// agent's environment may keep around long after the process exits.
+fn resolve_passphrase(cli_passphrase: Option<&str>) -> Result<Zeroizing<String>, String> {
     // Priority: --passphrase flag > MYSHELL_PASSPHRASE env > interactive prompt
     if let Some(p) = cli_passphrase {
-        return Ok(p.to_string());
+        return Ok(Zeroizing::new(p.to_string()));
     }
     if let Ok(p) = std::env::var("MYSHELL_PASSPHRASE") {
         if !p.is_empty() {
-            return Ok(p);
+            return Ok(Zeroizing::new(p));
         }
     }
     // Interactive prompt (no echo)
     eprint!("MyShell 主密码: ");
-    rpassword::read_password().map_err(|e| format!("读取密码失败: {}", e))
+    rpassword::read_password()
+        .map(Zeroizing::new)
+        .map_err(|e| format!("读取密码失败: {}", e))
 }
 
 fn unlock(state: &AppState, passphrase: &str) -> Result<(), String> {
@@ -194,10 +210,10 @@ fn unlock(state: &AppState, passphrase: &str) -> Result<(), String> {
         return Err("密码错误".to_string());
     }
 
-    let dek: [u8; 32] = match encrypted_dek_opt {
+    let dek: Zeroizing<[u8; 32]> = match encrypted_dek_opt {
         Some(blob) => {
             let bytes = crypto::decrypt_with_key(&master_key, &blob)?;
-            bytes.as_slice().try_into().map_err(|_| "DEK 长度错误")?
+            Zeroizing::new(bytes.as_slice().try_into().map_err(|_| "DEK 长度错误")?)
         }
         None => master_key,
     };
@@ -230,7 +246,7 @@ fn find_connection(state: &AppState, name: &str) -> Result<ConnectionConfig, Str
 fn resolve_secrets(state: &AppState, config: &mut ConnectionConfig) -> Result<(), String> {
     if config.auth_method != "key" && config.password.is_none() {
         let key = require_dek(state)?;
-        config.password = secrets::get_password(&config.id, &key)?;
+        config.password = secrets::get_password(&config.id, &key)?.map(|p| p.to_string());
     }
     if config.auth_method == "password"
         && config.password.as_deref().map(str::is_empty).unwrap_or(true)
@@ -239,13 +255,78 @@ fn resolve_secrets(state: &AppState, config: &mut ConnectionConfig) -> Result<()
     }
     if config.proxy_type != "none" && config.proxy_password.is_none() {
         let key = require_dek(state)?;
-        config.proxy_password = secrets::get_proxy_password(&config.id, &key)?;
+        config.proxy_password =
+        secrets::get_proxy_password(&config.id, &key)?.map(|p| p.to_string());
+    }
+    // Key auth: `get_all_connections` deliberately never returns the PEM (see
+    // `ConnectionConfig::private_key_pem` — it must not reach a UI), so the CLI
+    // resolves it from the vault here, exactly like the GUI's `ssh_connect`.
+    // Without this, key-auth connections would fail with "未导入私钥".
+    if config.auth_method == "key" && config.private_key_pem.is_none() {
+        let key = require_dek(state)?;
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        config.private_key_pem =
+            db::get_private_key_pem(&db, &key, &config.id).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
-// ============ Main ============
+/// Load the user's command-confirmation rules. Mirrors the GUI/MCP loader: a
+/// missing file means built-in defaults, a corrupt file is an ERROR — never a
+/// silent downgrade to the weaker defaults (`confirm_unknown: false`).
+fn load_command_rules() -> Result<command_rules::CommandRules, String> {
+    let mut path = dirs::config_dir().ok_or_else(|| "无法定位配置目录".to_string())?;
+    path.push("myshell");
+    path.push("mcp-command-rules.json");
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("解析命令规则失败: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(command_rules::CommandRules::default())
+        }
+        Err(e) => Err(format!("读取命令规则失败: {e}")),
+    }
+}
 
+/// Gate a remote command (or a destructive file op) behind the same rule engine
+/// the GUI and MCP server use.
+///
+/// The CLI used to run `exec`, `sftp rm` and `sftp put` with NO policy check at
+/// all, so the entire confirmation layer was bypassable by shelling out to
+/// `myshell-cli` instead of calling the sanctioned MCP tool — a real hole the
+/// moment `MYSHELL_PASSPHRASE` is exported into an agent's environment (the
+/// documented unlock mechanism).
+///
+/// There is no dialog on a terminal, so a hit is REFUSED unless the caller
+/// passes `--yes`: an explicit, greppable opt-in rather than a silent allow.
+fn ensure_allowed(op: &str, detail: &str, yes: bool) -> Result<(), String> {
+    if yes {
+        return Ok(());
+    }
+    // A rules file we cannot read is an error, not a pass — fail closed.
+    let rules = load_command_rules()?;
+    if !command_rules::command_needs_confirmation(detail, &rules) {
+        return Ok(());
+    }
+    let reasons = command_rules::command_danger_reasons(detail, &rules);
+    let why = if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n命中规则：\n{}",
+            reasons
+                .iter()
+                .map(|s| format!("  - {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    Err(format!(
+        "⛔ {op} 命中危险命令规则，已拒绝执行：{detail}{why}\n\
+         确认要执行请显式加 --yes 重试（该参数会被记入 shell history，请自行评估）。"
+    ))
+}
+
+// ============ Main ============
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -270,8 +351,21 @@ async fn main() {
         transfer_cancels: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
-    // Unlock vault for all other commands
-    if vault::is_initialized() {
+    // Unlock the vault for every command that actually needs credentials.
+    //
+    // `vault status` only reports `{"initialized": bool}` and never touches the
+    // DEK, but it used to go through the full unlock anyway. Headless (stdin at
+    // EOF) `read_password()` returns an empty string, `unlock()` fails against
+    // the verifier, and the failure was persisted via `lockout.record_failure()`
+    // — so three innocuous status probes locked the user out of their own
+    // vault for the backoff window (MAX_FAILED_ATTEMPTS = 3).
+    let needs_unlock = !matches!(
+        cli.command,
+        Commands::Vault {
+            action: VaultAction::Status
+        }
+    );
+    if needs_unlock && vault::is_initialized() {
         let passphrase = match resolve_passphrase(cli.passphrase.as_deref()) {
             Ok(p) => p,
             Err(e) => {
@@ -289,10 +383,10 @@ async fn main() {
         Commands::List => cmd_list(&state, cli.json).await,
         Commands::Test { connection } => cmd_test(&state, &connection, cli.json).await,
         Commands::Exec { connection, command, timeout } => {
-            cmd_exec(&state, &connection, &command, timeout, cli.json).await
+            cmd_exec(&state, &connection, &command, timeout, cli.json, cli.yes).await
         }
         Commands::Ssh { connection } => cmd_ssh(&state, &connection).await,
-        Commands::Sftp { action } => cmd_sftp(&state, action, cli.json).await,
+        Commands::Sftp { action } => cmd_sftp(&state, action, cli.json, cli.yes).await,
         Commands::Vault { action } => match action {
             VaultAction::Status => {
                 let initialized = vault::is_initialized();
@@ -384,7 +478,10 @@ async fn cmd_exec(
     command: &str,
     timeout_secs: u64,
     json: bool,
+    yes: bool,
 ) -> Result<(), String> {
+    // Check the policy BEFORE resolving credentials or dialing.
+    ensure_allowed("exec", command, yes)?;
     let mut config = find_connection(state, name)?;
     resolve_secrets(state, &mut config)?;
 
@@ -456,7 +553,34 @@ async fn cmd_exec(
 
     let stdout_str = String::from_utf8_lossy(&stdout);
     let stderr_str = String::from_utf8_lossy(&stderr);
-    let code = exit_code.unwrap_or(0);
+    // A missing ExitStatus is NOT exit code 0 — it means the connection dropped
+    // or the remote was signal-terminated. `--json` exists so an AI agent can
+    // act on the result; reporting a dropped connection as `"exit_code": 0`
+    // with truncated stdout is worse than useless, it is confidently wrong.
+    let Some(code) = exit_code else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "error": "远端未返回退出码：连接中断或进程被信号终止，结果未知（不能视为成功）",
+                    "exit_code": serde_json::Value::Null,
+                    "stdout": stdout_str,
+                    "stderr": stderr_str,
+                })
+            );
+        } else {
+            if !stdout_str.is_empty() {
+                print!("{}", stdout_str);
+            }
+            if !stderr_str.is_empty() {
+                eprint!("{}", stderr_str);
+            }
+            eprintln!(
+                "远端未返回退出码：连接中断或进程被信号终止，结果未知（不能视为成功）。"
+            );
+        }
+        std::process::exit(255);
+    };
 
     if json {
         println!(
@@ -525,7 +649,12 @@ async fn cmd_ssh(state: &AppState, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn cmd_sftp(state: &AppState, action: SftpAction, json: bool) -> Result<(), String> {
+async fn cmd_sftp(
+    state: &AppState,
+    action: SftpAction,
+    json: bool,
+    yes: bool,
+) -> Result<(), String> {
     match action {
         SftpAction::Ls { connection, path } => {
             let mut config = find_connection(state, &connection)?;
@@ -561,6 +690,14 @@ async fn cmd_sftp(state: &AppState, action: SftpAction, json: bool) -> Result<()
             Ok(())
         }
         SftpAction::Put { connection, local, remote } => {
+            // Matches the MCP policy: file tools ALWAYS require human
+            // acknowledgement regardless of the command rules. On a terminal
+            // that acknowledgement is the explicit `--yes` flag.
+            if !yes {
+                return Err(format!(
+                    "⛔ sftp put 会覆盖远端文件，必须显式确认。\n  本地: {local}\n  远端: {remote}\n确认无误请加 --yes 重试。"
+                ));
+            }
             let mut config = find_connection(state, &connection)?;
             resolve_secrets(state, &mut config)?;
             let handle = ssh::dial_and_authenticate(state, &config, false).await?;
@@ -589,14 +726,24 @@ async fn cmd_sftp(state: &AppState, action: SftpAction, json: bool) -> Result<()
             Ok(())
         }
         SftpAction::Rm { connection, path } => {
+            if !yes {
+                return Err(format!(
+                    "⛔ sftp rm 会删除远端文件，必须显式确认。\n  远端: {path}\n确认无误请加 --yes 重试。"
+                ));
+            }
             let mut config = find_connection(state, &connection)?;
             resolve_secrets(state, &mut config)?;
             let handle = ssh::dial_and_authenticate(state, &config, false).await?;
             let sftp = open_sftp(&handle).await?;
 
-            // Try removing as file first, then as directory
-            if sftp.remove_file(&path).await.is_err() {
-                sftp.remove_dir(&path).await.map_err(|e| format!("删除失败: {}", e))?;
+            // Try removing as file first, then as directory. Keep both errors:
+            // discarding the file error made a permission-denied FILE surface
+            // as an RMDIR failure — a message about an operation that was never
+            // intended, hiding the real cause.
+            if let Err(file_err) = sftp.remove_file(&path).await {
+                sftp.remove_dir(&path).await.map_err(|dir_err| {
+                    format!("删除失败: 删文件失败({file_err})，删目录失败({dir_err})")
+                })?;
             }
             let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
@@ -606,6 +753,11 @@ async fn cmd_sftp(state: &AppState, action: SftpAction, json: bool) -> Result<()
             Ok(())
         }
         SftpAction::Rename { connection, old, new } => {
+            if !yes {
+                return Err(format!(
+                    "⛔ sftp rename 会覆盖远端路径，必须显式确认。\n  原路径: {old}\n  新路径: {new}\n确认无误请加 --yes 重试。"
+                ));
+            }
             let mut config = find_connection(state, &connection)?;
             resolve_secrets(state, &mut config)?;
             let handle = ssh::dial_and_authenticate(state, &config, false).await?;

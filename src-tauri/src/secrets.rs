@@ -9,6 +9,7 @@
 
 use crate::crypto;
 use keyring::Entry;
+use zeroize::Zeroizing;
 
 const SERVICE: &str = "myshell";
 
@@ -29,12 +30,19 @@ pub fn set_password(id: &str, password: &str, key: &[u8; 32]) -> Result<(), Stri
 /// no entry exists (first run, never set, or post-migration). A corrupt or
 /// wrong-key blob surfaces as an error — caller can decide whether to treat
 /// it as "missing" or propagate.
-pub fn get_password(id: &str, key: &[u8; 32]) -> Result<Option<String>, String> {
+///
+/// The password comes back as `Zeroizing<String>`: this is the app's
+/// highest-value secret, and the `String` built here is the one copy that
+/// never has to cross a boundary (unlike the ones destined for russh or the
+/// frontend). Wiping it on the way out costs nothing and keeps a plaintext
+/// credential out of every heap snapshot the process leaves behind.
+pub fn get_password(id: &str, key: &[u8; 32]) -> Result<Option<Zeroizing<String>>, String> {
     let entry = Entry::new(SERVICE, id).map_err(|e| format!("keyring entry: {}", e))?;
     match entry.get_password() {
         Ok(blob) => {
             let pt = crypto::decrypt_with_key(key, &blob)?;
-            String::from_utf8(pt).map(Some).map_err(|e| format!("password utf8: {}", e))
+            let text = std::str::from_utf8(&pt).map_err(|e| format!("password utf8: {}", e))?;
+            Ok(Some(Zeroizing::new(text.to_string())))
         }
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(format!("keyring get: {}", e)),
@@ -76,13 +84,18 @@ pub fn set_proxy_password(id: &str, password: &str, key: &[u8; 32]) -> Result<()
         .map_err(|e| format!("keyring set proxy: {}", e))
 }
 
-pub fn get_proxy_password(id: &str, key: &[u8; 32]) -> Result<Option<String>, String> {
+pub fn get_proxy_password(
+    id: &str,
+    key: &[u8; 32],
+) -> Result<Option<Zeroizing<String>>, String> {
     let account = proxy_account(id);
     let entry = Entry::new(SERVICE, &account).map_err(|e| format!("keyring entry: {}", e))?;
     match entry.get_password() {
         Ok(blob) => {
             let pt = crypto::decrypt_with_key(key, &blob)?;
-            String::from_utf8(pt).map(Some).map_err(|e| format!("proxy password utf8: {}", e))
+            let text =
+                std::str::from_utf8(&pt).map_err(|e| format!("proxy password utf8: {}", e))?;
+            Ok(Some(Zeroizing::new(text.to_string())))
         }
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(format!("keyring get proxy: {}", e)),

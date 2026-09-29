@@ -113,6 +113,17 @@ pub fn build_path(dest: &Path, components: &[&str]) -> std::path::PathBuf {
 /// `File::create` so an attacker-planted link can't redirect the write
 /// outside the destination tree.
 pub async fn ensure_no_symlink_components(path: &Path) -> Result<(), String> {
+    ensure_no_symlink_components_sync(path)
+}
+
+/// Synchronous form of [`ensure_no_symlink_components`].
+///
+/// The walk is a handful of `symlink_metadata` calls on an already-chosen path,
+/// so there is nothing to await. Exists separately because the ZMODEM
+/// receiver's `accept_offer` is a synchronous function (it is called from the
+/// SSH reader task, and has to hand a `std::fs::File` straight to the disk
+/// queue) and still needs the same guarantee the SFTP/FTP paths have.
+pub fn ensure_no_symlink_components_sync(path: &Path) -> Result<(), String> {
     let mut cur = std::path::PathBuf::new();
     let mut iter = path.components();
     // Skip the RootDir/Prefix component — that's the drive/mount itself.
@@ -121,7 +132,7 @@ pub async fn ensure_no_symlink_components(path: &Path) -> Result<(), String> {
     }
     for comp in iter {
         cur.push(comp.as_os_str());
-        let md = tokio::fs::symlink_metadata(&cur).await;
+        let md = std::fs::symlink_metadata(&cur);
         match md {
             Ok(md) => {
                 #[cfg(windows)]

@@ -6,7 +6,7 @@
      显式禁用以守住行为不变）。清空按钮随旧版留在 #header 行内；#footer 放底部提示条。 -->
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { Delete } from "@element-plus/icons-vue";
+import { Delete, Warning } from "@element-plus/icons-vue";
 import { MyButton, MyDialog, confirmDialog, toast } from "myui";
 import type { ConnType, DeletedConnection } from "@/api";
 import {
@@ -24,13 +24,19 @@ const emit = defineEmits<{ close: [] }>();
 const items = ref<DeletedConnection[]>([]);
 const loading = ref(true);
 const busyId = ref<string | null>(null);
+/// A failed load used to leave `items` empty, which the template renders as
+/// "回收站为空" — telling the user there is nothing to recover while
+/// soft-deleted connections may well exist (e.g. the vault is locked).
+const loadError = ref<string | null>(null);
 
 async function reload(): Promise<void> {
+  loadError.value = null;
   try {
     const list = await getDeletedConnections();
     items.value = list;
   } catch (e) {
     console.error("[recycle] load failed", e);
+    loadError.value = String(e);
   } finally {
     loading.value = false;
   }
@@ -170,7 +176,17 @@ function relativeTime(iso: string): string {
 
     <!-- List -->
     <div class="list">
-      <div v-if="!loading && items.length === 0" class="empty-state">
+      <div v-if="!loading && loadError" class="empty-state">
+        <div class="empty-icon">
+          <el-icon :size="36"><Warning /></el-icon>
+        </div>
+        加载失败：{{ loadError }}
+        <div class="empty-hint">回收站的内容未知，请先确认保险库已解锁，然后重试</div>
+        <MyButton variant="secondary" size="small" style="margin-top: 8px" @click="reload">
+          重试
+        </MyButton>
+      </div>
+      <div v-else-if="!loading && items.length === 0" class="empty-state">
         <div class="empty-icon">
           <el-icon :size="36"><Delete /></el-icon>
         </div>
