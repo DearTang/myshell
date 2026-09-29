@@ -1712,7 +1712,7 @@ fn decrypt_field(key: &[u8; 32], blob: Option<String>) -> Result<Option<String>>
 mod tests {
     use super::*;
 
-    /// A throwaway database path under the OS temp dir, removed on drop.
+    /// A throwaway database file under the OS temp dir, removed on drop.
     struct TempDb(PathBuf);
     impl TempDb {
         fn new(tag: &str) -> Self {
@@ -1723,6 +1723,18 @@ mod tests {
     }
     impl Drop for TempDb {
         fn drop(&mut self) {
+            // `init_db_at` opens `self.0` as a **file** (its `create_dir_all`
+            // only makes the parent), so `remove_dir_all` was the wrong call:
+            // it returns NotADirectory, `let _ =` swallowed that, and every
+            // single test run leaked a ~92 KB database into %TEMP% — 78 of
+            // them had piled up (~7 MB) before this was noticed. WAL mode
+            // also leaves `-wal` / `-shm` sidecars next to it.
+            for suffix in ["", "-wal", "-shm"] {
+                let mut name = self.0.clone().into_os_string();
+                name.push(suffix);
+                let _ = std::fs::remove_file(std::path::PathBuf::from(name));
+            }
+            // Be forgiving if a future change turns the path into a directory.
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
@@ -1839,5 +1851,37 @@ mod tests {
             res.is_err(),
             "out-of-range port silently became 0 → a confusing connection error"
         );
+    }
+
+    /// 回归守卫：`TempDb` 必须真的删掉自己。
+    ///
+    /// 这条测试存在的原因很具体——`Drop` 里写的是 `remove_dir_all`，而
+    /// `init_db_at` 建的是**文件**。`remove_dir_all` 对文件返回
+    /// NotADirectory，又被 `let _ =` 吞掉，于是**每一次跑测试都往 %TEMP%
+    /// 里漏一个 ~92 KB 的库**。攒到 78 个（约 7 MB）才被发现。
+    /// 那个 `let _ =` 意味着它失败得毫无声响——看起来是"有清理的"。
+    #[test]
+    fn temp_db_actually_removes_itself() {
+        let path;
+        {
+            let tmp = TempDb::new("cleanup");
+            path = tmp.0.clone();
+            let conn = init_db_at(&tmp.0).expect("init");
+            conn.execute_batch("SELECT 1;").expect("use the db");
+            assert!(path.exists(), "测试库本应先被建出来");
+        } // ← conn 在这里析构，TempDb 随后析构并清理
+        assert!(
+            !path.exists(),
+            "TempDb 析构后文件仍在：Drop 的清理是无效的（%TEMP% 会持续堆积）"
+        );
+        // WAL 模式的 -wal / -shm 边车文件也不该留下。
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.clone().into_os_string();
+            name.push(suffix);
+            assert!(
+                !std::path::PathBuf::from(name).exists(),
+                "WAL 边车文件未清理"
+            );
+        }
     }
 }

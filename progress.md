@@ -4100,3 +4100,116 @@ GitHub 的 `github` remote URL 里**内嵌了明文 PAT**（`https://<user>:<pat
 | 什么可能导致偏离？ | **`cargo test --lib` 不覆盖 bin 里的测试**——`myshell-mcp.rs` 的测试必须 `--bin myshell-mcp`。**`npx tsc` 在 Vue 项目里是错的工具**，用 `npm run test:ts`。发布脚本按 `target_commitish=main` 建 tag，所以**每次发版前必须把 main 快进到同一提交**，否则 tag 落错位置。 |
 | 下一步最小可验证动作？ | ① 重启 MCP 后跑一次 zmodem_download，确认进度报 100%；② 装一次 `MyShell_2.15.1_x64-setup.exe` 冒烟；③ 换掉内嵌 PAT 后重跑一次 `git push` 验证。 |
 | 目标是什么？ | 让"发布"这件事本身也经得起审计——每条改动都能从 CHANGELOG 反推，每个发布脚本的隐含前提都写在文档里。 |
+
+### 阶段 145 — 发布后复测：进度修复闭环 + 抓到一个"文档说谎"的 bug（2026-09-29）
+
+阶段 143 留了唯一一件没闭环的事：MCP 进度修复的端到端复测。这一批做完了，并且**顺手挖出一个更值钱的发现**。
+
+#### 一、绕开"跑着的 MCP 还是旧二进制"
+
+ZCode 客户端持有的 `myshell-mcp.exe` 进程启动于 19:25 / 20:48，而修复后的二进制 21:03 才编译出来——
+MCP 只在 spawn 时加载代码，`cargo build` 改不动已在运行的进程。重启客户端才能生效，但那是用户侧动作。
+
+**换个办法：直接驱动新二进制。** MCP 走的是 stdio 换行分隔的 JSON-RPC 2.0，
+所以写个几十行脚本 spawn `myshell-mcp.exe`、发 `initialize` → `tools/call` → 轮询 `zmodem_status`
+就能端到端跑**新代码**。这比"等用户重启"快，也比"只跑单测"可信。
+
+#### 二、进度修复：端到端确认 ✅
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `progress_pct` | 0 | **100** |
+| `bytes_done` | 2097152 | 2097152 |
+| `bytes_total` | **0** | **2097152** |
+| md5 | — | `39b029a51f285ae36fd97715d5ce52bb` 与远端一致 |
+
+阶段 143 的"单测 + 反向对照"这次得到了真机背书。
+
+#### 三、抓到的 bug：`zmodem_download` 的工具描述在撒谎
+
+我顺手测了多文件（`sz -r <目录>`），结果失败。追下去发现**不是我的测试写错，是工具描述本身是假的**：
+
+> `remote_path` 参数说明原文：
+> "May be a file **OR a directory** — directories are recursed and their subtree mirrored under local_dir"
+
+以及 `local_dir`："a directory download keeps its tree structure under this dir"。
+
+**实际上下载路径里没有任何递归代码。** `sz -r <path>` 直接把路径丢给远端 `sz`，而：
+
+- lrzsz 0.12.21rc 的 `sz` **打不开目录** → `Can't open any requested files`，exit 128
+- `-r` 的真实含义是 `--resume`（断点续传），**不是递归**
+- 路径还被 `shell_quote` 包了，所以就算传通配符也不会被 shell 展开
+  （实测：不加引号 `sz -r *.bin` 能起来并发出 ZMODEM offer；加引号就 `Can't open any requested files`）
+
+代码里那句注释也跟着错：`// -r makes sz recurse into directories`。
+
+**为什么这条值得单独修**：MCP 的工具描述是 **AI agent 决定怎么行动的依据**。
+它读到"支持目录"，就会自信地拿目录去调 `zmodem_download`，然后撞上一个
+"sz 发送了取消序列"这种完全指不到真因的报错。**描述撒谎比功能缺失更贵**——
+功能缺失会让人换个工具，描述撒谎会让人一直用错工具。
+
+已改：三处描述改成"仅单文件，目录请用 `download_project`"，并把 `-r` 的真实语义写进代码注释。
+
+#### 四、顺带确认的两个不对称（不是 bug，但值得记）
+
+1. **上传方向是真的有递归**：`ssh.rs:1146` 有目录展开逻辑，还有 3 个通过的 `upload_expand_tests`
+   （`folder_expands_to_relative_offer_names` 等）。**上传目录可用，下载目录不可用**——这个不对称是真实存在的。
+2. **失败路径的报错质量不错**：目录场景下报的是
+   "远端中止了 ZMODEM 传输（sz 发送了取消序列，常见原因：文件不可读/权限不足，**或目标是目录**）"
+   ——它已经点出了目录这一可能。所以问题不在运行时反馈，只在**事前描述**。
+
+上传目录的真机实测**没做**：`zmodem_upload` 按设计永远要人工确认，headless 驱动会卡在 GUI 弹窗上。
+这一条以代码 + 单测为据，不假装测过。
+
+#### 六、发布后复测又抓到一个：测试自己在往 %TEMP% 里漏文件
+
+复测完 ZMODEM，清理测试残留时 `dir %TEMP%\myshell-*` 列出了 **78 个
+`myshell-dbt-*` 文件**（每个 ~92 KB，共约 7 MB）——全部来自**我自己**在阶段 133
+写的 db 测试辅助 `TempDb`。
+
+**根因**是一个"看起来在清理"的 Drop：
+
+```rust
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);   // ← 错的调用 + 被吞的错误
+    }
+}
+```
+
+- `init_db_at` 走的是 `Connection::open(path)`——建的是**文件**（它的
+  `create_dir_all` 只建父目录）。
+- `remove_dir_all` 对文件返回 `NotADirectory`。
+- `let _ =` 把这个错误吞了。
+
+于是**每一次跑测试都漏一个库文件**，失败得毫无声响。这和第三节"描述说谎"
+是同一类病：**看起来是"有处理"的，所以没有人去查**。区别只是这次说谎的是
+我自己的代码。
+
+**修法**：按文件删（`remove_file`），并连带清理 WAL 模式的 `-wal` / `-shm`
+边车文件；保留 `remove_dir_all` 作为"若未来路径变成目录"的兜底。
+
+**验证**：新增回归测试 `temp_db_actually_removes_itself`——建库、用库、
+析构，然后断言文件**真的没了**。配反向对照脚本
+`.zcode/verify-guard-tempdb.mjs`：把 Drop 退回旧实现，确认测试如期失败
+（`1 failed`）。已清掉积压的 78 个文件；**101 个测试完整跑一遍后
+%TEMP% 残留为 0**。
+
+这个案例值得留档的原因：**"我写了清理"不等于"清理在生效"**。任何
+`let _ = std::fs::remove...` 都应该配一条"清理真的发生了"的断言，
+否则它就只是一个从不失败、也从不生效的仪式。
+
+#### 五、本次发布状态说明
+
+v2.15.1 **已经发布**，上述三处描述修正**不在**该版本内，将进入下一次发版的暂存区。
+已按 doc-after-feature 规则写入 `RELEASE_NOTES_STAGING.md`（baseline 已是 `v2.15.1`）。
+
+## 五问重启检查（阶段 145）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 145 complete —— 进度修复端到端确认（100% / bytes_total 正确），并修复了 `zmodem_download` 工具描述谎称支持目录下载的问题。 |
+| 我要去哪里？ | 等下次 `打包` 把描述修正带出去；轮换 GitHub PAT。 |
+| 什么可能导致偏离？ | 本批抓到的两个 bug 是同一类病：**"看起来处理了"不等于"处理在生效"**。工具描述写宽了能力（AI 据此误用），`let _ = remove_dir_all` 吞掉了清理失败（每次测试漏一个文件）。所以：写给 AI 看的能力描述必须对应验证过的行为；任何 `let _ = std::fs::remove…` 必须配一条"清理真的发生了"的断言。另一个通用手法：`cargo build` 后的真机复测若涉及长驻进程（MCP/GUI），**要么重启它，要么直接 spawn 新二进制走它自己的协议驱动**——后者更快也更可信。 |
+| 下一步最小可验证动作？ | ① 下次发版后确认 CHANGELOG 含本条；② 装 v2.15.1 冒烟；③ 换掉内嵌 PAT。 |
+| 目标是什么？ | 让 AI 读到的每一条能力描述，都对应一个我真的验证过能用的行为。 |

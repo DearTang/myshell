@@ -511,8 +511,8 @@ fn tool_definitions() -> Value {
                     "type": "object",
                     "properties": {
                         "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
-                        "remote_path": { "type": "string", "description": "Absolute remote path to download (passed to `sz -r`). May be a file OR a directory — directories are recursed and their subtree mirrored under local_dir (relative subpaths preserved)." },
-                        "local_dir": { "type": "string", "description": "Absolute local directory where files land. Must exist. Files are named after the remote offer; a directory download keeps its tree structure under this dir." },
+                        "remote_path": { "type": "string", "description": "Absolute remote path of ONE FILE to download (passed verbatim to `sz -r`).\n\n⚠️ NOT a directory. `sz` cannot open a directory — lrzsz answers 'Can't open any requested files' and exits 128, and the path is shell-quoted so no glob is expanded either. To move a whole tree, use `download_project` (tar over SFTP) instead.\n\nThis param's description previously claimed directories were recursed and their subtree mirrored. That was never true: nothing in the download path walks a tree. (`zmodem_upload` DOES recurse, because its uploader expands folders into relative ZFILE offers — the two directions are deliberately asymmetric.)" },
+                        "local_dir": { "type": "string", "description": "Absolute local directory where the file lands. Must exist. The local name comes from the remote offer." },
                         "timeout": { "type": "integer", "description": "Max seconds to wait for the transfer (default 120). The first 20s is an initial handshake timeout before the transfer is considered stalled.", "default": 120 }
                     },
                     "required": ["connection", "remote_path", "local_dir"]
@@ -2574,8 +2574,14 @@ async fn run_download_task(
         }
     };
 
-    // -r makes sz recurse into directories (no effect on plain files); the
-    // receiver mirrors the tree under local_dir via relative offer paths.
+    // `-r` is lrzsz's `--resume` (continue an interrupted transfer). It is
+    // NOT recursion: `sz` only ever opens regular files, and it does not
+    // glob either — it relies on the shell having expanded the argument
+    // before it runs. Since we shell_quote the path, a directory or a
+    // wildcard reaches sz literally and it aborts with "Can't open any
+    // requested files" (exit 128), which surfaces here as a ZABORT. This
+    // path is single-file by construction; whole trees go through
+    // `download_project` (tar over SFTP).
     let cmd = format!("sz -r {}\r", shell_quote(remote_path));
     if let Err(e) = ssh::send_input(app, &session_id, cmd.as_bytes()).await {
         let _ = ssh::disconnect(app, &session_id).await;
