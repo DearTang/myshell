@@ -4028,3 +4028,75 @@ node .zcode/verify-guard-progress.mjs        # 进度守卫自身的反向对照
 | 什么可能导致偏离？ | **ZMODEM 的进度记账跑在 MCP 进程里，不是 GUI**——所以 `cargo build` 之后正在跑的任务不会变，任何"MCP 侧改动"的真机复测都必须先重启 MCP。同样，阶段 141/142 的 zeroize 改动大多在 GUI 与 lib 里，也需要重启 GUI 才生效。另：`cargo test --lib` **不覆盖 bin 里的测试**，`myshell-mcp.rs` 的测试要用 `--bin myshell-mcp` 才会跑。 |
 | 下一步最小可验证动作？ | ① 重启 MCP 服务；② 传一个 2 MiB 文件，确认 `zmodem_status` 报 100%；③ `sz -r` 传一个含多文件的目录，确认进度条不中途清零。 |
 | 目标是什么？ | 把"本地单测全绿"和"真实 lrzsz 上也对"之间的缺口关掉——顺便证明真机测试确实能抓到单测抓不到的东西。 |
+
+### 阶段 144 — 发布 v2.15.1（2026-09-29）
+
+#### 一、版本判定
+
+`RELEASE_NOTES_STAGING.md` 共 62 条：**🔒 安全 16 / 🛠️ 优化 7 / 🐛 修复 39，零 ✨ 新增**。
+按规则「无 ✨新增 → patch」，当前 `2.15.0` → **`2.15.1`**。
+
+需要说明的是：这一版的体量（62 条、含 16 条安全加固与一次完整的密钥生命周期重构）其实够得上 minor。
+但规则是仓库既有约定，**擅自改成 2.16.0 等于替维护者编造偏好**，所以按规则走 patch；
+若日后希望此类大批量加固走 minor，应先改规则里的判定条件，而不是单次例外。
+
+#### 二、完整性校验抓出 3 个漏记
+
+打包规则的 `git diff <baseline>..HEAD` 校验是"抓漏网"的关卡，这次真的抓到了——
+改了文件但 staging 无对应条目的 3 处：
+
+1. `db.rs` —— 端口号越界时 `unwrap_or(0)` 静默变成 0，连接时只报"无法连接"（→ 🐛）
+2. `useVault.ts` —— 保险库状态查询偶发 IPC 失败时把已有保险库显示成"未初始化"，
+   提交后撞上 `setup_vault` 的"已初始化"守卫，而没有任何重新查询路径，**只能重启应用**（→ 🐛）
+3. `fonts.rs` —— `#[tauri::command]` 留在 lib 里，迫使 CLI / MCP 两个二进制为枚举字体而链接 Tauri（→ 🛠️）
+
+三处均已补入 staging 并进入 CHANGELOG。若跳过这一步，这三条修复就会**存在于代码里但不出现在更新日志中**——
+用户看不到自己升级了什么，审计时也无法从发布说明反推改动范围。
+
+#### 三、预检时发现的一处文档失效
+
+打包规则 step 4 写的是 `npx tsc --noEmit`。这条命令在 **Vue 迁移后已经失效**：
+裸 `tsc` 不认识 `.vue` 单文件组件，会在 `src/main.ts` 报
+`TS2307: Cannot find module './App.vue'`。真正的类型检查是 `vue-tsc`（即 `npm run test:ts`）。
+
+已把 AGENTS.md 里所有 React 时代残留一并修正：项目描述、`App.tsx` → `App.vue`、
+`React component` → `Vue component`、前端文件清单重写为 Vue + Pinia + myui 结构，
+并在"Frontend"小节顶部加了一条醒目提示——**别再用 `npx tsc`，那是工具选错，不是代码坏了**。
+
+这类"文档里的命令悄悄过期"最危险：它不报错，只会让下一个人（或下一个 agent）
+在发版前的最后一道关卡上被一个假错误拦住，然后要么误判代码坏了，要么跳过预检。
+
+#### 四、发布结果
+
+| 平台 | 结果 |
+|---|---|
+| Gitee | https://gitee.com/argustang/myshell/releases/tag/v2.15.1 （release id 1174836） |
+| GitHub | https://github.com/DearTang/myshell/releases/tag/v2.15.1 （release id 399194800） |
+
+- 安装包：`MyShell_2.15.1_x64-setup.exe`（13,377,739 字节）
+- 提交：`69b5573 release: v2.15.1` + `abee66c chore: clear release staging after v2.15.1`
+- `界面更新` 与 `main` 一同快进到同一提交——**发布脚本按 `target_commitish=main` 建 tag**，
+  不同步 main 的话 tag 会落在 v2.15.0 那个旧提交上
+- 暂存区已清空，baseline → `v2.15.1`
+
+#### 五、发布过程中的一个安全发现（未擅自处理）
+
+GitHub 的 `github` remote URL 里**内嵌了明文 PAT**（`https://<user>:<pat>@github.com/...`）。
+它只存在于本地 `.git/config`，不会进仓库，但：
+
+- `.git/config` 一旦被复制、备份、或连同整个目录迁移，token 就跟着走
+- 任何能读该文件的工具/插件都能拿到它（不限于 git 本身）
+- 项目已经有 `.github-token` 文件 + 发布脚本读文件的机制，**remote 根本不需要内嵌**
+
+已在最终汇报里标出，**建议轮换该 token 并把 remote 改回无凭据 URL**。
+未擅自改动 remote——那会中断正在使用的推送凭据，属于需要维护者确认的动作。
+
+## 五问重启检查（阶段 144）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 144 complete —— v2.15.1 已发布到 Gitee + GitHub，暂存区清空，baseline 更新，main 与特性分支同步。 |
+| 我要去哪里？ | 重启 MCP 服务复测 ZMODEM 进度显示（阶段 143 遗留唯一未闭环项），以及轮换 GitHub PAT。 |
+| 什么可能导致偏离？ | **`cargo test --lib` 不覆盖 bin 里的测试**——`myshell-mcp.rs` 的测试必须 `--bin myshell-mcp`。**`npx tsc` 在 Vue 项目里是错的工具**，用 `npm run test:ts`。发布脚本按 `target_commitish=main` 建 tag，所以**每次发版前必须把 main 快进到同一提交**，否则 tag 落错位置。 |
+| 下一步最小可验证动作？ | ① 重启 MCP 后跑一次 zmodem_download，确认进度报 100%；② 装一次 `MyShell_2.15.1_x64-setup.exe` 冒烟；③ 换掉内嵌 PAT 后重跑一次 `git push` 验证。 |
+| 目标是什么？ | 让"发布"这件事本身也经得起审计——每条改动都能从 CHANGELOG 反推，每个发布脚本的隐含前提都写在文档里。 |
