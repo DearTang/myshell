@@ -4315,3 +4315,33 @@ npm run tauri:build                                                  # 模板渲
 | 什么可能导致偏离？ | **别把 `CheckIfAppIsRunning` 当成"提示关闭"**——它是确认后**强杀**，修复后安装器会主动结束运行中的 MCP 进程，AI 客户端连接会断（通常下次调用自动重拉），这是新增的预期行为。另一处：接管 Tauri 模板的代价是**上游 re-sync 时必须重放改动 1~5**，尤其这次新增的路径前缀——漏掉就会静默退回本次故障，且不报错。 |
 | 下一步最小可验证动作？ | ① 先用 ZCode 把 MCP 进程拉起并保持常驻，再运行新安装包，确认弹出"MyShell (MCP Server) 正在运行"确认框、点确定后安装完成且 `E:\Program Files\MyShell\myshell-mcp.exe` 为新版本；② MCP 运行中执行 `MyShell_X.Y.Z_x64-setup.exe /S`，应无框直接完成；③ 装完确认 `E:\Program Files\MyShell\` 下不再出现 `.old` 残留。 |
 | 目标是什么？ | 让"安装 → AI 客户端可用"这条链路不再依赖运气——升级时该弹框就弹框，该强杀就强杀，不会在几天后以"MCP 坏了"的形式暴露。 |
+
+### 阶段 148 — 发布 v2.15.3（2026-10-01）
+
+只含阶段 147 的安装器进程检测修复，1 条 🐛、零 ✨ → patch → **v2.15.3**。
+
+#### 一、结果
+
+| 平台 | 结果 |
+|---|---|
+| Gitee | https://gitee.com/argustang/myshell/releases/tag/v2.15.3 （release id 1178573）✅ |
+| GitHub | https://github.com/DearTang/myshell/releases/tag/v2.15.3 （release id 400891071）✅ |
+
+- 安装包：`MyShell_2.15.3_x64-setup.exe`（13,374,932 字节），双平台资产上传完成
+- 提交：`cdcef4b release: v2.15.3` + `ba896bb chore: clear release staging`，均已推 Gitee（main + 界面更新）与 GitHub（main）
+- 阶段 146 的两个遗留项均已闭环：GitHub 推送本次一次成功（代理 503 已恢复，且推送区间显示 67cc38c..cdcef4b，说明 v2.15.2 的补推早已完成）；GitHub releases 列表确认 v2.15.2 release 已存在（API 实查），双平台版本序列 v2.14.1 → v2.15.3 无缺口
+- **真机安装冒烟仍未做**（阶段 147 五问中的待办），留给用户：MCP 常驻时点安装包看确认框、`/S` 静默装、装后无 `.old` 残留
+
+#### 二、发布工具链又踩到同一个坑
+
+`clear-staging.mjs` 的 baseline 替换硬编码查找 `v2.15.0`，当前 baseline 已是 v2.15.2 → 不匹配 → **静默不更新**（脚本会打印校验值但不会失败）。本次改为手工编辑绕开。这与阶段 146 抓到的三个坑（release-prep 硬编码 GAPS、stripSection 吃空行、clear-staging 写死版本号）是同一模式：**发布脚本里的版本常量每次发版都会过期**。正确修法是把"旧 baseline"也做成参数或正则捕获（`baseline: (v[\d.]+)`），而不是写下一次又会过期的字面量。
+
+## 五问重启检查（阶段 148）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 148 完成 —— v2.15.3 已发布双平台，暂存区已清空（baseline → v2.15.3），发布链路无遗留断点。 |
+| 我要去哪里？ | 用户真机冒烟新安装包（验证确认框 / 静默安装 / 无 `.old`）；之后处理两件挂起事项：① `clear-staging.mjs` 的过期常量修复；② GitHub 远端 URL 内嵌 PAT 的清除（阶段 146 计划项，`.github-token` 文件已就位，脚本不受影响）。 |
+| 什么可能导致偏离？ | **升级 Tauri 后 re-sync 模板时漏掉改动 5**（`$INSTDIR` 前缀）会静默退回阶段 147 的故障且无报错——installer.nsi 头部注释有清单，逐项核对。另一处：别再用字面量版本号调 `clear-staging.mjs` 之外的未参数化脚本。 |
+| 下一步最小可验证动作？ | ① 下载 `MyShell_2.15.3_x64-setup.exe`，先让 ZCode 拉起 MCP 常驻再运行安装，确认弹"MyShell (MCP Server) 正在运行"确认框且装后 MCP 可用；② `dir "E:\Program Files\MyShell\*.old"` 应为空。 |
+| 目标是什么？ | 发布后的安装包装到任何一台"MCP 被广泛使用"的机器上都能正确完成升级，AI 客户端不再因升级而静默断连。 |
