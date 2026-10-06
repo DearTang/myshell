@@ -4433,3 +4433,36 @@ npm run tauri:build                                                  # 模板渲
 | 什么可能导致偏离？ | ① whatsnew-ack 若在门禁前就被调用会绕过 vault-watch 时序——不会，调用在 vault ready 分支内；② 无边框窗口在老驱动机器上的 resize 异常若出现，回退方案是恢复 decorations:true + 保留顶栏按钮改为无操作（不优雅但能止血）；③ 下次发版别再手抄图片 URL 签名（本轮调试时两次 400）。 |
 | 下一步最小可验证动作？ | 下载 `MyShell_2.16.0_x64-setup.exe` 安装 → 启动 → 解锁 → 确认无更新日志弹窗 + 顶栏右侧 ─ □ ✕ 可用 → 重启一次再确认无弹窗 → `type %APPDATA%\myshell\whatsnew-ack` 输出 2.16.0。 |
 | 目标是什么？ | 升级用户对 v2.16.0 的感知 = 一次安静的界面升级（一行顶栏）+ 零打扰（更新日志只弹一次或不弹），无回归。 |
+
+### 阶段 151 — 安装器"无法写入 myshell-mcp.exe"真机复现与实测纠正（2026-10-06）
+
+用户安装 v2.16.0 真机复现 v2.15.3 时代的撞锁错误（中止/重试/忽略）。先 taskkill 两个 myshell-mcp.exe 让用户点"重试"完成安装（myshell.exe/cli 更新成功，但 myshell-mcp.exe 因之前忽略而残留 v2.15.3）。
+
+#### 一、根因：阶段 147 的"修复"方向反了
+
+- 模板与渲染产物都正确包含 CheckIfAppIsRunning 调用 → 排除 Handlebars 吞宏。
+- 读 utils.nsh：宏底层是 nsis_tauri_utils::FindProcess/KillProcess（不是注释臆断的 Restart Manager），参数原样透传。
+- **本机 makensis + 插件 DLL 实测**（.zcode/nsis/test-findproc.nsi）：FindProcess 只按进程名（basename）匹配——裸名 → 0（找到）；**任何全路径恒 → 1（找不到），连 C:\Windows\explorer.exe 都"找不到"**。KillProcess 同理（test-kill.nsi：裸名找到→杀→复查消失）。
+- 结论：阶段 147 把 6 处调用从裸文件名改成 $INSTDIR 全路径 = 检测永久静默失效；官方模板传全路径本身就是无效检测（主程序的"应用运行中"框在官方模板同样不生效）。v2.15.3 发布记录里"真机安装冒烟仍未做"的遗留直接导致两版带病。
+
+#### 二、修复与验证
+
+- installer.nsi 8 处调用全部改回裸文件名（myshell.exe / myshell-mcp.exe / myshell-cli.exe，安装×2 轮 + 卸载）；文件头"改动 5"注释重写为两次教训的完整记录，防止将来再被"改回"。
+- 重建安装器（模板级改动，热缓存 ~7 分钟）；渲染产物复核为裸名。
+- **端到端真机验证**：从 E:\Program Files\MyShell 拉起 myshell-mcp.exe 模拟 AI 客户端占用 → /S 静默安装（UAC 一次）→ 安装器自动结束 MCP 进程 → myshell-mcp.exe 成功覆盖为当日构建（10/01 旧版 → 当日），无新增 .old，卸载器正常重建。用户机器已修复到完整 v2.16.0 三件套。
+- 副作用说明：裸名匹配会结束任意目录下的同名进程（含 G:\...\debug 开发实例），对安装器是更稳妥的行为。
+
+#### 三、遗留
+
+- 已发布的 v2.16.0 双平台资产仍是带病安装器（升级时 MCP 常驻会撞锁，需手动 taskkill）；staging 已记 🐛 条目，下次打包出 patch（v2.16.1）。
+- 顺手记录：.zcode/nsis/test-*.nsi 可作为安装器行为的本机回归脚本（纯 ASCII 注释，makensis 否则报 line 1 错）。
+
+## 五问重启检查（阶段 151）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 151 完成 —— 占用检测实测纠正 + 真机端到端验证通过，用户机器已是完整 v2.16.0；修复未发布（staging 一条 🐛）。 |
+| 我要去哪里？ | 用户说 `打包` 即出 v2.16.1（patch：仅此一条）；发布后该问题彻底闭环。 |
+| 什么可能导致偏离？ | ① 将来 re-sync NSIS 模板时"改动 5"被丢或被"改回"全路径——文件头注释 + 本阶段记录是仅有的防线；② 用了带中文注释的 .nsi 喂 makensis 会 line 1 报错，测试脚本必须纯 ASCII。 |
+| 下一步最小可验证动作？ | AI 客户端拉起 MCP 常驻状态下双击新安装器：应弹"MyShell (MCP Server) 正在运行"确认框（本次静默验证走的是 IfSilent 直杀分支，交互分支逻辑同宏、未单独真机点过）。 |
+| 目标是什么？ | 任何"MCP 被广泛使用"的机器升级 MyShell 都不再出现"无法打开要写入的文件"，MCP 二进制随主程序同步更新。 |

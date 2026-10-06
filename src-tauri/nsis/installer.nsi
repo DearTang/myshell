@@ -29,16 +29,20 @@
 ;      注意: 注释中切勿出现双花括号——Tauri 用 Handlebars 渲染整份模板，
 ;      不区分 NSIS 注释，会把注释里的 each/if 等标签当成真实模板语法解析导致崩溃。
 ;
-;   5. CheckIfAppIsRunning 的参数一律补全为 $INSTDIR 下的完整路径，并在复制
-;      binaries 前对 mcp/cli 各追加一次二次检查。
-;      起因: 官方模板传 "$INSTDIR\${MAINBINARYNAME}.exe"，而本副本此前 6 处
-;      全部误传裸文件名。该宏把参数原样交给 RestartManager_RegisterFile
-;      且自身不做任何路径补全，裸文件名被当作相对路径 → 匹配不到占用进程
-;      → 不弹框、不强杀 → 继续执行 File 覆盖 → 撞锁失败，myshell-mcp.exe
-;      覆盖不上而残留为 .old，MCP 对 AI 客户端静默失效（阶段 147 定位）。
+;   5. CheckIfAppIsRunning 的参数必须是"裸文件名"（myshell-mcp.exe），
+;      且在复制 binaries 前对 mcp/cli 各追加一次二次检查。
+;      起因与两次教训:
+;      a) 最初 6 处误传裸文件名以外的形式——阶段 147 一度认定裸名匹配不到
+;         占用进程，改成 $INSTDIR 全路径并随 v2.15.3/v2.16.0 发布。
+;      b) 2026-10-06 真机复现"无法打开要写入的文件 myshell-mcp.exe"，用
+;         本机 makensis + nsis_tauri_utils.dll 实测（.zcode/nsis/test-findproc.nsi）：
+;         FindProcess 只按进程名(basename)匹配——裸名返回 0(找到)，
+;         全路径一律返回 1(找不到)，连 C:\Windows\explorer.exe 都匹配不到。
+;         即阶段 147 的"全路径修复"方向反了，检测因此静默失效。
+;      现已改回裸文件名。副作用: 同名进程无论在哪个目录都会被检测/结束
+;      （例如 G:\...\debug\myshell-mcp.exe），对安装器反而更稳妥。
 ;      二次检查用于堵 TOCTOU: AI 客户端可能在开头检查通过后、文件复制前重新
-;      拉起 MCP 进程（MCP 使用面广时被频繁触发），导致复制再次撞锁。
-;      二次检查仍是"确认后强杀"，不做静默 taskkill。
+;      拉起 MCP 进程，导致复制再次撞锁。仍是"确认后强杀"，不做静默 taskkill。
 ;
 ; 维护须知（接管模板的代价）:
 ;   升级 Tauri（如 2.12）后，若官方改动了 installer.nsi，需 re-sync ——
@@ -683,14 +687,15 @@ Section Install
     !insertmacro NSIS_HOOK_PREINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; MyShell 改动: mcp/cli 二进制同样会被写入 $INSTDIR，若运行中会占用文件导致
   ; "无法打开要写入的文件" 报错（mcp 常被 AI 客户端作为子进程常驻拉起），
   ; 故安装/升级前一并检查；检测到占用时用户确认即强制结束该进程。
-  ; 路径必须带 $INSTDIR 前缀，否则 Restart Manager 匹配不到占用进程（见文件头改动 5）。
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\myshell-cli.exe" "${PRODUCTNAME} (CLI)"
+  ; 参数必须是裸文件名: FindProcess 只按进程名匹配，全路径恒返回"未找到"
+  ; （见文件头改动 5 的实测记录）。
+  !insertmacro CheckIfAppIsRunning "myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
+  !insertmacro CheckIfAppIsRunning "myshell-cli.exe" "${PRODUCTNAME} (CLI)"
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
@@ -709,8 +714,8 @@ Section Install
   ; MyShell 改动: 复制 binaries 前二次检查。AI 客户端可能在开头检查通过后、
   ; 文件复制前重新拉起 MCP 进程（MCP 使用面广时被频繁触发），复制时再次撞锁。
   ; 仍是"确认后强杀"，不做静默 taskkill；进程未运行时宏直接跳过，不打扰用户。
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\myshell-cli.exe" "${PRODUCTNAME} (CLI)"
+  !insertmacro CheckIfAppIsRunning "myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
+  !insertmacro CheckIfAppIsRunning "myshell-cli.exe" "${PRODUCTNAME} (CLI)"
 
   {{#each binaries}}
     File "/oname={{this}}" "{{no-escape @key}}"
@@ -835,11 +840,11 @@ Section Uninstall
     !insertmacro NSIS_HOOK_PREUNINSTALL
   !endif
 
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
   ; MyShell 改动: 卸载前同样检查 mcp/cli（mcp 常被 AI 客户端常驻拉起）
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
-  !insertmacro CheckIfAppIsRunning "$INSTDIR\myshell-cli.exe" "${PRODUCTNAME} (CLI)"
+  !insertmacro CheckIfAppIsRunning "myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
+  !insertmacro CheckIfAppIsRunning "myshell-cli.exe" "${PRODUCTNAME} (CLI)"
 
   ; Delete the app directory and its content from disk
   ; Copy main executable
