@@ -1,10 +1,14 @@
 <!-- 顶部栏（自包含，无 props）：品牌区 + 标签条 + 会话/广播下拉面板 +
-     壳层动作按钮。全部状态经 store（sessions/ui/connections）直接读写。
+     壳层动作按钮 + 窗口控制。全部状态经 store（sessions/ui/connections）直接读写。
      移植自旧 TabBar.tsx（功能结构）+ unified-ui-vue 模板 AppTopBar
-     （毛玻璃观感）。高度填满壳层 grid 第一行 var(--ui-topbar-h)。 -->
+     （毛玻璃观感）。高度填满壳层 grid 第一行 var(--ui-topbar-h)。
+     v2.15.4 起窗口无边框（decorations:false），最小化/最大化/关闭按钮
+     内嵌本栏最右（omp desktop 式一行顶栏），空白区域可拖动窗口。 -->
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Promotion } from "@element-plus/icons-vue";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   ChatDotRound,
   Expand,
@@ -111,14 +115,58 @@ function recomputeAnchor(): void {
   if (rect) anchor.value = rect;
 }
 
+// ── 窗口控制（无边框窗口自绘 ─ □ ✕）──
+const win = getCurrentWindow();
+const isMaximized = ref(false);
+let unlistenResized: UnlistenFn | null = null;
+
+function minimizeWin(): void {
+  void win.minimize().catch(() => {
+    /* best-effort */
+  });
+}
+
+function toggleMaximize(): void {
+  void win.toggleMaximize().catch(() => {
+    /* best-effort */
+  });
+}
+
+function closeWin(): void {
+  void win.close().catch(() => {
+    /* best-effort */
+  });
+}
+
 onMounted(() => {
   window.addEventListener("resize", recomputeAnchor);
   window.addEventListener("scroll", recomputeAnchor, true);
+  // ── 窗口控制（无边框窗口自绘按钮）──
+  void win
+    .isMaximized()
+    .then((m) => {
+      isMaximized.value = m;
+    })
+    .catch(() => {
+      /* 权限缺失时按钮退化为普通图标 */
+    });
+  void win
+    .onResized(async () => {
+      isMaximized.value = await win.isMaximized().catch(() => isMaximized.value);
+    })
+    .then((fn) => {
+      unlistenResized = fn;
+    })
+    .catch(() => {
+      /* best-effort */
+    });
 });
 
 onUnmounted(() => {
   window.removeEventListener("resize", recomputeAnchor);
   window.removeEventListener("scroll", recomputeAnchor, true);
+  unlistenResized?.();
+  unlistenResized = null;
 });
 
 // ── 面板数据 ──
@@ -194,7 +242,9 @@ function revokeSessionAllowed(): void {
 </script>
 
 <template>
-  <header class="app-topbar">
+  <!-- data-tauri-drag-region：元素自身空白处可拖动窗口（子元素不受影响）；
+       标签条空白区同样可拖（Chrome/omp 式）。双击空白 = 最大化/还原。 -->
+  <header class="app-topbar" data-tauri-drag-region>
     <!-- 左：侧栏折叠 + 品牌区 -->
     <div class="topbar-left">
       <button
@@ -233,7 +283,7 @@ function revokeSessionAllowed(): void {
 
     <!-- 中：标签条（横向滚动）+ 右侧下拉触发钮 -->
     <div class="tab-strip">
-      <div class="tabs-scroll">
+      <div class="tabs-scroll" data-tauri-drag-region>
         <div
           v-for="tab in sessions.tabs"
           :key="tab.id"
@@ -339,6 +389,36 @@ function revokeSessionAllowed(): void {
       </button>
       <button type="button" class="icon-btn" title="设置" @click="ui.showSettings = true">
         <el-icon :size="16"><Setting /></el-icon>
+      </button>
+    </div>
+
+    <!-- 右缘：窗口控制（无边框窗口自绘按钮，与顶栏同行，贴窗口右上角） -->
+    <div class="window-controls">
+      <button type="button" class="wc-btn" title="最小化" aria-label="最小化" @click="minimizeWin">
+        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+          <path d="M0 5h10" stroke="currentColor" stroke-width="1" />
+        </svg>
+      </button>
+      <button
+        type="button"
+        class="wc-btn"
+        :title="isMaximized ? '向下还原' : '最大化'"
+        :aria-label="isMaximized ? '向下还原' : '最大化'"
+        @click="toggleMaximize"
+      >
+        <!-- 最大化：空心方框；还原：双层方框（Windows 规范字形） -->
+        <svg v-if="!isMaximized" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+          <rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1" />
+        </svg>
+        <svg v-else width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+          <rect x="0.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1" />
+          <path d="M2.5 2.5V0.5h7v7h-2" fill="none" stroke="currentColor" stroke-width="1" />
+        </svg>
+      </button>
+      <button type="button" class="wc-btn wc-close" title="关闭" aria-label="关闭" @click="closeWin">
+        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+          <path d="M0 0l10 10M10 0L0 10" stroke="currentColor" stroke-width="1" />
+        </svg>
       </button>
     </div>
 
@@ -669,5 +749,52 @@ function revokeSessionAllowed(): void {
 .session-allowed-chip:hover {
   background: var(--warning);
   color: var(--text-inverse);
+}
+
+/* ─── 右缘：窗口控制（无边框窗口自绘）───
+   Windows 规范：46px 宽、全高、无圆角、悬停高亮；关闭钮悬停用系统
+   关闭红（非主题令牌——用户对 ─ □ ✕ 的红有肌肉记忆，主题色会认不出）。 */
+.window-controls {
+  display: flex;
+  align-items: stretch;
+  height: 100%;
+  flex-shrink: 0;
+}
+
+.wc-btn {
+  width: 46px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  transition:
+    background var(--duration-fast) var(--ease-in-out),
+    color var(--duration-fast) var(--ease-in-out);
+}
+
+.wc-btn:hover {
+  background: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+.wc-btn:active {
+  background: var(--bg-surface-active);
+}
+
+.wc-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+.wc-close:active {
+  background: #f1707a;
+  color: #fff;
 }
 </style>

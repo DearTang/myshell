@@ -114,7 +114,7 @@ function formatTime(timestamp: number | null): string {
 </script>
 
 <template>
-  <div class="gate">
+  <div class="gate" data-tauri-drag-region>
     <!-- Background Gradient Mesh -->
     <div class="gate-bg"></div>
 

@@ -214,6 +214,18 @@ export async function getAppVersion(): Promise<string> {
   return await invoke("get_app_version");
 }
 
+/** 上次确认过更新日志的版本（null = 从未）。Rust 侧文件持久化——
+ *  不用 localStorage：WebView2 的 localStorage LevelDB 日志一旦被非正常
+ *  退出写坏，后续所有写入都读不回来（更新日志弹窗每次启动都复现的根因）。 */
+export async function getWhatsnewAck(): Promise<string | null> {
+  return await invoke("get_whatsnew_ack");
+}
+
+/** 记录「用户已看过该版本的更新日志」，下个版本前不再弹出。 */
+export async function ackWhatsnew(version: string): Promise<void> {
+  await invoke("ack_whatsnew", { version });
+}
+
 export async function getPreviousVersion(): Promise<string | null> {
   return await invoke("get_previous_version");
 }

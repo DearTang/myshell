@@ -823,6 +823,41 @@ fn get_app_version() -> String {
     backup::APP_VERSION.to_string()
 }
 
+// ── What's-new acknowledgment (file-based, NOT webview localStorage) ──
+//
+// The changelog popup used to key off `myshell.knownVersion` in the webview's
+// localStorage. That LevelDB can be permanently wedged by an unclean shutdown
+// (a torn write mid-log makes every replay stop at the bad record, so all
+// later appends are silently unreadable — seen in the wild, popup on every
+// launch). The ack therefore lives in a plain file next to connections.db,
+// written through the same atomic-write pattern as the version marker.
+fn whatsnew_ack_path() -> std::path::PathBuf {
+    let mut path = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    path.push("myshell");
+    path.push("whatsnew-ack");
+    path
+}
+
+/// Version whose changelog the user last acknowledged (None = never shown).
+#[tauri::command]
+fn get_whatsnew_ack() -> Option<String> {
+    std::fs::read_to_string(whatsnew_ack_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Persist the acknowledged version; the changelog popup shows once per
+/// upgrade (known != current), never again afterwards.
+#[tauri::command]
+fn ack_whatsnew(version: String) -> Result<(), String> {
+    let path = whatsnew_ack_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create config dir: {e}"))?;
+    }
+    std::fs::write(&path, version.trim()).map_err(|e| format!("write whatsnew ack: {e}"))
+}
+
 /// Get previous version available for quick rollback
 #[tauri::command]
 fn get_previous_version() -> Option<String> {
@@ -5028,6 +5063,8 @@ pub fn run() {
             list_backups,
             rollback_backup,
             get_app_version,
+            get_whatsnew_ack,
+            ack_whatsnew,
             get_previous_version,
             check_for_updates,
             open_external_url,

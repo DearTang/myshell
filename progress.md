@@ -4345,3 +4345,53 @@ npm run tauri:build                                                  # 模板渲
 | 什么可能导致偏离？ | **升级 Tauri 后 re-sync 模板时漏掉改动 5**（`$INSTDIR` 前缀）会静默退回阶段 147 的故障且无报错——installer.nsi 头部注释有清单，逐项核对。另一处：别再用字面量版本号调 `clear-staging.mjs` 之外的未参数化脚本。 |
 | 下一步最小可验证动作？ | ① 下载 `MyShell_2.15.3_x64-setup.exe`，先让 ZCode 拉起 MCP 常驻再运行安装，确认弹"MyShell (MCP Server) 正在运行"确认框且装后 MCP 可用；② `dir "E:\Program Files\MyShell\*.old"` 应为空。 |
 | 目标是什么？ | 发布后的安装包装到任何一台"MCP 被广泛使用"的机器上都能正确完成升级，AI 客户端不再因升级而静默断连。 |
+
+### 阶段 149 — 更新日志弹窗根因修复 + 顶栏合并窗口控制（2026-10-06）
+
+两个用户报告项一次处理：①「每次登录都弹更新日志」的真正根因是 WebView2 localStorage 损坏，不是前端逻辑错；②按 omp desktop 规范把窗口最小化/最大化/关闭并入顶栏一行（无边框窗口）。
+
+#### 一、弹窗根因：WebView2 localStorage 的 LevelDB 日志写坏后永久失忆
+
+排查路径：App.vue 的 whatsnew 逻辑（对比 localStorage `myshell.knownVersion`）与旧 React 版逐行等价，静态无错 → 改查机器上的实际存储 `%LOCALAPPDATA%\com.myshell.client\EBWebView\Default\Local Storage\leveldb\000008.log`：
+
+- 用自写 CRC32C 校验器逐条重放（.zcode/verify3-ls-log.mjs）：**记录 #715（约 v2.14.1 时代，2026-09 中）CRC 损坏**——某次进程退出时写入被截断（安装器杀进程 / app.exit(0) 硬退出时 WebView2 lazy commit 被打断）。
+- 其后所有写入（2.15.0 ×6、2.15.2 ×10、2.15.3 ×5 次确认）全部追加在坏记录之后；**LevelDB 恢复语义 = 读到坏记录即停**，后面的写入永远读不回。
+- 于是每次启动 getItem 读到的都是坏点前的 `2.14.1` ≠ 当前版本 → 每次都弹；点「知道了」写入的值落盘了但下次读不到 → 死循环。副作用：**该机器所有 localStorage（主题、侧栏宽度、忽略更新版本号等）自 9 月中旬起跨启动全部失忆**。
+
+**修复（不再信任 WebView localStorage）**：确认状态改存 Rust 侧文件 `<config_dir>/myshell/whatsnew-ack`（与 connections.db 同级）：
+
+- main.rs：新增 `get_whatsnew_ack` / `ack_whatsnew` 两命令并注册 generate_handler!
+- api.ts：`getWhatsnewAck()` / `ackWhatsnew(v)` 包装
+- App.vue：vault-ready 检查与 closeAbout 全走 Rust 侧；首次（无记录）静默记录不弹窗——**升级到本版本的所有用户不会多看一次弹窗**
+
+遗留：EBWebView 损坏目录本身未清（应用层无法触碰 WebView 进程的 LevelDB）。用户侧可选修复：完全退出 MyShell 后删除 `%LOCALAPPDATA%\com.myshell.client\EBWebView\`，WebView2 会重建，主题/侧栏等 localStorage 恢复持久。其余仍依赖 localStorage 的键（ui.prefs / ignoredUpdateVersion / aiPanelWidth 等）暂未迁移，待观察。
+
+#### 二、顶栏合并窗口控制（omp desktop 式一行顶栏）
+
+- tauri.conf.json：主窗口 `decorations: false`（去系统标题栏，Linux/GTK CSD 同样生效）
+- capabilities/main.json：补 `allow-minimize` / `allow-close` / `allow-toggle-maximize` / `allow-start-dragging`
+- AppTopBar.vue：右缘新增窗口控制组（46px 宽、全高、SVG 规范字形：─ / 空心方框 / 双层方框还原 / ✕；关闭钮悬停系统红 #e81123）；`data-tauri-drag-region` 加在 header 与标签条空白处（Chrome/omp 式拖动 + 双击最大化/还原）；`isMaximized` 经 onResized 跟踪切换最大化/还原图标。**现有菜单/按钮零改动**，仅追加。
+
+#### 三、验证
+
+- `npm run test:ts`（vue-tsc）✅ 零错误
+- `cargo check` ✅ 仅存量警告（ftp.rs/ssh.rs/TaskDialog 字段名等，均与本改动无关）
+- 未做真机 GUI 冒烟（需交互解锁保险库）：顶栏拖动、三按钮、无边框边缘 resize 留给用户下个 dev/build 验证
+
+## 五问重启检查（阶段 149）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 149 完成 —— 弹窗根因修复 + 无边框顶栏已落地并通过双检查，未提交未发布。 |
+| 我要去哪里？ | 用户 `cargo tauri dev` 冒烟：顶栏拖窗/双击最大化/三按钮/边缘 resize；确认下次启动不再弹更新日志（装新版本首启会静默记录不弹）。之后走 `打包` 流程出 v2.16.0（含 ✨ 条目 → minor）。 |
+| 什么可能导致偏离？ | ① 无边框窗口在部分 GPU/驱动组合下的 resize/拖动异常（wc-btn 全高 44px，若与下拉面板锚点打架优先查 SessionDropdownPanel 的 anchor）；② 用户手动删 EBWebView 时 MyShell 未完全退出会删一半更糟——务必先退干净；③ Linux 下无边框 = GTK CSD，按钮/拖区行为与 Windows 有差异，deb 包发版前应在 Linux 冒烟。 |
+| 下一步最小可验证动作？ | `cargo tauri dev` 起应用：拖顶栏空白移动窗口、双击最大化、─ □ ✕ 三键、关闭重开确认无更新日志弹窗、检查 `%APPDATA%\myshell\whatsnew-ack`（dirs::config_dir 在 Windows = %APPDATA%）内容为当前版本号。 |
+| 目标是什么？ | 更新日志只在升级后首启弹一次（不依赖 WebView 存储可靠性）；顶栏与窗口控制一行化，界面与 omp desktop 规范对齐，现有功能零回归。 |
+
+#### 附：阶段 149 补充（同日）——折叠侧栏展开按钮被裁半
+
+用户冒烟 v2.15.4-dev 时报告「展开的按键被遮住了」。用 Vite 调试页复现定位（debug-shell.html + src/debug-shell.ts，stub 掉 __TAURI_INTERNALS__ 在纯浏览器挂真实 AppTopBar/AppSidebar）：折叠态 .side-collapsed 缺少展开态模板那条 overflow:visible 内联覆盖（AppSidebar.vue 展开模板第 572 行），壳层 .shell-side { overflow:hidden } 把骑跨右缘的 .toggle-btn（right:-13px，26px 圆钮）裁掉 12px，只剩弧形。修复：折叠模板补 :style="{ overflow: 'visible' }"。命中地图 + 元素截图双验证（x=34~54 全程命中按钮、完整圆形骑跨两背景）。这是存量 bug（与无边框改动无关），此前折叠态一直被裁。debug-shell.* 调试页保留在仓库根（未提交产物，纯浏览器可复现壳层布局，后续调 UI 可复用）。
+
+#### 附二：阶段 149 补充（同日）——侧栏头部溢出与精简
+
+用户冒烟第二轮反馈三点：①侧栏头部图标行「超出方框」；②蓝色圆形「+ 新建连接」按钮与其他图标按钮风格不一；③顶栏已有设置入口，侧栏的设置冗余。定位：.side 为骑跨按钮保持 overflow:visible（内联），头部 7 个 28px 图标（主题/快捷命令/设置/刷新/回收站/新建文件夹/+）需 252px，而 ui.sidebarWidth 因 localStorage 失忆落在钳制下限 200px（Number(null)=0 → isFinite → 钳到 200），整行直接溢出面板外。修复：删侧栏设置按钮（顶栏保留）；+ 按钮由 btn-new（accent 底色圆钮）改为统一 icon-btn；side-header 横向 padding 16→8、actions gap 4→2（6×28+5×2+16=194 ≤ 200 单行收纳），并给 .header-actions 加 flex-wrap 兜底。调试页验证：200px 下单行、框内 1px、plus 按钮 className=icon-btn 背景透明。附带发现（未处理）：ui store 初始化 Number(localStorage.getItem(...)) 对 null 得 0 而非 NaN，IsFinite(0)=true → 空存储时 sidebarWidth/aiPanelWidth 直接钳到下限而非默认值。

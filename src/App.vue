@@ -4,7 +4,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, watch } from "vue";
 import { MyButton } from "myui";
-import { getAppVersion, openExternalUrl } from "./api";
+import { ackWhatsnew, getAppVersion, getWhatsnewAck, openExternalUrl } from "./api";
 import {
   checkReportNeeded,
   markVersionHandled,
@@ -87,17 +87,21 @@ watch(
     if (state !== "ready") return;
     void reloadConnections();
     void getAppVersion()
-      .then((v) => {
+      .then(async (v) => {
         ui.appVersion = v;
+        // 升级后首次启动弹更新日志。确认状态存 Rust 侧文件（whatsnew-ack），
+        // 不用 localStorage：WebView2 的 localStorage LevelDB 日志被非正常退出
+        // 写坏后，其后所有写入永远读不回（曾导致每次启动都弹，见 阶段 149）。
         let known: string | null = null;
         try {
-          known = localStorage.getItem("myshell.knownVersion");
+          known = await getWhatsnewAck();
         } catch {
           known = null;
         }
         if (known === null) {
+          // 全新安装（或状态文件丢失）：静默记录，不打扰新用户
           try {
-            localStorage.setItem("myshell.knownVersion", v);
+            await ackWhatsnew(v);
           } catch {
             /* best-effort */
           }
@@ -127,13 +131,11 @@ watch(
 );
 
 function closeAbout(): void {
-  // whatsnew 关闭即确认版本，下次启动不再弹
+  // whatsnew 关闭即确认版本，下次启动不再弹（Rust 侧文件持久化）
   if (ui.about.mode === "whatsnew" && ui.appVersion) {
-    try {
-      localStorage.setItem("myshell.knownVersion", ui.appVersion);
-    } catch {
+    void ackWhatsnew(ui.appVersion).catch(() => {
       /* best-effort */
-    }
+    });
   }
   ui.about = { open: false, mode: "about" };
 }
@@ -162,8 +164,9 @@ function onAiWidthChange(w: number): void {
 </script>
 
 <template>
-  <!-- 保险库门禁：checking 全屏加载；setup/unlock 走门禁组件 -->
-  <div v-if="vault === 'checking'" class="vault-splash">加载中…</div>
+  <!-- 保险库门禁：checking 全屏加载；setup/unlock 走门禁组件。
+       顶栏尚未渲染，两层都带 drag-region 保证无边框窗口在门禁阶段可拖动 -->
+  <div v-if="vault === 'checking'" class="vault-splash" data-tauri-drag-region>加载中…</div>
   <MasterPasswordGate v-else-if="vault !== 'ready'" :mode="vault === 'setup' ? 'setup' : 'unlock'" @success="onVaultReady" />
 
   <div

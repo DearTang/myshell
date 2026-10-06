@@ -25,7 +25,6 @@ import {
   Plus,
   RefreshRight,
   Search,
-  Setting,
   Sunny,
   Warning,
 } from "@element-plus/icons-vue";
@@ -514,8 +513,11 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 </script>
 
 <template>
-  <!-- 折叠态：44px 窄条（仅 Logo / 竖排标题 / 展开按钮） -->
-  <div v-if="ui.sidebarCollapsed" class="side side-collapsed">
+  <!-- 折叠态：44px 窄条（仅 Logo / 竖排标题 / 展开按钮）。
+       overflow:visible 与展开态同理（AppSidebar.vue 展开模板的内联覆盖）：
+       壳层 .shell-side 是 overflow:hidden，不放开会把骑跨右缘的
+       .toggle-btn（right:-13px）裁掉一半，展开按钮只剩弧形不可点。 -->
+  <div v-if="ui.sidebarCollapsed" class="side side-collapsed" :style="{ overflow: 'visible' }">
     <svg
       class="brand-logo"
       width="26"
@@ -582,9 +584,7 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
         <button type="button" class="icon-btn" title="快捷命令" @click="openQuickCommands">
           <el-icon :size="15"><MagicStick /></el-icon>
         </button>
-        <button type="button" class="icon-btn" title="设置" @click="ui.showSettings = true">
-          <el-icon :size="15"><Setting /></el-icon>
-        </button>
+        <!-- 设置入口只在顶栏（右上角），此处不再重复，避免头部一行过挤 -->
         <button type="button" class="icon-btn" title="刷新" @click="void reloadConnections()">
           <el-icon :size="15"><RefreshRight /></el-icon>
         </button>
@@ -594,8 +594,8 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
         <button type="button" class="icon-btn" title="新建文件夹" @click="void handleAddFolder('/')">
           <el-icon :size="15"><FolderAdd /></el-icon>
         </button>
-        <button type="button" class="btn-new" title="新建连接" aria-label="新建连接" @click="handleAddNew()">
-          <el-icon :size="16"><Plus /></el-icon>
+        <button type="button" class="icon-btn" title="新建连接" aria-label="新建连接" @click="handleAddNew()">
+          <el-icon :size="15"><Plus /></el-icon>
         </button>
       </div>
     </div>
@@ -858,7 +858,9 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 
 /* ── 头部 ── */
 .side-header {
-  padding: 14px 16px;
+  /* 横向 padding 收窄（16→8）：侧栏最窄 200px 时 6 个 28px 图标 + gap2
+     恰好单行（194px），不再溢出/换行 */
+  padding: 12px 8px;
   border-bottom: 1px solid var(--border-subtle);
   display: flex;
   align-items: center;
@@ -874,8 +876,11 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 }
 .header-actions {
   display: flex;
-  gap: 4px;
+  gap: 2px;
   align-items: center;
+  /* 兜底：更窄时在头部内换行，而不是借 .side 的
+     overflow:visible 溢出面板（骑跨按钮需要 visible） */
+  flex-wrap: wrap;
 }
 .icon-btn {
   width: 28px;
@@ -894,33 +899,6 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 .icon-btn:hover {
   background: var(--bg-surface-hover);
   color: var(--text-primary);
-}
-.btn-new {
-  width: 28px;
-  height: 28px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--accent-primary-muted);
-  color: var(--accent-primary);
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  transition:
-    background var(--duration-normal) var(--ease-out-expo),
-    color var(--duration-normal) var(--ease-out-expo),
-    border-color var(--duration-normal) var(--ease-out-expo),
-    box-shadow var(--duration-normal) var(--ease-out-expo),
-    transform var(--duration-fast) var(--ease-out-expo);
-}
-.btn-new:hover {
-  background: var(--accent-primary);
-  color: var(--text-inverse);
-  border-color: var(--accent-primary-hover);
-  box-shadow: var(--shadow-glow);
-}
-.btn-new:active {
-  transform: scale(0.88);
 }
 
 /* ── 搜索框 ── */

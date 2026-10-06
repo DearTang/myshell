@@ -108,11 +108,16 @@ export const ui = reactive<UiState>({
   ...pickPersisted(),
 });
 
-// 初始化持久化的数值字段（带边界钳制，沿用旧版语义）
+// 初始化持久化的数值字段（带边界钳制，沿用旧版语义）。
+// 注意 getItem 返回 null 时 Number(null)=0（不是 NaN），若直接 Number.isFinite(0)
+// 为真会把空存储钳到下限——全新安装/存储失忆时会拿到 200px 而非默认宽度。
+// 因此 null 一律按 NaN 处理（视作"未存储"，走默认值）。
 {
-  const storedSidebar = Number(localStorage.getItem("myshell.sidebarWidth"));
+  const rawSidebar = localStorage.getItem("myshell.sidebarWidth");
+  const storedSidebar = rawSidebar === null ? NaN : Number(rawSidebar);
   if (Number.isFinite(storedSidebar)) ui.sidebarWidth = Math.min(560, Math.max(200, storedSidebar));
-  const storedAi = Number(localStorage.getItem("myshell.aiPanelWidth"));
+  const rawAi = localStorage.getItem("myshell.aiPanelWidth");
+  const storedAi = rawAi === null ? NaN : Number(rawAi);
   if (Number.isFinite(storedAi)) ui.aiPanelWidth = Math.min(720, Math.max(300, storedAi));
   const storedTheme = localStorage.getItem("myshell-theme-choice");
   if (storedTheme === "light" || storedTheme === "dark") ui.themeChoice = storedTheme;
