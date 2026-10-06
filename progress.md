@@ -4395,3 +4395,41 @@ npm run tauri:build                                                  # 模板渲
 #### 附二：阶段 149 补充（同日）——侧栏头部溢出与精简
 
 用户冒烟第二轮反馈三点：①侧栏头部图标行「超出方框」；②蓝色圆形「+ 新建连接」按钮与其他图标按钮风格不一；③顶栏已有设置入口，侧栏的设置冗余。定位：.side 为骑跨按钮保持 overflow:visible（内联），头部 7 个 28px 图标（主题/快捷命令/设置/刷新/回收站/新建文件夹/+）需 252px，而 ui.sidebarWidth 因 localStorage 失忆落在钳制下限 200px（Number(null)=0 → isFinite → 钳到 200），整行直接溢出面板外。修复：删侧栏设置按钮（顶栏保留）；+ 按钮由 btn-new（accent 底色圆钮）改为统一 icon-btn；side-header 横向 padding 16→8、actions gap 4→2（6×28+5×2+16=194 ≤ 200 单行收纳），并给 .header-actions 加 flex-wrap 兜底。调试页验证：200px 下单行、框内 1px、plus 按钮 className=icon-btn 背景透明。附带发现（未处理）：ui store 初始化 Number(localStorage.getItem(...)) 对 null 得 0 而非 NaN，IsFinite(0)=true → 空存储时 sidebarWidth/aiPanelWidth 直接钳到下限而非默认值。
+
+### 阶段 150 — 发布 v2.16.0（2026-10-06）
+
+阶段 149 的四项改动（无边框顶栏 / 更新日志弹窗根因修复 / 侧栏头部精简 + 骑跨按钮修复 / 宽度下限修复），含 ✨ → minor → **v2.16.0**。
+
+#### 一、结果
+
+| 平台 | 结果 |
+|---|---|
+| Gitee | https://gitee.com/argustang/myshell/releases/tag/v2.16.0 （release id 1186345）✅ |
+| GitHub | https://github.com/DearTang/myshell/releases/tag/v2.16.0 （release id 404822654）✅ |
+
+- 安装包：`MyShell_2.16.0_x64-setup.exe`（13,376,268 字节），双平台资产上传完成
+- 提交：`0522d42 release: v2.16.0`，已推 Gitee（main + 界面更新）与 GitHub（main + 界面更新）
+- 构建：`scripts\build-release.bat` 全量走完（MCP → CLI → tauri build + NSIS）；Cargo.lock 变动导致 release profile 全量重编，全程约 50 分钟（G: 盘慢）
+- 完整性校验：baseline v2.15.3 → 工作区 15 个改动文件全部有对应暂存条目，无漏记
+
+#### 二、真机冒烟提醒
+
+- 用户从 v2.15.3 升级到 v2.16.0 后**不应再看到更新日志弹窗**（whatsnew-ack 首次静默记录）；若弹了说明 ack 文件路径或调用链有问题，优先查 `%APPDATA%\myshell\whatsnew-ack` 是否生成为 2.16.0
+- 无边框窗口在真机的拖动/双击最大化/边缘 resize/最大化还原图标切换均待确认（dev 实例已验证渲染与命中，未验证真实窗口行为）
+- 安装器沿用 v2.15.3 的 CheckIfAppIsRunning 修复（$INSTDIR 全路径），MCP 常驻时升级仍应弹确认框
+
+#### 三、挂起事项（沿袭 + 本轮新增）
+
+- GitHub 远端 URL 内嵌 PAT 的清除（阶段 146 计划项，.github-token 已就位）——本轮 `git remote -v` 再次暴露该 PAT 在本地明文，仍未清
+- EBWebView 损坏目录用户侧清理建议已提出（删目录恢复主题等 localStorage 持久化），未验证用户是否执行
+- linux/deb 的无边框（GTK CSD）行为未冒烟
+
+## 五问重启检查（阶段 150）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 150 完成 —— v2.16.0 已发布双平台，暂存区已清空（baseline → v2.16.0），发布链路无遗留断点。 |
+| 我要去哪里？ | 用户真机升级冒烟：①不弹更新日志；②无边框三按钮/拖动/双击最大化；③MCP 常驻时安装确认框仍正常。之后处理挂起项（GitHub PAT 清除优先）。 |
+| 什么可能导致偏离？ | ① whatsnew-ack 若在门禁前就被调用会绕过 vault-watch 时序——不会，调用在 vault ready 分支内；② 无边框窗口在老驱动机器上的 resize 异常若出现，回退方案是恢复 decorations:true + 保留顶栏按钮改为无操作（不优雅但能止血）；③ 下次发版别再手抄图片 URL 签名（本轮调试时两次 400）。 |
+| 下一步最小可验证动作？ | 下载 `MyShell_2.16.0_x64-setup.exe` 安装 → 启动 → 解锁 → 确认无更新日志弹窗 + 顶栏右侧 ─ □ ✕ 可用 → 重启一次再确认无弹窗 → `type %APPDATA%\myshell\whatsnew-ack` 输出 2.16.0。 |
+| 目标是什么？ | 升级用户对 v2.16.0 的感知 = 一次安静的界面升级（一行顶栏）+ 零打扰（更新日志只弹一次或不弹），无回归。 |
