@@ -7,8 +7,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Promotion } from "@element-plus/icons-vue";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   ChatDotRound,
   Expand,
@@ -32,6 +30,7 @@ import {
 import type { Tab } from "@/api";
 import ConnIcon from "./ConnIcon.vue";
 import SessionDropdownPanel from "./SessionDropdownPanel.vue";
+import WindowControls from "./WindowControls.vue";
 import {
   DropdownTrigger,
   readAnchorRect,
@@ -115,58 +114,16 @@ function recomputeAnchor(): void {
   if (rect) anchor.value = rect;
 }
 
-// ── 窗口控制（无边框窗口自绘 ─ □ ✕）──
-const win = getCurrentWindow();
-const isMaximized = ref(false);
-let unlistenResized: UnlistenFn | null = null;
-
-function minimizeWin(): void {
-  void win.minimize().catch(() => {
-    /* best-effort */
-  });
-}
-
-function toggleMaximize(): void {
-  void win.toggleMaximize().catch(() => {
-    /* best-effort */
-  });
-}
-
-function closeWin(): void {
-  void win.close().catch(() => {
-    /* best-effort */
-  });
-}
+// 窗口控制按钮已抽到 WindowControls.vue（与保险库门禁页共用）。
 
 onMounted(() => {
   window.addEventListener("resize", recomputeAnchor);
   window.addEventListener("scroll", recomputeAnchor, true);
-  // ── 窗口控制（无边框窗口自绘按钮）──
-  void win
-    .isMaximized()
-    .then((m) => {
-      isMaximized.value = m;
-    })
-    .catch(() => {
-      /* 权限缺失时按钮退化为普通图标 */
-    });
-  void win
-    .onResized(async () => {
-      isMaximized.value = await win.isMaximized().catch(() => isMaximized.value);
-    })
-    .then((fn) => {
-      unlistenResized = fn;
-    })
-    .catch(() => {
-      /* best-effort */
-    });
 });
 
 onUnmounted(() => {
   window.removeEventListener("resize", recomputeAnchor);
   window.removeEventListener("scroll", recomputeAnchor, true);
-  unlistenResized?.();
-  unlistenResized = null;
 });
 
 // ── 面板数据 ──
@@ -392,35 +349,9 @@ function revokeSessionAllowed(): void {
       </button>
     </div>
 
-    <!-- 右缘：窗口控制（无边框窗口自绘按钮，与顶栏同行，贴窗口右上角） -->
-    <div class="window-controls">
-      <button type="button" class="wc-btn" title="最小化" aria-label="最小化" @click="minimizeWin">
-        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-          <path d="M0 5h10" stroke="currentColor" stroke-width="1" />
-        </svg>
-      </button>
-      <button
-        type="button"
-        class="wc-btn"
-        :title="isMaximized ? '向下还原' : '最大化'"
-        :aria-label="isMaximized ? '向下还原' : '最大化'"
-        @click="toggleMaximize"
-      >
-        <!-- 最大化：空心方框；还原：双层方框（Windows 规范字形） -->
-        <svg v-if="!isMaximized" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-          <rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1" />
-        </svg>
-        <svg v-else width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-          <rect x="0.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1" />
-          <path d="M2.5 2.5V0.5h7v7h-2" fill="none" stroke="currentColor" stroke-width="1" />
-        </svg>
-      </button>
-      <button type="button" class="wc-btn wc-close" title="关闭" aria-label="关闭" @click="closeWin">
-        <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-          <path d="M0 0l10 10M10 0L0 10" stroke="currentColor" stroke-width="1" />
-        </svg>
-      </button>
-    </div>
+    <!-- 右缘：窗口控制（无边框窗口自绘按钮，与顶栏同行，贴窗口右上角）。
+         与保险库门禁页共用同一组件，避免两处逻辑漂移。 -->
+    <WindowControls />
 
     <!-- 下拉面板（锚定于各自触发钮） -->
     <SessionDropdownPanel
@@ -496,9 +427,14 @@ function revokeSessionAllowed(): void {
 }
 
 .icon-btn:hover {
-  color: var(--text-primary);
-  background: var(--surface-translucent-hover);
-  border-color: var(--border-subtle);
+  color: var(--accent-primary);
+  background: var(--accent-primary-muted);
+  border-color: var(--border-accent);
+}
+
+.icon-btn:active {
+  background: var(--bg-surface-active);
+  color: var(--accent-primary-hover);
 }
 
 .brand {
@@ -751,50 +687,6 @@ function revokeSessionAllowed(): void {
   color: var(--text-inverse);
 }
 
-/* ─── 右缘：窗口控制（无边框窗口自绘）───
-   Windows 规范：46px 宽、全高、无圆角、悬停高亮；关闭钮悬停用系统
-   关闭红（非主题令牌——用户对 ─ □ ✕ 的红有肌肉记忆，主题色会认不出）。 */
-.window-controls {
-  display: flex;
-  align-items: stretch;
-  height: 100%;
-  flex-shrink: 0;
-}
+/* 窗口控制样式在 WindowControls.vue（顶栏与门禁页共用）。 */
 
-.wc-btn {
-  width: 46px;
-  height: 100%;
-  display: grid;
-  place-items: center;
-  padding: 0;
-  border: none;
-  border-radius: 0;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  user-select: none;
-  -webkit-user-select: none;
-  transition:
-    background var(--duration-fast) var(--ease-in-out),
-    color var(--duration-fast) var(--ease-in-out);
-}
-
-.wc-btn:hover {
-  background: var(--bg-surface-hover);
-  color: var(--text-primary);
-}
-
-.wc-btn:active {
-  background: var(--bg-surface-active);
-}
-
-.wc-close:hover {
-  background: #e81123;
-  color: #fff;
-}
-
-.wc-close:active {
-  background: #f1707a;
-  color: #fff;
-}
 </style>

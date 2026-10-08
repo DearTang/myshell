@@ -4501,3 +4501,338 @@ npm run tauri:build                                                  # 模板渲
 | 什么可能导致偏离？ | ① 将来 re-sync NSIS 模板时把"改动 5"丢掉或改回全路径（阶段 151 教训，文件头注释是防线）；② GitHub 推送 503 时别急着动代理配置——先拆条重试。 |
 | 下一步最小可验证动作？ | 在 AI 客户端挂着 MCP 的状态下双击升级到 v2.16.1：应弹"MyShell (MCP Server) 正在运行"确认框，确认后安装完成、myshell-mcp.exe 时间戳与主程序同批。 |
 | 目标是什么？ | MCP 被广泛使用的机器升级 MyShell 全程无"无法打开要写入的文件"，AI 客户端升级后 MCP 零感知可用。 |
+
+### 阶段 153 — 暗色模式侧栏/顶栏图标对比度重设计（2026-10-08）
+
+用户反馈"左侧菜单和顶部的操作图标在暗色模式下看着太暗"，并以参考图（更亮的图标 + 强调色悬停 + 彩色徽标）示意目标观感。改动纯前端样式，不涉及 IPC / 后端。
+
+#### 一、根因（实测对比度，非主观判断）
+
+用 WCAG 相对亮度公式实算（侧栏毛玻璃有效底色 `--glass-bg` 0.88 over `--bg-base` ≈ `#151a21`）：
+
+| 元素 | 改动前 | 对比度 | 改动后 | 对比度 |
+|---|---|---|---|---|
+| 侧栏头部操作图标 | `--text-tertiary` #6e7681 | 3.80:1 | `--text-secondary` #8b949e | 5.68:1 |
+| 文件夹图标（折叠） | tertiary + `opacity .7` | 2.51:1 | `--text-secondary` | 5.68:1 |
+| 文件夹数字徽标 | `--text-muted` on `--bg-surface` | **1.84:1** | `--text-secondary` + 描边 | 4.95:1 |
+| 连接副标题（host/分组） | `--text-muted` | 2.11:1 | `--text-tertiary` | 3.80:1 |
+| 连接行 ⋯ 按钮 | primary + `opacity .35` | 2.92:1 | `--text-secondary` | 5.68:1 |
+
+即：不是"整体偏暗"，而是**多处叠加了 `opacity` 把本就偏灰的令牌又压暗一级**。徽标 1.84:1 已低于 WCAG AA(3:1) 大图形阈值，属于"几乎不可见"。
+
+#### 二、改动（`AppSidebar.vue` / `AppTopBar.vue`）
+
+- **头部 6 个操作图标**：静止态 tertiary → secondary；hover 由"变亮灰"改为 **强调色 + 强调色底 + 描边胶囊**（对齐参考图的悬停语言）；新增 `:active` 态。
+- **文件夹行**：图标去掉 `opacity .7`；新增状态语义 —— **折叠态中性亮灰、展开态强调蓝**（蓝色专指"已展开的分支"，因此 hover 刻意不染蓝，否则折叠项悬停与展开项同色、层级线索失效）；行改为**圆角卡片**（`margin 1px 6px` + `radius-md`），替代原先"右缘贴边、只左侧圆角"的旧形态。
+- **连接行**：图标去掉 `opacity .85`（类型色本身是识别线索，压暗即失效）；hover 增加 **左侧 2px 强调竖条**便于长列表定位；新增 `:focus-visible` 可见焦点环。
+- **徽标 / ⋯ 按钮 / 搜索计数 / 空态 / 页脚**：统一抬升一级令牌；⋯ 与反馈图标 hover 转强调色。
+- **顶栏**：`AppTopBar.vue` 的 `.icon-btn:hover` 同步为强调色底 + 描边，与侧栏一致（原先只有 `--surface-translucent-hover` 的灰底）。
+
+#### 三、跨主题验证（关键：不能只修 Carbon）
+
+`--text-secondary` / `--text-tertiary` 在**非 Carbon 预设下并不来自 `themes.ts`**——`themes.ts` 只给 Carbon 定义了这两个令牌，其余 9 套预设的 `ui` 覆盖里没有它们，实际生效的是 myui 的 oklch 灰阶（`oklch(68% .012 250)` / `oklch(55% .012 250)`，即 #9399a0 / #6c7278）。
+
+实算各预设下头部图标对比度（改动前 2.5~3.8 → 改动后）：carbon 6.02、dracula 4.95、nord 4.34、gruvbox 5.13、monokai 5.17、tokyo-night 5.95、one-dark 4.87、everforest 4.34 —— **全部 ≥4.3:1**。浅色预设同样复核（carbon 7.43 / nord 6.45 / tokyo-night 5.12）。
+
+浏览器内实拍复核：Carbon 与 Dracula 两套暗色预设、浅色主题、以及文件夹/连接行/顶栏三处 hover 态，均符合预期。
+
+#### 四、验证方式与遗留
+
+- 新增本地可视化预览页 `.zcode/ui-preview.html` + `.zcode/ui-preview.ts`（stub 掉 Tauri IPC，注入样例连接树），可在纯浏览器里截屏核对侧栏/顶栏观感 —— 后续改这两个组件的外观时可直接复用。
+- `npm run test:ts`（vue-tsc）通过。
+- 未改任何令牌定义本身（`app.css` / `themes.ts` 零改动），因此对 33 套配色预设的既有观感无影响，只改了组件的令牌引用与交互态。
+
+## 五问重启检查（阶段 153）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 153 完成 —— 暗色侧栏/顶栏图标对比度重设计已落地并跨预设验证；仅样式改动，无发布。 |
+| 我要去哪里？ | 若用户仍觉得偏暗/偏亮，`.zcode/ui-preview.ts` 里的样例树可直接改样式再截屏比对；同类"迁移后对比度下降"问题可顺带排查 SFTP 面板与设置抽屉。 |
+| 什么可能导致偏离？ | ① 误以为 `--text-secondary` 全预设统一 —— 只有 Carbon 有定义，其余走 myui oklch 灰阶，改令牌前必须复核；② 后续给文件夹图标重新加 `opacity` 会退回 2.5:1；③ 把"展开态强调色"改成 hover 也染蓝，会让折叠/展开层级线索失效。 |
+| 下一步最小可验证动作？ | 真机 `cargo tauri dev`，在暗色下把鼠标依次移过侧栏 6 个头部图标、文件夹行、连接行，确认悬停为强调色胶囊/竖条而非灰底，且文件夹展开为蓝色。 |
+| 目标是什么？ | 暗色模式下侧栏与顶栏的所有可点元素在静止态即可辨认（≥4.3:1），悬停有明确的强调色反馈，且 33 套配色预设下表现一致。 |
+
+### 阶段 154 — 真机启动测试：修复 dom-ready 首帧信号丢失 + 定位单实例弹窗系统级故障（2026-10-08）
+
+用户要求「启动测试，我看下效果」。`npm run tauri:dev` 编译成功后启动，样式改动在真机验证通过；同时暴露两个**与本轮样式无关**的既有问题，一个已修、一个定为系统层故障。
+
+#### 一、已修复：`dom-ready` 首帧信号在 Vue 迁移中丢失（每次启动白等 4 秒）
+
+**现象**：每次启动都出现
+```
+WARN [startup] dom-ready not received within 4s; force-showing window
+```
+即主窗口以 `visible:false` 创建后，等了 4 秒兜底定时器才显示 —— 用户每次启动都要盯着空桌面 4 秒。
+
+**根因**：后端（`main.rs` setup 段）监听前端 `dom-ready` 事件后才 `show()` 窗口，React 时代由 `src-legacy/main.tsx:89` 发送该信号；Vue 迁移到 `src/main.ts` 时**这个 emit 没有一并移植**，全仓搜索 `dom-ready` 在 `src/` 下零命中。后端兜底逻辑仍在，所以表现为"能启动但慢 4 秒"，不易察觉。
+
+**修复**（`src/main.ts`）：补回信号发送，等两帧 `requestAnimationFrame` 再 emit（确保浏览器真的完成一次绘制，而非仅排好队），`try/catch` + 动态 `import()` 保证纯浏览器调试页静默跳过。权限侧无需改动 —— `capabilities/main.json` 已含 `core:event:default`。
+
+**验证**：冷启动三次，stderr 日志均**不再出现**该 WARN（此前两个构建每次都出现）；`npm run test:ts` 通过。
+
+#### 二、已定位未修复：单实例「覆盖启动/退出」弹窗在本机 OS 上无法创建
+
+**现象**：第二次启动（debug 与已发布 v2.16.1 安装版均复现）**不弹窗、静默退出**（exit code 0），用户视角是"双击图标没反应"，且永远没有机会选「覆盖启动」：
+```
+[single-instance] TaskDialog cbSize=176 (expect 176), buttons_ptr=..., n_buttons=2
+[single-instance] TaskDialogIndirect 失败 hr=-2147024809，默认按退出处理   ← 0x80070057 = E_INVALIDARG
+```
+
+**排查过程**（独立最小 Rust 程序，逐项排除，全部否掉）：
+
+| 检验项 | 结果 |
+|---|---|
+| 结构体尺寸 / 字段偏移 | 176 字节，偏移与 SDK `10.0.26100.0\um\commctrl.h` **逐字段一致**（cbSize@0 … cxWidth@168） |
+| comctl32 绑定版本 | 实际绑定 WinSxS **v6** DLL（`..._6.0.26100.9549_...`），非 v5 |
+| 简版 `TaskDialog()` API | **正常弹窗**（不涉及结构体路径） |
+| 本项目配置 / 纯内建按钮 / MSDN 示例同形配置 | 三种均 E_INVALIDARG |
+| cbSize 扫描 176→400 | 全部 E_INVALIDARG |
+| 补 `CoInitializeEx(STA)` / 换 `TD_WARNING_ICON` / 补 hInstance / `nDefaultButton=0` | 均 E_INVALIDARG |
+
+结论：**独立进程 + 布局正确 + v6 已激活**的前提下，`TaskDialogIndirect` 对任意合法配置均返回 E_INVALIDARG，而简版 `TaskDialog` 正常 → 故障在 OS 层（Windows 11 build 26300），与本项目代码无关。阶段 105 曾在旧系统上验收通过，推测为系统更新引入的回归。
+
+**遗留**：`ask_restart_or_quit()` 失败分支静默按「退出」处理 → 用户完全无感知。建议将来单独出 patch：失败时回退 `MessageBoxW`（阶段 105 前的实现仍在 git 历史），保证至少有可见降级；涉及 Rust 侧改动与重新构建安装器，**不与本轮纯样式改动混在一起发布**。
+
+#### 三、本轮真机验证通过的项
+
+- debug 实例冷启动、窗口正常显示（1216x809），stderr 无异常。
+- 暗色侧栏/顶栏新样式在真机生效并逐项截图核对：头部 6 个操作图标明显提亮、文件夹图标（展开=强调蓝 / 折叠=中性灰）、连接行 hover 呈圆角卡片 + 左侧强调竖条、头部图标 hover 为强调色胶囊、数量徽标清晰可辨。
+- 用户真实连接树（含 3.0池/信创/自用/sftp 等分组、11/6/4/2/1 计数徽标）渲染正常，无布局回归。
+
+## 五问重启检查（阶段 154）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 154 完成 —— 样式改动真机验证通过；`dom-ready` 丢失已修复并冷启动验证；单实例弹窗定为 OS 层故障（未改代码，记录在案）。 |
+| 我要去哪里？ | 若要修单实例弹窗：给 `ask_restart_or_quit()` 加 `MessageBoxW` 降级回退，单独出 patch；样式改动可随下次 `打包` 正常发布。 |
+| 什么可能导致偏离？ | ① 别把 E_INVALIDARG 误判成结构体/参数写错去"修" `TASKDIALOGCONFIG`（已逐字段证明正确）；② 别把 `dom-ready` 的 emit 再删掉（那是窗口显隐握手，删了启动就白等 4 秒）；③ debug 构建依赖 vite dev server（1420 端口），关掉 vite 后实例会 ERR_CONNECTION_REFUSED。 |
+| 下一步最小可验证动作？ | 在另一台非 26300 的 Windows 上跑 `.zcode/tdprobe.exe 4`：若弹窗则确认本机 OS 为唯一变量，可直接按降级方案改 Rust 侧。 |
+| 目标是什么？ | ① 启动即在有内容时立刻显示窗口（不再白等 4 秒）；② 第二次启动始终能看见「覆盖启动/退出」，或在系统 API 不可用时至少有可见的降级提示。 |
+
+### 阶段 155 — 解锁页/侧栏文字提亮 + 修复 myui 令牌桥失效（阶段 108 遗留）（2026-10-08）
+
+用户反馈两点：① 解锁页（登录页）在暗色下"不好看"；② 侧栏菜单名称仍偏暗，希望提亮或加粗。排查中发现**第二个是表症，真正的病根是 myui 令牌桥从未生效**（Vue 迁移时引入，阶段 108 的成果实际是空的）。
+
+#### 一、myui 令牌桥特异性失效（主 bug，影响全库组件）
+
+**证据**：浏览器里实测 `--accent-primary`（预设）= `#58a6ff` 品牌蓝，但 `--accent`（myui 组件实际消费）= `oklch(0.72 0.15 180)` 青色 —— 两者不等，说明桥接规则被压掉了。
+
+**根因**：myui 的定义写在 `node_modules/myui/dist/myui-tokens.css`：
+```css
+:root, html.dark { --accent: oklch(0.72 0.15 180); ... }   /* 特异性 (0,1,1) */
+```
+而 `src/styles/app.css` 的桥接只写 `:root`，特异性 (0,1,0) —— **输**。加上 `html.dark` 后特异性持平，靠源码顺序（app.css 最后加载）即可胜出。
+
+**影响面**：`src/styles/app.css` 里 11 个桥接令牌**全部失效**（`--accent` / `--accent-hover` / `--accent-active` / `--accent-subtle` / `--accent-fg` / `--border-base` / `--border-strong` / `--text-disabled` / `--surface-translucent` / `--surface-translucent-hover` / `--danger`）。扫描 myui-lib.css 确认 **27 个 myui 组件**消费这些变量（my-button/my-input/my-select/my-toggle/my-checkbox/my-segmented/my-slider/my-progress/my-nav/my-dialog/my-field/my-tree/my-tabs/my-avatar/my-spinner/my-panel/my-section/my-dropdown…）。
+
+**用户可见后果**：33 套配色预设与深浅切换**对 myui 组件从未生效**——无论在哪个预设下，myui 按钮/开关/滑块/进度条永远是 myui 内置青色；`--danger` 也一直是 myui 的 `--danger`，而非 MyShell 的 `--error`。
+
+**修复**（`src/styles/app.css`）：桥接选择器补 `html.dark, html.light`，附注释说明特异性原因，防止将来被"简化"回去。
+
+**验证**（浏览器实测，逐预设采样按钮真实背景色）：
+| 预设 | `--accent-primary` | `--accent` | 主要按钮实际底色 | 跟随 |
+|---|---|---|---|---|
+| carbon | #58a6ff | #58a6ff | rgb(88,166,255) | ✅ |
+| dracula | #c4a0ff | #c4a0ff | rgb(196,160,255) | ✅ |
+| monokai | #a6e22e | #a6e22e | rgb(166,226,46) | ✅ |
+| tokyo-night | #7aa2f7 | #7aa2f7 | rgb(122,162,247) | ✅ |
+
+浅色主题同样核对：carbon light `--accent` = `--accent-primary` = `#0969da`，`--accent-fg` = `#ffffff`。另用 `.zcode/bridge-preview.html` 渲染本项目实际用到的 14 个 myui 组件（按钮/输入/选择/开关/复选/分段/滑块/进度/导航/spinner/取色/对话框…）逐一确认无外观回归。
+
+#### 二、解锁页暗色可读性（用户直接反馈项）
+
+实算对比度（卡片底 `--bg-elevated` #161b22）：
+
+| 元素 | 改前 | 对比度 | 改后 | 对比度 |
+|---|---|---|---|---|
+| 副标题 | `--text-tertiary` | 3.77:1 | `--text-secondary` | 5.62:1 |
+| 页脚说明 | `--text-muted` | **2.09:1** | `--text-tertiary` | 3.77:1 |
+| 字段标签字重 | 500 | — | 600 + letter-spacing | — |
+| 字段数字符数 | `--text-muted` | — | `--text-tertiary` | — |
+| 背景光晕 opacity | 0.6 | — | 0.9 | — |
+| 卡片 | — | — | 加顶部高光渐变，从暗底"浮起" | — |
+
+**主按钮两处实测缺陷**（用户截图里那片"糊白"的成因）：
+- **禁用态**：EP 默认 = 白字压 `--el-color-primary-light-5`（浅青 #85decd）→ **1.58:1**。用户截图正是空密码时的禁用态。改为中性面 `--bg-surface` + `--text-secondary` → 4.95:1，且"不可点"语义更清楚。
+- **启用/悬停态**：EP 默认纯白字压强调色底 → 2.26:1 / 1.83:1。改用 `--text-inverse`（反色文字）→ **7.49:1 / 9.73:1**。
+
+实现上用 EP 自己的变量覆盖（`--el-button-text-color` 等），避免与 EP 选择器打架。**注意**：禁用态变量必须挂在 `.submit-btn:disabled, .submit-btn.is-disabled` 上 —— EP 有一条 `html.dark .el-button { --el-button-disabled-text-color: #ffffff80 }`（特异性 0,2,1）会压过裸 `.submit-btn`（0,2,0）；带伪类后为 0,3,0 才胜出。
+
+#### 三、侧栏菜单名称提亮 + 加粗（用户直接反馈项）
+
+- **文件夹名**：`--text-secondary`（暗色 5.68:1，与图标同灰、整列发闷）→ `color-mix(in oklab, var(--text-primary) 78%, var(--text-secondary))`，实测 ≈ **12.75:1**，并加 `font-weight: 500`。用 `color-mix` 而非硬编码，33 套预设自动跟随（已确认 WebView 支持）。
+- **连接名**：保持 `--text-primary` 最亮，另加 `font-weight: 500` 让小字号在暗底上更实。
+
+`npm run test:ts` 通过；真机（debug 实例）截图确认解锁页与侧栏效果。
+
+#### 四、遗留
+
+- 桥接修复是**全局性**的：所有 myui 组件的外观都会从"myui 内置青"切换为"MyShell 品牌色"。这是设计意图（阶段 108 本来就要做的），但属于视觉变更，发布说明里应提及。
+- myui 的 `--el-color-primary-light-3/5/7/8/9`、`--el-color-primary-dark-2` 仍是 myui 硬编码的青色色阶（仅 `--el-color-primary` 走桥接）。因此 EP 的 hover/active/disabled **默认**色阶在非青色预设下仍会偏青 —— 本项目已在解锁页按钮上显式覆盖；其它用 EP 原生按钮的位置若发现偏色，需同样按需覆盖（或待 myui 上游把色阶也接入变量）。
+
+## 五问重启检查（阶段 155）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 155 完成 —— 解锁页与侧栏文字提亮已落地；并修掉 myui 令牌桥特异性失效（预设/深浅切换对 27 个 myui 组件从未生效）。 |
+| 我要去哪里？ | 下次 `打包` 时在候选条目里强调"myui 组件开始跟随主题强调色"这一视觉变更；若要彻底解决 EP 色阶偏青，需 myui 上游把 `--el-color-primary-light-*` 也改为变量派生。 |
+| 什么可能导致偏离？ | ① 把桥接选择器"简化"回 `:root` 会再次静默失效（注释是防线）；② 禁用态变量若移出 `:disabled` 伪类会被 EP 的 `html.dark .el-button` 压过；③ 误以为 `--accent-primary` 变了就等于 myui 组件变了 —— 必须验 `--accent`。 |
+| 下一步最小可验证动作？ | 真机切换配色预设（设置 → 外观），观察 myui 按钮/开关/滑块/进度条是否从青色变为该预设的强调色。 |
+| 目标是什么？ | 33 套配色预设与深浅主题对**全部**界面元素（含 myui/EP 组件）一致生效；解锁页与侧栏在暗色下所有文字达到可读对比度。 |
+
+### 阶段 156 — 修复菜单/会话层级被压平 + 侧栏展开箭头换用 MyIcon（2026-10-08）
+
+用户反馈两点：① "无法区分是菜单还是具体的会话了，看着差不多"；② "菜单左侧的箭头直接看不清"，并建议换图标、设合适大小。两点都是**阶段 155 改动引入的回归或遗漏**。
+
+#### 一、层级被压平（阶段 155 直接引入的回归）
+
+**根因**：阶段 155 为了"提亮菜单名称"，把文件夹名混到 `color-mix(in oklab, --text-primary 78%, --text-secondary)` = 12.75:1，而连接名（会话）是纯 `--text-primary` = 14.79:1 —— **两者只差 1.16x，肉眼无法分级**（实测数据见阶段 155 表格里的候选值，当时选错了档位）。
+
+**修复**（`AppSidebar.vue`）：用"亮度差 + 字重差"双通道分级：
+
+| 层级 | 语义 | 颜色 | 对比度 | 字重 |
+|---|---|---|---|---|
+| 文件夹名 | 菜单/目录（中层） | `color-mix(--text-primary 40%, --text-secondary)` | **9.32:1** | 500 |
+| 连接名 | 会话/叶子（顶层） | `--text-primary` | **14.79:1** | **600** |
+
+亮度差 1.59x（超过 1.5x 的可分阈值）+ 字重 500/600 差异，两级层次明确。`.conn-name` 不再单独声明字重，改由 `.conn-row` 统一给 600，避免两处规则打架。
+
+**验证**（浏览器实测 11 行混合树）：文件夹行 `font-weight:500` / `oklab(0.774)`，连接行 `font-weight:600` / `rgb(230,237,243)`，逐行断言通过。
+
+#### 二、展开箭头看不清（阶段 155 的漏改项）
+
+**原实现**：CSS 字符 `›` + `font-size: 8px` + `opacity: 0.75` —— 8px 字符本身极细，叠加 75% 不透明度后实际对比度很低，用户描述"直接看不清"。
+
+**修复**：改用 myui `MyIcon` 的线性箭头（用户建议的方向）：
+
+```vue
+<MyIcon class="chevron" :class="{ open: row.isOpen }" name="Right" :size="14" />
+```
+
+- **图标名用 `Right` 而非 `ArrowRight`**：实测 myui 注册表（111 个图标）里**没有** `ArrowRight`（传了会渲染成 Unknown），可用的是 `Right` / `ArrowDown` / `ArrowLeft` / `DArrowRight` 等。已用候选对比页（`.zcode/arrow-preview.html`）逐个渲染确认。
+- **尺寸 14px**（原 8px 的 1.75 倍）：与相邻的文件夹图标（14px）视觉重量一致，不再是最小的那个。
+- **只换 transform 不换图标**：折叠 → 无旋转（箭头向右 `→`）；展开 → `rotate(90deg)`（箭头向下 `↓`）。比按状态切换两个不同图标更省，动画也更连续。
+- **颜色走 `--text-secondary`**：MyIcon 不传 `color` 时内部用 `currentColor`（已核对实现），因此父级 CSS 的 `color` 能正常生效，悬停提亮到 primary 的逻辑保持不变。
+
+**验证**：真机折叠态与展开态各截图一次，箭头清晰可辨；浏览器实测 `--my-icon-size: 14px`、折叠 `transform: matrix(1,0,0,1,0,0)` / 展开 `matrix(0,1,-1,0,0,0)`、内部确为 `<svg>`。
+
+`npm run test:ts` 通过。
+
+#### 三、教训（已存入长期记忆）
+
+**"提亮"不是层级设计的全部**：给父级提亮时若不检查它与子级的**对比度差**，很容易把两层压成一层。可操作的判据是「对比度比值 ≥1.5x」+「字重不同」双通道。阶段 155 只算了单一元素的对比度绝对值（都"达标"），漏了层级间的相对关系 —— 这是本轮回归的根本原因。
+
+## 五问重启检查（阶段 156）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 156 完成 —— 菜单/会话层级已重建（亮度差 1.59x + 字重 500/600），展开箭头换成 14px MyIcon 线性箭头并双态验证。 |
+| 我要去哪里？ | 待用户真机确认观感；后续若再调侧栏配色，先算"文件夹 vs 连接"的对比度比值，守住 ≥1.5x。 |
+| 什么可能导致偏离？ | ① 继续给文件夹名提亮会再次压平层级（78% 就是反例）；② myui 图标名只有 `Right`/`ArrowDown` 这类，写 `ArrowRight` 会渲染成 Unknown；③ 若给 `.conn-name` 重新加字重声明，注意别与 `.conn-row` 的 600 冲突。 |
+| 下一步最小可验证动作？ | 真机展开/折叠文件夹，确认箭头方向与清晰度，并核对文件夹名与连接名的深浅差异一眼可辨。 |
+| 目标是什么？ | 侧栏里"目录"与"会话"在暗色下一眼可分（不靠猜），展开/折叠箭头作为交互入口始终清晰可见。 |
+
+### 阶段 157 — myui 升级 0.18.0 → 0.27.2 + 箭头换独立图标 + 登录页补窗口控制（2026-10-08）
+
+用户反馈三点：① 箭头希望用 `ArrowRight` / `ArrowDown`（并提示"myui 有的，没有的话可能需要升级"）；② 登录界面没有放大缩小和关闭。
+
+#### 一、myui 升级 0.18.0 → 0.27.2（用户的判断是对的）
+
+**核实结论**：0.18.0 的图标白名单里**确实没有 `ArrowRight`**（只有 `ArrowDown`/`ArrowLeft`/`DArrowLeft`/`DArrowRight`），所以上一轮用 `Right` 是受版本所限的妥协。远端最新为 **v0.27.2**，升级后 `ArrowRight` / `ArrowDown` / `ArrowUp` / `ArrowUpRight` / `ArrowDownRight` 等均已入白名单。
+
+**过程坑（重要）**：先用 `npm install` 升级**失败**（`Cannot read properties of null (reading 'matches')`）——本项目是 **pnpm** 工程（有 `pnpm-lock.yaml`、`node_modules` 是 pnpm 软链结构），须用 `pnpm add`。改用 pnpm 后 22 秒完成。
+
+**升级后核对**：
+- **API 兼容性**：逐项核对升级前记录的 21 个具名导出与 15 个组件文件，**全部存在**（MyButton/MyInput/MySelect/MyDialog/MyIcon/MyNav/MySection/MySegmented/MySlider/MySpinner/MyToggle/MyCheckbox/MyColorField/MyCombobox/MyProgress + confirmDialog/setupMyUII18n/toast + NavGroup/SelectGroup/SelectOption 类型）。`MyIcon` 的 props 签名未变。
+- `npm run test:ts`（vue-tsc）通过；`npm run build` 生产构建通过（CSS 由 47066 → 556569 字节，新产品如 `my-cascade-menu`/`my-contribution-grid` 样式已进入产物）。
+- **组件回归**：用 `.zcode/bridge-preview.html` 渲染本项目实际用到的 14 个组件（按钮/输入/选择/开关/复选/分段/滑块/进度/导航/spinner/取色/分区…）逐项确认渲染正常，且 `[data-icon-fallback="unknown"]` 计数为 **0**（无图标名失配）。
+
+**一个必须知道的坑**：pnpm 换了 `node_modules` 后 **vite 的依赖预构建缓存（`node_modules/.vite`）仍是旧版**，表现为新图标名照旧渲染成 Unknown 回退图标。**必须删掉 `.vite` 缓存并重启 dev server**，否则会误判为"升级没生效"。
+
+#### 二、箭头改用两个独立图标
+
+```vue
+<MyIcon class="chevron" :name="row.isOpen ? 'ArrowDown' : 'ArrowRight'" :size="14" />
+```
+
+按状态换图标（不再靠 `rotate` 复用同一图标），方向语义更直白 —— 这正是用户建议的方案。CSS 里随之删掉 `.chevron.open { transform: rotate(90deg) }` 与 transform 过渡，只保留颜色过渡。验证：折叠态与展开态分别解析成功（`data-icon-fallback` 为 null、viewBox `0 0 1024 1024`），14px。
+
+#### 三、登录页补窗口控制（真实可用性缺陷）
+
+**问题**：无边框窗口（`decorations: false`）下标题栏由应用自绘，而这三个按钮原本只存在于顶栏；保险库门禁页是 `position: fixed; inset: 0; z-index: 5000` 的**全屏覆盖层、且顶栏此时尚未渲染** —— 用户在解锁/设置密码阶段**既不能最小化也不能关闭窗口**，只能走任务管理器。
+
+**修复**：把窗口控制抽成 `WindowControls.vue` 共用组件（避免顶栏与门禁页两份逻辑漂移），两处引用：
+- `AppTopBar.vue`：改为 `<WindowControls />`，删掉重复的 122 行逻辑与样式；
+- `MasterPasswordGate.vue`：新增 `<WindowControls tone="overlay" />`；
+- `App.vue` 的 `vault === 'checking'` 加载页同样补上（该阶段顶栏也未渲染）。
+
+新增 `tone="overlay"` 变体：浮层形态贴在覆盖层右上角（`position: absolute`，`z-index: 1`），默认色比顶栏亮一档（背景是深色渐变而非毛玻璃），悬停用半透明白底以与渐变背景分离；关闭钮悬停仍用系统关闭红。按钮尺寸沿用 Windows 规范 46×44。
+
+**验证**：真机截图确认三个按钮出现在登录页右上角；浏览器实测三者均渲染为 46×44、`title`/`aria-label` 正确、内部 SVG 存在。
+
+`npm run test:ts` 通过。
+
+#### 四、遗留
+
+- myui 从 0.18 跨到 0.27 是**9 个小版本**，本次只覆盖了本项目实际用到的组件与 API。新版本带来的新组件/新能力未逐一评估，若后续要用新组件需再核对。
+- 顶栏的窗口控制按钮在本次重构后未单独真机点测（逻辑与门禁页完全同源，且此前 v2.15.4 已验收过），下次真机可直接点一遍 ─ □ ✕ 确认。
+
+## 五问重启检查（阶段 157）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 157 完成 —— myui 升至 0.27.2（API 全兼容、构建通过），箭头改 ArrowRight/ArrowDown 独立图标，登录页与加载页补齐窗口控制。 |
+| 我要去哪里？ | 真机点一遍 ─ □ ✕ 三键（顶栏 + 登录页各一次）；下次 `打包` 时记得安装器构建流程会重新拉 pnpm 依赖。 |
+| 什么可能导致偏离？ | ① 用 `npm install` 而非 `pnpm add` 升级依赖（本项目是 pnpm 工程，npm 会直接报错）；② 升级 myui 后不删 `node_modules/.vite` 就重启 dev，新图标会误显示为 Unknown；③ 把 `WindowControls` 的两份引用改回内联，登录页会再次失去窗口控制。 |
+| 下一步最小可验证动作？ | 真机在解锁页点「最小化」→ 窗口应最小化；点「关闭」→ 应退出。解锁后在主界面重复一次。 |
+| 目标是什么？ | 任何界面状态下（加载/解锁/主界面）窗口都能被最小化与关闭；箭头图标语义直白且清晰可见。 |
+
+
+### 阶段 158 — OCR 本地模式代码审计（首轮）+ 修复 ZMODEM 读写命令 P0（2026-10-09）
+
+用户指令：先『使用 ocr 本地模式进行代码审计』，后改为『先修复问题，然后打包』。
+
+#### 审计执行（open-code-review v1.12.13 委托模式，无外部 LLM）
+
+- 范围：ocr scan --preview 423 文件 → 283 可审；修正 .zcode/ocr-scope.mjs 的双计数 bug 与调试残留排除后，**93 文件 / 41,336 行**（外加 main.rs 5,947 行被 ocr 标 too_large 需人工拆段）。
+- 规则：ocr delegate rule 生成三语言规则表（rust/ts/vue），存 .zcode/ocr-rule-*.md。
+- 派发 12 个子代理批次（rust 6 + vue 5 + scripts/css 1）。**限流影响**：9 批因模型凭证限流失败，**2 批完成**（rust-zmodem、rust-main），其余失败批次待重发。
+- 已完成批次的结论：main.rs 报 P0×2 / P1×2 / P2×7（报告 .zcode/ocr-audit-rust-main.md）；zmodem 协议报 P1×3 / P2×2 / P3×3（报告 .zcode/ocr-audit-rust-zmodem.md）。其余批次（ssh-core/mcp/data/ai/vue/ts/scripts）待重发后补充。
+
+#### 先核旧账：2026-09-29 审计报告的 7 个 P0 已全部修复（逐条代码核实）
+
+| 旧 P0 | 证据 |
+|---|---|
+| 黑名单引号绕过 | command_rules.rs 已有 CONTROL_TOKENS + 命令位置分词 + 专项测试 |
+| 私钥明文下发 webview | lib.rs private_key_pem 已 skip_serializing，改传 has_private_key |
+| MCP 确认门 fail-open | useMcpBridge.ts 默认 needsConfirm=true，失败照常弹窗 |
+| read_file_base64 任意读 | 已有 require_dek + 图片扩展名白名单 + 机密目录拒绝 |
+| 改主密码非原子 | vault.rs 已改单文件 bundle + tmp/rename 原子提交 |
+| endpoint panic | endpoint() 已返回 Result |
+| 密钥发往任意 base_url | 已有 allow_vault_key_to_new_host 确认门 |
+
+**教训**：修复前必须核实——旧报告直接照搬会重做已修的工作。
+
+#### 本轮修复（合并进 v2.16.2，用户明确指示）
+
+**P0-A（main.rs rz_open_read/rz_read_chunk）**：零门禁任意文件读。可读 <config>/myshell/gui-ipc-port（IPC token）、vault.bundle、~/.ssh/id_rsa。
+**P0-B（main.rs sz_open_write/sz_write_chunk）**：黑名单不含应用配置目录，可覆写 vault.bundle/connections.db/authorized_keys。
+
+修复（沿用 read_file_base64 的既有加固模式）：
+1. 新增共用助手 `is_secret_path(target)`：canonicalize 后比对 <config_dir>/myshell 与 ~/.ssh 拒绝清单；**文件不存在时向上走到最深存在祖先再比对**，把尚未创建的新文件也覆盖住。每轮探测从 target 重启（初版把 probe 提在循环外，会污染第二个目录的起点——自查发现已修）。
+2. rz_open_read：require_dek + is_secret_path 拒绝（统一报错不作存在性 oracle）。
+3. sz_open_write：require_dek + is_secret_path（存在与不存在两分支）+ 原 is_protected_write_path 保留。
+4. rz_read_chunk / sz_write_chunk：require_dek（开着的句柄不得活过锁定态）。
+5. 新增 3 个回归测试（secret_path_tests）：已存在文件拒绝 / 未创建文件拒绝 / 普通临时文件放行。
+
+验证：cargo check 通过（warnings 均为既有）；cargo test --bin myshell secret_path_tests 3 passed；npm run test:ts 干净。真机 ZMODEM 收发待发版后回归（门禁只在锁保险库时才影响正常流程——解锁态用户无感知）。
+
+## 五问重启检查（阶段 158）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 158 完成 —— 审计首轮 2 批结论落地，ZMODEM 四命令门禁修复并过测试；v2.16.2 已含安全修复节。 |
+| 我要去哪里？ | 完成本次打包（预检已绿，构建→提交→发布）；重发审计失败的批次并复核。 |
+| 什么可能导致偏离？ | ① 旧审计报告未核实就照搬（本轮已证明 7 个 P0 全修过）；② 内联 node -e 输出被吞——一律落 .mjs 脚本文件再跑；③ 审计子代理限流——分小批重发。 |
+| 下一步最小可验证动作？ | 构建产物生成后安装冒烟：解锁态做一次 sz/rz 传输确认无回归。 |
+| 目标是什么？ | 被攻陷的 webview 无法借 ZMODEM 命令读密/改密；发布流程按 打包 规则走完。 |

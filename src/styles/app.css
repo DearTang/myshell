@@ -125,8 +125,14 @@
 }
 
 /* ─── myui 令牌桥：把 myui 组件消费的名字映射到 MyShell 令牌上，
-       让 33 套配色预设与深浅主题自动生效于 myui 组件 ─── */
-:root {
+       让 33 套配色预设与深浅主题自动生效于 myui 组件 ───
+   选择器必须带上 html.dark / html.light：myui 自己的定义写在
+   `:root, html.dark { ... }`（特异性 0,1,1），若此处只写 `:root`（0,1,0）
+   会**整条链都抢不过**——myui 组件会一直用 myui 内置的青色强调色，
+   预设与品牌色形同失效。补齐选择器后特异性持平，靠源码顺序（app.css 最后加载）取胜。 */
+:root,
+html.dark,
+html.light {
   --accent: var(--accent-primary);
   --accent-hover: var(--accent-primary-hover);
   --accent-active: var(--accent-primary);

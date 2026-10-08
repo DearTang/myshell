@@ -45,8 +45,8 @@ importers:
         specifier: ^14.1.0
         version: 14.3.1
       myui:
-        specifier: git+https://gitee.com/argustang/my-ui.git#v0.18.0
-        version: git+https://gitee.com/argustang/my-ui.git#bfe8a3596097a6964cee4860b8ae90c767c80353(@element-plus/icons-vue@2.3.2(vue@3.5.42(typescript@5.6.3)))(element-plus@2.14.5(vue@3.5.42(typescript@5.6.3)))(vue-i18n@11.4.10(vue@3.5.42(typescript@5.6.3)))(vue@3.5.42(typescript@5.6.3))
+        specifier: git+https://gitee.com/argustang/my-ui.git#v0.27.2
+        version: git+https://gitee.com/argustang/my-ui.git#99f2a42af32df35d0a146d3557b3c210469ceff2(@element-plus/icons-vue@2.3.2(vue@3.5.42(typescript@5.6.3)))(element-plus@2.14.5(vue@3.5.42(typescript@5.6.3)))(vue-i18n@11.4.10(vue@3.5.42(typescript@5.6.3)))(vue@3.5.42(typescript@5.6.3))
       vue:
         specifier: ^3.5.32
         version: 3.5.42(typescript@5.6.3)
@@ -871,9 +871,9 @@ packages:
   muggle-string@0.4.1:
     resolution: {integrity: sha512-VNTrAak/KhO2i8dqqnqnAHOa3cYBwXEZe9h+D5h/1ZqFSTEFHdM65lR7RoIqq3tBBYavsOXV84NoHXZ0AkPyqQ==}
 
-  myui@git+https://gitee.com/argustang/my-ui.git#bfe8a3596097a6964cee4860b8ae90c767c80353:
-    resolution: {commit: bfe8a3596097a6964cee4860b8ae90c767c80353, repo: https://gitee.com/argustang/my-ui.git, type: git}
-    version: 0.18.0
+  myui@git+https://gitee.com/argustang/my-ui.git#99f2a42af32df35d0a146d3557b3c210469ceff2:
+    resolution: {commit: 99f2a42af32df35d0a146d3557b3c210469ceff2, repo: https://gitee.com/argustang/my-ui.git, type: git}
+    version: 0.27.2
     peerDependencies:
       '@element-plus/icons-vue': ^2.3.0
       element-plus: ^2.14.0
@@ -1740,7 +1740,7 @@ snapshots:
 
   muggle-string@0.4.1: {}
 
-  myui@git+https://gitee.com/argustang/my-ui.git#bfe8a3596097a6964cee4860b8ae90c767c80353(@element-plus/icons-vue@2.3.2(vue@3.5.42(typescript@5.6.3)))(element-plus@2.14.5(vue@3.5.42(typescript@5.6.3)))(vue-i18n@11.4.10(vue@3.5.42(typescript@5.6.3)))(vue@3.5.42(typescript@5.6.3)):
+  myui@git+https://gitee.com/argustang/my-ui.git#99f2a42af32df35d0a146d3557b3c210469ceff2(@element-plus/icons-vue@2.3.2(vue@3.5.42(typescript@5.6.3)))(element-plus@2.14.5(vue@3.5.42(typescript@5.6.3)))(vue-i18n@11.4.10(vue@3.5.42(typescript@5.6.3)))(vue@3.5.42(typescript@5.6.3)):
     dependencies:
       '@element-plus/icons-vue': 2.3.2(vue@3.5.42(typescript@5.6.3))
       element-plus: 2.14.5(vue@3.5.42(typescript@5.6.3))

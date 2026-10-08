@@ -2723,6 +2723,47 @@ fn normalize_folder_path(input: &str) -> String {
     format!("/{}", segments.join("/"))
 }
 
+/// Does `target` (already canonicalized) live inside the app's own secret
+/// area (`<config_dir>/myshell` — vault bundle, IPC port+token file, DB) or
+/// the user's `~/.ssh`? Best-effort: if a directory doesn't exist yet, walk
+/// up to its deepest existing ancestor and compare that, so a not-yet-created
+/// file inside the config dir is still rejected. Callers degrade to a generic
+/// error so this can't double as an existence oracle.
+fn is_secret_path(target: &std::path::Path) -> bool {
+    let mut denied: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(cfg) = dirs::config_dir() {
+        denied.push(cfg.join("myshell"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        denied.push(home.join(".ssh"));
+    }
+    for dir in &denied {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        // Walk up while the file itself doesn't exist yet; the moment the
+        // probe exists, canonicalize resolves symlinks too and we compare.
+        // probe restarts from `target` per denied dir — a walk-up for one
+        // dir must not shrink the starting point of the next.
+        let mut probe = target.to_path_buf();
+        loop {
+            match std::fs::canonicalize(&probe) {
+                Ok(resolved) => {
+                    if resolved.starts_with(&dir) {
+                        return true;
+                    }
+                    break;
+                }
+                Err(_) => {
+                    // Not yet on disk (or unreadable): try the parent.
+                    if !probe.pop() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Reject writes to system-critical locations. Defense-in-depth for
 /// `sz_open_write` — even though the path should originate from a save
 /// dialog, the cost of an over-broad check is low while the cost of an
@@ -3795,6 +3836,50 @@ mod server_info_tests {
     }
 }
 
+#[cfg(test)]
+mod secret_path_tests {
+    use super::*;
+
+    /// The ZMODEM read/write commands must refuse the app's own secret area
+    /// and ~/.ssh. `is_secret_path` is the shared gate; these tests pin the
+    /// two cases a regression would break: a file that exists on disk inside
+    /// the config dir, and one that doesn't exist yet (the walk-up path).
+    #[test]
+    fn rejects_existing_file_inside_config_myshell() {
+        let dir = dirs::config_dir().expect("config dir exists on CI/desktop");
+        std::fs::create_dir_all(dir.join("myshell")).expect("create myshell dir");
+        let f = dir.join("myshell").join("is_secret_path_test.probe");
+        std::fs::write(&f, b"x").expect("write probe file");
+        let target = std::fs::canonicalize(&f).expect("canonicalize probe");
+        let hit = is_secret_path(&target);
+        let _ = std::fs::remove_file(&f);
+        assert!(hit, "existing file inside <config>/myshell must be denied");
+    }
+
+    #[test]
+    fn rejects_not_yet_created_file_inside_config_myshell() {
+        // Use a plausible config dir path with a suffix that cannot exist,
+        // so canonicalize fails all the way up to the config root — this
+        // exercises the walk-up branch without touching real secret files.
+        let dir = dirs::config_dir().expect("config dir");
+        let f = dir.join("myshell").join("no_such_dir_9f2c").join("f.bin");
+        assert!(is_secret_path(&f), "not-yet-created file inside <config>/myshell must be denied");
+    }
+
+    #[test]
+    fn allows_file_outside_secret_dirs() {
+        let tmp = std::env::temp_dir().join("myshell_is_secret_path_ok_test");
+        std::fs::create_dir_all(&tmp).expect("mk tmp");
+        let f = tmp.join("probe.txt");
+        std::fs::write(&f, b"x").expect("write probe");
+        let target = std::fs::canonicalize(&f).expect("canonicalize");
+        let ok = !is_secret_path(&target);
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_dir(&tmp);
+        assert!(ok, "ordinary temp file must not be denied");
+    }
+}
+
 // ============ SFTP Commands ============
 
 #[tauri::command]
@@ -4176,8 +4261,20 @@ struct ZmodemReadOpenResult {
 /// block PATH-truncation tricks.
 #[tauri::command]
 fn rz_open_read(path: String, state: State<'_, AppState>) -> Result<ZmodemReadOpenResult, String> {
+    // (1) Vault must be unlocked — rz transfers are user-initiated, and this
+    //     keeps the read primitive unavailable to a compromised webview while
+    //     the vault is locked (same posture as `read_file_base64`).
+    require_dek(&state)?;
     if path.bytes().any(|b| b == 0) || path.len() > 4096 {
         return Err("无效路径".to_string());
+    }
+    // (2) Never serve the app's own secrets (vault bundle, IPC token file,
+    //     DB) or the user's ~/.ssh, whatever the caller names the file.
+    //     Uniform error so this cannot double as an existence oracle.
+    if let Ok(target) = std::fs::canonicalize(&path) {
+        if is_secret_path(&target) {
+            return Err("无法读取文件".to_string());
+        }
     }
     let meta = std::fs::metadata(&path).map_err(|_| "无法读取文件".to_string())?;
     if !meta.is_file() {
@@ -4219,6 +4316,10 @@ fn rz_read_chunk(
     state: State<'_, AppState>,
 ) -> Result<Vec<u8>, String> {
     use std::io::{Read, Seek, SeekFrom};
+    // Vault must still be unlocked — an open handle must not outlive the
+    // locked state (a compromised webview could park a handle, lock never
+    // happens, read at leisure). Same posture as `rz_open_read`.
+    require_dek(&state)?;
     let mut files = state.zmodem_files.lock().map_err(|e| e.to_string())?;
     let handle = files
         .get_mut(&id)
@@ -4284,8 +4385,23 @@ struct ZmodemWriteOpenResult {
 ///      serve as a write-target oracle.
 #[tauri::command]
 fn sz_open_write(path: String, state: State<'_, AppState>) -> Result<ZmodemWriteOpenResult, String> {
+    // (0) Vault must be unlocked — same posture as the read side.
+    require_dek(&state)?;
     if path.bytes().any(|b| b == 0) || path.len() > 4096 {
         return Err("无效路径".to_string());
+    }
+    // (0b) Never let a sz offer clobber the app's own secrets (vault bundle,
+    //      IPC token file, DB) or ~/.ssh. Defense-in-depth on top of the
+    //      system-dir blacklist; uniform error, no existence oracle.
+    if let Ok(target) = std::fs::canonicalize(&path) {
+        if is_secret_path(&target) {
+            return Err("目标路径受保护".to_string());
+        }
+    } else if is_secret_path(&std::path::Path::new(&path)) {
+        // Path doesn't exist yet (the common case for a new download):
+        // is_secret_path walks up to the deepest existing ancestor, so a
+        // not-yet-created file inside <config>/myshell or ~/.ssh is caught.
+        return Err("目标路径受保护".to_string());
     }
     if is_protected_write_path(&path) {
         return Err("目标路径受保护".to_string());
@@ -4345,6 +4461,9 @@ fn sz_write_chunk(
     use std::io::{Seek, SeekFrom, Write};
     const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
     const MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+    // Vault must still be unlocked — mirrors `rz_read_chunk`. An open write
+    // handle must not outlive the locked state.
+    require_dek(&state)?;
     if bytes.len() > MAX_CHUNK_BYTES {
         return Err("数据块过大".to_string());
     }

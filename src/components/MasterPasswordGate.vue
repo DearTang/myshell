@@ -12,6 +12,7 @@ import { MyButton } from "myui";
 import { setupVault, unlockVault, getLockoutInfo } from "@/api";
 import type { LockoutInfo } from "@/api";
 import { BROWSER_PREVIEW_NOTICE, isTauri } from "@/utils/environment";
+import WindowControls from "./WindowControls.vue";
 
 defineOptions({ name: "MasterPasswordGate" });
 
@@ -117,6 +118,10 @@ function formatTime(timestamp: number | null): string {
   <div class="gate" data-tauri-drag-region>
     <!-- Background Gradient Mesh -->
     <div class="gate-bg"></div>
+
+    <!-- 窗口控制：门禁页是全屏覆盖层，顶栏此时尚未渲染，没有这组按钮
+         （无边框窗口下）用户既不能最小化也不能关闭窗口。 -->
+    <WindowControls tone="overlay" />
 
     <!-- Main Card -->
     <div class="card animate-scale-in">
@@ -275,7 +280,8 @@ function formatTime(timestamp: number | null): string {
     radial-gradient(ellipse at 30% 20%, var(--accent-primary-muted) 0%, transparent 50%),
     radial-gradient(ellipse at 70% 80%, var(--accent-secondary-muted) 0%, transparent 50%),
     var(--bg-base);
-  opacity: 0.6;
+  /* 0.6 → 0.9：暗色下原值让背景光晕几乎看不见，整页发死沉 */
+  opacity: 0.9;
 }
 
 .card {
@@ -286,6 +292,8 @@ function formatTime(timestamp: number | null): string {
   border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-xl);
   box-shadow: var(--shadow-xl);
+  /* 顶部高光描边：让卡片从暗背景里"浮"起来，而不是平贴在上面 */
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.04) 0%, transparent 140px);
 }
 
 .header {
@@ -315,7 +323,8 @@ function formatTime(timestamp: number | null): string {
 
 .subtitle {
   font-size: 13px;
-  color: var(--text-tertiary);
+  /* tertiary 在卡片面上仅 3.77:1，副标题读不清；secondary 提到 5.62:1 */
+  color: var(--text-secondary);
   margin-top: 8px;
   line-height: 1.6;
 }
@@ -352,7 +361,9 @@ function formatTime(timestamp: number | null): string {
   font-size: 12px;
   color: var(--text-secondary);
   margin-bottom: 6px;
-  font-weight: 500;
+  /* 500 → 600：小字号在暗底上需要更实的字重才立得住 */
+  font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
 /* el-input：复刻旧版输入框观感（monospace、错误描边、聚焦光晕）。
@@ -417,7 +428,7 @@ function formatTime(timestamp: number | null): string {
 }
 
 .char-count {
-  color: var(--text-muted);
+  color: var(--text-tertiary);
 }
 
 .mismatch {
@@ -443,17 +454,39 @@ function formatTime(timestamp: number | null): string {
   font-size: 14px;
 }
 
+/* 主按钮配色：全部通过 EP 自己的变量覆盖，避免与其选择器打架。
+   实测问题（暗色）：
+   - 禁用态：EP 默认「白字 + --el-color-primary-light-5 浅底」= 1.58:1，
+     整块糊成一片白（用户截图即此态）。
+   - 启用/悬停态：EP 默认纯白字压强调色底 = 2.26:1 / 1.83:1，同样偏糊。
+   MyShell 的 --text-inverse 是反色文字，压在强调色上是 7.5:1 / 9.7:1。
+   禁用态改用中性面 + 次级文字：一眼看出不可点，标签仍清晰可读。
+
+   注意禁用态变量必须挂到 :disabled/.is-disabled 上：EP 有一条
+   `html.dark .el-button { --el-button-disabled-text-color: #ffffff80 }`
+   （特异性 0,2,1）会压过裸 `.submit-btn`（0,2,0）。带上伪类后为 0,3,0，才能胜出。 */
 .submit-btn {
   width: 100%;
   height: 44px;
   font-size: 14px;
   font-weight: 600;
+  --el-button-text-color: var(--text-inverse);
+  --el-button-hover-text-color: var(--text-inverse);
+  --el-button-active-text-color: var(--text-inverse);
+}
+
+.submit-btn:disabled,
+.submit-btn.is-disabled {
+  --el-button-disabled-text-color: var(--text-secondary);
+  --el-button-disabled-bg-color: var(--bg-surface);
+  --el-button-disabled-border-color: var(--border-default);
 }
 
 .footer-hint {
   margin-top: 20px;
   text-align: center;
   font-size: 11px;
-  color: var(--text-muted);
+  /* muted 在卡片面上只有 2.09:1，等于看不见；tertiary 提到 3.77:1 */
+  color: var(--text-tertiary);
 }
 </style>

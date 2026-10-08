@@ -28,7 +28,7 @@ import {
   Sunny,
   Warning,
 } from "@element-plus/icons-vue";
-import { MyDialog, MyInput, toast } from "myui";
+import { MyDialog, MyIcon, MyInput, toast } from "myui";
 import {
   type ConnectionConfig,
   type ConnType,
@@ -636,9 +636,14 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
           @click="toggle(row.node.path)"
           @contextmenu="onFolderContext(row.node, $event)"
         >
-          <span class="chevron" :class="{ open: row.isOpen }">›</span>
+          <!-- 展开指示：myui MyIcon 箭头。折叠=ArrowRight、展开=ArrowDown，
+               两个独立图标（非旋转同一图标），方向语义更直白。
+               注：ArrowRight 需 myui ≥0.27（0.18 无此图标名，会渲染成 Unknown）。 -->
+          <MyIcon class="chevron" :name="row.isOpen ? 'ArrowDown' : 'ArrowRight'" :size="14" />
+          <!-- 颜色交给 CSS（.folder-emoji / .folder-emoji.open / :hover），
+               内联 :color 会挡住悬停变色（内联优先级高于类选择器） -->
           <span class="folder-emoji" :class="{ open: row.isOpen }">
-            <el-icon :size="14" :color="row.isOpen ? 'var(--accent-primary)' : 'var(--text-secondary)'">
+            <el-icon :size="14">
               <FolderOpened v-if="row.isOpen" /><Folder v-else />
             </el-icon>
           </span>
@@ -889,16 +894,23 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   align-items: center;
   justify-content: center;
   background: transparent;
-  color: var(--text-tertiary);
-  border: none;
-  border-radius: var(--radius-md);
+  /* 静止态用 text-secondary 而非 tertiary：tertiary 在 --bg-elevated 上仅 ~3.8:1，
+     暗色模式下整排图标糊成一团灰。悬停再切强调色，形成"可用"的层级感。 */
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   font-size: 14px;
   cursor: pointer;
   transition: all var(--duration-fast) var(--ease-in-out);
 }
 .icon-btn:hover {
-  background: var(--bg-surface-hover);
-  color: var(--text-primary);
+  background: var(--accent-primary-muted);
+  border-color: var(--border-accent);
+  color: var(--accent-primary);
+}
+.icon-btn:active {
+  background: var(--bg-surface-active);
+  color: var(--accent-primary-hover);
 }
 
 /* ── 搜索框 ── */
@@ -913,7 +925,7 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 .search-count {
   margin-top: 6px;
   font-size: 11px;
-  color: var(--text-muted);
+  color: var(--text-tertiary);
   text-align: center;
 }
 
@@ -926,7 +938,7 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 .empty {
   padding: 32px;
   text-align: center;
-  color: var(--text-muted);
+  color: var(--text-tertiary);
   font-size: 12px;
 }
 .empty-emoji {
@@ -953,49 +965,71 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   align-items: center;
   gap: 8px;
   font-size: 12px;
+  /* secondary → 暗色下 #8b949e 对 --bg-elevated 约 6:1，标题层级清晰不糊 */
   color: var(--text-secondary);
   user-select: none;
-  transition: background var(--duration-fast) var(--ease-out-expo);
-  border-radius: 0 var(--radius-md) var(--radius-md) 0;
-  margin-right: 8px;
+  transition: background var(--duration-fast) var(--ease-out-expo), color var(--duration-fast) var(--ease-in-out);
+  border-radius: var(--radius-md);
+  margin: 1px 6px 1px 6px;
 }
 /* drop target 高亮只在 isDropTarget 时生效；非 target 时保持 hover 背景 */
 .folder-row:not(.drop-target):hover {
   background: var(--bg-surface-hover);
+  color: var(--text-primary);
 }
+/* 悬停只提亮文字，不把折叠文件夹染成强调色——蓝色专指"已展开的分支"，
+   否则折叠项悬停时与展开项同色，层级线索就废了 */
 .folder-row.drop-target {
   background: var(--accent-primary-muted);
   box-shadow: inset 0 0 0 1px var(--border-accent);
+  color: var(--text-primary);
 }
+/* 展开箭头（MyIcon 箭头图标）：
+   替换原先的 CSS 字符 ›（8px + opacity .75，实测几乎不可见）。
+   折叠 → ArrowRight、展开 → ArrowDown（按状态换图标，不再靠 rotate）。
+   颜色走 secondary，悬停提到 primary。 */
 .chevron {
-  font-size: 8px;
-  opacity: 0.6;
-  transition: transform var(--duration-normal) var(--ease-out-expo);
-  display: inline-block;
-  transform: rotate(0deg);
-}
-.chevron.open {
-  transform: rotate(90deg);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  transition: color var(--duration-fast) var(--ease-in-out);
 }
 .folder-emoji {
   font-size: 14px;
-  opacity: 0.7;
+  display: inline-flex;
+  align-items: center;
+  transition: color var(--duration-fast) var(--ease-in-out);
+  /* 折叠态：跟随层级用中性亮灰（tertiary 在暗色下只有 3.8:1，图标会糊掉）；
+     展开态：强调色点出"当前展开的分支"（对齐参考图的蓝色文件夹） */
+  color: var(--text-secondary);
 }
 .folder-emoji.open {
-  opacity: 1;
+  color: var(--accent-primary);
+}
+.folder-row:hover .chevron {
+  color: var(--text-primary);
 }
 .folder-name {
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* 层级：文件夹=菜单(中层) / 连接=会话(顶层)，两者必须一眼可分。
+     连名是纯 primary(14.8:1)，此处混 40% primary → 9.3:1，亮度差 1.6x；
+     若继续调到 78%(12.8:1) 只差 1.16x，就和连接名糊成一片了（走过的弯路）。
+     用 color-mix 而非硬编码，33 套预设（含 myui oklch 灰阶）自动跟随。 */
+  color: color-mix(in oklab, var(--text-primary) 40%, var(--text-secondary));
+  font-weight: 500;
 }
 .folder-count {
   font-size: 10px;
-  color: var(--text-muted);
+  /* muted(#484f58) 压在 surface(#21262d) 上只有 ~1.8:1，徽标几乎不可见；
+     改用 secondary + 描边，既可见又不像强调色那样抢眼 */
+  color: var(--text-secondary);
   background: var(--bg-surface);
-  padding: 2px 6px;
+  border: 1px solid var(--border-default);
+  padding: 1px 6px;
   border-radius: var(--radius-full);
+  line-height: 1.4;
 }
 
 /* 连接行 */
@@ -1008,12 +1042,20 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   font-size: 13px;
   color: var(--text-primary);
   outline: none;
-  transition: background var(--duration-fast) var(--ease-in-out);
-  border-radius: 0 var(--radius-md) var(--radius-md) 0;
-  margin-right: 8px;
+  transition: background var(--duration-fast) var(--ease-in-out), box-shadow var(--duration-fast) var(--ease-in-out);
+  border-radius: var(--radius-md);
+  margin: 1px 6px 1px 6px;
+  /* 会话=叶子节点，比文件夹(菜单)权重更高：文件名主色已是最亮，
+     再用 600 字重把它从"目录标题"里拎出来 */
+  font-weight: 600;
 }
 .conn-row:not(.is-dragged):hover {
   background: var(--bg-surface-hover);
+  /* 左侧强调条：悬停行在长列表里更好定位 */
+  box-shadow: inset 2px 0 0 0 var(--accent-primary);
+}
+.conn-row:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--border-accent);
 }
 /* 被拖行：pointer-events:none 让 elementFromPoint 穿过它命中下面的文件夹；
    同时降透明 + 抬升作为"正在拖这个"的视觉反馈。 */
@@ -1025,7 +1067,8 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   box-shadow: var(--shadow-glow);
 }
 .conn-icon {
-  opacity: 0.85;
+  /* 不再叠透明度：类型色（蓝/青/黄）本身就是识别线索，压暗后反而认不出 */
+  flex-shrink: 0;
 }
 .conn-main {
   flex: 1;
@@ -1038,10 +1081,11 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* 字重由 .conn-row 统一给（600），此处不重复声明以免规则打架 */
 }
 .conn-group {
   font-size: 10px;
-  color: var(--text-muted);
+  color: var(--text-tertiary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1055,15 +1099,16 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 }
 .conn-more {
   font-size: 12px;
-  opacity: 0.35;
+  /* secondary 而非 tertiary：⋯ 是可点操作入口，各预设下 ≥4.3:1，悬停再转强调色 */
+  color: var(--text-secondary);
   cursor: pointer;
   padding: 2px 6px;
   border-radius: var(--radius-sm);
   transition: all var(--duration-fast) var(--ease-in-out);
 }
 .conn-more:hover {
-  opacity: 1;
-  background: var(--bg-surface-active);
+  background: var(--accent-primary-muted);
+  color: var(--accent-primary);
 }
 
 /* 拖拽横幅 */
@@ -1120,11 +1165,11 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 }
 .footer-brand {
   font-size: 11px;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
 }
 .footer-version {
   font-size: 11px;
-  color: var(--text-muted);
+  color: var(--text-tertiary);
 }
 .update-dot {
   width: 7px;
@@ -1139,10 +1184,11 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   line-height: 1;
   cursor: pointer;
   padding: 0 2px;
-  opacity: 0.6;
+  color: var(--text-tertiary);
+  transition: color var(--duration-fast) var(--ease-in-out);
 }
 .feedback-icon:hover {
-  opacity: 1;
+  color: var(--accent-primary);
 }
 /* 没有更新点占据右缘时，反馈图标自己贴右 */
 .feedback-icon.no-push {

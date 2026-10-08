@@ -36,6 +36,7 @@ import {
 import { rendererBackend } from "@/composables/useRendererPref";
 import AppTopBar from "@/components/AppTopBar.vue";
 import AppSidebar from "@/components/AppSidebar.vue";
+import WindowControls from "@/components/WindowControls.vue";
 import TerminalPanel from "@/components/TerminalPanel.vue";
 import SftpPanel from "@/components/SftpPanel.vue";
 import MultiWindowGrid from "@/components/MultiWindowGrid.vue";
@@ -165,8 +166,12 @@ function onAiWidthChange(w: number): void {
 
 <template>
   <!-- 保险库门禁：checking 全屏加载；setup/unlock 走门禁组件。
-       顶栏尚未渲染，两层都带 drag-region 保证无边框窗口在门禁阶段可拖动 -->
-  <div v-if="vault === 'checking'" class="vault-splash" data-tauri-drag-region>加载中…</div>
+       顶栏尚未渲染，两层都带 drag-region 保证无边框窗口在门禁阶段可拖动；
+       窗口控制按钮也需在此阶段可见（否则无法最小化/关闭） -->
+  <div v-if="vault === 'checking'" class="vault-splash" data-tauri-drag-region>
+    <WindowControls tone="overlay" />
+    加载中…
+  </div>
   <MasterPasswordGate v-else-if="vault !== 'ready'" :mode="vault === 'setup' ? 'setup' : 'unlock'" @success="onVaultReady" />
 
   <div
