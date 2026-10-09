@@ -226,6 +226,12 @@ body {
 .app-shell > .shell-side {
   grid-area: side;
   min-width: 0;
+  /* min-height:0 是滚动的前提，不是保险。侧栏根元素被模板内联了
+     overflow:visible（骑跨右缘的折叠按钮不能被裁），而 overflow 非 hidden
+     的 flex/grid 项目在块轴上会恢复"自动最小尺寸"= 内容完整高度 ——
+     .side 因此被连接列表撑破、溢出网格行，里面的 .list(flex:1) 永远不滚动，
+     连接多时直接顶出界面外且无法滚动。与 .shell-work 保持同一套约束。 */
+  min-height: 0;
   overflow: hidden;
   position: relative;
   z-index: 2; /* 侧栏不透明，压在壳层背景图之上 */

@@ -4836,3 +4836,221 @@ WARN [startup] dom-ready not received within 4s; force-showing window
 | 什么可能导致偏离？ | ① 旧审计报告未核实就照搬（本轮已证明 7 个 P0 全修过）；② 内联 node -e 输出被吞——一律落 .mjs 脚本文件再跑；③ 审计子代理限流——分小批重发。 |
 | 下一步最小可验证动作？ | 构建产物生成后安装冒烟：解锁态做一次 sz/rz 传输确认无回归。 |
 | 目标是什么？ | 被攻陷的 webview 无法借 ZMODEM 命令读密/改密；发布流程按 打包 规则走完。 |
+
+### 阶段 159：左侧栏连接列表无法滚动（min-height 自动最小尺寸撑破网格行）
+
+**症状**：连接数一多，左侧栏内容直接顶出窗口外，滚轮无效，头部/页脚被挤出可视区。
+
+**根因**：`.side`（AppSidebar 根元素，同时带壳层的 `shell-side` 类）被模板内联了
+`overflow: visible` —— 这是**必需**的：折叠切换按钮 `.toggle-btn` 用 `right:-13px`
+骑跨在侧栏右缘，`overflow:hidden` 会把它裁成半圆不可点。但 CSS 里 flex/grid 项目的
+「自动最小尺寸」（`min-height:auto` → 内容的完整高度）**只在 overflow 为 visible 时
+生效**；一旦 overflow 不是 hidden，最小高度就退化为 0，项目才能被压缩到网格行高度、
+内部列表才能滚动。
+
+于是链条是：`overflow:visible` → `min-height:auto` → `.side` 的最小高度 = 全部连接
+行的高度总和 → 侧栏被内容撑破、溢出 `1fr` 网格行 → 里面的 `.list{flex:1;
+overflow-y:auto}` 永远不需要滚动（父高已经装得下全部内容）→ 用户看到的「超界且
+滚不动」。
+
+壳层 CSS 里 `.shell-side` 只写了 `min-width: 0`、漏了 `min-height: 0`（对照
+`.shell-work` 两者都有），正是这个坑。
+
+**修复**：`src/styles/app.css` 的 `.app-shell > .shell-side` 补 `min-height: 0`。
+显式 `min-height:0` 让自动最小尺寸直接为 0，**不依赖 overflow 取值**，所以不用动
+折叠按钮依赖的 `overflow:visible` 内联样式。
+
+**验证**：纯浏览器跑不动 Tauri 应用（缺 `invoke`），所以复刻真实 DOM 结构 +
+app.css + AppSidebar 关键布局规则做了 A/B 探针（80 行连接，壳层高 501px）：
+
+| | 侧栏高度 | 列表可视高 | 列表内容高 | 可滚动 |
+|---|---|---|---|---|
+| 修复前 `min-height:auto` | 2526px | 2416px | 2416px | 否 |
+| 修复后 `min-height:0` | 457px | 347px | 2416px | **是** |
+
+截图确认页脚固定在底部、滚动条出现在列表内。`npm run test:ts` 干净。
+
+**教训**：给 flex/grid 项目写 `overflow: visible` 前先想清楚块轴最小尺寸——
+「内容装不下时压缩内部滚动区」这套写法靠的是显式 `min-*: 0`，不是默认行为。
+
+#### 同一根因的第二面：窗口变小时底部整条（输入栏 + 状态栏）消失
+
+用户后续报「全屏正常，缩小后下部内容看不到、会话内也滚不动」。**这不是新 bug，
+就是上面这条修复要解决的同一个病**，只是当时装的是 v2.16.2（无此修复）。
+
+**因果链（缺一环）**：侧栏自动最小高度 ≈988px（30 来行连接撑出来的）→ grid 的
+`1fr` 行是 `minmax(auto, 1fr)`，行高被侧栏的自动最小尺寸顶到 988 → **同一行的
+`.shell-work` 跟着变 988** → 底部 232px（输入栏 + 状态栏）落到视口外 →
+`.app-shell` 和 `body` 都是 `overflow: hidden`，所以既看不见也滚不动。
+
+**为什么只在"缩小"时出现**：分界线就是窗口高度本身。
+`44(顶栏) + 988(侧栏最小高) = 1032`：
+- 最大化 1152px → 1032 装得下 → 一切正常（所以"全屏正常"）
+- 还原后 800px → 底部 232px 出界 → 输入栏/状态栏消失
+
+也就是说**和终端输出量无关**：用户当时在 10 万文件的目录里跑 `ls`，只是恰好撞上
+这个时间点；`Ctrl+C` 退出也没用，进一步说明与终端内容无关。窗口高度 >1032 就好，
+<1032 就坏。放大恢复、缩小再坏，同样是这个阈值的往复。
+
+**取证方法（值得复用）**：纯浏览器验证不了 Tauri，于是给 WebView2 加
+`--remote-debugging-port=9222` 重启应用，用 CDP 直连真实页面读 DOM。先后排除了：
+- 原生层没问题：`WRY_WEBVIEW` 子窗口 1200x800，与父窗口客户区完全一致；
+- 布局代码没问题：把真实 `App.vue` 在浏览器里用 IPC 桩跑起来，1001→360px 全区间
+  扫描，xterm 高度始终小于容器，AI 面板开关都正常；
+- 真机 CDP 一读就现形：`.shell-side` 高 988、`bottom=1032`、`min-height: auto`。
+
+**真机 A/B 证明**（`side.style.minHeight` 往返切换，可重复）：
+
+| 状态 | grid 行 | shellScrollH | 状态栏 bottom | 侧栏列表可滚 |
+|---|---|---|---|---|
+| v2.16.2 现状 | 44px **988px** | 1032 | **1032** ❌ | 否 |
+| `min-height: 0` | 44px **756px** | 800 | **800** ✅ | 是 |
+| 清除后（再次变坏） | 44px 988px | 1032 | 1032 ❌ | 否 |
+| 再加回（再次修好） | 44px 756px | 800 | 800 ✅ | 是 |
+
+**顺带加固**：`.terminal-panel`（`.tab-stack` 列向 flex 子项、overflow 可见）
+同样缺 `min-height: 0`。海量输出时终端内容极高，会把下方输入栏顶出可视区——
+已一并补上，属同类预防，不是本次症状的成因。
+
+**教训（补）**：同一个"自动最小尺寸"陷阱会顺着 flex/grid 树往上传染**整行**，
+症状却出现在毫不相干的组件上（底部状态栏）。定位此类问题要直接量
+`gridTemplateRows` 与各子项的 `min-height`，别从"哪个组件不见了"倒推。
+
+## 五问重启检查（阶段 159）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 159 完成 —— 修掉左侧栏不可滚动的布局根因，一行 CSS（min-height:0）修复，实测 A/B 复现并确认。 |
+| 我要去哪里？ | 用户实机确认侧栏滚动正常；本条进暂存区，下次 `打包` 作为 🐛修复 发布。 |
+| 什么可能导致偏离？ | ① 用 `overflow:hidden`「顺手修好」会打回折叠按钮（骑跨右缘被裁）——必须走 min-height:0；② 纯浏览器验证不了 Tauri 应用，只能复刻结构做探针，结论要标明验证边界。 |
+| 下一步最小可验证动作？ | 用户在真机上把连接数拉到几十条，确认头部/页脚不再被顶走、列表可滚。 |
+| 目标是什么？ | 侧栏内容再多也只在列表内部滚动，不再溢出界面。 |
+
+### 阶段 160：兼容供应商「填了 Base URL 也报必须填写」——unwrap_or 立即求值提前 return
+
+**症状**：设置 → AI → 选「OpenAI 兼容」，Base URL 明明填了
+`https://api.minimaxi.com/v1`，点「测试」仍报
+`测试失败: OpenAI 兼容 / Anthropic 兼容供应商必须填写 Base URL`。
+
+**根因**（`ai.rs` `Provider::endpoint`）：
+
+```rust
+let base = base_url.as_deref()
+    .map(|s| s.trim_end_matches('/'))
+    .filter(|s| !s.trim().is_empty())
+    .unwrap_or(match self {
+        ...
+        Self::OpenAiCompatible | Self::AnthropicCompatible => return Err("...必须填写 Base URL"),
+    });
+```
+
+`unwrap_or` 的参数是**立即求值**的（不是闭包）。于是无论 `base_url` 是 `Some`
+还是 `None`，`match` 都会先跑一遍，`return Err(...)` 抢先从函数返回 ——
+"填了 Base URL 照样失败"被焊死在这条路径上。
+
+**影响面比报错的按钮大**：`endpoint()` 同时被 AI 对话流调用（`ai.rs:701`），
+所以**所有 OpenAI / Anthropic 兼容供应商的聊天功能整体不可用**，不只"测试"
+按钮报错。用户在设置页只能看到测试报错，看不出聊天也坏了。
+
+**定位方法**：纯浏览器验证不了 Tauri，于是在 `ai.rs` 里加临时 `#[cfg(test)]`
+探针，把前端实际发出的 overrides JSON 灌进 `AiTestOverrides` 再调 `endpoint`。
+输出直接定案：`base_url=Some("https://api.minimaxi.com/v1")` 的同时
+`endpoint=Err("...必须填写 Base URL")` —— 反序列化没问题，是 endpoint 本身。
+
+**修复**：改成显式 `match`：有 base_url 走 Some 分支，只有 `None`/空/纯空白
+才进默认值 match 并 return Err。**`unwrap_or_else` 同样不行** —— 闭包里的
+`return` 只返回闭包（返回值类型也对不上），必须用 `match`。
+
+**验证**：新增 `ai::endpoint_tests` 4 个测试（替代临时探针）：
+1. `compatible_provider_uses_supplied_base_url` —— 兼容供应商带 base_url 拼出正确
+   endpoint；含"贴了完整 endpoint 不重复拼后缀"与"尾部多个斜杠"两种边界；
+   **这条在修复前必然失败**（探针已证），是真回归守卫。
+2. `compatible_provider_without_base_url_errors` —— None / 空串 / 纯空白三种
+   缺省形态仍须报错（守住"没填就报错"的原意，别把校验一起改没了）。
+3. `default_providers_fall_back_to_their_known_endpoints` —— Claude/OpenAI/Ollama
+   默认 endpoint 与显式覆盖的行为不变。
+4. `overrides_deserialize_from_frontend_payload` —— 前端 overrides JSON 字段
+   对得上（含 camelCase 映射）。
+
+`cargo test --lib` 105 passed / 0 failed。
+
+**教训**：`unwrap_or(f())` 里的 `f()` 只要带 `return` / panic / 副作用，就是一颗
+定时炸弹 —— 它跟 Option 是否为 Some 无关。凡是 fallback 分支要 `return`，
+一律用显式 `match`。
+
+## 五问重启检查（阶段 160）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 160 完成 —— 定位并修复 `endpoint()` 的 `unwrap_or` 立即求值 bug，兼容供应商聊天+测试双链路恢复，4 个回归测试落地，全套 105 测试通过。 |
+| 我要去哪里？ | 回到 v2.16.3 确认门，用户确认后走预检/构建/发布；两条 🐛 进同一 patch 版本。 |
+| 什么可能导致偏离？ | ① 只修了报错文案、没注意聊天链路同源（同一函数）——影响面要顺着调用点查，不能只看报错处；② `unwrap_or_else` 看起来等价其实不等价（闭包内 return 只返回闭包）；③ 纯浏览器验证不了 Tauri，探针要在 Rust 侧做才有效。 |
+| 下一步最小可验证动作？ | 打包后在真机上用兼容供应商跑一次真实对话（不只是"测试"按钮）。 |
+| 目标是什么？ | 兼容供应商（MiniMax / 智谱等）能正常配置并对话。 |
+
+### 阶段 161：sz 下载「文件不存在」无提示 + 传输失败可能永久卡死
+
+用户报两条：(1) `sz` 下载时文件不存在 / 无权限**没有任何提示**；(2) 下载过程中失败
+**不会退出 ZMODEM 状态，只能 Ctrl+C**。
+
+#### 问题 1：文件不存在时后端根本收不到信号
+
+先查了真机日志（`<config>/myshell/logs/myshell-*.log`），同一进程里三次 `sz`：
+
+| 时间 | 操作 | 日志 |
+|---|---|---|
+| 02:00:11 | 正常传输 | ZRQINIT → ZFILE → ZEOF → ZFIN ✅ |
+| 02:28:18 | 正常传输 | ZRQINIT → ZFILE → ZEOF → ZFIN ✅ |
+| 02:29:18 | 无权限 | ZRQINIT → abort burst → 报错并退出 ✅ |
+| — | **`sz 123.5xt`（不存在）** | **一条记录都没有** ❌ |
+
+接收器是在看到第一个 ZDLE 字节时才创建的（`zmodem_rx` 的 Probing 状态）。
+日志空白说明远端**连一个协议字节都没发**。用户补测 `sz 123.5xt; echo "EXIT=$?"`
+得到 `EXIT=128` 且中间零输出 —— 坐实 **lrzsz 对不存在的文件是彻底静默失败**。
+
+既有 fast-fail 只覆盖「已发 ZRQINIT、随后打印纯文本报错」这一种（无权限那类，
+日志 01:52 那次确实命中）。文件不存在属于**协议根本没开始**，后端拿不到任何
+信号，无从提示 —— 这不是漏判，是没有可判的东西。
+
+**修法**：改在客户端兜。终端本来就知道用户敲了什么（`recordKeystroke` 在 Enter
+时回传整条命令），于是：执行完 `sz`/`rz` 后 6 秒内没有 ZMODEM 会话启动，就往终端
+补一条 `[ZMODEM 提示]`。要点：
+- 只认整条命令就是 `sz`/`rz` 及其参数，`echo sz` / `ls | sz` 不误触发；
+- 判定用「本次意图之后是否起过会话」这个独立标记，**不是**看当前 `isZmodem` ——
+  无权限那种场景会话 1 秒内起又立刻结束，用实时状态会误判成"没起过"；
+- 提示行而非弹窗，误报代价低；`zmodem_start` / `zmodem_offer` 都会撤销待发提示；
+  组件卸载时清定时器。
+
+#### 问题 2：WaitingAccept 永久等待
+
+`idle_timeout()` 里 `WaitingAccept`（等前端选保存目录）被**有意排除**在超时之外 ——
+选择器合法地可以开着几分钟。但"无限期"意味着前端一旦不应答（对话框丢失、标签页
+在传输中崩溃、IPC 断开），会话就永远停在 ZMODEM 模式：终端吞掉所有后续输出、
+按键全部失效，用户只能 Ctrl+C。**这正是"不会退出、只能 Ctrl+C"的机制。**
+
+**修**：
+- 后端 `RxState::WaitingAccept` 加 5 分钟上限（新增 `accept_since` 字段）。上限从
+  「进入 WaitingAccept」起算而非 `last_feed`：发送方在等我们的 ZRPOS、本就不发任何
+  字节，用 `last_feed` 会被一帧杂音重置回零，等于没加。
+- 前端 `zmodemAcceptOffer` 失败原来只 `console.error`；改为发取消序列 + 终端报错。
+
+**测试**：新增 2 个（上限内不超时 / 超 5 分钟必超时 / 杂音不重置上限），并把原
+`idle_timeout_exempts_waiting_accept`（断言"永不超时"）改成有界语义。`cargo test
+--lib` 106 passed；`npm run test:ts` 干净。
+
+#### 遗留（已知未覆盖）
+
+**传输进行到一半失败**（传大文件时删掉远端文件 / 断网）这条路径**尚未复现**。
+用户已确认先发布、后续再改。已知该场景下如果远端静默死亡会走 30s 空闲超时正常
+退出；只有"落盘失败"（磁盘满/权限变更/设备拔出）目前**只在 FileComplete 时上报**，
+传输中途失败不会立即提示——这是下一轮要查的点。
+
+## 五问重启检查（阶段 161）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 161 完成 —— sz 静默失败加客户端提示、WaitingAccept 永久等待加 5 分钟上限与前端失败兜底；问题 2 的"传中失败"分支留待后续。 |
+| 我要去哪里？ | 完成 v2.16.3 发布（三条 🐛 同版本）；传中失败的落盘即时上报另开阶段。 |
+| 什么可能导致偏离？ | ① 看到"没提示"就想去后端加判据——其实后端收不到任何字节，判据只能放客户端；② 用 `last_feed` 给 WaitingAccept 计时会形同虚设；③ 日志空白要想到"远端压根没发协议帧"，而不是"解析失败"。 |
+| 下一步最小可验证动作？ | 用户复现"传输中途失败"：传大文件时删远端文件/断网，不按 Ctrl+C，观察是否卡住。 |
+| 目标是什么？ | sz/rz 的失败对用户都有反馈，且任何失败路径都不会把终端永久卡死。 |

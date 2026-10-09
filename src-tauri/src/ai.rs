@@ -179,11 +179,19 @@ impl Provider {
             Self::OpenAi | Self::OpenAiCompatible => "chat/completions",
             Self::Ollama => "chat",
         };
-        let base = base_url
+        // 兼容供应商缺 base_url 时才报错 —— 必须用显式 match，不能用
+        // `unwrap_or(match self { ... => return Err(..) })`：`unwrap_or` 的
+        // 参数是**立即求值**的，那个 `return` 会在 base_url 明明是 Some 时
+        // 抢先返回，把整条"填了 Base URL 也照样失败"的路径焊死（聊天与
+        // 测试两条链路同时中招）。`unwrap_or_else` 也不行：闭包里的
+        // `return` 只返回闭包，类型也对不上。
+        let base = match base_url
             .as_deref()
             .map(|s| s.trim_end_matches('/'))
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or(match self {
+        {
+            Some(b) => b,
+            None => match self {
                 Self::Claude => "https://api.anthropic.com/v1",
                 Self::OpenAi => "https://api.openai.com/v1",
                 Self::Ollama => "http://localhost:11434/api",
@@ -191,7 +199,8 @@ impl Provider {
                 Self::OpenAiCompatible | Self::AnthropicCompatible => {
                     return Err("OpenAI 兼容 / Anthropic 兼容供应商必须填写 Base URL".to_string())
                 }
-            });
+            },
+        };
         if base.ends_with(suffix) {
             Ok(base.to_string())
         } else {
@@ -1653,4 +1662,101 @@ pub async fn fetch_models_for_supplier(
 ) -> Result<Vec<String>, String> {
     let s = load_settings_for_supplier(state, supplier_id, override_key.as_deref())?;
     fetch_provider_models(s.provider.id_str(), &s.base_url.unwrap_or_default(), &s.api_key).await
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    fn url(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    /// A compatible provider WITH a base_url must build its endpoint. This is
+    /// the regression guard for the `unwrap_or(match .. => return Err)` eager
+    /// evaluation that made every OpenAI/Anthropic-compatible provider fail
+    /// with "必须填写 Base URL" even when the field was filled.
+    #[test]
+    fn compatible_provider_uses_supplied_base_url() {
+        assert_eq!(
+            Provider::OpenAiCompatible
+                .endpoint(&url("https://api.minimaxi.com/v1"))
+                .unwrap(),
+            "https://api.minimaxi.com/v1/chat/completions"
+        );
+        assert_eq!(
+            Provider::AnthropicCompatible
+                .endpoint(&url("https://example.com/v1"))
+                .unwrap(),
+            "https://example.com/v1/messages"
+        );
+        // Full endpoint pasted in — no duplicated suffix.
+        assert_eq!(
+            Provider::OpenAiCompatible
+                .endpoint(&url("https://open.bigmodel.cn/api/paas/v4/chat/completions"))
+                .unwrap(),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+        // Trailing slashes are tolerated.
+        assert_eq!(
+            Provider::OpenAiCompatible
+                .endpoint(&url("https://api.minimaxi.com/v1///"))
+                .unwrap(),
+            "https://api.minimaxi.com/v1/chat/completions"
+        );
+    }
+
+    /// The error must only fire when the base_url is genuinely absent.
+    #[test]
+    fn compatible_provider_without_base_url_errors() {
+        for empty in [None, Some(String::new()), Some("   ".to_string())] {
+            assert!(Provider::OpenAiCompatible.endpoint(&empty).is_err());
+            assert!(Provider::AnthropicCompatible.endpoint(&empty).is_err());
+        }
+    }
+
+    /// The three providers with built-in defaults keep their defaults.
+    #[test]
+    fn default_providers_fall_back_to_their_known_endpoints() {
+        assert_eq!(
+            Provider::Claude.endpoint(&None).unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            Provider::OpenAi.endpoint(&None).unwrap(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            Provider::Ollama.endpoint(&None).unwrap(),
+            "http://localhost:11434/api/chat"
+        );
+        // An explicit base_url still wins over the default.
+        assert_eq!(
+            Provider::OpenAi.endpoint(&url("https://proxy.internal/v1")).unwrap(),
+            "https://proxy.internal/v1/chat/completions"
+        );
+    }
+
+    /// The override payload the Settings form sends must survive
+    /// deserialization field-for-field — `baseUrl` in particular, whose loss
+    /// is indistinguishable from "user forgot to fill it".
+    #[test]
+    fn overrides_deserialize_from_frontend_payload() {
+        let payload = serde_json::json!({
+            "supplierId": 7,
+            "provider": "openai_compatible",
+            "model": "MiniMax-M3",
+            "baseUrl": "https://api.minimaxi.com/v1",
+            "proxyUrl": "http://172.19.109.247:3128",
+            "apiKey": "",
+            "temperature": 0.7,
+            "allowVaultKeyToNewHost": false
+        });
+        let o: AiTestOverrides = serde_json::from_value(payload).expect("deserialize");
+        assert_eq!(o.supplier_id, Some(7));
+        assert_eq!(o.provider.as_deref(), Some("openai_compatible"));
+        assert_eq!(o.base_url.as_deref(), Some("https://api.minimaxi.com/v1"));
+        assert_eq!(o.proxy_url.as_deref(), Some("http://172.19.109.247:3128"));
+        assert!(!o.allow_vault_key_to_new_host);
+    }
 }

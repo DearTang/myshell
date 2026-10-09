@@ -84,7 +84,7 @@ pub(crate) fn offset_bytes(off: u64) -> [u8; 4] {
 }
 
 /// State of the native ZMODEM receiver state machine.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RxState {
     /// First frame not yet seen — deciding download vs upload.
     Probing,
@@ -182,6 +182,12 @@ pub struct ZmodemReceiver {
     /// without a CAN burst) would otherwise leave the session in Zmodem mode
     /// forever, swallowing all terminal output.
     last_feed: Option<std::time::Instant>,
+    /// When the receiver entered WaitingAccept (ZFILE offered, frontend must
+    /// pick a save directory). Drives the accept-wait cap in `idle_timeout` —
+    /// deliberately NOT keyed on `last_feed`, because a sender waiting for our
+    /// ZRPOS emits nothing, and one stray frame would reset a `last_feed`
+    /// based cap back to zero and let a stuck session live forever.
+    accept_since: Option<std::time::Instant>,
 }
 
 impl ZmodemReceiver {
@@ -203,6 +209,7 @@ impl ZmodemReceiver {
             noise_seen_at: None,
             start_emitted: false,
             last_feed: None,
+            accept_since: None,
         }
     }
 
@@ -342,9 +349,16 @@ impl ZmodemReceiver {
     /// for minutes — no protocol bytes flow while it's open). Covers the
     /// failure mode where sz dies without a CAN burst (e.g. killed by a
     /// signal) and the receiver would otherwise wait forever.
+    ///
+    /// WaitingAccept is capped separately and generously (5 min): the picker
+    /// staying open is legitimate, but "the frontend never answers" (dialog
+    /// lost, tab crashed mid-transfer, IPC dropped) used to hang the session
+    /// *forever* — terminal stuck in Zmodem mode, swallowing all shell output
+    /// and eating every keystroke, with Ctrl+C as the only exit.
     pub fn idle_timeout(&self, limit: std::time::Duration) -> bool {
+        const ACCEPT_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(300);
         if self.state == RxState::WaitingAccept {
-            return false;
+            return matches!(self.accept_since, Some(t) if t.elapsed() > ACCEPT_WAIT_CAP);
         }
         match self.last_feed {
             Some(t) => t.elapsed() > limit,
@@ -823,6 +837,7 @@ impl ZmodemReceiver {
                         self.file_size = size;
                         self.file_index += 1;
                         self.state = RxState::WaitingAccept;
+                        self.accept_since = Some(std::time::Instant::now());
                         actions.events.push(RxEvent::Offer { name, size });
                     }
                     None => {
@@ -1397,17 +1412,41 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_exempts_waiting_accept() {
+    fn idle_timeout_exempts_waiting_accept_but_caps_it() {
         let mut rx = ZmodemReceiver::new();
         let _ = rx.feed(&hex_header(frame_type::ZRQINIT));
         // Just fed — a 1-hour idle limit must not trip.
         assert!(!rx.idle_timeout(std::time::Duration::from_secs(3600)));
 
         // Offer arrives → WaitingAccept: the directory picker may stay open
-        // for minutes, so the idle watchdog must never fire in this state,
-        // not even with a zero limit.
+        // for minutes, so the normal 30s watchdog must not fire, not even
+        // with a zero limit.
         let _ = rx.feed(&zfile_frame("a.txt", 1));
+        assert_eq!(rx.state, RxState::WaitingAccept);
         assert!(!rx.idle_timeout(std::time::Duration::ZERO));
+
+        // …but "the frontend never answers" must not hang the session
+        // forever either. Past the cap the receiver force-ends so the
+        // terminal leaves ZMODEM mode without the user reaching for Ctrl+C.
+        rx.accept_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(301));
+        assert!(rx.idle_timeout(std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn accept_wait_cap_is_not_reset_by_stray_bytes() {
+        // The cap must run from "entered WaitingAccept", not from the last
+        // byte received: the sender is waiting for our ZRPOS and emits
+        // nothing, and a stray frame must not buy the session another 5 min.
+        let mut rx = ZmodemReceiver::new();
+        let _ = rx.feed(&hex_header(frame_type::ZRQINIT));
+        let _ = rx.feed(&zfile_frame("a.txt", 1));
+        let stale = Some(std::time::Instant::now() - std::time::Duration::from_secs(301));
+
+        // A fresh feed() would normally refresh last_feed.
+        rx.feed(b"");
+        assert_eq!(rx.state, RxState::WaitingAccept);
+        rx.accept_since = stale;
+        assert!(rx.idle_timeout(std::time::Duration::ZERO));
     }
 
     #[test]

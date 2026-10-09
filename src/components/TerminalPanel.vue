@@ -524,6 +524,49 @@ function setupTerminal(): void {
     resizeTo(props.sessionId, t.cols, t.rows).catch(() => {});
   }, 100);
 
+  // ── sz/rz 无声失败的提示 ────────────────────────────────────────────────
+  // lrzsz 的 sz 对"文件不存在"是**静默**退出：实测 `sz 123.5xt` 退出码 128、
+  // 一个字节都不输出（连 ZDLE 都没有），所以后端状态机压根不会被唤醒，
+  // 拿不到任何信号——终端上只表现为敲完命令直接回到提示符，用户无法区分
+  // "传完了"、"失败了"还是"命令打错了"。这里在客户端补一个兜底提示：敲了
+  // sz/rz 之后若 ZMODEM 会话迟迟没启动，就告诉用户最可能的原因。
+  // 纯提示行（不弹窗、不改变终端状态），误报代价很低。
+  const ZMODEM_SILENT_HINT_MS = 6000;
+  // sawSession 用"本次意图之后是否真的起过会话"来判断，而不是看当前
+  // isZmodem —— 无权限那种场景会话会在 1 秒内起又立刻结束，用实时状态
+  // 会误判成"没起过"从而多打一条提示。
+  let zmodemIntentTimer: ReturnType<typeof setTimeout> | null = null;
+  let sawZmodemSession = false;
+
+  function clearZmodemIntentHint(): void {
+    if (zmodemIntentTimer !== null) {
+      clearTimeout(zmodemIntentTimer);
+      zmodemIntentTimer = null;
+    }
+  }
+
+  /** 任何 ZMODEM 会话信号（start / offer）都算"起过了"，撤销待发提示。 */
+  function markZmodemSessionStarted(): void {
+    sawZmodemSession = true;
+    clearZmodemIntentHint();
+  }
+
+  function noteZmodemIntent(cmd: string): void {
+    clearZmodemIntentHint();
+    // 只认整条命令就是 sz / rz 及其参数，避免 `echo sz`、`ls | sz` 之类的
+    // 误伤（那类命令同样不会起会话，但用户并不需要这个提示）。
+    if (!/^\s*(sz|rz)(\s|$)/.test(cmd)) return;
+    sawZmodemSession = false;
+    zmodemIntentTimer = setTimeout(() => {
+      zmodemIntentTimer = null;
+      if (sawZmodemSession || closed) return;
+      t.write(
+        "\r\n\x1b[33m[ZMODEM 提示] 未检测到远端发起传输。lrzsz 的 sz/rz 在文件不存在时" +
+          "会静默退出（无任何输出）；请确认文件名与路径是否正确。\x1b[0m\r\n",
+      );
+    }, ZMODEM_SILENT_HINT_MS);
+  }
+
   // Handle user input. In ZMODEM mode, swallow keystrokes so the user
   // can't corrupt the protocol stream by typing into the terminal.
   // When broadcast targets are configured, mirror the keystrokes to all
@@ -544,6 +587,7 @@ function setupTerminal(): void {
     // records its own perspective.
     if (props.connectionId) {
       recordKeystroke(data, cmdBufRef, ansiEscRef, (cmd) => {
+        noteZmodemIntent(cmd);
         addCommandHistory(props.connectionId, cmd)
           .then(() => {
             refreshHistory?.();
@@ -719,6 +763,7 @@ function setupTerminal(): void {
   // longer fed to the JS bridge.
   onZmodemStart(sid, (direction) => {
     isZmodem = true;
+    markZmodemSessionStarted();
     nativeDownload = direction === "download";
     if (direction === "download") {
       nativeDir = null;
@@ -749,24 +794,35 @@ function setupTerminal(): void {
 
   // Native download: a file is offered — prompt for dir (once), accept/skip.
   onZmodemOffer(sid, (p) => {
+    markZmodemSessionStarted();
     void (async () => {
-      const dir = await promptNativeDir();
-      const path = dir !== null ? joinZmodemPath(dir, p.fileName) : null;
-      if (path !== null) {
-        zmodemStatus.value = {
-          active: true,
-          direction: "download",
-          currentFile: p.fileName,
-          bytesTransferred: 0,
-          bytesTotal: p.fileSize,
-          speedBps: 0,
-          error: null,
-          startTime: Date.now(),
-        };
+      try {
+        const dir = await promptNativeDir();
+        const path = dir !== null ? joinZmodemPath(dir, p.fileName) : null;
+        if (path !== null) {
+          zmodemStatus.value = {
+            active: true,
+            direction: "download",
+            currentFile: p.fileName,
+            bytesTransferred: 0,
+            bytesTotal: p.fileSize,
+            speedBps: 0,
+            error: null,
+            startTime: Date.now(),
+          };
+        }
+        await zmodemAcceptOffer(props.sessionId, path);
+      } catch (e) {
+        // 拿不到目录 / IPC 失败时必须主动收场。接收端此时停在 WaitingAccept，
+        // 而该状态被有意排除在空闲超时之外（目录选择器可以合法地开着几分钟），
+        // 所以这里一旦不吭声，会话就永远停在 ZMODEM 模式：终端吞掉所有后续
+        // 输出、按键也进不去，用户只能 Ctrl+C。先发取消序列再报给用户。
+        console.error("zmodemAcceptOffer failed:", e);
+        sshSendZmodemAbort(props.sessionId).catch(() => {});
+        t.write(
+          `\r\n\x1b[31m[ZMODEM 错误] 无法选择保存目录或提交失败，已取消本次传输：${e}\x1b[0m\r\n`,
+        );
       }
-      zmodemAcceptOffer(props.sessionId, path).catch((e) =>
-        console.error("zmodemAcceptOffer failed:", e),
-      );
     })();
   })
     .then((un) => {
@@ -889,6 +945,7 @@ function setupTerminal(): void {
   disposeFn = () => {
     closed = true;
     clearTimeout(focusRetry);
+    clearZmodemIntentHint();
     window.removeEventListener("focus", onWindowFocus);
     unlistenOutput?.();
     unlistenClosed?.();
@@ -1223,6 +1280,12 @@ onUnmounted(() => {
   height: 100%;
   display: flex;
   flex-direction: column;
+  /* 同 .shell-side 的坑（见 app.css）：本元素是 .tab-stack 列向 flex 的
+     子项且 overflow 可见，块轴的「自动最小尺寸」会退化成内容的完整高度。
+     海量输出（ls 上万行）时终端内容极高，整块面板被撑大、把下方的输入栏
+     顶出可视区。显式 min-height:0 让它能被压缩到 .tab-stack 给的高度，
+     由 xterm 自己的视口负责滚动。 */
+  min-height: 0;
 }
 
 /* When a background image is active, force xterm.js internal DOM
