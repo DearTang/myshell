@@ -7,16 +7,7 @@
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { zipSync, strToU8 } from "fflate";
-import {
-  Camera,
-  ChatDotRound,
-  CircleCheck,
-  CircleClose,
-  FolderOpened,
-  Link,
-  Picture,
-} from "@element-plus/icons-vue";
-import { MyButton, MyCheckbox, MyDialog, MyInput, MySegmented } from "myui";
+import { MyButton, MyCheckbox, MyDialog, MyIcon, MyInput, MySegmented, MyTextArea } from "myui";
 import {
   clearFeedbackDir,
   getFeedbackLog,
@@ -340,6 +331,8 @@ const logSizeText = (): string => {
     size="lg"
     align-center
     class="feedback-dialog"
+    body-class="feedback-dialog-body"
+    footer-class="feedback-dialog-footer"
     :close-on-click-modal="!submitting"
     :close-on-press-escape="!submitting"
     @cancel="handleClose"
@@ -347,7 +340,7 @@ const logSizeText = (): string => {
     <template #header>
       <div class="dlg-header">
         <span class="header-icon">
-          <el-icon :size="20"><ChatDotRound /></el-icon>
+          <MyIcon :size="20" name="ChatDotRound" />
         </span>
         <div>
           <div class="header-title">提交反馈</div>
@@ -361,13 +354,8 @@ const logSizeText = (): string => {
         <div class="scroll-body">
           <div class="result-wrap">
             <div class="result-icon">
-              <el-icon
-                :size="48"
-                :color="result.kind === 'success' ? 'var(--success)' : 'var(--error)'"
-              >
-                <CircleCheck v-if="result.kind === 'success'" />
-                <CircleClose v-else />
-              </el-icon>
+              <MyIcon :size="48"
+                :color="result.kind === 'success' ? 'var(--success)' : 'var(--error)'" :icon="result.kind === 'success' ? 'CircleCheck' : 'CircleClose'" />
             </div>
             <div class="result-title" :class="result.kind === 'success' ? 'is-success' : 'is-error'">
               {{ result.kind === "success" ? "提交成功" : "提交失败" }}
@@ -380,7 +368,7 @@ const logSizeText = (): string => {
             </div>
             <div v-if="result.savedPath" class="result-folder-row">
               <MyButton variant="secondary" :class="{ 'folder-btn-error': result.kind === 'error' }" @click="openRevealFolder">
-                <el-icon :size="13"><FolderOpened /></el-icon>
+                <MyIcon :size="13" name="FolderOpened" />
                 打开反馈包所在文件夹
               </MyButton>
             </div>
@@ -411,8 +399,9 @@ const logSizeText = (): string => {
             <label class="field-label">
               描述 <span class="required-star">*</span>
             </label>
-            <textarea
+            <MyTextArea
               v-model="description"
+              bare
               class="desc-textarea"
               :placeholder="
                 type === 'bug'
@@ -420,7 +409,7 @@ const logSizeText = (): string => {
                   : '你想看到什么功能？为什么需要它？'
               "
               autofocus
-            ></textarea>
+            />
           </div>
 
           <!-- Contact -->
@@ -437,18 +426,19 @@ const logSizeText = (): string => {
             <label class="field-label">截图 / 图片（选填）</label>
             <div class="image-actions">
               <MyButton variant="secondary" size="small" @click="captureScreen">
-                <el-icon :size="13"><Camera /></el-icon>
+                <MyIcon :size="13" name="Camera" />
                 截图
               </MyButton>
               <MyButton variant="secondary" size="small" @click="addImageFromFile">
-                <el-icon :size="13"><Picture /></el-icon>
+                <MyIcon :size="13" name="Picture" />
                 选择图片
               </MyButton>
             </div>
             <div v-if="attachments.length > 0" class="attachment-list">
               <div v-for="(att, i) in attachments" :key="i" class="attachment-thumb">
                 <img :src="att.dataUrl" :alt="att.name" />
-                <button type="button" class="att-remove" title="移除" @click="removeAttachment(i)">✕</button>
+                <MyIconButton
+                  title="移除" class="att-remove" label="移除" size="12" name="Close" @click="removeAttachment(i)" />
                 <!-- 图片上的角标：黑色半透明遮罩上必须用白字（任何主题下），无对应令牌 -->
                 <div class="att-size">{{ formatBytes(att.bytes) }}</div>
               </div>
@@ -470,7 +460,7 @@ const logSizeText = (): string => {
                 {{ showLog ? "收起日志" : "查看日志内容" }}
               </MyButton>
               <MyButton v-if="logInfo.logDir" variant="secondary" size="small" @click="revealPath(logInfo.logDir)">
-                <el-icon :size="13"><FolderOpened /></el-icon>
+                <MyIcon :size="13" name="FolderOpened" />
                 打开日志目录
               </MyButton>
             </div>
@@ -491,7 +481,7 @@ const logSizeText = (): string => {
               title="在 Gitee 上提交 Issue"
               @click.prevent="openGiteeIssue"
             >
-              <el-icon :size="12"><Link /></el-icon>
+              <MyIcon :size="12" name="Link" />
               也可通过 Gitee Issue 提交
             </a>
             <MyButton variant="secondary" :disabled="submitting" @click="handleClose">取消</MyButton>
@@ -516,14 +506,14 @@ const logSizeText = (): string => {
   max-height: 86vh;
 }
 
-:global(.feedback-dialog .el-dialog__body) {
+:global(.feedback-dialog-body) {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
 }
 
 /* 让 #footer 分隔线紧贴 body 结束处（去掉 EP footer 自带的 padding-top） */
-:global(.feedback-dialog .el-dialog__footer) {
+:global(.feedback-dialog-footer) {
   padding-top: 0;
 }
 

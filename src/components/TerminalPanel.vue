@@ -7,8 +7,8 @@
      - 所有 tab 面板常驻挂载（App.vue 用绝对定位 + visibility 切换），
        xterm 容器必须保持真实尺寸。 -->
 <script setup lang="ts">
+import { MyIcon, toast } from "myui";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { Document, FolderOpened, Loading } from "@element-plus/icons-vue";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -44,6 +44,11 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { captureTerminalToDataUrl } from "@/utils/screenshot";
 import { recordKeystroke } from "@/utils/cmd-buffer";
 import { appearance, getActivePalette } from "@/store/appearance";
+import {
+  refreshCommandHistory,
+  registerSessionAction,
+  unregisterSessionAction,
+} from "@/store/sessions";
 import { ui } from "@/store/ui";
 import { primaryFont, resolveFontStack } from "@/composables/useTerminalFont";
 import { resolveRenderer } from "@/composables/useRendererPref";
@@ -98,6 +103,10 @@ const props = defineProps<{
    * new terminal to restore scrollback history. The caller is responsible
    * for clearing it (via snapshot-consumed) so it's only restored once. */
   reconnectSnapshot?: string;
+  /** 是否在本面板内部渲染命令栏。默认 true（多窗口网格：每个格子自带一条）。
+   *  2026-10-10 起主标签区传 false —— 命令栏被提升到壳层底部行，由 App.vue 统一
+   *  渲染一条给活动标签用，与服务器状态栏一起贯穿整个窗口宽度。 */
+  commandBar?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -106,8 +115,6 @@ const emit = defineEmits<{
    * 由 terminal-gone 注销。 */
   (e: "terminal-ready", sessionId: string, term: Terminal): void;
   (e: "terminal-gone", sessionId: string): void;
-  (e: "open-ai"): void;
-  (e: "open-multiwindow"): void;
   (e: "reconnect"): void;
   /** reconnectSnapshot 已写入新终端，父层据此清掉 tab 上的快照。 */
   (e: "snapshot-consumed"): void;
@@ -175,13 +182,13 @@ let disposeFn: (() => void) | null = null;
 // 命令写回后端。
 const cmdBufRef = { current: "" };
 const ansiEscRef = { current: false };
-// CommandBar 挂载时注册的历史列表刷新回调：录入新命令后触发。
-let refreshHistory: (() => void) | null = null;
+// 2026-10-10：原先这里是 `let refreshHistory` —— CommandBar 挂载时通过
+// `@register-refresh` 把自己的 reload 回调存进来，录完命令后调用。命令栏提升到
+// 壳层底部行后两者不再是父子关系，改为 CommandBar 把 reload 注册进
+// store/sessions 的 historyRefreshers（按 connectionId），这里直接触发。
 // abort 兜底定时器：zmodem_finish 正常应在一个 IPC 往返内触发 zmodem_end，
 // 若未到达（会话已死 / IPC 失败）2s 后强制重置。
 let abortTimeout: ReturnType<typeof setTimeout> | null = null;
-// 截图横幅自动清除定时器
-let screenshotTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Native ZMODEM state. Both download (sz) and upload (rz) are handled
 // entirely in Rust — data never crosses IPC. The frontend only prompts
@@ -210,15 +217,10 @@ const zmodemStatus = ref<ZmodemStatus>({
 // relative paths; lrzsz rz recreates the tree remotely).
 const uploadChooserOpen = ref(false);
 
-// Screenshot status banner — shown transiently after the user clicks 📷.
-// `state` is one of: "capturing" | "saved" | "error". Auto-clears after 4s
-// via the timeout stored in `screenshotTimer`.
-type ScreenshotState =
-  | { state: "capturing" }
-  | { state: "saved"; path: string }
-  | { state: "error"; message: string }
-  | null;
-const screenshotStatus = ref<ScreenshotState>(null);
+// Screenshot 状态——迁移到 myui 的 toast 后只剩"正在截取"这一瞬时态：
+// 成功/失败两种结果都改由 toast 承载（成功带「打开」动作，失败带类型色），
+// 不再需要手工 4s 定时器与自绘横幅。
+const screenshotCapturing = ref(false);
 
 // ── 主题 / 字体 / 背景图（computed：预设或深浅切换即重算） ──
 const activePalette = computed(() => getActivePalette());
@@ -298,34 +300,33 @@ function cancelNativeUpload(): void {
 async function handleScreenshot(): Promise<void> {
   const t = term;
   if (!t) {
-    flashScreenshot({ state: "error", message: "终端尚未就绪，请稍候重试" });
+    toast("终端尚未就绪，请稍候重试", { type: "error", duration: 4000 });
     return;
   }
-  // Clear any previous banner + timer.
-  if (screenshotTimer) clearTimeout(screenshotTimer);
-  screenshotStatus.value = { state: "capturing" };
+  screenshotCapturing.value = true;
 
   try {
     const dataUrl = await captureTerminalToDataUrl(t);
     if (!dataUrl) {
-      flashScreenshot({ state: "error", message: "截图失败：无法捕获终端画面" });
+      toast("截图失败：无法捕获终端画面", { type: "error", duration: 4000 });
       return;
     }
     const path = await saveScreenshot(dataUrl, props.connectionName || props.sessionId);
-    flashScreenshot({ state: "saved", path });
+    // 带 action 的 toast 默认 duration=0（避免动作来不及点），这里显式给时长；
+    // 「打开」是用户真正会去点的动作，给足 8s（旧的横幅只有 4s 且要精准命中按钮）。
+    toast(`已保存：${path}`, {
+      type: "success",
+      duration: 8000,
+      action: { label: "打开", onClick: () => openSavedPath(path) },
+    });
   } catch (e: unknown) {
     const msg = e instanceof Error && e.message ? String(e.message) : String(e);
     // The Rust side returns a localized error when the attachment dir isn't
     // configured — surface it verbatim so the user knows what to fix.
-    flashScreenshot({ state: "error", message: msg.includes("附件目录") ? msg : `保存失败: ${msg}` });
+    toast(msg.includes("附件目录") ? msg : `保存失败: ${msg}`, { type: "error", duration: 4000 });
+  } finally {
+    screenshotCapturing.value = false;
   }
-}
-
-/** Set the banner and auto-clear it after 4s. */
-function flashScreenshot(s: ScreenshotState): void {
-  screenshotStatus.value = s;
-  if (screenshotTimer) clearTimeout(screenshotTimer);
-  screenshotTimer = setTimeout(() => (screenshotStatus.value = null), 4000);
 }
 
 /** 打开已保存截图所在目录（资源管理器中选中该文件）。 */
@@ -336,6 +337,29 @@ async function openSavedPath(path: string): Promise<void> {
     /* best-effort — ignore if open fails */
   }
 }
+
+// 2026-10-10：命令栏被提升到壳层底部行后，它对所有 tab 都可见，但「📷 截图」
+// 只有拥有那一个 xterm 实例的 TerminalPanel 能做 —— 截图要用闭包里的 term，
+// 过程态（「正在截取终端…」）也挂在本组件上。故把动作注册进 store，壳层按
+// sessionId 调用。
+//
+// 必须 watch sessionId 而不是只在 onMounted 注册：重连会换 sessionId
+// （tabId 才是跨重连稳定的标识），只在挂载时注册的话，重连后壳层按新
+// sessionId 查不到动作，截图会静默失灵。
+const runScreenshot = (): void => void handleScreenshot();
+
+watch(
+  () => props.sessionId,
+  (sid, oldSid) => {
+    if (oldSid) unregisterSessionAction(oldSid, "screenshot");
+    registerSessionAction(sid, "screenshot", runScreenshot);
+  },
+  { immediate: true },
+);
+
+onUnmounted(() => {
+  unregisterSessionAction(props.sessionId, "screenshot");
+});
 
 // ── Native ZMODEM download 辅助（目录记忆 + 路径净化） ──
 
@@ -590,7 +614,7 @@ function setupTerminal(): void {
         noteZmodemIntent(cmd);
         addCommandHistory(props.connectionId, cmd)
           .then(() => {
-            refreshHistory?.();
+            refreshCommandHistory(props.connectionId);
           })
           .catch(() => {
             // Silently ignore history-write failures (not critical).
@@ -1140,9 +1164,11 @@ function syncBroadcastDims(): void {
 
 watch(() => [props.broadcastTargets.join(","), props.active] as const, syncBroadcastDims);
 
-function onRegisterRefresh(fn: () => void): void {
-  refreshHistory = fn;
-}
+// commandBar 是可选布尔 prop，不传时为 undefined（falsy）。用 !== false 表达
+// 「默认开启、显式关闭」—— 多窗口网格不传它（每个格子自带命令栏），主标签区传
+// false（改用壳层底部行那一条）。不改成 withDefaults 是为了避免为一个默认值把
+// 上面整块 props 声明重排缩进。
+const showCommandBar = computed(() => props.commandBar !== false);
 
 function onZmodemCancel(): void {
   bridge?.abort();
@@ -1179,10 +1205,6 @@ watch(
 
 onUnmounted(() => {
   teardownTerminal();
-  if (screenshotTimer) {
-    clearTimeout(screenshotTimer);
-    screenshotTimer = null;
-  }
 });
 </script>
 
@@ -1220,55 +1242,45 @@ onUnmounted(() => {
       <div v-if="uploadChooserOpen" class="upload-chooser">
         <span class="chooser-title">↑ ZMODEM 上传</span>
         <span class="chooser-hint">远端 rz 已就绪，选择要发送的内容：</span>
-        <button type="button" class="chooser-btn" @click="pickUploadFiles">
-          <el-icon :size="13"><Document /></el-icon>
+        <MyButton variant="secondary" size="small" class="chooser-btn" @click="pickUploadFiles">
+          <MyIcon :size="13" name="Document" />
           选择文件
-        </button>
-        <button type="button" class="chooser-btn" @click="pickUploadFolder">
-          <el-icon :size="13"><FolderOpened /></el-icon>
+        </MyButton>
+        <MyButton variant="secondary" size="small" class="chooser-btn" @click="pickUploadFolder">
+          <MyIcon :size="13" name="FolderOpened" />
           选择文件夹（递归上传）
-        </button>
-        <button type="button" class="chooser-btn chooser-cancel" @click="cancelNativeUpload">取消</button>
+        </MyButton>
+        <MyButton variant="ghost" size="small" class="chooser-btn chooser-cancel" @click="cancelNativeUpload">
+          取消
+        </MyButton>
       </div>
     </div>
 
-    <!-- CommandBar — only for SSH terminal tabs (connectionId provided) -->
+    <!-- 命令栏。多窗口网格里每个格子自带一条（commandBar 默认开启）；主标签区
+         传 :command-bar="false"，改由壳层底部行统一渲染一条给活动标签用 ——
+         那条与服务器状态栏一起贯穿整个窗口宽度。 -->
     <CommandBar
-      v-if="connectionId"
+      v-if="showCommandBar && connectionId"
       :session-id="sessionId"
       :connection-id="connectionId"
       :conn-type="connType"
       :broadcast-targets="broadcastTargets"
       :status="status"
       @reconnect="emit('reconnect')"
-      @open-ai="emit('open-ai')"
-      @open-multiwindow="emit('open-multiwindow')"
       @open-quick-commands-manage="emit('open-quick-commands-manage', connectionId)"
       @screenshot="handleScreenshot"
-      @register-refresh="onRegisterRefresh"
     />
 
     <!-- Screenshot status banner — transient toast that appears after the
          user clicks 📷. Sits at the bottom-right so it doesn't cover the
          terminal content. Auto-dismisses after 4s (see flashScreenshot). -->
-    <div v-if="screenshotStatus" class="screenshot-banner" :class="`is-${screenshotStatus.state}`">
-      <template v-if="screenshotStatus.state === 'capturing'">
-        <span class="spinner">
-          <el-icon :size="14"><Loading /></el-icon>
-        </span>
-        <span>正在截取终端...</span>
-      </template>
-      <template v-else-if="screenshotStatus.state === 'saved'">
-        <span class="ok-mark">✓</span>
-        <span class="saved-path">已保存：{{ screenshotStatus.path }}</span>
-        <button type="button" class="open-btn" title="在文件管理器中显示" @click="openSavedPath(screenshotStatus.path)">
-          打开
-        </button>
-      </template>
-      <template v-else>
-        <span class="err-mark">✕</span>
-        <span class="err-msg">{{ screenshotStatus.message }}</span>
-      </template>
+    <!-- 「正在截取」瞬时提示；成功/失败结果改由 myui 的 toast 承载
+         （成功带「打开」动作，见 handleScreenshot）。 -->
+    <div v-if="screenshotCapturing" class="screenshot-banner is-capturing">
+      <span class="spinner">
+        <MyIcon :size="14" name="Loading" spin />
+      </span>
+      <span>正在截取终端...</span>
     </div>
   </div>
 </template>
@@ -1394,45 +1406,7 @@ onUnmounted(() => {
   gap: 8px;
 }
 
-.screenshot-banner.is-error {
-  border-color: var(--error);
-}
-
-.screenshot-banner.is-saved {
-  border-color: var(--success);
-}
-
 .spinner {
-  animation: spin 1s linear infinite;
-}
-
-.ok-mark {
-  color: var(--success);
-}
-
-.saved-path {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.open-btn {
-  background: var(--bg-input);
-  color: var(--text-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-sm);
-  padding: 3px 8px;
-  font-size: 11px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.err-mark {
-  color: var(--error);
-}
-
-.err-msg {
-  flex: 1;
+  display: inline-flex;
 }
 </style>

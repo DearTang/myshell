@@ -14,8 +14,17 @@
 import { computed, onUnmounted, ref } from "vue";
 import type { ComponentPublicInstance } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpened, Hide, View } from "@element-plus/icons-vue";
-import { MyButton, MyCheckbox, MyDialog, MyInput, MySelect, toast, type SelectOption } from "myui";
+import {
+  MyButton,
+  MyCheckbox,
+  MyDialog,
+  MyIcon,
+  MyIconButton,
+  MyInput,
+  MySelect,
+  toast,
+  type SelectOption,
+} from "myui";
 import {
   readTextFile,
   revealConnectionPassword,
@@ -590,7 +599,14 @@ function onKeepaliveInput(v: string): void {
 <template>
   <!-- MyDialog 壳：dismissable 默认 false（遮罩/Esc/X 全禁用，表单防误关，与旧版一致）；
        header/footer 均为自定义插槽（标题动态：编辑连接/新建连接）。壳层 v-if 挂载，恒为打开态。 -->
-  <MyDialog :model-value="true" :width="480" align-center class="conn-dialog">
+  <MyDialog
+    :model-value="true"
+    :width="480"
+    align-center
+    class="conn-dialog"
+    body-class="conn-dialog-body"
+    footer-class="conn-dialog-footer"
+  >
     <template #header>
       <div class="dlg-header">
         <div>
@@ -603,18 +619,18 @@ function onKeepaliveInput(v: string): void {
 
     <!-- Type Selector -->
       <div class="type-selector" :class="{ disabled: !!config }">
-        <button
+        <MyButton
           v-for="opt in TYPE_OPTIONS"
           :key="opt.value"
-          type="button"
           class="type-btn"
+          variant="secondary"
           :class="{ active: connType === opt.value }"
           :disabled="!!config"
           @click="handleTypeChange(opt.value)"
         >
           <ConnIcon :type="opt.value" :size="24" class="type-icon" />
           <span>{{ opt.label }}</span>
-        </button>
+        </MyButton>
       </div>
 
       <!-- Form -->
@@ -770,16 +786,16 @@ function onKeepaliveInput(v: string): void {
                   @update:model-value="onPasswordInput"
                 />
               </div>
-              <button
+              <MyIconButton
+                :title="showPassword ? '隐藏密码' : '查看密码'"
                 v-if="config"
-                type="button"
                 class="reveal-btn"
                 :class="{ shown: showPassword }"
-                :title="showPassword ? '隐藏密码' : '查看密码'"
+                :label="showPassword ? '隐藏密码' : '查看密码'"
+                size="14"
+                :name="showPassword ? 'Hide' : 'View'"
                 @click="passwordVerifyTarget = 'password'"
-              >
-                <el-icon :size="14"><Hide v-if="showPassword" /><View v-else /></el-icon>
-              </button>
+              />
             </div>
           </div>
           <div v-else class="form-field">
@@ -791,18 +807,11 @@ function onKeepaliveInput(v: string): void {
                 :disabled="keyBusy"
                 @click="pickKeyFile"
               >
-                <el-icon v-if="!keyBusy && !hasExistingKey" :size="13"><FolderOpened /></el-icon>
+                <MyIcon v-if="!keyBusy && !hasExistingKey" :size="13" name="FolderOpened" />
                 {{ keyBusy ? "读取中..." : hasExistingKey ? "替换私钥" : "选择私钥文件" }}
               </MyButton>
-              <button
-                v-if="hasNewKey || hasExistingKey"
-                type="button"
-                class="key-clear"
-                title="清除"
-                @click="clearKey"
-              >
-                ✕
-              </button>
+              <MyIconButton
+                title="清除私钥" v-if="hasNewKey || hasExistingKey" class="key-clear" label="清除私钥" name="Close" @click="clearKey" />
               <span class="key-status" :class="{ ok: hasNewKey || hasExistingKey }">
                 {{
                   hasNewKey
@@ -918,16 +927,16 @@ function onKeepaliveInput(v: string): void {
                     :placeholder="proxyPasswordPlaceholder"
                   />
                 </div>
-                <button
+                <MyIconButton
+                  :title="showProxyPassword ? '隐藏密码' : '查看密码'"
                   v-if="hasProxyPw"
-                  type="button"
                   class="reveal-btn"
                   :class="{ shown: showProxyPassword }"
-                  :title="showProxyPassword ? '隐藏密码' : '查看密码'"
+                  :label="showProxyPassword ? '隐藏密码' : '查看密码'"
+                  size="14"
+                  :name="showProxyPassword ? 'Hide' : 'View'"
                   @click="passwordVerifyTarget = 'proxy'"
-                >
-                  <el-icon :size="14"><Hide v-if="showProxyPassword" /><View v-else /></el-icon>
-                </button>
+                />
               </div>
             </div>
             <div v-if="connType === 'ftp' && ftpTls !== 'none'" class="warning-box">
@@ -1081,14 +1090,14 @@ function onKeepaliveInput(v: string): void {
   max-height: 90vh;
 }
 
-:global(.conn-dialog .el-dialog__body) {
+:global(.conn-dialog-body) {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
 }
 
 /* 让 #footer 分隔线紧贴 body 结束处（去掉 EP footer 自带的 padding-top） */
-:global(.conn-dialog .el-dialog__footer) {
+:global(.conn-dialog-footer) {
   padding-top: 0;
 }
 
@@ -1137,22 +1146,20 @@ function onKeepaliveInput(v: string): void {
   opacity: 0.5;
 }
 
+/* 类型卡片：按钮本体走 MyButton（secondary 变体承担底色/描边/圆角/disabled）。
+   这里只留卡片的纵向排版与呼吸感。
+   「选中」态是刻意的设计偏离并保留自绘：myui 目前没有「选中态卡片按钮」
+   原语（MyTabs 也不适用——这是一组平铺卡片而非标签页），primary 变体的
+   实心强调底在这块 200px 宽的卡上过于抢眼，故保留淡强调底 + 强调色字。
+   （工具栏的开关按钮就不同了，那里 primary 变体是自然映射，已改为按状态切
+   variant，不再自绘 .active。） */
 .type-btn {
   flex: 1;
-  background: var(--bg-surface);
-  color: var(--text-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
   padding: 14px 12px;
   font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  display: flex;
   flex-direction: column;
-  align-items: center;
   gap: 8px;
   transition: all var(--duration-normal) var(--ease-out-expo);
-  box-shadow: none;
 }
 
 .type-btn.active {
@@ -1161,10 +1168,6 @@ function onKeepaliveInput(v: string): void {
   border: 1px solid var(--border-accent);
   font-weight: 600;
   box-shadow: var(--shadow-glow);
-}
-
-.type-btn:disabled {
-  cursor: not-allowed;
 }
 
 /* 活动类型图标着主色（覆盖 ConnIcon 内联类型色，需 !important） */
@@ -1288,17 +1291,13 @@ function onKeepaliveInput(v: string): void {
   flex: 1;
 }
 
+/* 密码显示钮：外观由 MyIconButton 承担，这里只留内边距与状态色。 */
 .reveal-btn {
   padding: 0 12px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  font-size: 14px;
-  cursor: pointer;
   color: var(--text-tertiary);
-  transition: all var(--duration-fast) var(--ease-in-out);
 }
 
+/* 密码已显示时给成功色，与下方密码框的状态色一致 */
 .reveal-btn.shown {
   color: var(--success);
 }
@@ -1310,15 +1309,10 @@ function onKeepaliveInput(v: string): void {
   align-items: center;
 }
 
+/* 清除私钥：MyIconButton 提供按钮本体与无障碍标签，这里只保留与左侧
+   「选择私钥文件」按钮等高的点击区。 */
 .key-clear {
-  padding: 8px 12px;
-  background: transparent;
-  color: var(--text-tertiary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  font-size: 12px;
-  cursor: pointer;
-  transition: all var(--duration-fast) var(--ease-in-out);
+  flex: none;
 }
 
 .key-status {

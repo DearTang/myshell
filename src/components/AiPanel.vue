@@ -4,8 +4,8 @@
      - markdown 由 react-markdown+remark-gfm 换为 markdown-it（html:false 保持防 XSS 语义）；
      - 宽度拖拽 emit width-change，由壳层（ui.aiPanelWidth）持久化。 -->
 <script setup lang="ts">
+import { MyButton, MyIcon, MyIconButton, MyPopover, MyTextArea } from "myui";
 import { computed, onUnmounted, ref, watch } from "vue";
-import { ChatDotRound, Link, Search } from "@element-plus/icons-vue";
 import type { Terminal } from "@xterm/xterm";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import MarkdownIt from "markdown-it";
@@ -477,23 +477,25 @@ function onSelectModel(supplierId: number, modelString: string): void {
     <header class="panel-header">
       <div class="header-titles">
         <span class="panel-title">
-          <el-icon class="title-icon" :size="14"><ChatDotRound /></el-icon>
+          <MyIcon class="title-icon" :size="14" name="Robot" />
           AI 助手
         </span>
         <span class="ctx-label" :title="ctxLabel">上下文：{{ ctxLabel }}</span>
       </div>
-      <button
+      <MyButton
         v-if="activeConnType === 'ssh' || activeConnType === 'local'"
-        type="button"
         class="inspect-btn"
+        variant="secondary"
+        size="small"
         :disabled="streaming"
         title="采集服务器/本机指标，让 AI 出健康报告"
         @click="runInspection"
       >
-        <el-icon :size="12"><Search /></el-icon>
+        <MyIcon :size="12" name="Search" />
         巡检
-      </button>
-      <button type="button" class="close-btn" title="关闭" @click="emit('close')">×</button>
+      </MyButton>
+      <MyIconButton
+        title="关闭 AI 面板" class="close-btn" label="关闭 AI 面板" size="14" name="Close" @click="emit('close')" />
     </header>
 
     <!-- Messages -->
@@ -528,83 +530,115 @@ function onSelectModel(supplierId: number, modelString: string): void {
     <div class="input-bar">
       <div v-if="attachedSelection" class="attach-chip">
         <span class="attach-text">
-          <el-icon class="attach-icon" :size="12"><Link /></el-icon>
+          <MyIcon class="attach-icon" :size="12" name="Link" />
           已附带选区：{{ attachedSelection.slice(0, 40) }}{{ attachedSelection.length > 40 ? "…" : "" }}
         </span>
-        <button type="button" class="attach-remove" @click="attachedSelection = null">×</button>
+        <MyIconButton
+          title="取消附带终端输出" class="attach-remove" label="取消附带终端输出" size="12" name="Close" @click="attachedSelection = null" />
       </div>
       <div class="input-wrap">
-        <textarea
+        <MyTextArea
           v-model="input"
+          bare
           class="input-textarea"
-          rows="4"
+          :rows="4"
           title="Enter 发送
 Shift+Enter 换行"
           placeholder="描述你想做的事…
 Enter 发送 ● Shift+Enter 换行"
           @keydown="onKeyDown"
         />
-        <button v-if="streaming" type="button" class="stop-btn" title="停止生成" @click="cancelActive">■</button>
+        <MyButton
+          v-if="streaming"
+          class="stop-btn"
+          variant="danger"
+          title="停止生成"
+          @click="cancelActive"
+        >■</MyButton>
       </div>
       <div class="input-toolbar">
-        <button
-          type="button"
+        <MyButton
           class="attach-btn"
+          variant="ghost"
+          size="small"
           :disabled="!activeTerm"
           :title="activeTerm ? '把终端里选中的文本作为上下文' : '当前无活动终端'"
           @click="attachSelection"
         >
-          <el-icon :size="12"><Link /></el-icon>
+          <MyIcon :size="12" name="Link" />
           附带选区
-        </button>
+        </MyButton>
         <span class="toolbar-hint">{{ activeTerm ? "将自动附带最近输出" : "AI 命令请确认后再执行" }}</span>
-      </div>
-      <!-- Two-step model picker — supplier → model. -->
-      <div class="model-picker">
-        <button
-          type="button"
-          class="picker-toggle"
-          title="点击切换 AI 模型（先选供应商，再选模型）"
-          @click="modelPickerOpen = !modelPickerOpen"
+
+        <!-- Two-step model picker — supplier → model.
+             2026-10-10：从输入区**下方**整条移进本工具条内。此前面板底部是三条
+             横排（输入框 / 附带选区行 / 模型选择器行），比壳层底部操作栏
+             （输入命令·快捷·截图·历史那一行）还低一整行，右栏下沿与左栏对不齐。
+             移进工具条后，面板底边正好落在那一行上。
+             浮层改用 MyPopover：迁移前是手搓 absolute 面板 + v-if，
+             既无 click-outside 也无 Esc，只能靠「选完模型才关」。
+             两列级联本身是刻意设计（换 MyCascadeMenu 会变成 hover flyout、
+             改变交互模型），故内容保持不变，只把定位与关闭逻辑交给 popper。
+             placement 由 top-start 改 top-end：触发钮现在贴工具条右缘，
+             浮层右对齐才不会越出面板。 -->
+        <MyPopover
+          v-model="modelPickerOpen"
+          placement="top-end"
+          trigger="click"
+          popper-class="ai-picker-popper"
         >
-          <span class="picker-label">{{ pickerLabel }}</span>
-          <span v-if="activeModel" class="provider-chip">{{ providerLabel(activeModel.provider) }}</span>
-          <span class="picker-arrow">{{ modelPickerOpen ? "▲" : "▼" }}</span>
-        </button>
-        <div v-if="modelPickerOpen" class="picker-dropdown">
-          <!-- Left: supplier column -->
-          <div class="supplier-col">
-            <div
-              v-for="(m, idx) in enabledModels"
-              :key="m.id"
-              class="supplier-row"
-              :class="{ chosen: idx === safeIdx, active: m.id === aiActiveId }"
-              @click="selectedSupplierIdx = idx"
-            >
-              <span class="supplier-name">{{ m.name }}</span>
-              <span v-if="!m.hasKey" class="need-key">需</span>
-            </div>
-          </div>
-          <!-- Right: model column -->
-          <div class="model-col">
-            <div v-if="!pickerSupplier" class="model-empty">请先选择供应商</div>
-            <div v-else-if="!pickerModelList || pickerModelList.length === 0" class="model-empty">该供应商暂无额外模型</div>
-            <template v-else>
-              <div
-                v-for="sm in pickerModelList"
-                :key="sm.id || sm.modelId"
-                class="model-row"
-                :class="{ active: modelRowActive(sm) }"
-                :title="sm.modelId"
-                @click="onSelectModel(pickerSupplier.id, sm.modelId)"
-              >
-                <span class="model-name">{{ sm.label ?? sm.modelId }}</span>
-                <span v-if="sm.label" class="model-id">{{ sm.modelId }}</span>
-                <span v-if="modelRowActive(sm)" class="model-check">✓</span>
+          <MyButton
+            class="picker-toggle"
+            variant="secondary"
+            size="small"
+            title="点击切换 AI 模型（先选供应商，再选模型）"
+          >
+            <span class="picker-label">{{ pickerLabel }}</span>
+            <span v-if="activeModel" class="provider-chip">{{ providerLabel(activeModel.provider) }}</span>
+            <MyIcon
+              class="picker-arrow"
+              :size="10"
+              :name="modelPickerOpen ? 'ArrowUp' : 'ArrowDown'"
+            />
+          </MyButton>
+
+          <template #content>
+            <div class="picker-dropdown">
+              <!-- Left: supplier column -->
+              <div class="supplier-col">
+                <div
+                  v-for="(m, idx) in enabledModels"
+                  :key="m.id"
+                  class="supplier-row"
+                  :class="{ chosen: idx === safeIdx, active: m.id === aiActiveId }"
+                  @click="selectedSupplierIdx = idx"
+                >
+                  <span class="supplier-name">{{ m.name }}</span>
+                  <span v-if="!m.hasKey" class="need-key">需</span>
+                </div>
               </div>
-            </template>
-          </div>
-        </div>
+              <!-- Right: model column -->
+              <div class="model-col">
+                <div v-if="!pickerSupplier" class="model-empty">请先选择供应商</div>
+                <div v-else-if="!pickerModelList || pickerModelList.length === 0" class="model-empty">该供应商暂无额外模型</div>
+                <template v-else>
+                  <div
+                    v-for="sm in pickerModelList"
+                    :key="sm.id || sm.modelId"
+                    class="model-row"
+                    :class="{ active: modelRowActive(sm) }"
+                    :title="sm.modelId"
+                    @click="onSelectModel(pickerSupplier.id, sm.modelId)"
+                  >
+                    <span class="model-name">{{ sm.label ?? sm.modelId }}</span>
+                    <span v-if="sm.label" class="model-id">{{ sm.modelId }}</span>
+                    <MyIcon v-if="modelRowActive(sm)" class="model-check" :size="12" name="Check" />
+                  </div>
+                </template>
+              </div>
+            </div>
+          </template>
+        </MyPopover>
       </div>
     </div>
   </div>
@@ -679,17 +713,9 @@ Enter 发送 ● Shift+Enter 换行"
   white-space: nowrap;
 }
 
+/* 巡检钮改用 MyButton 后只留外距与图标文字间距，配色交给 secondary 变体。 */
 .inspect-btn {
-  background: var(--bg-surface);
-  color: var(--text-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: 6px;
-  padding: 4px 10px;
-  font-size: 12px;
-  cursor: pointer;
   margin-right: 4px;
-  display: inline-flex;
-  align-items: center;
   gap: 4px;
 }
 
@@ -885,89 +911,72 @@ Enter 发送 ● Shift+Enter 换行"
   position: relative;
 }
 
+/* AI 输入框：外观（边框/圆角/聚焦环）由 MyTextArea 的 bare 态承担，
+   这里只留布局与可拖拽高度。 */
 .input-textarea {
   width: 100%;
   resize: vertical;
-  background: var(--bg-input);
-  color: var(--text-primary);
-  border: 1px solid var(--border-default);
-  border-radius: 8px;
-  padding: 8px 10px;
-  font-size: 13px;
-  line-height: 1.5;
-  font-family: inherit;
-  outline: none;
   min-height: 48px;
   max-height: 300px;
   box-sizing: border-box;
   display: block;
 }
 
+/* 停止钮：角标定位与 28×28 方形盒子保留；配色（红底白字）改由 danger
+   变体承担，比迁移前的浅红底+红字实心度更高。 */
 .stop-btn {
   position: absolute;
   right: 8px;
   bottom: 8px;
   width: 28px;
   height: 28px;
-  background: var(--error-muted);
-  border: 1px solid var(--error);
-  border-radius: 6px;
-  color: var(--error);
-  font-size: 12px;
-  line-height: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.2s cubic-bezier(0.32, 0.72, 0, 1);
+  padding: 0;
 }
 
+/* 输入框下方唯一的一条工具条。2026-10-10 起「附带选区」与「模型选择器」
+   并到这一行，面板底边因此与壳层底部操作栏（输入命令·快捷·截图·历史那一行）
+   齐平 —— 此前模型选择器独占第三行，右栏比左栏低一整行。 */
 .input-toolbar {
   display: flex;
-  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
   margin-top: 6px;
 }
 
+/* 「附带选区」文字链：ghost 变体承担配色与 disabled 态，这里只留
+   零内边距（贴左对齐工具条）与图标文字间距。 */
 .attach-btn {
-  background: transparent;
-  border: none;
-  color: var(--text-secondary);
-  font-size: 11px;
-  cursor: pointer;
   padding: 0;
-  display: inline-flex;
-  align-items: center;
   gap: 4px;
+  flex-shrink: 0;
 }
 
-.attach-btn:disabled {
-  color: var(--text-muted);
-  cursor: default;
-}
-
+/* 提示文字吃掉中间余量，长文案省略而不是把模型选择器挤出面板。 */
 .toolbar-hint {
+  flex: 1;
+  min-width: 0;
   font-size: 11px;
   color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── 模型选择器 ── */
-.model-picker {
-  position: relative;
-  margin-top: 6px;
-  border-top: 1px solid var(--border-subtle);
-  padding-top: 6px;
-}
-
+/* 从「输入区底边」改成「工具条右侧的一枚紧凑胶囊」：
+   原来它带 border-left/right/bottom + 圆角 + border-top，刻意做成输入框的
+   外框底边（那是为了和输入框拼成一个整框）；现在输入框由 ElInput 自身的
+   边框独立成框（MyTextArea 的 bare 只去掉了外层字段标签，不影响控件边框），
+   这层"底边"职责连同那些装饰一起去掉。
+   定位（absolute / 上下左右锚定）交给 popper，这里只留盒子与排版。 */
 .picker-toggle {
   display: flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
-  background: var(--bg-input);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  padding: 5px 8px;
-  cursor: pointer;
+  margin-left: auto;
+  flex-shrink: 1;
+  max-width: 58%;
+  padding: 2px 8px;
   text-align: left;
 }
 
@@ -991,22 +1000,33 @@ Enter 发送 ● Shift+Enter 换行"
 }
 
 .picker-arrow {
-  font-size: 10px;
+  flex: none;
   color: var(--text-tertiary);
 }
 
+/* MyButton 底层是 EP ElButton，它会把 default 插槽包进一个
+   <span class="el-button__content">（inline）。于是本组件原本挂在
+   .picker-toggle 上的 display:flex/gap 作用在这一层内层上，
+   .picker-label{flex:1} 也失去意义 —— 箭头会被顶到标签右边而不是右端。
+   这里把 flex 布局下推到 content 层（不再撑满按钮宽度：胶囊尺寸随内容）。 */
+.picker-toggle :deep(.el-button__content) {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 定位（absolute / 上下左右锚定）交给 popper；这里只留面板自身的盒子。
+   宽度必须写死：display:flex + .model-col{flex:1} 在 auto 宽容器里由内容决定，
+   长模型名（如「MiniMax M3 / MiniMax-M3 OpenAI兼容」）会把右列撑得极宽、
+   整块浮层视觉上像「模型列掉到下一行」。两列级联要的是稳定的左右两栏。 */
 .picker-dropdown {
-  position: absolute;
-  bottom: 100%;
-  left: 0;
-  right: 0;
-  margin-bottom: 4px;
+  width: 340px;
   max-height: 280px;
   background: var(--bg-elevated);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
-  z-index: 10;
   display: flex;
   overflow: hidden;
 }
@@ -1106,7 +1126,17 @@ Enter 发送 ● Shift+Enter 换行"
 }
 
 .model-check {
-  font-size: 10px;
+  flex: none;
   color: var(--accent-primary);
+}
+
+/* popper 外壳中和：EP 默认给 .el-popover 加 12px padding 与自带边框圆角，
+   面板自己有盒子，去掉避免双层。 */
+:global(.ai-picker-popper.el-popover) {
+  padding: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
 }
 </style>

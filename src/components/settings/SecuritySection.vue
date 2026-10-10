@@ -1,8 +1,7 @@
 <!-- 安全 — 管理员权限 / 自动锁定 / 隐私 / 修改登录密码（旧 security 分区） -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { CircleCheck, CircleClose } from "@element-plus/icons-vue";
-import { MyButton, MyInput, MySection, MySelect, MyToggle, type SelectOption, confirmDialog } from "myui";
+import { MyButton, MyIcon, MyInput, MySection, MySelect, MyToggle, confirmDialog, type SelectOption } from "myui";
 import {
   changeMasterPassword,
   getAppSettings,
@@ -252,11 +251,11 @@ async function handleChangePassword(): Promise<void> {
     </div>
 
     <div v-if="passwordErr" class="msg-box error">
-      <el-icon :size="14"><CircleClose /></el-icon>
+      <MyIcon :size="14" name="CircleClose" />
       {{ passwordErr }}
     </div>
     <div v-if="passwordSuccess" class="msg-box success">
-      <el-icon :size="14"><CircleCheck /></el-icon>
+      <MyIcon :size="14" name="CircleCheck" />
       密码修改成功
     </div>
 

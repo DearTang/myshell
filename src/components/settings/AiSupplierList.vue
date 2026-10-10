@@ -1,7 +1,7 @@
 <!-- AI 供应商左列表 — 选择 / 双击重命名 / 启用开关（从旧 AiSection 拆出）。 -->
 <script setup lang="ts">
 import { ref } from "vue";
-import { MyButton, MyToggle } from "myui";
+import { MyButton, MyInput, MyToggle } from "myui";
 import type { AiModel } from "@/api";
 
 defineOptions({ name: "AiSupplierList" });
@@ -58,9 +58,11 @@ function onRenameKeydown(e: KeyboardEvent): void {
         <!-- 行 1：名称 + 启用/禁用开关 -->
         <div class="supplier-row">
           <span class="supplier-name" :class="{ selected: selectedId === m.id }">
-            <input
+            <MyInput
               v-if="renamingId === m.id"
               v-model="renameBuf"
+              bare
+              size="small"
               class="rename-input"
               autofocus
               @click.stop

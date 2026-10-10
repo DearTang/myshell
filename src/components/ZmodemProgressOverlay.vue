@@ -4,6 +4,7 @@
      TerminalPanel 嵌入并传实时 status 时行为与旧版完全一致。 -->
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from "vue";
+import { MyButton, MyIcon, MyProgress } from "myui";
 import type { ZmodemStatus } from "@/zmodem-bridge";
 
 defineOptions({ name: "ZmodemProgressOverlay" });
@@ -96,7 +97,6 @@ const percent = computed(() =>
   st.value.bytesTotal > 0 ? Math.min(100, (st.value.bytesTransferred / st.value.bytesTotal) * 100) : 0,
 );
 
-const dirIcon = computed(() => (st.value.direction === "upload" ? "↑" : "↓"));
 const dirLabel = computed(() => (st.value.direction === "upload" ? "上传" : "下载"));
 
 // 计算 ETA 和已用时间（elapsed 依赖 tick：每秒重算 Date.now()）
@@ -116,18 +116,22 @@ const etaSeconds = computed(() => {
     <!-- 第一行：方向 + 文件名 + 取消按钮 -->
     <div class="row-top">
       <div class="left">
-        <span class="dir-icon">{{ dirIcon }}</span>
+        <MyIcon class="dir-icon" :size="16" :name="st.direction === 'upload' ? 'ArrowUp' : 'ArrowDown'" />
         <span class="dir-label">ZMODEM {{ dirLabel }}</span>
         <span class="file">{{ st.currentFile || "—" }}</span>
         <span v-if="st.error" class="err">错误：{{ st.error }}</span>
       </div>
-      <button type="button" class="cancel-btn" @click="emit('cancel')">取消</button>
+      <MyButton variant="ghost-danger" size="small" @click="emit('cancel')">取消</MyButton>
     </div>
 
     <!-- 第二行：进度条 -->
-    <div class="track">
-      <div class="fill" :style="{ width: `${percent}%` }" />
-    </div>
+    <MyProgress
+      class="zm-progress"
+      :percentage="percent"
+      :stroke-width="8"
+      :show-text="false"
+      :transition-duration="120"
+    />
 
     <!-- 第三行：字节数 / 百分比 / 速度 -->
     <div class="row-bytes">
@@ -180,8 +184,7 @@ const etaSeconds = computed(() => {
 
 .dir-icon {
   color: var(--accent-primary);
-  font-size: 16px;
-  line-height: 1;
+  flex: none;
 }
 
 .dir-label {
@@ -201,33 +204,19 @@ const etaSeconds = computed(() => {
   color: var(--error);
 }
 
-.cancel-btn {
-  background: transparent;
-  border: 1px solid var(--error);
-  color: var(--error);
-  padding: 2px 12px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  font-size: 12px;
-  font-family: inherit;
-  white-space: nowrap;
-}
+/* 过渡时长改用 MyProgress 的 transitionDuration prop（v0.28.0 起）——
+   Short + LINEAR。progress 以固定 10 Hz 到达（Rust 侧把 zmodem_progress
+   节流到 100ms）。EP 内置的是 .6s 长缓动，会被不断重新定向、永远跑不完，
+   结果是进度条落后百分比几十个点。
 
-.track {
-  height: 8px;
+   v0.27.x 时这里只能 `:deep(.el-progress-bar__inner)` 打穿 EP 内部类名，
+   myui 换底层会静默失效；现已由 MyUI 自己写 --my-progress-transition 接管，
+   故不再有任何对 EP 内部结构的耦合。 */
+.zm-progress {
+  margin: 0;
+}
+.zm-progress :deep(.el-progress-bar__outer) {
   background: var(--bg-surface);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-}
-
-.fill {
-  height: 100%;
-  background: linear-gradient(90deg, var(--accent-primary), var(--accent-primary-hover));
-  /* Short + LINEAR: progress arrives at a fixed 10 Hz (Rust throttles
-   * zmodem_progress to 100ms). A long ease transition that keeps getting
-   * retargeted faster than it can finish made the bar crawl tens of percent
-   * behind the numbers. */
-  transition: width 120ms linear;
 }
 
 .row-bytes {

@@ -1,6 +1,10 @@
-<!-- App Shell：五区布局 + 保险库门禁 + 全局浮层装配。
-     布局参照 unified-ui-vue 模板；面板挂载关系与旧 App.tsx 一致：
-     所有 tab 的面板绝对定位堆叠（visibility 切换），保住 xterm 容器真实尺寸。 -->
+<!-- App Shell：布局 + 保险库门禁 + 全局浮层装配。
+     壳层网格见 styles/app.css 的「App Shell 布局」：顶栏 / (侧栏 · 工作区 · AI
+     栏) / 底栏三行。底栏（命令栏 + 服务器状态栏）贯穿整个窗口宽度，2026-10-10
+     从工作区内部提升而来 —— 此前二者只占工作区那一列，AI 栏自带底部两行与之
+     并排、互不对齐。
+     面板挂载关系与旧 App.tsx 一致：所有 tab 的面板绝对定位堆叠（visibility
+     切换），保住 xterm 容器真实尺寸。 -->
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, watch } from "vue";
 import { MyButton } from "myui";
@@ -24,6 +28,7 @@ import {
   registerTerminal,
   unregisterTerminal,
   getBroadcastTargets,
+  callSessionAction,
 } from "@/store/sessions";
 import { refreshVaultStatus, vault } from "@/composables/useVault";
 import { startMcpBridge } from "@/composables/useMcpBridge";
@@ -41,6 +46,7 @@ import TerminalPanel from "@/components/TerminalPanel.vue";
 import SftpPanel from "@/components/SftpPanel.vue";
 import MultiWindowGrid from "@/components/MultiWindowGrid.vue";
 import ServerInfoPanel from "@/components/ServerInfoPanel.vue";
+import CommandBar from "@/components/CommandBar.vue";
 import AiPanel from "@/components/AiPanel.vue";
 import MasterPasswordGate from "@/components/MasterPasswordGate.vue";
 import ConnectionDialog from "@/components/ConnectionDialog.vue";
@@ -162,6 +168,53 @@ function onAiWidthChange(w: number): void {
   ui.aiPanelWidth = w;
   localStorage.setItem("myshell.aiPanelWidth", String(w));
 }
+
+// ── 壳层底部行（命令栏 + 服务器状态栏）──
+// 2026-10-10：命令栏从 TerminalPanel 内部提升到这里，与状态栏一起贯穿整个窗口
+// 宽度；AI 栏（grid-area: ai）因此自动停在底栏上沿。
+//
+// 出现条件沿用迁移前的语义：此前命令栏是 TerminalPanel 的子节点，而 TerminalPanel
+// 只在「已建连的终端 tab」时渲染（连接中 / 连接失败 / SFTP / FTP / 欢迎页都不
+// 渲染），故这里要求 activeTab 同时具备 sessionId 与 connectionId。多窗口模式是
+// 例外 —— 那种布局每个格子自带终端与命令栏，由 MultiWindowGrid 内的
+// TerminalPanel 自己渲染（commandBar 默认开启），壳层这条不出现。
+//
+// 返回类型把 sessionId / connectionId 收窄成 string：Tab 上这两个字段是可选的，
+// 而 CommandBar 的 props 要求 string。判空已经在 computed 里做掉了，模板不必
+// 再写 `?? ''`。
+interface BottomTarget {
+  tab: Tab;
+  sessionId: string;
+  connectionId: string;
+}
+
+const bottomCommandTab = computed<BottomTarget | null>(() => {
+  if (ui.multiWindowMode) return null;
+  const t = activeTab.value;
+  if (!t || t.type !== "terminal" || !t.sessionId || !t.connectionId) return null;
+  return { tab: t, sessionId: t.sessionId, connectionId: t.connectionId };
+});
+
+const bottomServerInfoTab = computed<BottomTarget | null>(() => {
+  if (ui.multiWindowMode) return null;
+  const t = activeTab.value;
+  if (!t || !t.sessionId || t.connType !== "ssh" || t.type !== "terminal") return null;
+  if (t.status !== "connected" || !t.connectionId) return null;
+  return { tab: t, sessionId: t.sessionId, connectionId: t.connectionId };
+});
+
+/** 底部命令栏的「📷 截图」：动作本身由拥有那个 xterm 实例的 TerminalPanel 执行
+ *  （闭包里的 term + 「正在截取」提示都在那边），这里只按 sessionId 转发。 */
+function onBottomScreenshot(): void {
+  callSessionAction(bottomCommandTab.value?.sessionId, "screenshot");
+}
+
+/** 两个调用方的载荷不同：TerminalPanel 转发的是 connectionId；壳层底部那条
+ *  CommandBar 自己的 emit 不带参数，回落到活动标签的连接。 */
+function onOpenQuickCommandsManage(cid?: string): void {
+  ui.qcInitialConnectionId = cid ?? activeTab.value?.connectionId ?? null;
+  ui.showQuickCommands = true;
+}
 </script>
 
 <template>
@@ -197,8 +250,8 @@ function onAiWidthChange(w: number): void {
       </div>
 
       <!-- 标签页堆叠：保持所有 tab 面板挂载（xterm 尺寸不变量）。
-           work-panes 占据状态栏以上的全部空间；tab-stack 的 inset:0 以它为
-           定位基准，终端不再铺到底部监控条底下与之重叠 -->
+           work-panes 就是工作区的全部高度；命令栏与服务器状态栏已移出，
+           现在统一待在壳层底栏 .shell-bottom（贯穿整个窗口宽度）。 -->
       <template v-else>
         <div class="work-panes">
           <div
@@ -241,7 +294,8 @@ function onAiWidthChange(w: number): void {
               @disconnected="tab.status = 'disconnected'"
             />
 
-            <!-- 终端面板 -->
+            <!-- 终端面板。:command-bar="false" —— 命令栏已提升到壳层底部行，
+                 由下面 .shell-bottom 统一渲染一条给活动标签用 -->
             <TerminalPanel
               v-else
               :tab-id="tab.id"
@@ -255,38 +309,44 @@ function onAiWidthChange(w: number): void {
               :connection-name="tab.name"
               :reconnect-snapshot="tab.reconnectSnapshot"
               :broadcast-targets="getBroadcastTargets(tab)"
+              :command-bar="false"
               @terminal-ready="registerTerminal"
               @terminal-gone="unregisterTerminal"
-              @open-ai="ui.showAiPanel = !ui.showAiPanel"
-              @open-multiwindow="ui.showMultiWindowPicker = true"
               @reconnect="reconnectTab(tab.id)"
               @snapshot-consumed="clearReconnectSnapshot(tab.id)"
               @disconnected="tab.status = 'disconnected'"
-              @open-quick-commands-manage="
-                (cid: string) => {
-                  ui.qcInitialConnectionId = cid;
-                  ui.showQuickCommands = true;
-                }
-              "
+              @open-quick-commands-manage="onOpenQuickCommandsManage"
             />
           </div>
         </div>
-
-        <!-- 服务器监控（仅活动 SSH 终端）：流式布局中的最后一行，
-             位于 work-panes 之下、窗口最底部，与终端内容互不重叠 -->
-        <ServerInfoPanel
-          v-if="
-            activeTab &&
-            activeTab.sessionId &&
-            activeTab.connType === 'ssh' &&
-            activeTab.type === 'terminal' &&
-            activeTab.status === 'connected'
-          "
-          :session-id="activeTab.sessionId"
-          :active="true"
-        />
       </template>
     </main>
+
+    <!-- ── 底栏：贯穿整个窗口宽度（含 AI 栏下方）。
+         2026-10-10 从 .shell-work 内部提升到这里。此前命令栏嵌在 TerminalPanel
+         里、状态栏是 work 区的最后一个子元素，两者都只占工作区那一列，右侧 AI
+         栏自带的底部两行与之并排、互不对齐。提升为壳层第三行后，AI 栏的底边
+         自动停在底栏上沿。多窗口模式下两者都不渲染（该模式由每个格子自带）。 -->
+    <div class="shell-bottom">
+      <CommandBar
+        v-if="bottomCommandTab"
+        :key="bottomCommandTab.sessionId"
+        :session-id="bottomCommandTab.sessionId"
+        :connection-id="bottomCommandTab.connectionId"
+        :conn-type="bottomCommandTab.tab.connType"
+        :broadcast-targets="getBroadcastTargets(bottomCommandTab.tab)"
+        :status="bottomCommandTab.tab.status"
+        @reconnect="reconnectTab(bottomCommandTab.tab.id)"
+        @open-quick-commands-manage="onOpenQuickCommandsManage"
+        @screenshot="onBottomScreenshot"
+      />
+
+      <ServerInfoPanel
+        v-if="bottomServerInfoTab"
+        :session-id="bottomServerInfoTab.sessionId"
+        :active="true"
+      />
+    </div>
 
     <!-- AI 助手（右栏） -->
     <AiPanel

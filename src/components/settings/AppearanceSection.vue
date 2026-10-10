@@ -2,8 +2,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Brush, CircleCheck, Picture } from "@element-plus/icons-vue";
-import { MyButton, MySection, MySlider, MyToggle } from "myui";
+import { MyButton, MyIcon, MySection, MySegmented, MySlider, MyToggle } from "myui";
 import { readFileBase64 } from "@/api";
 import { compressImageDataUrl } from "@/utils/image";
 import {
@@ -29,7 +28,7 @@ import CustomPaletteDialog from "./CustomPaletteDialog.vue";
 
 defineOptions({ name: "AppearanceSection" });
 
-// 背景透明度滑杆范围。与下方 <input type="range"> 保持同步。
+// 背景透明度滑杆范围。与下方 MySlider 的 min/max 保持同步。
 const BG_OPACITY_MIN = 10;
 const BG_OPACITY_MAX = 100;
 
@@ -179,19 +178,38 @@ const RENDERER_OPTIONS: { id: RendererBackend; label: string; desc: string }[] =
   { id: "webgl", label: "WebGL", desc: "性能最佳，依赖 GPU 合成" },
   { id: "dom", label: "DOM", desc: "最轻量，仅聚焦时显示光标" },
 ];
+
+/* 渲染后端是一组单选项 → MySegmented（迁移前是 4 枚裸 button + 自绘
+   .backend-chip.active 选中态）。MySegmented 逐项只渲染 label、不透传
+   逐项 title，所以原先挂在 title 上的说明改为在下方常驻显示当前项的
+   desc——tooltip 只能鼠标悬停时看到，这行字现在始终可见。 */
+const RENDERER_SEGMENTED_OPTIONS = RENDERER_OPTIONS.map((o) => ({
+  label: o.label,
+  value: o.id,
+}));
+
+const rendererDesc = computed(
+  () => RENDERER_OPTIONS.find((o) => o.id === rendererBackend.value)?.desc ?? "",
+);
+
+function onRendererChange(v: string | number | boolean): void {
+  if (typeof v !== "string") return;
+  if (!RENDERER_OPTIONS.some((o) => o.id === v)) return;
+  setRendererBackend(v as RendererBackend);
+}
 </script>
 
 <template>
   <!-- 配色方案 -->
   <MySection title="配色方案" description="选择预设配色方案，同步更新终端和界面颜色">
     <div class="preset-grid">
-      <button
+      <MyButton
         v-for="preset in PRESETS"
         :key="preset.id"
         class="preset-card"
+        variant="secondary"
         :class="{ active: appearance.paletteId === preset.id && !appearance.customPalette }"
         :title="preset.name"
-        type="button"
         @click="choosePreset(preset.id)"
       >
         <span
@@ -209,21 +227,21 @@ const RENDERER_OPTIONS: { id: RendererBackend; label: string; desc: string }[] =
           />
         </span>
         <span class="preset-name">{{ preset.name }}</span>
-      </button>
+      </MyButton>
     </div>
 
     <!-- 自定义主题入口 -->
-    <button
+    <MyButton
       class="custom-entry"
+      variant="secondary"
       :class="{ 'has-custom': !!appearance.customPalette }"
-      type="button"
       @click="showCustomDialog = true"
     >
       <span class="custom-entry-icon">
-        <el-icon :size="14"><Brush /></el-icon>
+        <MyIcon :size="14" name="Brush" />
       </span>
       {{ appearance.customPalette ? "管理自定义主题" : "自定义主题..." }}
-    </button>
+    </MyButton>
 
     <!-- 自定义主题对话框 -->
     <CustomPaletteDialog
@@ -245,7 +263,7 @@ const RENDERER_OPTIONS: { id: RendererBackend; label: string; desc: string }[] =
       :disabled="bgImageBusy"
       @click="pickBgImage"
     >
-      <el-icon :size="14"><Picture /></el-icon>
+      <MyIcon :size="14" name="Picture" />
       {{ bgImageBusy ? "选择中..." : appearance.bgImage.dataUrl ? "更换图片" : "选择图片" }}
     </MyButton>
 
@@ -262,10 +280,7 @@ const RENDERER_OPTIONS: { id: RendererBackend; label: string; desc: string }[] =
     <!-- 状态 -->
     <div class="bg-status" :class="{ ok: !!appearance.bgImage.dataUrl }">
       <span class="bg-status-icon">
-        <el-icon :size="13">
-          <CircleCheck v-if="appearance.bgImage.dataUrl" />
-          <Picture v-else />
-        </el-icon>
+        <MyIcon :size="13" :icon="appearance.bgImage.dataUrl ? 'CircleCheck' : 'Picture'" />
       </span>
       <span>
         {{
@@ -329,19 +344,13 @@ const RENDERER_OPTIONS: { id: RendererBackend; label: string; desc: string }[] =
   >
     <div class="field">
       <label class="field-label">渲染后端</label>
-      <div class="backend-row">
-        <button
-          v-for="opt in RENDERER_OPTIONS"
-          :key="opt.id"
-          class="backend-chip"
-          :class="{ active: rendererBackend === opt.id }"
-          :title="opt.desc"
-          type="button"
-          @click="setRendererBackend(opt.id)"
-        >
-          {{ opt.label }}
-        </button>
-      </div>
+      <MySegmented
+        :model-value="rendererBackend"
+        :options="RENDERER_SEGMENTED_OPTIONS"
+        size="small"
+        @update:model-value="onRendererChange"
+      />
+      <div class="backend-hint">{{ rendererDesc }}</div>
     </div>
 
     <div class="gpu-row">
@@ -368,32 +377,28 @@ const RENDERER_OPTIONS: { id: RendererBackend; label: string; desc: string }[] =
   gap: 10px;
 }
 
+/* 色板卡片走 MyButton：hover / focus / disabled 交给 secondary 变体。
+   卡片自身的纵向排版保留自绘。
+   「选中」态仍自绘——myui 没有"选中态卡片按钮"原语，而 primary 的实心
+   强调底会盖掉卡片里那张真实的配色预览图（这正是选中态要展示的东西），
+   所以这里刻意保留淡强调底 + 强调色描边。 */
 .preset-card {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 6px;
   padding: 10px 6px;
-  background: var(--bg-surface);
-  border: 2px solid transparent;
+  border-width: 2px;
+  /* 卡片比按钮大一档圆角（令牌桥把 EP base 接到 --radius-md=10px，
+     卡片沿用 --radius-lg=14px） */
   border-radius: var(--radius-lg);
-  cursor: pointer;
   transition: all var(--duration-fast) var(--ease-out-expo);
 }
 
-.preset-card:hover {
-  border-color: var(--border-emphasis);
-  background: var(--bg-surface-hover);
-}
-
-.preset-card.active {
-  background: var(--accent-primary-muted);
-  border-color: var(--accent-primary);
-}
-
+.preset-card.active,
 .preset-card.active:hover {
-  border-color: var(--accent-primary);
   background: var(--accent-primary-muted);
+  border-color: var(--accent-primary);
 }
 
 .preset-dot {
@@ -426,28 +431,17 @@ const RENDERER_OPTIONS: { id: RendererBackend; label: string; desc: string }[] =
   color: var(--accent-primary);
 }
 
+/* 自定义主题入口走 MyButton。虚线描边是刻意的设计偏离——它在表达
+   "这里还没有内容，点我新建"，实线按钮表达不了"尚未配置"这层意思，
+   故 border 保留自绘；底色/文字/hover 交给变体。 */
 .custom-entry {
   margin-top: 10px;
   width: 100%;
   padding: 10px 14px;
-  background: var(--bg-surface);
-  color: var(--text-tertiary);
   border: 1px dashed var(--border-default);
-  border-radius: var(--radius-md);
   font-size: 12px;
   font-weight: 500;
-  cursor: pointer;
-  transition: all var(--duration-fast) var(--ease-in-out);
-  display: flex;
-  align-items: center;
-  justify-content: center;
   gap: 6px;
-}
-
-.custom-entry:hover {
-  background: var(--accent-primary-muted);
-  border-color: var(--border-accent);
-  color: var(--accent-primary);
 }
 
 .custom-entry.has-custom {
@@ -542,29 +536,14 @@ const RENDERER_OPTIONS: { id: RendererBackend; label: string; desc: string }[] =
   line-height: 1.6;
 }
 
-.backend-row {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.backend-chip {
-  padding: 8px 14px;
-  background: var(--bg-input);
-  color: var(--text-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  font-size: 12px;
-  font-weight: 400;
-  cursor: pointer;
-  transition: all var(--duration-fast) var(--ease-in-out);
-}
-
-.backend-chip.active {
-  background: var(--accent-primary-muted);
-  color: var(--accent-primary);
-  border-color: var(--accent-primary);
-  font-weight: 600;
+/* 渲染后端改用 MySegmented 后，.backend-row / .backend-chip 及自绘的
+   .backend-chip.active 选中态全部删除。说明文字从原来的逐项 title
+   改为下方常驻一行。 */
+.backend-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 8px;
+  line-height: 1.6;
 }
 
 .gpu-row {

@@ -1,11 +1,19 @@
-<!-- 窗口控制按钮（无边框窗口自绘 ─ □ ✕）。
+<!-- 窗口控制三联钮 ─ □ ✕。
      顶栏与保险库门禁页共用：门禁页是全屏覆盖层（z-index 5000），顶栏尚未渲染，
      若不共用，用户在解锁/设置密码阶段既不能最小化也不能关闭窗口。
-     Windows 规范：46px 宽、全高、无圆角、悬停高亮；关闭钮悬停用系统关闭红
-     （非主题令牌——用户对 ─ □ ✕ 的红有肌肉记忆，主题色会认不出）。 -->
+
+     2026-10-09：改用 myui 的 MyWindowControls（v0.29.0 新增）。此前本文件
+     自绘三个 <button> + 内联 SVG，是因为 myui 既无 caption 按钮条组件、
+     图标注册表也没有 Maximize / Restore / Minus 三枚字形（EP 的 FullScreen
+     是四角外扩角括号，语义是"进全屏"，用作最大化按钮属语义错配）。
+     现两者都已补齐，图标与 Windows 规范字形由库提供。
+
+     MyWindowControls 只 emit 事件、不碰窗口系统——本文件仍自己接
+     getCurrentWindow()，myui 保持零桌面运行时依赖。 -->
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { MyWindowControls } from "myui";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 defineOptions({ name: "WindowControls" });
@@ -63,78 +71,47 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="window-controls" :class="`is-${tone}`">
-    <button type="button" class="wc-btn" title="最小化" aria-label="最小化" @click="minimizeWin">
-      <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-        <path d="M0 5h10" stroke="currentColor" stroke-width="1" />
-      </svg>
-    </button>
-    <button
-      type="button"
-      class="wc-btn"
-      :title="isMaximized ? '向下还原' : '最大化'"
-      :aria-label="isMaximized ? '向下还原' : '最大化'"
-      @click="toggleMaximize"
-    >
-      <!-- 最大化：空心方框；还原：双层方框（Windows 规范字形） -->
-      <svg v-if="!isMaximized" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-        <rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1" />
-      </svg>
-      <svg v-else width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-        <rect x="0.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1" />
-        <path d="M2.5 2.5V0.5h7v7h-2" fill="none" stroke="currentColor" stroke-width="1" />
-      </svg>
-    </button>
-    <button type="button" class="wc-btn wc-close" title="关闭" aria-label="关闭" @click="closeWin">
-      <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-        <path d="M0 0l10 10M10 0L0 10" stroke="currentColor" stroke-width="1" />
-      </svg>
-    </button>
-  </div>
+  <MyWindowControls
+    class="window-controls"
+    :class="`is-${tone}`"
+    :maximized="isMaximized"
+    @minimize="minimizeWin"
+    @toggle-maximize="toggleMaximize"
+    @close="closeWin"
+  />
 </template>
 
 <style scoped>
+/* ── MyWindowControls 之上叠两处 MyShell 的刻意偏离 ──
+
+   1) 按钮全高：库默认 46×32（贴合常见标题栏），本项目顶栏 44px、
+      门禁页覆盖层 44px，按钮需 `height: 100%` 才与栏等高。
+   2) 关闭钮悬停用系统红 `#e81123` 而非库默认的 `var(--danger)`——
+      用户对 ─ □ ✕ 的红有肌肉记忆，主题色会认不出。这是早于 myui
+      接入就存在的刻意选择，保留。
+
+   两者都要下钻到 `.my-window-controls__btn`：MyWindowControls 是
+   `inheritAttrs:false` + 根节点 mergeProps，所以根上的 .window-controls
+   直接生效，子按钮是库内部结构，只能 :deep()。若 myui 日后改按钮类名，
+   这两条会静默失效。 */
 .window-controls {
-  display: flex;
-  align-items: stretch;
   height: 100%;
-  flex-shrink: 0;
 }
 
-.wc-btn {
-  width: 46px;
+.window-controls :deep(.my-window-controls__btn) {
   height: 100%;
-  display: grid;
-  place-items: center;
-  padding: 0;
-  border: none;
   border-radius: 0;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
+  font-family: inherit;
   user-select: none;
   -webkit-user-select: none;
-  font-family: inherit;
-  transition:
-    background var(--duration-fast) var(--ease-in-out),
-    color var(--duration-fast) var(--ease-in-out);
 }
 
-.wc-btn:hover {
-  background: var(--bg-surface-hover);
-  color: var(--text-primary);
-}
-
-.wc-btn:active {
-  background: var(--bg-surface-active);
-}
-
-.wc-close:hover {
+.window-controls :deep(.my-window-controls__btn.is-close:hover) {
   background: #e81123;
   color: #fff;
 }
 
-.wc-close:active {
+.window-controls :deep(.my-window-controls__btn.is-close:active) {
   background: #f1707a;
   color: #fff;
 }
@@ -146,20 +123,14 @@ onUnmounted(() => {
   top: 0;
   right: 0;
   z-index: 1;
-  height: 44px;
 }
 
-.window-controls.is-overlay .wc-btn {
+.window-controls.is-overlay :deep(.my-window-controls__btn) {
   color: var(--text-tertiary);
 }
 
-.window-controls.is-overlay .wc-btn:hover {
+.window-controls.is-overlay :deep(.my-window-controls__btn:hover) {
   background: rgba(255, 255, 255, 0.08);
   color: var(--text-primary);
-}
-
-.window-controls.is-overlay .wc-close:hover {
-  background: #e81123;
-  color: #fff;
 }
 </style>

@@ -5,8 +5,7 @@
      按"行为语义零变化"不予新增。 -->
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { Cpu, DataLine, Files, TrendCharts } from "@element-plus/icons-vue";
-import { MyProgress } from "myui";
+import { MyIcon, MyProgress } from "myui";
 import { sshGetServerInfo, type ServerInfo } from "@/api";
 
 defineOptions({ name: "ServerInfoPanel" });
@@ -100,14 +99,14 @@ function clampPct(pct: number): number {
         <!-- Single-row metric chip: icon + label + content + optional bar, all
              inline. Designed for a compact bottom status bar. -->
         <div class="chip" :class="{ stale }" :title="`内核 ${info.kernel || '-'}`">
-          <span class="chip-icon"><el-icon :size="12"><Files /></el-icon></span>
+          <span class="chip-icon"><MyIcon :size="12" name="Files" /></span>
           <span class="chip-label">系统</span>
           <span class="chip-content">{{ info.osPretty || "unknown" }}</span>
         </div>
       </div>
       <div class="group is-divided">
         <div class="chip" :class="{ stale }">
-          <span class="chip-icon"><el-icon :size="12"><Cpu /></el-icon></span>
+          <span class="chip-icon"><MyIcon :size="12" name="Cpu" /></span>
           <span class="chip-label">CPU</span>
           <span class="chip-content">{{ info.cpuCores }} 核 {{ info.cpuUsagePct.toFixed(1) }}%</span>
           <div class="usage-bar" :class="{ stale }">
@@ -123,7 +122,7 @@ function clampPct(pct: number): number {
       </div>
       <div class="group is-divided">
         <div class="chip" :class="{ stale }">
-          <span class="chip-icon"><el-icon :size="12"><TrendCharts /></el-icon></span>
+          <span class="chip-icon"><MyIcon :size="12" name="TrendCharts" /></span>
           <span class="chip-label">内存</span>
           <span class="chip-content">
             {{ formatBytes(info.memUsedBytes) }}/{{ formatBytes(info.memTotalBytes) }} {{ info.memUsagePct.toFixed(0) }}%
@@ -145,7 +144,7 @@ function clampPct(pct: number): number {
           :class="{ stale }"
           :title="info.diskMaxDev ? `最高分区设备 ${info.diskMaxDev} 挂载于 ${info.diskMaxMount}` : undefined"
         >
-          <span class="chip-icon"><el-icon :size="12"><DataLine /></el-icon></span>
+          <span class="chip-icon"><MyIcon :size="12" name="DataLine" /></span>
           <span class="chip-label">磁盘</span>
           <span class="chip-content">{{ diskContent }}</span>
           <div class="usage-bar" :class="{ stale }">

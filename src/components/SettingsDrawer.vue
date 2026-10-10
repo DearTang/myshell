@@ -31,7 +31,7 @@ const emit = defineEmits<{
 
 const categories = [
   { id: "appearance", label: "外观", icon: "Brush" },
-  { id: "ai", label: "AI 助手", icon: "ChatDotRound" },
+  { id: "ai", label: "AI 助手", icon: "Robot" },
   { id: "mcp", label: "MCP 支持", icon: "Connection" },
   { id: "multiWindow", label: "多窗口", icon: "Grid" },
   { id: "transfer", label: "文件传输", icon: "Upload" },
@@ -81,7 +81,8 @@ function onNavSelect(key: string): void {
           <div class="panel-title">设置</div>
           <div class="panel-subtitle">管理应用配置与安全设置</div>
         </div>
-        <button class="close-btn" type="button" @click="emit('close')">✕</button>
+        <MyIconButton
+          title="关闭设置" class="close-btn" label="关闭设置" size="14" name="Close" @click="emit('close')" />
       </div>
 
       <!-- 主内容区 -->

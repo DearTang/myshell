@@ -12,23 +12,17 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { ElMessageBox } from "element-plus";
 import {
-  Connection,
-  CopyDocument,
-  Delete,
-  EditPen,
-  Folder,
-  FolderAdd,
-  FolderOpened,
-  MagicStick,
-  Message,
-  Moon,
-  Plus,
-  RefreshRight,
-  Search,
-  Sunny,
-  Warning,
-} from "@element-plus/icons-vue";
-import { MyDialog, MyIcon, MyInput, toast } from "myui";
+  MyBadge,
+  MyDialog,
+  MyDropdown,
+  MyEmpty,
+  MyIcon,
+  MyIconButton,
+  MyInput,
+  MyStatusDot,
+  toast,
+  type MyDropdownItem,
+} from "myui";
 import {
   type ConnectionConfig,
   type ConnType,
@@ -54,10 +48,14 @@ interface FolderNode {
   depth: number;
   children: FolderNode[];
   conns: ConnectionConfig[];
+  /** 整棵子树（含本层）的连接总数。徽标显示它，而不是 conns.length。
+   *  只数直接子级时，「连接都在二级文件夹里」的父级行会显示不出任何数字，
+   *  折叠状态下无法判断这棵树里有多少连接。 */
+  totalConns: number;
 }
 
 function buildTree(conns: ConnectionConfig[], folders: string[]): FolderNode {
-  const root: FolderNode = { path: "/", name: "root", depth: 0, children: [], conns: [] };
+  const root: FolderNode = { path: "/", name: "root", depth: 0, children: [], conns: [], totalConns: 0 };
   const nodeByPath = new Map<string, FolderNode>([["/", root]]);
 
   const ensureNode = (path: string): FolderNode => {
@@ -73,6 +71,7 @@ function buildTree(conns: ConnectionConfig[], folders: string[]): FolderNode {
       depth: segments.length,
       children: [],
       conns: [],
+      totalConns: 0,
     };
     parent.children.push(node);
     nodeByPath.set(path, node);
@@ -91,6 +90,18 @@ function buildTree(conns: ConnectionConfig[], folders: string[]): FolderNode {
     n.children.forEach(sortRec);
   };
   sortRec(root);
+
+  // 后序累加子树连接数：父级 = 本层 + 所有后代。
+  // 放在树上做而不是另开一个「按 group_path 前缀匹配」的统计，是为了不依赖
+  // 路径字符串约定——树的实际结构就是唯一事实来源。
+  const tallyRec = (n: FolderNode): number => {
+    let total = n.conns.length;
+    for (const child of n.children) total += tallyRec(child);
+    n.totalConns = total;
+    return total;
+  };
+  tallyRec(root);
+
   return root;
 }
 
@@ -178,16 +189,20 @@ function toggleTheme(): void {
 const deleteConnConfirm = ref<{ conn: ConnectionConfig } | null>(null);
 const deleteFolderConfirm = ref<{ path: string; connCount: number; subFolderCount: number } | null>(null);
 
-// 行内 ⋯ 菜单（同一时刻至多一个：旧版每行独立状态 + 全屏遮罩，打开新菜单前
-// 必须先点掉旧菜单的遮罩，因此单份全局状态与旧行为等价）。
-interface RowMenuState {
-  conn: ConnectionConfig;
-  x: number;
-  y: number;
-  /** 锚点靠近视口右缘时菜单向左展开（旧版按 anchor.x + 140 > innerWidth 判定） */
-  flip: boolean;
+// 行内 ⋯ 菜单：MyDropdown 自带"同一时刻至多一个 + 点外关闭 + 视口碰撞翻转"，
+// 故不再需要旧版的「每行独立状态 + 全屏遮罩 + 手工 flip 判定」。
+// 菜单项是静态的；"属于哪条连接"由模板闭包在 @command 里带上，无需全局状态。
+const ROW_MENU_ITEMS: MyDropdownItem[] = [
+  { command: "connect", label: "连接", name: "Connection" },
+  { command: "edit", label: "编辑", name: "EditPen" },
+  { command: "rename", label: "重命名", name: "EditPen" },
+  { command: "copy", label: "复制", name: "CopyDocument" },
+  { command: "delete", label: "删除", name: "Delete", danger: true },
+];
+
+function rowMenuItems(): MyDropdownItem[] {
+  return ROW_MENU_ITEMS.map((it) => ({ ...it }));
 }
-const rowMenu = ref<RowMenuState | null>(null);
 
 // ── 长按拖拽移动到文件夹 ─────────────────────────────────────────────────────
 // 拖拽期间列表切换为 folders-only 视图（全部展开），避免为够到目标文件夹而
@@ -408,20 +423,55 @@ function onFolderContext(node: FolderNode, e: MouseEvent): void {
   menu.value = { x: e.clientX, y: e.clientY, kind: "folder", folderPath: node.path };
 }
 
-function openRowMenu(conn: ConnectionConfig, e: MouseEvent): void {
-  e.stopPropagation();
-  const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-  rowMenu.value = {
-    conn,
-    x: r.right,
-    y: r.bottom + 4,
-    flip: r.right + 140 > window.innerWidth,
-  };
+/** 连接行 ⋯ 菜单派发：菜单项 + 当前连接 → 原有各处理函数。
+ *
+ *  ⚠️ 2026-10-10 修复「菜单能展开、点任何一项都没反应」：myui 的 `@command`
+ *  回传的是**整个 item 对象**，不是 item.command 的值 —— 见 MyDropdownItem.command
+ *  的类型注释原文：「command 载荷；@command 回传整个 item，业务从 item.command
+ *  取值」。此前这里写的是 `String(cmd)`，把对象直接 String() 得到
+ *  `"[object Object]"`，switch 一个分支都命中不了，于是菜单点什么都静默返回。
+ *  （`tsconfig` 的 `strict` 抓不到：旧签名 `cmd: string | number | object` 与
+ *  库声明的 `onCommand?: (item: MyDropdownItem) => any` 兼容，模板里的箭头函数
+ *  形参又没有类型标注。） */
+function onRowMenuCommand(item: MyDropdownItem, conn: ConnectionConfig): void {
+  switch (String(item.command ?? "")) {
+    case "connect":
+      rowMenuConnect(conn);
+      break;
+    case "edit":
+      rowMenuEdit(conn);
+      break;
+    case "rename":
+      rowMenuRename(conn);
+      break;
+    case "copy":
+      rowMenuCopy(conn);
+      break;
+    case "delete":
+      rowMenuDelete(conn);
+      break;
+  }
 }
+
+/** 行内交互控件（目前是行尾的「⋯」菜单钮）。落在这类元素上的 pointerdown
+ *  不能进入长按拖拽流程。
+ *
+ *  2026-10-10 修复「⋯ 菜单点不开」：beginDrag 第一件事就是给行元素
+ *  `el.setPointerCapture(pointerId)`。指针捕获生效后，浏览器把后续的 pointerup
+ *  以及与之配对的兼容性 mouseup / click 一并重定向到**捕获元素（行本身）**，
+ *  而 click 的目标是 pointerdown 目标与 pointerup 目标的最近共同祖先 ——
+ *  即 `<button class="conn-more">` 与 `.conn-row` 的共同祖先 = 行本身。
+ *  于是按钮上的 click 永远不会触发，ElDropdown 的触发器与业务 @click 一起哑火，
+ *  表现为「⋯ 点不动」。这与 dragState 无关，是纯粹的事件路由问题，
+ *  所以在入口按事件目标短路，而不是去改拖拽状态机。 */
+const ROW_INTERACTIVE_SELECTOR =
+  'button, a, input, select, textarea, [role="button"], [contenteditable="true"]';
 
 /** 连接行 pointerdown 入口：长按拖拽仅树形视图可用（搜索平铺行不可拖，与旧版一致）。 */
 function onConnPointerDown(conn: ConnectionConfig, noDrag: boolean, e: PointerEvent): void {
   if (noDrag) return;
+  const target = e.target;
+  if (target instanceof Element && target.closest(ROW_INTERACTIVE_SELECTOR)) return;
   beginDrag(conn, e);
 }
 
@@ -455,31 +505,21 @@ function ctxDeleteFolder(): void {
   if (p) handleDeleteFolder(p);
   closeMenu();
 }
-// 行内 ⋯ 菜单
-function rowMenuConnect(): void {
-  const c = rowMenu.value?.conn;
-  rowMenu.value = null;
-  if (c) handleConnect(c);
+// 行内 ⋯ 菜单：菜单项的 command 直接带连接对象，MyDropdown 点击后收起。
+function rowMenuConnect(c: ConnectionConfig): void {
+  handleConnect(c);
 }
-function rowMenuEdit(): void {
-  const c = rowMenu.value?.conn;
-  rowMenu.value = null;
-  if (c) handleEdit(c);
+function rowMenuEdit(c: ConnectionConfig): void {
+  handleEdit(c);
 }
-function rowMenuRename(): void {
-  const c = rowMenu.value?.conn;
-  rowMenu.value = null;
-  if (c) void handleRenameConnection(c.id, c.name);
+function rowMenuRename(c: ConnectionConfig): void {
+  void handleRenameConnection(c.id, c.name);
 }
-function rowMenuCopy(): void {
-  const c = rowMenu.value?.conn;
-  rowMenu.value = null;
-  if (c) void handleCopy(c.id);
+function rowMenuCopy(c: ConnectionConfig): void {
+  void handleCopy(c.id);
 }
-function rowMenuDelete(): void {
-  const c = rowMenu.value?.conn;
-  rowMenu.value = null;
-  if (c) handleDeleteConnection(c);
+function rowMenuDelete(c: ConnectionConfig): void {
+  handleDeleteConnection(c);
 }
 
 // ── 壳层入口 ────────────────────────────────────────────────────────────────
@@ -578,25 +618,55 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
     <!-- 头部：动作图标行（myui/EP 单色图标体系） -->
     <div class="side-header">
       <div class="header-actions">
-        <button type="button" class="icon-btn" :title="isDark ? '切换到亮色模式' : '切换到暗色模式'" @click="toggleTheme">
-          <el-icon :size="15"><Sunny v-if="isDark" /><Moon v-else /></el-icon>
-        </button>
-        <button type="button" class="icon-btn" title="快捷命令" @click="openQuickCommands">
-          <el-icon :size="15"><MagicStick /></el-icon>
-        </button>
+        <MyIconButton
+          :title="isDark ? '切换到亮色模式' : '切换到暗色模式'"
+          class="icon-btn"
+          :label="isDark ? '切换到亮色模式' : '切换到暗色模式'"
+          size="15"
+          :name="isDark ? 'Sunny' : 'Moon'"
+          @click="toggleTheme"
+        />
+        <MyIconButton
+          title="快捷命令"
+          class="icon-btn"
+          label="快捷命令"
+          size="15"
+          name="MagicStick"
+          @click="openQuickCommands"
+        />
         <!-- 设置入口只在顶栏（右上角），此处不再重复，避免头部一行过挤 -->
-        <button type="button" class="icon-btn" title="刷新" @click="void reloadConnections()">
-          <el-icon :size="15"><RefreshRight /></el-icon>
-        </button>
-        <button type="button" class="icon-btn" title="回收站" @click="ui.showRecycle = true">
-          <el-icon :size="15"><Delete /></el-icon>
-        </button>
-        <button type="button" class="icon-btn" title="新建文件夹" @click="void handleAddFolder('/')">
-          <el-icon :size="15"><FolderAdd /></el-icon>
-        </button>
-        <button type="button" class="icon-btn" title="新建连接" aria-label="新建连接" @click="handleAddNew()">
-          <el-icon :size="15"><Plus /></el-icon>
-        </button>
+        <MyIconButton
+          title="刷新"
+          class="icon-btn"
+          label="刷新"
+          size="15"
+          name="RefreshRight"
+          @click="void reloadConnections()"
+        />
+        <MyIconButton
+          title="回收站"
+          class="icon-btn"
+          label="回收站"
+          size="15"
+          name="Delete"
+          @click="ui.showRecycle = true"
+        />
+        <MyIconButton
+          title="新建文件夹"
+          class="icon-btn"
+          label="新建文件夹"
+          size="15"
+          name="FolderAdd"
+          @click="void handleAddFolder('/')"
+        />
+        <MyIconButton
+          title="新建连接"
+          class="icon-btn"
+          label="新建连接"
+          size="15"
+          name="Plus"
+          @click="handleAddNew()"
+        />
       </div>
     </div>
 
@@ -609,7 +679,7 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
         placeholder="搜索连接名称或地址..."
       >
         <template #prefix>
-          <el-icon :size="13"><Search /></el-icon>
+          <MyIcon :size="13" name="Search" />
         </template>
       </MyInput>
       <div v-if="searchQuery" class="search-count">找到 {{ filteredConnections.length }} 个连接</div>
@@ -621,7 +691,7 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
       <div v-if="isDragging" class="drag-hint">
         <span class="drag-hint-title">正在移动「{{ dragState?.connName ?? "" }}」</span>
         <span>拖到文件夹上松开即可移动到该文件夹；ESC 或松开在空白处取消</span>
-        <span v-if="dragHintTarget" class="drag-hint-target">当前目标：<span class="drag-hint-folder"><el-icon :size="11" style="vertical-align: -1px"><Folder /></el-icon> {{ dragHintTarget }}</span></span>
+        <span v-if="dragHintTarget" class="drag-hint-target">当前目标：<span class="drag-hint-folder"><MyIcon :size="11" style="vertical-align: -1px" name="Folder" /> {{ dragHintTarget }}</span></span>
         <span v-else class="drag-hint-none">当前目标：移到文件夹上以选择</span>
       </div>
 
@@ -643,12 +713,16 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
           <!-- 颜色交给 CSS（.folder-emoji / .folder-emoji.open / :hover），
                内联 :color 会挡住悬停变色（内联优先级高于类选择器） -->
           <span class="folder-emoji" :class="{ open: row.isOpen }">
-            <el-icon :size="14">
-              <FolderOpened v-if="row.isOpen" /><Folder v-else />
-            </el-icon>
+            <MyIcon :size="14" :icon="row.isOpen ? 'FolderOpened' : 'Folder'" />
           </span>
           <span class="folder-name" :title="row.node.name">{{ row.node.name }}</span>
-          <span v-if="row.node.conns.length > 0" class="folder-count">{{ row.node.conns.length }}</span>
+          <MyBadge
+        v-if="row.node.totalConns > 0"
+        class="folder-count"
+        type="info"
+        :value="row.node.totalConns"
+        :title="`本文件夹及其子文件夹共 ${row.node.totalConns} 个连接`"
+      />
         </div>
 
         <!-- 连接行：双击/回车连接；长按拖拽移动；右键仅抑制系统菜单（动作在 ⋯ 菜单） -->
@@ -675,32 +749,47 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
           >
             <span class="conn-name">{{ row.conn.name }}</span>
             <span v-if="row.showGroupPath && row.conn.group_path && row.conn.group_path !== '/'" class="conn-group">
-              <el-icon :size="10" style="vertical-align: -1px"><FolderOpened /></el-icon>
+              <MyIcon :size="10" style="vertical-align: -1px" name="FolderOpened" />
               {{ row.conn.group_path.startsWith("/") ? row.conn.group_path.slice(1) : row.conn.group_path }}
             </span>
             <span v-if="row.showGroupPath" class="conn-host">{{ row.conn.host }}:{{ row.conn.port }}</span>
           </div>
-          <span
-            class="conn-more"
-            title="更多操作"
-            @click.stop="openRowMenu(row.conn, $event)"
-            @pointerdown.stop
-          >⋯</span>
+          <MyDropdown
+          trigger="click"
+          placement="bottom-end"
+          :items="rowMenuItems()"
+          @command="(item) => onRowMenuCommand(item, row.conn)"
+        >
+          <!-- MyDropdown 的 default 插槽**就是触发元素**（EP ElDropdown 把它当
+               reference）。迁移时只写了 items/trigger/@command 而漏了这个插槽，
+               等于一个触发点都没有 —— 菜单永远弹不出来，表现为「⋯ 点不动」。
+               这里用 MyIconButton 补回触发钮，与行内其他动作钮同一套观感。 -->
+          <MyIconButton
+            title="更多操作" class="conn-more" label="更多操作" size="15" name="More" />
+        </MyDropdown>
         </div>
       </template>
 
       <!-- 搜索无结果 -->
-      <div v-if="filteredConnections.length === 0 && searchQuery" class="empty">
-        <div class="empty-emoji"><el-icon :size="26"><Search /></el-icon></div>
-        <div>未找到匹配的连接</div>
-        <div class="empty-sub">尝试其他关键词</div>
-      </div>
+      <MyEmpty
+        v-if="filteredConnections.length === 0 && searchQuery"
+        class="empty"
+        icon="Search"
+        :image-size="26"
+        description="未找到匹配的连接"
+        hint="尝试其他关键词"
+        compact
+      />
       <!-- 完全为空 -->
-      <div v-if="connectionsStore.connections.length === 0 && connectionsStore.folders.length === 0 && !searchQuery" class="empty">
-        <i class="iconfont icon-fuwuqi empty-conn-icon" aria-hidden="true"></i>
-        <div>暂无连接</div>
-        <div class="empty-sub">点击 + 新建</div>
-      </div>
+      <MyEmpty
+        v-if="connectionsStore.connections.length === 0 && connectionsStore.folders.length === 0 && !searchQuery"
+        class="empty"
+        icon="Monitor"
+        :image-size="26"
+        description="暂无连接"
+        hint="点击 + 新建"
+        compact
+      />
     </div>
 
     <!-- 版本页脚：点版本打开关于；💬 反馈阻止冒泡。更新点出现时贴右缘。 -->
@@ -712,49 +801,39 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
     >
       <span class="footer-brand">MyShell</span>
       <span class="footer-version">v{{ ui.appVersion }}</span>
-      <span v-if="updateAvailable" class="update-dot" title="发现新版本"></span>
+      <MyStatusDot
+        v-if="updateAvailable"
+        class="update-dot"
+        tone="accent"
+        glow
+        aria-label="发现新版本"
+      />
       <span
         class="feedback-icon"
         :class="{ 'no-push': !updateAvailable }"
         title="反馈与建议"
         @click.stop="openFeedback"
-      ><el-icon :size="13"><Message /></el-icon></span>
+      ><MyIcon :size="13" name="Message" /></span>
     </div>
 
     <!-- 空白区右键菜单 -->
     <div v-if="menu" class="ctx-menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @click.stop>
       <template v-if="menu.kind === 'blank'">
-        <div class="menu-item" @click="ctxNewConnection"><span class="menu-ico"><el-icon :size="13"><Plus /></el-icon></span>新建连接</div>
-        <div class="menu-item" @click="ctxNewFolder"><span class="menu-ico"><el-icon :size="13"><FolderAdd /></el-icon></span>新建文件夹</div>
+        <div class="menu-item" @click="ctxNewConnection"><span class="menu-ico"><MyIcon :size="13" name="Plus" /></span>新建连接</div>
+        <div class="menu-item" @click="ctxNewFolder"><span class="menu-ico"><MyIcon :size="13" name="FolderAdd" /></span>新建文件夹</div>
       </template>
       <template v-else>
-        <div class="menu-item" @click="ctxNewConnectionInFolder"><span class="menu-ico"><el-icon :size="13"><Plus /></el-icon></span>新建连接</div>
-        <div class="menu-item" @click="ctxNewSubFolder"><span class="menu-ico"><el-icon :size="13"><FolderAdd /></el-icon></span>新建子文件夹</div>
-        <div class="menu-item" @click="ctxRenameFolder"><span class="menu-ico"><el-icon :size="13"><EditPen /></el-icon></span>重命名</div>
-        <div class="menu-item danger" @click="ctxDeleteFolder"><span class="menu-ico"><el-icon :size="13"><Delete /></el-icon></span>删除</div>
+        <div class="menu-item" @click="ctxNewConnectionInFolder"><span class="menu-ico"><MyIcon :size="13" name="Plus" /></span>新建连接</div>
+        <div class="menu-item" @click="ctxNewSubFolder"><span class="menu-ico"><MyIcon :size="13" name="FolderAdd" /></span>新建子文件夹</div>
+        <div class="menu-item" @click="ctxRenameFolder"><span class="menu-ico"><MyIcon :size="13" name="EditPen" /></span>重命名</div>
+        <div class="menu-item danger" @click="ctxDeleteFolder"><span class="menu-ico"><MyIcon :size="13" name="Delete" /></span>删除</div>
       </template>
     </div>
 
-    <!-- 连接行 ⋯ 菜单（全屏遮罩 + 锚定弹出） -->
-    <template v-if="rowMenu">
-      <div class="row-overlay" @click.stop="rowMenu = null"></div>
-      <div
-        class="ctx-menu"
-        :style="{
-          left: `${rowMenu.x}px`,
-          top: `${rowMenu.y}px`,
-          transform: rowMenu.flip ? 'translateX(-100%)' : undefined,
-          transformOrigin: 'top right',
-        }"
-        @click.stop
-      >
-        <div class="menu-item" @click="rowMenuConnect"><span class="menu-ico"><el-icon :size="13"><Connection /></el-icon></span>连接</div>
-        <div class="menu-item" @click="rowMenuEdit"><span class="menu-ico"><el-icon :size="13"><EditPen /></el-icon></span>编辑</div>
-        <div class="menu-item" @click="rowMenuRename"><span class="menu-ico"><el-icon :size="13"><EditPen /></el-icon></span>重命名</div>
-        <div class="menu-item" @click="rowMenuCopy"><span class="menu-ico"><el-icon :size="13"><CopyDocument /></el-icon></span>复制</div>
-        <div class="menu-item danger" @click="rowMenuDelete"><span class="menu-ico"><el-icon :size="13"><Delete /></el-icon></span>删除</div>
-      </div>
-    </template>
+    <!-- 连接行 ⋯ 菜单已内联为 MyDropdown（见行内 ⋯ 触发钮）：
+         迁移前是「全屏遮罩 + getBoundingClientRect 手工定位 + flip 判定」
+         三段自建逻辑，右侧空间不足时要手工 translateX(-100%) 翻边。
+         popper 自带视口碰撞翻转与点外关闭，故这三条一并删除。 -->
 
     <!-- 删除连接确认模态（window.confirm 在 Tauri WebView 会被吞，用真实模态）。
          MyDialog 壳：danger 确认键；旧版「点遮罩 = 取消」用 close-on-click-modal 保持
@@ -772,7 +851,7 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
     >
       <template #header>
         <div class="confirm-head">
-          <span class="confirm-ico"><el-icon :size="18" color="var(--warning)"><Warning /></el-icon></span>
+          <span class="confirm-ico"><MyIcon :size="18" color="var(--warning)" name="Warning" /></span>
           <span class="confirm-title">删除连接</span>
         </div>
       </template>
@@ -793,7 +872,7 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
     >
       <template #header>
         <div class="confirm-head">
-          <span class="confirm-ico"><el-icon :size="18" color="var(--warning)"><Warning /></el-icon></span>
+          <span class="confirm-ico"><MyIcon :size="18" color="var(--warning)" name="Warning" /></span>
           <span class="confirm-title">
             {{ deleteFolderConfirm.connCount > 0 || deleteFolderConfirm.subFolderCount > 0 ? "删除文件夹" : "删除空文件夹" }}
           </span>
@@ -837,8 +916,8 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 .side {
   position: relative;
   background: var(--surface-translucent);
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
   border-right: 1px solid var(--glass-border);
   display: flex;
   flex-direction: column;
@@ -887,22 +966,16 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
      overflow:visible 溢出面板（骑跨按钮需要 visible） */
   flex-wrap: wrap;
 }
+/* 头部动作钮：外观（悬停/按下/禁用/焦点环）由 MyIconButton 承担，
+   这里只把尺寸压到侧栏密度，并保留静止态的次级文字色——
+   tertiary 在 --bg-elevated 上仅 ~3.8:1，暗色下整排图标会糊成一团灰。 */
 .icon-btn {
   width: 28px;
   height: 28px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: transparent;
-  /* 静止态用 text-secondary 而非 tertiary：tertiary 在 --bg-elevated 上仅 ~3.8:1，
-     暗色模式下整排图标糊成一团灰。悬停再切强调色，形成"可用"的层级感。 */
   color: var(--text-secondary);
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  font-size: 14px;
-  cursor: pointer;
-  transition: all var(--duration-fast) var(--ease-in-out);
 }
+/* 悬停/按下改用强调色系（库的默认是中性 bg-elevated）：
+   「悬停变主色」是本项目一贯的可用性反馈，标题栏与命令栏一致。 */
 .icon-btn:hover {
   background: var(--accent-primary-muted);
   border-color: var(--border-accent);
@@ -940,21 +1013,6 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   text-align: center;
   color: var(--text-tertiary);
   font-size: 12px;
-}
-.empty-emoji {
-  font-size: 32px;
-  opacity: 0.3;
-  margin-bottom: 12px;
-}
-.empty-conn-icon {
-  font-size: 32px;
-  opacity: 0.3;
-  margin-bottom: 12px;
-  color: var(--text-secondary);
-}
-.empty-sub {
-  margin-top: 4px;
-  color: var(--text-muted);
 }
 
 /* 文件夹行 */
@@ -1021,15 +1079,12 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   font-weight: 500;
 }
 .folder-count {
-  font-size: 10px;
-  /* muted(#484f58) 压在 surface(#21262d) 上只有 ~1.8:1，徽标几乎不可见；
-     改用 secondary + 描边，既可见又不像强调色那样抢眼 */
-  color: var(--text-secondary);
-  background: var(--bg-surface);
-  border: 1px solid var(--border-default);
-  padding: 1px 6px;
-  border-radius: var(--radius-full);
-  line-height: 1.4;
+  /* 文件夹内连接数徽标：外观与配色由 MyBadge 承担，这里只压一下字号
+     （侧栏密度高于通用场景）并靠右推。原先手搓的版本是 muted 色压在
+     surface 上只有 ~1.8:1，徽标几乎不可见 —— 这类可读性判断随组件走。 */
+  margin-left: auto;
+  transform: scale(0.88);
+  transform-origin: right center;
 }
 
 /* 连接行 */
@@ -1097,15 +1152,13 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 连接行「⋯」触发钮：盒子与焦点环由 MyIconButton 承担，这里只保留
+   静止态次级色与「悬停转强调色」的项目惯例（库默认悬停是中性底）。 */
 .conn-more {
-  font-size: 12px;
-  /* secondary 而非 tertiary：⋯ 是可点操作入口，各预设下 ≥4.3:1，悬停再转强调色 */
   color: var(--text-secondary);
-  cursor: pointer;
-  padding: 2px 6px;
-  border-radius: var(--radius-sm);
-  transition: all var(--duration-fast) var(--ease-in-out);
+  flex: none;
 }
+
 .conn-more:hover {
   background: var(--accent-primary-muted);
   color: var(--accent-primary);
@@ -1171,12 +1224,8 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   font-size: 11px;
   color: var(--text-tertiary);
 }
+/* 更新提示圆点：光晕与尺寸由 MyStatusDot 的 glow 承担，这里只靠右推。 */
 .update-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: var(--radius-full);
-  background: var(--accent-secondary);
-  box-shadow: 0 0 6px var(--accent-secondary);
   margin-left: auto;
 }
 .feedback-icon {

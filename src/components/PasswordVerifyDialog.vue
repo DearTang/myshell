@@ -5,8 +5,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import type { ComponentPublicInstance } from "vue";
-import { Lock } from "@element-plus/icons-vue";
-import { MyButton, MyInput } from "myui";
+import { MyButton, MyIcon, MyInput } from "myui";
 import { verifyPassword } from "@/api";
 
 defineOptions({ name: "PasswordVerifyDialog" });
@@ -67,7 +66,7 @@ async function submit(): Promise<void> {
   <div class="overlay">
     <div class="panel" @click.stop>
       <div class="title">
-        <el-icon class="title-icon" :size="14"><Lock /></el-icon>
+        <MyIcon class="title-icon" :size="14" name="Lock" />
         验证密码
       </div>
       <div class="subtitle">请输入登录密码以查看明文密码</div>

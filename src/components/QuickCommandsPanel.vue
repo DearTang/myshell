@@ -8,8 +8,17 @@
      「全局命令」顶项经默认插槽 el-option 保留（groups 渲染后仍渲染默认插槽，顺序不变）。 -->
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import { Delete, EditPen } from "@element-plus/icons-vue";
-import { MyButton, MyDialog, MySelect, confirmDialog, toast, type SelectGroup } from "myui";
+import {
+  MyButton,
+  MyDialog,
+  MyIcon,
+  MyInput,
+  MySelect,
+  MyTextArea,
+  confirmDialog,
+  toast,
+  type SelectGroup,
+} from "myui";
 import {
   listQuickCommands,
   addQuickCommand,
@@ -207,6 +216,7 @@ function lineCount(command: string): number {
     show-close
     hide-footer
     class="qc-dialog"
+    body-class="qc-dialog-body"
     @cancel="emit('close')"
   >
     <template #header>
@@ -238,15 +248,15 @@ function lineCount(command: string): number {
           <div class="editor">
             <div class="editor-title">
               {{ editing.id === null ? "新增快捷命令" : "编辑快捷命令" }}
-              <button
-                type="button"
+              <MyButton
                 class="help-btn"
-                :class="{ 'is-open': helpOpen }"
+                :variant="helpOpen ? 'primary' : 'secondary'"
+                size="small"
                 title="命令编写规则"
                 @click="helpOpen = !helpOpen"
               >
                 ?
-              </button>
+              </MyButton>
             </div>
             <div v-if="helpOpen" class="help-box">
               <div>• 每行一条命令，按顺序逐行发送到终端</div>
@@ -265,8 +275,9 @@ function lineCount(command: string): number {
               <label class="editor-label">
                 名称<span class="required-star">*</span>
               </label>
-              <input
+              <MyInput
                 v-model="editing.label"
+                bare
                 class="editor-input"
                 :class="{ 'field-error': !editing.label.trim() }"
                 placeholder="如：重启 nginx"
@@ -279,13 +290,14 @@ function lineCount(command: string): number {
                 <span class="required-star">*</span>
                 <span class="label-hint">每行一条，点标题旁 ? 查看写法</span>
               </label>
-              <textarea
+              <MyTextArea
                 v-model="editing.command"
+                bare
                 class="editor-textarea"
                 :class="{ 'field-error': !editing.command.trim() }"
                 :placeholder="'sudo systemctl restart nginx\n# 清理 7 天前的日志\nfind /var/log -mtime +7 -delete\n\n# 需要等待交互提示时，用 ##delay:N 插入延迟：\n# mysql -u root -p\n# ##delay:800\n# mypassword'"
-                rows="8"
-              ></textarea>
+                :rows="8"
+              />
             </div>
             <div class="editor-actions">
               <MyButton variant="secondary" @click="editing = null">取消</MyButton>
@@ -301,9 +313,9 @@ function lineCount(command: string): number {
           </div>
         </template>
         <template v-else>
-          <button type="button" class="add-btn" @click="startAdd">
+          <MyButton variant="ghost" size="small" class="add-btn" @click="startAdd">
             + 新增快捷命令
-          </button>
+          </MyButton>
 
           <div v-if="loading" class="body-hint">加载中...</div>
           <div v-else-if="items.length === 0" class="body-hint empty">
@@ -314,30 +326,34 @@ function lineCount(command: string): number {
               <div class="command-head">
                 <span class="command-label" :title="item.label">{{ item.label }}</span>
                 <span class="command-lines">{{ lineCount(item.command) }} 行</span>
-                <button
-                  type="button"
-                  class="row-btn"
+                <MyIconButton
                   title="上移"
+                  class="row-btn"
+                  label="上移"
+                  size="14"
+                  name="ArrowUp"
                   :disabled="!(index > 0)"
                   @click="handleMove(index, -1)"
-                >
-                  ↑
-                </button>
-                <button
-                  type="button"
-                  class="row-btn"
+                />
+                <MyIconButton
                   title="下移"
+                  class="row-btn"
+                  label="下移"
+                  size="14"
+                  name="ArrowDown"
                   :disabled="!(index < items.length - 1)"
                   @click="handleMove(index, 1)"
-                >
-                  ↓
-                </button>
-                <button type="button" class="row-btn" title="编辑" @click="startEdit(item)">
-                  <el-icon :size="14"><EditPen /></el-icon>
-                </button>
-                <button type="button" class="row-btn danger" title="删除" @click="handleDelete(item.id)">
-                  <el-icon :size="14"><Delete /></el-icon>
-                </button>
+                />
+                <MyIconButton
+                  title="编辑" class="row-btn" label="编辑" size="14" name="EditPen" @click="startEdit(item)" />
+                <MyIconButton
+                  title="删除"
+                  class="row-btn danger"
+                  label="删除"
+                  size="14"
+                  name="Delete"
+                  @click="handleDelete(item.id)"
+                />
               </div>
               <pre class="command-text">{{ item.command }}</pre>
             </div>
@@ -356,7 +372,7 @@ function lineCount(command: string): number {
   max-height: 88vh;
 }
 
-:global(.qc-dialog .el-dialog__body) {
+:global(.qc-dialog-body) {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -516,27 +532,18 @@ function lineCount(command: string): number {
   gap: 8px;
 }
 
+/* 「?」帮助钮：18px 圆形小钮是刻意的紧凑造型（标题行里不该出现一行高的
+   文字按钮），故圆形/尺寸保留自绘；底色、描边、hover 交给 MyButton，
+   展开态也不再自绘实心强调底，改由 :variant 在 ghost ⇄ primary 间切。 */
 .help-btn {
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  border: 1px solid var(--border-default);
-  background: var(--bg-input);
-  color: var(--text-muted);
   font-size: 11px;
   font-weight: 700;
   line-height: 1;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
   padding: 0;
   flex-shrink: 0;
-}
-
-.help-btn.is-open {
-  background: var(--accent-primary);
-  color: var(--text-inverse);
 }
 
 .help-box {

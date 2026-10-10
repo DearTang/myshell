@@ -3,10 +3,8 @@
      拆分为 CommandRulesEditor，自行响应 active）。 -->
 <script setup lang="ts">
 import { onMounted, ref, watch } from "vue";
-import type { Component } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Camera, ChatDotRound, Lightning, Tools } from "@element-plus/icons-vue";
-import { MyButton, MySection, MyToggle, toast } from "myui";
+import { MyButton, MyIcon, MySection, MyToggle, toast } from "myui";
 import {
   mcpDetectTools,
   mcpWriteConfig,
@@ -148,8 +146,9 @@ async function removeToolConfig(tool: AiToolInfo): Promise<void> {
   }
 }
 
-function toolIcon(id: string): Component {
-  return id === "claude" ? ChatDotRound : id === "opencode" ? Lightning : Tools;
+/** 工具图标 → myui 图标注册表名（MyIcon 的 name 入参接受注册表名）。 */
+function toolIcon(id: string): string {
+  return id === "claude" ? "ChatDotRound" : id === "opencode" ? "Lightning" : "Tools";
 }
 </script>
 
@@ -182,7 +181,7 @@ function toolIcon(id: string): Component {
 
         <div v-if="!attachmentDir && !attachmentDirAcknowledged" class="warning-banner">
           尚未配置附件目录。终端截图功能（CommandBar 的
-          <el-icon class="inline-icon" :size="12"><Camera /></el-icon>
+          <MyIcon class="inline-icon" :size="12" name="Camera" />
           按钮）会保存到这里，请先选择一个目录。
         </div>
 
@@ -207,7 +206,7 @@ function toolIcon(id: string): Component {
           <div v-for="tool in mcpTools" :key="tool.id" class="tool-row">
             <div class="tool-info">
               <span class="tool-icon">
-                <el-icon :size="14"><component :is="toolIcon(tool.id)" /></el-icon>
+                <MyIcon :size="14" :icon="toolIcon(tool.id)" />
               </span>
               <div>
                 <div class="tool-name">{{ tool.name }}</div>

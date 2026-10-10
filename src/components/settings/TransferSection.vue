@@ -2,7 +2,7 @@
      并发数为 localStorage 读取的传输开始值；Rust 侧无论存什么都会钳到 1..=16。 -->
 <script setup lang="ts">
 import { ref } from "vue";
-import { MySection } from "myui";
+import { MySection, MySegmented } from "myui";
 import {
   getSftpDownloadConcurrency,
   setSftpDownloadConcurrency,
@@ -13,9 +13,20 @@ defineOptions({ name: "TransferSection" });
 
 const CONCURRENCY_CHOICES = [1, 2, 3, 4, 6, 8, 12, 16];
 
+/* 并发数是一组单选项，迁移前是 8 枚各自独立的裸 <button class="chip">，
+   选中态靠自绘 .chip.active（淡强调底 + 强调色字）。这类"单选按钮组"
+   在 myui 里正是 MySegmented 的场景——选中/未选、键盘方向键导航、
+   radio 语义与无障碍全部由库承担，这里不再维护第二套选中态配色。 */
+const CONCURRENCY_OPTIONS = CONCURRENCY_CHOICES.map((n) => ({
+  label: n === DEFAULT_SFTP_CONCURRENCY ? `${n}（默认）` : String(n),
+  value: n,
+}));
+
 const sftpConcurrency = ref(getSftpDownloadConcurrency());
 
-function setConcurrency(n: number): void {
+function setConcurrency(v: string | number | boolean): void {
+  const n = typeof v === "number" ? v : Number(v);
+  if (!Number.isFinite(n) || !CONCURRENCY_CHOICES.includes(n)) return;
   sftpConcurrency.value = n;
   setSftpDownloadConcurrency(n);
 }
@@ -28,19 +39,12 @@ function setConcurrency(n: number): void {
   >
     <div class="field">
       <label class="field-label">并发下载线程数</label>
-      <div class="chip-row">
-        <button
-          v-for="n in CONCURRENCY_CHOICES"
-          :key="n"
-          class="chip"
-          :class="{ active: sftpConcurrency === n }"
-          :title="n === DEFAULT_SFTP_CONCURRENCY ? '默认' : undefined"
-          type="button"
-          @click="setConcurrency(n)"
-        >
-          {{ n }}{{ n === DEFAULT_SFTP_CONCURRENCY ? "（默认）" : "" }}
-        </button>
-      </div>
+      <MySegmented
+        :model-value="sftpConcurrency"
+        :options="CONCURRENCY_OPTIONS"
+        size="small"
+        @update:model-value="setConcurrency"
+      />
     </div>
     <div class="chip-hint">
       线程数决定同时下载的文件数（单一文件不受影响）。所有线程复用同一条 SSH 连接，过高线程数对高延迟链路收益有限、部分服务器可能限制并发句柄。修改对下一次下载立即生效。ZMODEM（终端
@@ -62,31 +66,8 @@ function setConcurrency(n: number): void {
   font-weight: 500;
 }
 
-.chip-row {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.chip {
-  min-width: 44px;
-  padding: 8px 10px;
-  background: var(--bg-input);
-  color: var(--text-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  font-size: 12px;
-  font-weight: 400;
-  cursor: pointer;
-  transition: all var(--duration-fast) var(--ease-in-out);
-}
-
-.chip.active {
-  background: var(--accent-primary-muted);
-  color: var(--accent-primary);
-  border-color: var(--accent-primary);
-  font-weight: 600;
-}
+/* 并发线程数改用 MySegmented 后，.chip-row / .chip 及自绘的 .chip.active
+   选中态全部删除——单选按钮组的选中表达由 myui 承接。 */
 
 .chip-hint {
   font-size: 11px;

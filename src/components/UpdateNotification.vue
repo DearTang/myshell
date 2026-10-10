@@ -10,8 +10,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { Bell } from "@element-plus/icons-vue";
-import { MyButton } from "myui";
+import { MyButton, MyIcon } from "myui";
 import {
   downloadUpdate,
   installUpdate,
@@ -146,7 +145,7 @@ function openBrowser(): void {
     <div class="header">
       <div class="icon-circle">
         <span class="icon">
-          <el-icon :size="22"><Bell /></el-icon>
+          <MyIcon :size="22" name="Bell" />
         </span>
       </div>
       <div class="title">MyShell 有新版本可用</div>

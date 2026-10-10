@@ -52,6 +52,55 @@ export function getTerminal(sessionId?: string): Terminal | undefined {
   return sessionId ? terminalRegistry.get(sessionId) : undefined;
 }
 
+// ── 命令历史刷新回调注册表（非响应式）──
+// 2026-10-10：CommandBar 从 TerminalPanel 内部提升到壳层底部行之后，两者不再
+// 是父子关系，原来那条 `@register-refresh` 的 emit 直连断了。改走与
+// terminalRegistry 对称的注册表：CommandBar 按 connectionId 注册自己的 reload，
+// TerminalPanel 录完一条命令后按 connectionId 触发。
+// 注意 CommandBar 是**挂载时 + connectionId 变化时**加载历史的，不是开浮层时，
+// 所以这条回调是历史列表能立刻出现刚跑过那条命令的唯一机制，不能省。
+const historyRefreshers = new Map<string, () => void>();
+
+export function registerHistoryRefresher(connectionId: string, fn: () => void): void {
+  historyRefreshers.set(connectionId, fn);
+}
+
+export function unregisterHistoryRefresher(connectionId: string): void {
+  historyRefreshers.delete(connectionId);
+}
+
+export function refreshCommandHistory(connectionId: string): void {
+  historyRefreshers.get(connectionId)?.();
+}
+
+// ── 会话动作注册表（非响应式）──
+// 壳层底部行的命令栏对所有 tab 都可见，但它要触发的动作（当前是「截图」）只有
+// 拥有那个 xterm 实例的 TerminalPanel 能做 —— 截图要用它闭包里的 term 与
+// 「正在截取」提示状态。TerminalPanel 挂载时注册，卸载时注销；壳层按 sessionId
+// 调用。与 terminalRegistry 同一套「会话实例向壳层暴露能力」的思路。
+const sessionActions = new Map<string, Map<string, () => void>>();
+
+export function registerSessionAction(sessionId: string, action: string, fn: () => void): void {
+  let m = sessionActions.get(sessionId);
+  if (!m) {
+    m = new Map();
+    sessionActions.set(sessionId, m);
+  }
+  m.set(action, fn);
+}
+
+export function unregisterSessionAction(sessionId: string, action: string): void {
+  const m = sessionActions.get(sessionId);
+  if (!m) return;
+  m.delete(action);
+  if (m.size === 0) sessionActions.delete(sessionId);
+}
+
+export function callSessionAction(sessionId: string | undefined, action: string): void {
+  if (!sessionId) return;
+  sessionActions.get(sessionId)?.get(action)?.();
+}
+
 export function getTab(tabId: string): Tab | undefined {
   return sessions.tabs.find((t) => t.id === tabId);
 }

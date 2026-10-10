@@ -13,9 +13,8 @@
      规则经 getCommandRules 拉取一次缓存；拉取失败时不高亮、仅展示原文。 -->
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from "vue";
-import { Warning } from "@element-plus/icons-vue";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
-import { MyButton, MyDialog } from "myui";
+import { MyButton, MyDialog, MyIcon } from "myui";
 import { resolveMcpConfirm, ui } from "@/store/ui";
 import { getCommandRules } from "@/api";
 import type { CommandRules } from "@/api";
@@ -133,7 +132,7 @@ function onCancel(): void {
       </div>
       <div v-if="ui.mcpConfirm.reasons.length > 0" class="reasons-box">
         <div class="reasons-title">
-          <el-icon class="reasons-icon" :size="12"><Warning /></el-icon>
+          <MyIcon class="reasons-icon" :size="12" name="Warning" />
           危害说明（命中的危险规则）
         </div>
         <ul class="reasons-list">

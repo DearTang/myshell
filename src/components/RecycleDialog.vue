@@ -6,8 +6,7 @@
      显式禁用以守住行为不变）。清空按钮随旧版留在 #header 行内；#footer 放底部提示条。 -->
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { Delete, Warning } from "@element-plus/icons-vue";
-import { MyButton, MyDialog, confirmDialog, toast } from "myui";
+import { MyButton, MyDialog, MyIcon, MyResultState, confirmDialog, toast } from "myui";
 import type { ConnType, DeletedConnection } from "@/api";
 import {
   getDeletedConnections,
@@ -149,12 +148,14 @@ function relativeTime(iso: string): string {
     dismissable
     :close-on-press-escape="false"
     class="recycle-dialog"
+    body-class="recycle-dialog-body"
+    footer-class="recycle-dialog-footer"
     @cancel="emit('close')"
   >
     <template #header>
       <div class="dlg-header">
         <span class="header-icon">
-          <el-icon :size="18"><Delete /></el-icon>
+          <MyIcon :size="18" name="Delete" />
         </span>
         <div class="header-text">
           <div class="header-title">找回连接</div>
@@ -176,23 +177,25 @@ function relativeTime(iso: string): string {
 
     <!-- List -->
     <div class="list">
-      <div v-if="!loading && loadError" class="empty-state">
-        <div class="empty-icon">
-          <el-icon :size="36"><Warning /></el-icon>
-        </div>
-        加载失败：{{ loadError }}
-        <div class="empty-hint">回收站的内容未知，请先确认保险库已解锁，然后重试</div>
-        <MyButton variant="secondary" size="small" style="margin-top: 8px" @click="reload">
-          重试
-        </MyButton>
-      </div>
-      <div v-else-if="!loading && items.length === 0" class="empty-state">
-        <div class="empty-icon">
-          <el-icon :size="36"><Delete /></el-icon>
-        </div>
-        回收站为空
-        <div class="empty-hint">删除的连接会暂存在这里</div>
-      </div>
+      <MyResultState
+        v-if="!loading && loadError"
+        class="empty-state"
+        type="error"
+        :title="`加载失败：${loadError}`"
+        description="回收站的内容未知，请先确认保险库已解锁，然后重试"
+        retryable
+        retry-text="重试"
+        compact
+        @retry="reload"
+      />
+      <MyResultState
+        v-else-if="!loading && items.length === 0"
+        class="empty-state"
+        type="empty"
+        title="回收站为空"
+        description="删除的连接会暂存在这里"
+        compact
+      />
       <template v-else>
         <div v-for="item in items" :key="item.id" class="row">
           <i
@@ -241,14 +244,18 @@ function relativeTime(iso: string): string {
 </template>
 
 <style scoped>
-/* ── MyDialog 壳适配（class 经 attrs 透传到 el-dialog 根元素，故用 :global） ── */
+/* ── MyDialog 壳适配 ──
+   body / footer 的样式挂在我ui 0.28.0 新增的 bodyClass / footerClass 上，
+   不再写 `.el-dialog__body` / `.el-dialog__footer`——那些是 EP 的内部类名，
+   myui 换底层时会静默失效。仍需 :global：EP 渲染出的容器不带本组件的
+   scope id，scoped 选择器匹配不到。 */
 :global(.recycle-dialog.el-dialog) {
   display: flex;
   flex-direction: column;
   max-height: 80vh;
 }
 
-:global(.recycle-dialog .el-dialog__body) {
+:global(.recycle-dialog-body) {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -289,24 +296,10 @@ function relativeTime(iso: string): string {
   padding: 8px;
 }
 
+/* 空态 / 错误态由 MyResultState 承载（自带图标、文案层级与重试按钮），
+   这里只保留它在对话框正文里的居中与留白。 */
 .empty-state {
-  padding: 48px 20px;
   text-align: center;
-  color: var(--text-muted);
-  font-size: 13px;
-  line-height: 1.7;
-}
-
-.empty-icon {
-  font-size: 36px;
-  opacity: 0.3;
-  margin-bottom: 14px;
-}
-
-.empty-hint {
-  margin-top: 6px;
-  font-size: 11px;
-  color: var(--text-tertiary);
 }
 
 .row {
@@ -355,7 +348,7 @@ function relativeTime(iso: string): string {
 }
 
 /* 让 #footer 分隔线紧贴 body 结束处（去掉 EP footer 自带的 padding-top） */
-:global(.recycle-dialog .el-dialog__footer) {
+:global(.recycle-dialog-footer) {
   padding-top: 0;
 }
 

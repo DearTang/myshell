@@ -2,8 +2,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { CircleClose, Delete, Download, PriceTag, RefreshLeft, Upload } from "@element-plus/icons-vue";
-import { MyButton, MyDialog, MyInput, MySection, confirmDialog } from "myui";
+import { MyButton, MyDialog, MyIcon, MyInput, MySection, confirmDialog } from "myui";
 import {
   exportConnections,
   importConnections,
@@ -184,7 +183,7 @@ async function handleRollback(version: string): Promise<void> {
   <!-- 导入导出 -->
   <MySection title="配置导入导出" description="导出连接配置到加密文件，或从文件导入">
     <div v-if="ioErr" class="msg-box error">
-      <el-icon :size="14"><CircleClose /></el-icon>
+      <MyIcon :size="14" name="CircleClose" />
       {{ ioErr }}
     </div>
 
@@ -195,7 +194,7 @@ async function handleRollback(version: string): Promise<void> {
         :disabled="exportBusy || importBusy"
         @click="startExport"
       >
-        <el-icon :size="14"><Upload /></el-icon>
+        <MyIcon :size="14" name="Upload" />
         导出配置
       </MyButton>
       <MyButton
@@ -204,7 +203,7 @@ async function handleRollback(version: string): Promise<void> {
         :disabled="exportBusy || importBusy"
         @click="startImport"
       >
-        <el-icon :size="14"><Download /></el-icon>
+        <MyIcon :size="14" name="Download" />
         导入配置
       </MyButton>
     </div>
@@ -212,7 +211,7 @@ async function handleRollback(version: string): Promise<void> {
 
     <!-- 回收站入口 — 恢复或彻底清除软删除的连接。 -->
     <MyButton variant="secondary" class="recycle-btn" @click="ui.showRecycle = true">
-      <el-icon :size="14"><Delete /></el-icon>
+      <MyIcon :size="14" name="Delete" />
       找回连接 / 回收站
     </MyButton>
   </MySection>
@@ -223,7 +222,7 @@ async function handleRollback(version: string): Promise<void> {
   <MySection title="版本备份与回退" description="升级时自动备份配置，支持回退到旧版本">
     <div class="version-card">
       <span class="version-icon">
-        <el-icon :size="16"><PriceTag /></el-icon>
+        <MyIcon :size="16" name="PriceTag" />
       </span>
       <div>
         <div class="version-label">当前版本</div>
@@ -246,7 +245,7 @@ async function handleRollback(version: string): Promise<void> {
       :disabled="rollbackBusy"
       @click="handleRollback(previousVersion)"
     >
-      <el-icon :size="14"><RefreshLeft /></el-icon>
+      <MyIcon :size="14" name="RefreshLeft" />
       快速回退到上一版本 ({{ previousVersion }})
     </MyButton>
 

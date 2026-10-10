@@ -144,6 +144,19 @@ html.light {
   --surface-translucent: var(--glass-bg);
   --surface-translucent-hover: var(--bg-surface-hover);
   --danger: var(--error);
+  /* 状态色淡底：myui 叫 -subtle，MyShell 叫 -muted，语义一一对应。
+     myui 的 my-tone.types.ts 把 "--xxx-subtle" 当字符串交给 MyIconTile 写成
+     内联样式，静态扫 CSS 产物必然查不到引用，此处必须显式桥接。
+     透明度惯例两侧一致：暗 0.12 / 亮 0.1。 */
+  --success-subtle: var(--success-muted);
+  --warning-subtle: var(--warning-muted);
+  --danger-subtle: var(--error-muted); /* myui 叫 danger，MyShell 叫 error */
+  --info-subtle: var(--info-muted);
+  /* 圆角桥：myui 的 element-theme 把 EP 圆角压平成 6px 单档，MyShell 是
+     6/10/14 的三档。不桥的话每个 myui 按钮都比迁移前的裸 button 少一档
+     圆角（迁移前 .bar-btn / .ddp-btn / .backend-chip 都是 --radius-md）。 */
+  --el-border-radius-base: var(--radius-md);
+  --el-border-radius-small: var(--radius-sm);
   --ui-topbar-h: 44px;
   /* 状态栏已移除；此变量仅为 UpdateNotification 等浮层的底部偏移保留 */
   --ui-statusbar-h: 0px;
@@ -196,12 +209,20 @@ body {
 }
 
 /* ═══════════════ App Shell 布局 ═══════════════
-   TabBar 横贯顶部；左侧连接树；中央工作区；右侧 AI 面板（可选）；底部状态栏 */
+   顶栏横贯顶部；左侧连接树；中央工作区；右侧 AI 面板（可选）；
+   最底一行是**贯穿整个窗口宽度**的底栏（命令栏 + 服务器状态栏）。
+
+   2026-10-10 新增 bottom 行。此前命令栏嵌在 TerminalPanel 内部、状态栏是
+   .shell-work 的最后一个子元素，两者都只占"工作区"那一列；右侧 AI 栏与工作区
+   同高、自带底部两行，于是同一条高度上并排着两种底栏（红框那种混排）。
+   把它们提升为壳层的第三行后，AI 栏（grid-area: ai，只在第二行）的底边自动
+   停在底栏上沿，输入区上移到底栏之上。 */
 .app-shell {
   display: grid;
   grid-template:
     "topbar topbar topbar" var(--ui-topbar-h)
     "side   work   ai" 1fr
+    "bottom bottom bottom" auto
     / var(--ui-sidebar-w) minmax(0, 1fr) auto;
   height: 100%;
   transition: grid-template-columns 0.2s var(--ease-in-out);
@@ -216,11 +237,23 @@ body {
   grid-template:
     "topbar topbar" var(--ui-topbar-h)
     "side   work" 1fr
+    "bottom bottom" auto
     / var(--ui-sidebar-w) minmax(0, 1fr);
 }
 
 .app-shell.sidebar-collapsed.no-ai {
   grid-template-columns: 44px minmax(0, 1fr);
+}
+
+/* 底栏容器：命令栏 + 服务器状态栏。两者都可能不渲染（SFTP/欢迎页/多窗口模式），
+   此时整行高度为 0，不留空带。 */
+.app-shell > .shell-bottom {
+  grid-area: bottom;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  position: relative;
+  z-index: 2;
 }
 
 .app-shell > .shell-side {
@@ -254,8 +287,8 @@ body {
   min-height: 0;
   overflow: hidden;
   background: var(--surface-translucent);
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
   border-left: 1px solid var(--glass-border);
   position: relative;
   z-index: 2;
@@ -274,8 +307,9 @@ body {
   z-index: 0;
 }
 
-/* 标签页堆叠层：占据底部监控条以上的全部空间，作为 .tab-stack 的定位
-   上下文（inset:0 以此为基准），终端不会铺到监控条底下 */
+/* 标签页堆叠层：占据工作区的全部空间，作为 .tab-stack 的定位上下文
+   （inset:0 以此为基准）。2026-10-10 起监控条移到了壳层底栏（.shell-bottom），
+   不再是这个 flex 列的子元素，所以本层现在就是工作区的全部可用高度。 */
 .work-panes {
   position: relative;
   flex: 1;

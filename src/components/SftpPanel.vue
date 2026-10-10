@@ -6,19 +6,6 @@
 import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
-  Back,
-  Close,
-  Document,
-  Download,
-  Edit,
-  Folder,
-  FolderAdd,
-  RefreshRight,
-  Right,
-  Top,
-  Upload,
-} from "@element-plus/icons-vue";
-import {
   ftpCancelTransfer,
   ftpDownload,
   ftpListDir,
@@ -39,7 +26,19 @@ import {
 } from "@/api";
 import type { FileEntry, SftpTransferProgressPayload, Tab } from "@/api";
 import { getSftpDownloadConcurrency } from "@/utils/transfer-settings";
-import { MyButton, MyDialog, MyInput, MyProgress, MySpinner, confirmDialog, toast } from "myui";
+import {
+  MyBadge,
+  MyButton,
+  MyCheckbox,
+  MyDialog,
+  MyIcon,
+  MyIconButton,
+  MyInput,
+  MyProgress,
+  MySpinner,
+  confirmDialog,
+  toast,
+} from "myui";
 
 defineOptions({ name: "SftpPanel" });
 
@@ -244,7 +243,7 @@ function goUp(): void {
 }
 
 // 新建目录输入条出现时自动聚焦（等价旧 autoFocus）。
-const mkdirInputRef = ref<HTMLInputElement | null>(null);
+const mkdirInputRef = ref<InstanceType<typeof MyInput> | null>(null);
 watch(showMkdir, (v) => {
   if (v) void nextTick(() => mkdirInputRef.value?.focus());
 });
@@ -534,43 +533,71 @@ const remaining = computed(() => {
   <div class="sftp-panel" :class="{ 'full-height': fullHeight }">
     <!-- Toolbar -->
     <div class="toolbar">
-      <button type="button" class="nav-btn" title="后退" :disabled="historyIndex <= 0" @click="goBack">
-        <el-icon :size="14"><Back /></el-icon>
-      </button>
-      <button
-        type="button"
+      <MyIconButton
+        title="后退"
         class="nav-btn"
+        label="后退"
+        size="14"
+        name="Back"
+        :disabled="historyIndex <= 0"
+        @click="goBack"
+      />
+      <MyIconButton
         title="前进"
+        class="nav-btn"
+        label="前进"
+        size="14"
+        name="Right"
         :disabled="historyIndex >= history.length - 1"
         @click="goForward"
-      >
-        <el-icon :size="14"><Right /></el-icon>
-      </button>
-      <button type="button" class="nav-btn" title="上级目录" @click="goUp">
-        <el-icon :size="14"><Top /></el-icon>
-      </button>
-      <button type="button" class="nav-btn" title="刷新" @click="loadDir(currentPath)">
-        <el-icon :size="14"><RefreshRight /></el-icon>
-      </button>
+      />
+      <MyIconButton
+        title="上级目录" class="nav-btn" label="上级目录" size="14" name="Top" @click="goUp" />
+      <MyIconButton
+        title="刷新" class="nav-btn" label="刷新" size="14" name="RefreshRight" @click="loadDir(currentPath)" />
       <div class="toolbar-sep" />
-      <button type="button" class="nav-btn" title="新建文件夹" @click="showMkdir = !showMkdir">
-        <el-icon :size="14"><FolderAdd /></el-icon>
-      </button>
+      <MyIconButton
+        title="新建文件夹"
+        class="nav-btn"
+        label="新建文件夹"
+        size="14"
+        name="FolderAdd"
+        @click="showMkdir = !showMkdir"
+      />
       <template v-if="source === 'ssh'">
         <div class="toolbar-sep" />
-        <button type="button" class="nav-btn" title="上传文件（可多选）" @click="handleUpload">
-          <el-icon :size="14"><Upload /></el-icon>
-        </button>
-        <button
-          type="button"
+        <MyIconButton
+          title="上传文件（可多选）"
           class="nav-btn"
-          :title="selectedFileEntries.length > 0 ? `下载 ${selectedFileEntries.length} 个选中文件` : '下载选中文件（先勾选文件）'"
+          label="上传文件（可多选）"
+          size="14"
+          name="Upload"
+          @click="handleUpload"
+        />
+        <MyIconButton
+          :title="
+            selectedFileEntries.length > 0
+              ? `下载 ${selectedFileEntries.length} 个选中文件`
+              : '下载选中文件（先勾选文件）'
+          "
+          class="nav-btn"
+          :label="
+            selectedFileEntries.length > 0
+              ? `下载 ${selectedFileEntries.length} 个选中文件`
+              : '下载选中文件（先勾选文件）'
+          "
+          size="14"
+          name="Download"
           :disabled="selectedFileEntries.length === 0"
           @click="handleDownload"
         >
-          <el-icon :size="14"><Download /></el-icon>
-          <span v-if="selectedFileEntries.length > 0" class="nav-count">{{ selectedFileEntries.length }}</span>
-        </button>
+          <MyBadge
+            v-if="selectedFileEntries.length > 0"
+            class="nav-count"
+            type="primary"
+            :value="selectedFileEntries.length"
+          />
+        </MyIconButton>
       </template>
     </div>
 
@@ -591,14 +618,22 @@ const remaining = computed(() => {
         <polyline points="4 5 7 8 4 11" />
         <line x1="9" y1="11" x2="12" y2="11" />
       </svg>
-      <input v-model="currentPath" class="path-input" @keydown.enter="navigateTo(currentPath)" />
+      <MyInput
+        v-model="currentPath"
+        bare
+        size="small"
+        class="path-input"
+        @keydown.enter="navigateTo(currentPath)"
+      />
     </div>
 
     <!-- Mkdir Input -->
     <div v-if="showMkdir" class="mkdir-bar">
-      <input
+      <MyInput
         ref="mkdirInputRef"
         v-model="newFolderName"
+        bare
+        size="small"
         class="mkdir-input"
         placeholder="文件夹名称"
         @keydown.enter="handleMkdir"
@@ -636,22 +671,18 @@ const remaining = computed(() => {
         >
           <!-- Checkbox — files only (folders aren't transferable, files-only contract). -->
           <span v-if="source === 'ssh'" class="col-check">
-            <input
+            <MyCheckbox
               v-if="!entry.is_dir"
-              type="checkbox"
               class="row-check"
-              :checked="selected.has(entry.path)"
+              :model-value="selected.has(entry.path)"
               @click.stop
-              @change="toggleSelected(entry.path)"
+              @update:model-value="toggleSelected(entry.path)"
             />
           </span>
           <!-- Icon — dirs use accent-primary (blue), files a neutral muted glyph,
               so SFTP and SSH tabs read as one surface. -->
           <span class="col-icon" :class="entry.is_dir ? 'is-dir' : 'is-file'">
-            <el-icon :size="entry.is_dir ? 15 : 14">
-              <Folder v-if="entry.is_dir" />
-              <Document v-else />
-            </el-icon>
+            <MyIcon :size="entry.is_dir ? 15 : 14" :icon="entry.is_dir ? 'Folder' : 'Document'" />
           </span>
           <!-- Name — dirs get accent-primary color + medium weight to match the
               SSH visual grammar (accent = navigable/interactive). -->
@@ -669,10 +700,10 @@ const remaining = computed(() => {
           <!-- Actions -->
           <span class="col-actions">
             <span class="row-action rename" title="重命名" @click.stop="openRenameDialog(entry)">
-              <el-icon :size="12"><Edit /></el-icon>
+              <MyIcon :size="12" name="Edit" />
             </span>
             <span class="row-action delete" title="删除" @click.stop="handleDelete(entry)">
-              <el-icon :size="13"><Close /></el-icon>
+              <MyIcon :size="13" name="Close" />
             </span>
           </span>
         </div>
@@ -761,21 +792,12 @@ const remaining = computed(() => {
   flex-shrink: 0;
 }
 
+/* 工具栏导航钮：外观（悬停/按下/禁用/焦点环）由 MyIconButton 承担，
+   这里只保留工具栏密度与「禁用时明显变淡」的额外弱化
+   （库的 disabled 只降色，导航类按钮需要更强的不可用暗示）。 */
 .nav-btn {
-  background: transparent;
-  color: var(--text-secondary);
   padding: 5px 6px;
-  font-size: 13px;
-  border-radius: var(--radius-sm);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid transparent;
-  cursor: pointer;
-  transition:
-    background var(--duration-fast),
-    color var(--duration-fast),
-    border-color var(--duration-fast);
+  color: var(--text-secondary);
 }
 
 .nav-btn:hover:not(:disabled) {
@@ -785,9 +807,7 @@ const remaining = computed(() => {
 }
 
 .nav-btn:disabled {
-  color: var(--text-muted);
   opacity: 0.35;
-  cursor: default;
 }
 
 .nav-count {
@@ -816,22 +836,13 @@ const remaining = computed(() => {
   flex-shrink: 0;
 }
 
+/* 路径栏：外观由 MyInput 的 bare+small 承担，这里只留布局与等宽字体
+   （路径是代码性文本，比例字体会让 / 与数字对不齐）。 */
 .path-input {
   flex: 1;
   min-width: 0;
-  background: var(--bg-input);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-sm);
-  padding: 4px 8px;
-  color: var(--text-primary);
-  font-size: 11px;
   font-family: "JetBrains Mono", "Cascadia Code", "Fira Code", ui-monospace, monospace;
   letter-spacing: -0.01em;
-  outline: none;
-}
-
-.path-input:focus {
-  border-color: var(--border-accent);
 }
 
 /* ─── 新建目录条 ─── */
@@ -847,17 +858,6 @@ const remaining = computed(() => {
 .mkdir-input {
   flex: 1;
   min-width: 0;
-  background: var(--bg-input);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-sm);
-  padding: 3px 8px;
-  color: var(--text-primary);
-  font-size: 12px;
-  outline: none;
-}
-
-.mkdir-input:focus {
-  border-color: var(--border-accent);
 }
 
 /* ─── 列头 ─── */
@@ -967,10 +967,9 @@ const remaining = computed(() => {
   align-items: center;
 }
 
+/* 复选框本体与强调色由 MyCheckbox 承担，这里只留行内对齐。 */
 .row-check {
   margin: 0;
-  accent-color: var(--accent-primary);
-  cursor: pointer;
 }
 
 .col-icon {

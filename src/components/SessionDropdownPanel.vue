@@ -1,28 +1,26 @@
-<!-- 通用"锚定下拉面板"：列出会话标签。由顶栏"当前会话"入口（全部标签）和
-     广播徽标（广播组成员）共用。面板经 anchorRect 右对齐定位到触发钮下方。
+<!-- 通用"锚定下拉面板"：列出全部会话标签，锚定到顶栏的「当前会话」触发钮下方。
      每行显示连接图标 + 完整标签名（绝不截断——本面板存在的意义就是标签条
-     放不下名字）+ 状态点 + 可选的行尾操作（关闭 / 退出广播），可选的行内
-     次操作（广播切换）。点击行切换到该标签并关闭面板；点外与 Esc 均关闭。
+     放不下名字）+ 状态点 + 行尾操作（关闭 / 退出广播），以及行内次操作（广播切换）。
+     点击行切换到该标签并关闭面板；点外与 Esc 均关闭。
+     2026-10-10 起不再有独立的「广播」面板：广播组是全部标签页的子集，
+     单独一个面板与「当前会话」列的是同一批行，改为在本面板内用标题行的
+     批量动作 + 行内 📡 开关管理广播，标题行右侧保留广播计数徽标。
      本文件还导出两个辅助：readAnchorRect（锚点矩形读取）与
      DropdownTrigger（触发按钮，样式由使用方 AppTopBar 的 scoped CSS 提供：
      父作用域 id 只会落到子组件根节点，故内部 span 走 :deep()）。 -->
 <script lang="ts">
 import { defineComponent, h, ref } from "vue";
-import { ElIcon } from "element-plus";
-import { Document, Promotion } from "@element-plus/icons-vue";
+import { MyButton, MyIcon, MyListRow, MyStatusDot, type MyTone } from "myui";
 import type { Tab } from "@/api";
 
-/** 面板/触发钮可用的框架图标（EP 单色图标，取代旧 emoji）。 */
+/** 面板/触发钮可用的框架图标（myui 注册表名，取代旧 emoji）。
+ *  存字符串名而非组件：MyIcon 的 icon/name 入参都接受注册表名，
+ *  模板与 render 函数可共用同一份映射，不必再引 @element-plus/icons-vue。 */
 export const DROPDOWN_ICONS = {
-  Document,
-  Promotion,
+  Document: "Document",
+  Promotion: "Promotion",
 } as const;
 export type DropdownIconName = keyof typeof DROPDOWN_ICONS;
-
-/** 按名字渲染 EP 图标的辅助（render 函数用）。 */
-function renderIcon(name: DropdownIconName, size = 14) {
-  return h(ElIcon, { size }, () => h(DROPDOWN_ICONS[name]));
-}
 
 /** 每行的数据：tab + 行尾主操作（如"✕"关闭 / "退出"广播组）。 */
 export interface DropdownRow {
@@ -55,14 +53,25 @@ export function readAnchorRect(el: HTMLElement | null): { right: number; top: nu
   return { right: r.right, top: r.bottom };
 }
 
-/** 两个下拉触发钮（当前会话 / 广播）共用的切换按钮：图标 + 文案 + 计数徽标。
- * 父组件通过组件 ref（`$el`）拿按钮 DOM 作为定位锚点。 */
+/** 下拉触发钮（图标 + 文案 + 计数徽标 + 广播徽标）。父组件通过组件 ref（`$el`）
+ *  拿按钮 DOM 作为定位锚点。
+ *
+ *  2026-10-10：「当前会话」与「广播」合并为**同一个**触发钮（两个面板列的是同一批
+ *  标签页，只是筛选口径不同，用户视角确实重叠），广播状态改为挂在计数右侧的
+ *  📡 徽标，面板内提供批量加入/退出广播与逐行切换。
+ *
+ *  同时把这里的裸 `<button>` 收口到 `MyButton`——阶段 170 的裸 button 盘点只扫了
+ *  模板里的 `<button`，本组件走 `h()` 渲染路径被漏掉了。用 `variant="ghost"`
+ *  （EP text 按钮，透明底无边框）贴合顶栏原有的无框观感，其余盒模型仍由
+ *  AppTopBar 的 scoped CSS 覆盖。 */
 export const DropdownTrigger = defineComponent({
   name: "DropdownTrigger",
   props: {
     iconName: { type: String, required: true },
     label: { type: String, required: true },
     count: { type: Number, required: true },
+    /** 广播组成员数；0 时不渲染 📡 徽标。 */
+    broadcastCount: { type: Number, default: 0 },
     active: { type: Boolean, default: false },
     title: { type: String, required: true },
     accent: { type: Boolean, default: false },
@@ -72,9 +81,10 @@ export const DropdownTrigger = defineComponent({
     const hover = ref(false);
     return () =>
       h(
-        "button",
+        MyButton,
         {
-          type: "button",
+          variant: props.accent ? "ghost-primary" : "ghost",
+          size: "small",
           class: [
             "dropdown-trigger",
             { "is-active": props.active, "is-accent": props.accent, "is-hover": hover.value },
@@ -88,15 +98,34 @@ export const DropdownTrigger = defineComponent({
             hover.value = false;
           },
         },
-        [
-          h("span", { class: "trigger-icon" }, renderIcon(props.iconName as DropdownIconName)),
-          h("span", { class: "trigger-label" }, props.label),
-          h(
-            "span",
-            { class: ["trigger-count", { "is-hot": props.active || props.accent }] },
-            String(props.count),
-          ),
-        ],
+        {
+          default: () => [
+            h(MyIcon, { size: 14, name: props.iconName, class: "trigger-icon", decorative: true }),
+            h("span", { class: "trigger-label" }, props.label),
+            // 两枚计数徽标都带图标，构成一对：「N 个终端会话」与「其中 N 个在广播组」。
+            // 此前只有广播那枚有图标（📡 纸飞机），会话那枚是光秃秃的数字，两枚
+            // 形态不一致、读起来对不上号。会话数用 Terminal 图标 —— 它数的正是终端
+            // 会话，且与 📡（发往）构成「发往这 N 个」的语义对照。
+            h(
+              "span",
+              { class: ["trigger-count", { "is-hot": props.active || props.accent }] },
+              [h(MyIcon, { size: 10, name: "Terminal", decorative: true }), String(props.count)],
+            ),
+            props.broadcastCount > 0
+              ? h(
+                  "span",
+                  {
+                    class: "trigger-bcast",
+                    title: `${props.broadcastCount} 个标签页在广播组中`,
+                  },
+                  [
+                    h(MyIcon, { size: 10, name: "Promotion", decorative: true }),
+                    String(props.broadcastCount),
+                  ],
+                )
+              : null,
+          ],
+        },
       );
   },
 });
@@ -108,12 +137,17 @@ import ConnIcon from "./ConnIcon.vue";
 
 defineOptions({ name: "SessionDropdownPanel" });
 
-/** 状态 → 彩色圆点，与标签条内联指示器共享语义。 */
-const STATUS_DOT: Record<NonNullable<Tab["status"]>, { color: string; title: string }> = {
-  connecting: { color: "var(--warning)", title: "连接中" },
-  connected: { color: "var(--success)", title: "已连接" },
-  disconnected: { color: "var(--error)", title: "已断开" },
-  error: { color: "var(--error)", title: "连接失败" },
+/** 状态 → 语义色调 + 文案。颜色与光晕由 MyStatusDot 的 tone/glow 承担，
+ *  故这里不再存 CSS 颜色值——原实现直接内联 `background: var(--error)`，
+ *  绕过了 MyShell 的令牌层（33 套配色预设换不掉它）。 */
+const STATUS_DOT: Record<
+  NonNullable<Tab["status"]>,
+  { tone: MyTone; title: string; pulse?: boolean; glow?: boolean }
+> = {
+  connecting: { tone: "warning", title: "连接中", pulse: true, glow: true },
+  connected: { tone: "success", title: "已连接" },
+  disconnected: { tone: "danger", title: "已断开" },
+  error: { tone: "danger", title: "连接失败", glow: true },
 };
 
 const props = withDefaults(
@@ -140,8 +174,11 @@ const props = withDefaults(
     rowSecondaryAction?: (tab: Tab) => RowSecondaryActionInfo | undefined;
     /** 次操作点击回调。 */
     onRowSecondaryAction?: (tab: Tab) => void;
+    /** 广播组成员数——标题行渲染 📡 徽标（0 时不渲染）。合并「广播」面板后
+     *  由调用方直接喂 store 的 broadcastCount。 */
+    broadcastCount?: number;
   }>(),
-  { disconnectedCount: 0 },
+  { disconnectedCount: 0, broadcastCount: 0 },
 );
 
 const panelRef = ref<HTMLDivElement | null>(null);
@@ -162,7 +199,7 @@ const panelLeft = computed(() => `${Math.max(8, props.anchorRect.right - PANEL_W
 const panelTop = computed(() => `${props.anchorRect.top + GAP}px`);
 
 interface RenderRow extends DropdownRow {
-  dot: { color: string; title: string };
+  dot: { tone: MyTone; title: string; pulse?: boolean; glow?: boolean };
   secondary: RowSecondaryActionInfo | null;
 }
 
@@ -184,91 +221,116 @@ function handleRowClick(row: DropdownRow): void {
 </script>
 
 <template>
-  <!-- 全屏点击拦截层——点击面板外任意处关闭（含再次点击触发钮，即切换关闭）。 -->
-  <div class="ddp-overlay" @click="onClose()" />
-  <div
-    ref="panelRef"
-    class="ddp-panel"
-    :style="{ left: panelLeft, top: panelTop }"
-    @click.stop
-  >
+  <!-- 必须 Teleport 到 body：面板挂在 AppTopBar 里，而顶栏带
+       `backdrop-filter`（毛玻璃）+ `overflow: hidden` —— **这两个属性会让顶栏
+       成为其后代的 position:fixed 包含块并裁剪之**，面板会被裁到 44px 顶栏
+       高度之外，表现是「点当前会话/广播毫无反应」（遮罩同样被裁，连点外关闭
+       也失效）。Teleport 后脱离该包含块，scoped 的 data-v 属性仍保留，
+       样式照常生效。 -->
+  <Teleport to="body">
+    <!-- 全屏点击拦截层——点击面板外任意处关闭（含再次点击触发钮，即切换关闭）。 -->
+    <div class="ddp-overlay" @click="onClose()" />
+    <div
+      ref="panelRef"
+      class="ddp-panel"
+      :style="{ left: panelLeft, top: panelTop }"
+      @click.stop
+    >
     <!-- 标题行 -->
     <div class="ddp-header">
-      <span class="ddp-header-icon"><el-icon :size="14"><component :is="DROPDOWN_ICONS[iconName]" /></el-icon></span>
-      <button
+      <span class="ddp-header-icon"><MyIcon :size="14" :icon="DROPDOWN_ICONS[iconName]" /></span>
+      <MyButton
         v-if="onCloseDisconnected && disconnectedCount > 0"
-        type="button"
-        class="ddp-btn ddp-btn-danger"
+        class="ddp-btn"
+        variant="danger"
+        outline
+        size="small"
         :title="`批量关闭 ${disconnectedCount} 个掉线的会话`"
         @click.stop="onCloseDisconnected()"
       >
         清理掉线 × {{ disconnectedCount }}
-      </button>
-      <button
+      </MyButton>
+      <MyButton
         v-for="(action, i) in batchActions"
         :key="i"
-        type="button"
         class="ddp-btn"
+        variant="secondary"
+        outline
+        size="small"
         :title="action.title || action.label"
         @click.stop="action.onClick()"
       >
         {{ action.label }}
-      </button>
+      </MyButton>
       <span class="ddp-count">{{ rows.length }}</span>
+      <span
+        v-if="broadcastCount > 0"
+        class="ddp-bcast"
+        :title="`${broadcastCount} 个标签页在广播组中，广播命令会发往这 ${broadcastCount} 个会话`"
+      >
+        <MyIcon :size="11" name="Promotion" />
+        {{ broadcastCount }}
+      </span>
     </div>
 
     <!-- 列表 -->
     <div class="ddp-list">
       <div v-if="rows.length === 0" class="ddp-empty">{{ emptyHint || "暂无会话" }}</div>
       <template v-else>
-        <div
+        <MyListRow
           v-for="row in renderRows"
           :key="row.tab.id"
           class="ddp-row"
-          :class="{ 'is-active': row.tab.id === activeTabId }"
+          clickable
+          :selected="row.tab.id === activeTabId"
           :title="row.tab.name"
-          @click="handleRowClick(row)"
+          @activate="handleRowClick(row)"
         >
-          <ConnIcon
-            class="ddp-row-icon"
-            :type="row.tab.connType || 'ssh'"
-            :size="15"
-          />
+          <template #lead>
+            <ConnIcon class="ddp-row-icon" :type="row.tab.connType || 'ssh'" :size="15" />
+          </template>
+
           <span class="ddp-row-name">{{ row.tab.name }}</span>
           <!-- 状态点 -->
-          <span
+          <MyStatusDot
             class="ddp-row-dot"
-            :title="row.dot.title"
-            :style="{
-              background: row.dot.color,
-              boxShadow: row.tab.status === 'connecting' ? `0 0 5px ${row.dot.color}` : 'none',
-            }"
+            :tone="row.dot.tone"
+            :pulse="row.dot.pulse"
+            :glow="row.dot.glow"
+            :aria-label="row.dot.title"
           />
-          <!-- 行内次操作（如广播切换） -->
-          <span
-            v-if="row.secondary"
-            class="ddp-row-secondary"
-            :class="{ 'is-on': row.secondary.active }"
-            :title="row.secondary.title"
-            @click.stop="onRowSecondaryAction?.(row.tab)"
-          >
-            <el-icon v-if="row.secondary.iconName" :size="12">
-              <component :is="DROPDOWN_ICONS[row.secondary.iconName]" />
-            </el-icon>
-            <template v-else>{{ row.secondary.label }}</template>
-          </span>
-          <span
-            v-if="row.onAction && row.actionLabel"
-            class="ddp-row-action"
-            :title="row.actionTitle"
-            @click.stop="row.onAction(row.tab)"
-          >
-            {{ row.actionLabel }}
-          </span>
-        </div>
+
+          <template #actions>
+            <!-- 行内次操作（如广播切换）与行尾主操作（关闭/退出）。
+                 两者原本各写一句 @click.stop 防冒泡到行；MyListRow 的
+                 closestInteractiveControl 只认原生交互控件与 ARIA widget 角色，
+                 这两个是 <span>，故按 myui 文档用 data-list-row-stop 显式豁免。 -->
+            <span
+              v-if="row.secondary"
+              class="ddp-row-secondary"
+              :class="{ 'is-on': row.secondary.active }"
+              data-list-row-stop
+              :title="row.secondary.title"
+              @click="onRowSecondaryAction?.(row.tab)"
+            >
+              <MyIcon v-if="row.secondary.iconName" :size="12" :icon="DROPDOWN_ICONS[row.secondary.iconName]" />
+              <template v-else>{{ row.secondary.label }}</template>
+            </span>
+            <span
+              v-if="row.onAction && row.actionLabel"
+              class="ddp-row-action"
+              data-list-row-stop
+              :title="row.actionTitle"
+              @click="row.onAction(row.tab)"
+            >
+              {{ row.actionLabel }}
+            </span>
+          </template>
+        </MyListRow>
       </template>
+      </div>
     </div>
-  </div>
+  </Teleport>
 </template>
 
 <style scoped>
@@ -307,12 +369,15 @@ function handleRowClick(row: DropdownRow): void {
 }
 
 /* ─── 标题行 ─── */
+/* 合并「广播」面板后批量动作最多可达 4 枚（全部重连 / 全部广播 / 退出全部广播 /
+   清理掉线），320px 宽放不下时换行而不是溢出裁切。 */
 .ddp-header {
   padding: 11px 14px;
   border-bottom: 1px solid var(--border-subtle);
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px 8px;
   font-size: 12px;
   font-weight: 600;
   color: var(--text-secondary);
@@ -322,41 +387,32 @@ function handleRowClick(row: DropdownRow): void {
   font-size: 14px;
 }
 
+/* 批量操作钮改用 MyButton + outline：描边、配色、hover 反色全部交给
+   myui（危险那枚是 danger 变体，hover 自动实心化，与迁移前一致）。
+   这里只留标题行里的外距与不换行。 */
 .ddp-btn {
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--text-secondary);
-  background: transparent;
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  padding: 3px 9px;
-  cursor: pointer;
   margin-right: 4px;
   white-space: nowrap;
-  transition: all var(--duration-fast) var(--ease-in-out);
-  font-family: inherit;
-}
-
-.ddp-btn:hover {
-  background: var(--bg-surface-hover);
-  border-color: var(--border-emphasis);
-}
-
-.ddp-btn-danger {
-  color: var(--error);
-  border-color: var(--error);
-}
-
-.ddp-btn-danger:hover {
-  /* 旧版为白字；白不是令牌，统一用反色文本令牌 */
-  background: var(--error);
-  color: var(--text-inverse);
 }
 
 .ddp-count {
   font-size: 11px;
   color: var(--text-muted);
   background: var(--bg-surface);
+  padding: 1px 8px;
+  border-radius: var(--radius-full);
+}
+
+/* 广播计数徽标：与 .ddp-count 同一形态，但着成功色 —— 面板标题行原本没有
+   任何语义色，这里用它标出"组内有 N 个会话会收到广播命令"。 */
+.ddp-bcast {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--success);
+  background: var(--success-muted);
   padding: 1px 8px;
   border-radius: var(--radius-full);
 }
@@ -386,12 +442,18 @@ function handleRowClick(row: DropdownRow): void {
   transition: background var(--duration-fast) var(--ease-in-out);
 }
 
-.ddp-row:hover:not(.is-active) {
+/* 行盒（flex / gap / padding / 圆角 / cursor / 过渡 / focus 环）由 MyListRow
+   提供，此处只保留两处 MyShell 的刻意偏离：
+   ① 悬停底色用 --bg-surface-hover 而非库的 --bg-elevated —— 后者在暗色 Carbon
+      下明显更暗，悬停反馈几乎消失；
+   ② 行内操作恒显（库默认 hover / 聚焦 / 选中时才浮现），关闭/退出是常驻操作，
+      不该藏起来。 */
+.ddp-row:hover:not(.is-selected) {
   background: var(--bg-surface-hover);
 }
 
-.ddp-row.is-active {
-  background: var(--accent-primary-muted);
+.ddp-row :deep(.my-list-row__actions) {
+  opacity: 1;
 }
 
 .ddp-row-icon {
@@ -400,7 +462,7 @@ function handleRowClick(row: DropdownRow): void {
 }
 
 /* 活动行图标着主色（覆盖 ConnIcon 的内联类型色，需 !important） */
-.ddp-row.is-active .ddp-row-icon {
+.ddp-row.is-selected .ddp-row-icon {
   color: var(--accent-primary) !important;
 }
 
@@ -415,16 +477,16 @@ function handleRowClick(row: DropdownRow): void {
   white-space: nowrap;
 }
 
-.ddp-row.is-active .ddp-row-name {
+.ddp-row.is-selected .ddp-row-name {
   color: var(--accent-primary);
   font-weight: 600;
 }
 
+/* 状态圆点：直径与发光由 MyStatusDot 的 size / glow / pulse 承担，
+   这里只把它按会话列表的密度压小一号并禁止收缩。 */
 .ddp-row-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: var(--radius-full);
   flex-shrink: 0;
+  transform: scale(0.875);
 }
 
 .ddp-row-secondary {

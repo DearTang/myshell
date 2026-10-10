@@ -3,7 +3,7 @@
      的输入状态为本地状态。 -->
 <script setup lang="ts">
 import { ref } from "vue";
-import { MyButton, MyInput, toast } from "myui";
+import { MyButton, MyIconButton, MyInput, toast } from "myui";
 import {
   fetchProviderModels,
   fetchModelsForSupplier,
@@ -128,15 +128,15 @@ defineExpose({ resetTransient });
           {{ model.label ? `${model.label} (${model.modelId})` : model.modelId }}
         </span>
         <span v-if="idx === 0" class="model-primary">主</span>
-        <button
+        <MyIconButton
           class="model-remove"
+          :label="idx === 0 ? '主模型不可删除' : '删除模型'"
           :disabled="idx === 0"
           :title="idx === 0 ? '主模型不可删除' : '删除'"
-          type="button"
+          color="var(--error)"
+          name="Close"
           @click="removeModel(idx)"
-        >
-          ×
-        </button>
+        />
       </div>
     </div>
 
@@ -156,17 +156,17 @@ defineExpose({ resetTransient });
     <div v-if="fetchedModels.length > 0" class="fetched-block">
       <div class="fetched-hint">点击添加到列表：</div>
       <div class="fetched-chips">
-        <button
+        <MyButton
           v-for="mid in fetchedModels"
           :key="mid"
           class="fetched-chip"
-          :class="{ added: models.some((m) => m.modelId === mid) }"
+          :variant="models.some((m) => m.modelId === mid) ? 'secondary' : 'primary'"
+          size="small"
           :disabled="models.some((m) => m.modelId === mid)"
-          type="button"
           @click="addFetchedModel(mid)"
         >
           {{ models.some((m) => m.modelId === mid) ? "✓ " : "+ " }}{{ mid }}
-        </button>
+        </MyButton>
       </div>
     </div>
 
@@ -255,18 +255,9 @@ defineExpose({ resetTransient });
   color: var(--text-muted);
 }
 
+/* 删除钮：MyIconButton 承担按钮本体、禁用态与危险色，这里只收紧外距。 */
 .model-remove {
-  background: transparent;
-  border: none;
-  color: var(--error);
-  font-size: 14px;
-  cursor: pointer;
-  padding: 0 4px;
-}
-
-.model-remove:disabled {
-  color: var(--text-muted);
-  cursor: default;
+  flex: none;
 }
 
 .fetch-row {
@@ -294,22 +285,14 @@ defineExpose({ resetTransient });
   overflow-y: auto;
 }
 
+/* 「已获取模型」胶囊钮：可点（未添加）走 primary 变体、已添加走 secondary
+   变体 + disabled，两态的底色/描边/文字全部由 myui 承担，不再自绘
+   .fetched-chip.added。药丸造型（radius-full）保留自绘，这是 myui
+   ButtonVariant 里没有的形状。 */
 .fetched-chip {
-  background: var(--accent-primary-muted);
-  border: 1px solid var(--accent-primary);
   border-radius: var(--radius-full);
-  padding: 3px 10px;
   font-size: 11px;
-  color: var(--text-primary);
-  cursor: pointer;
-}
-
-.fetched-chip.added {
-  background: var(--bg-input);
-  border-color: var(--border-default);
-  color: var(--text-muted);
-  cursor: default;
-  opacity: 0.5;
+  padding: 3px 10px;
 }
 
 .manual-add {

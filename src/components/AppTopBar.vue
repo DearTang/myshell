@@ -5,17 +5,8 @@
      v2.15.4 起窗口无边框（decorations:false），最小化/最大化/关闭按钮
      内嵌本栏最右（omp desktop 式一行顶栏），空白区域可拖动窗口。 -->
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { Promotion } from "@element-plus/icons-vue";
-import {
-  ChatDotRound,
-  Expand,
-  Fold,
-  Grid,
-  Lightning,
-  Setting,
-  Unlock,
-} from "@element-plus/icons-vue";
+import { MyButton, MyIcon, MyIconButton, MyStatusDot, type MyTone } from "myui";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { persistUi, setMcpSessionAllowed, ui } from "@/store/ui";
 import {
   broadcastAll,
@@ -44,11 +35,17 @@ defineOptions({ name: "AppTopBar" });
 type TabStatus = NonNullable<Tab["status"]>;
 
 // 状态指示器的颜色与图标（与旧 TabBar 一致）
-const STATUS_CONFIG: Record<TabStatus, { color: string; icon: string; label: string; fontSize: number }> = {
-  connecting: { color: "var(--warning)", icon: "⏳", label: "连接中", fontSize: 14 },
-  connected: { color: "var(--success)", icon: "●", label: "已连接", fontSize: 14 },
-  disconnected: { color: "var(--error)", icon: "●", label: "已断开", fontSize: 14 },
-  error: { color: "var(--error)", icon: "✕", label: "连接失败", fontSize: 12 },
+/** 标签状态 → 语义色调 + 文案。颜色与呼吸动画由 MyStatusDot 的 tone/pulse 承担。
+ *
+ *  2026-10-10：此前这里存的是 `color: "var(--error)"` 之类的 CSS 颜色值，
+ *  模板再内联 `background`/`boxShadow` —— **绕过了令牌层**，33 套配色预设切换时
+ *  状态点颜色不变。改成语义 tone 后由 myui 经 `--success/--warning/--danger`
+ *  取色，预设能生效。 */
+const STATUS_CONFIG: Record<TabStatus, { tone: MyTone; label: string; pulse?: boolean }> = {
+  connecting: { tone: "warning", label: "连接中", pulse: true },
+  connected: { tone: "success", label: "已连接" },
+  disconnected: { tone: "neutral", label: "已断开" },
+  error: { tone: "danger", label: "连接失败" },
 };
 
 function statusOf(tab: Tab): (typeof STATUS_CONFIG)[TabStatus] {
@@ -61,56 +58,35 @@ function canBroadcast(tab: Tab): boolean {
 
 const broadcastCount = computed(() => sessions.broadcastIds.size);
 
-// 广播组内的标签（已连接的 SSH 终端），按标签条顺序，供广播下拉用
-const broadcastTabs = computed(() => sessions.tabs.filter((t) => sessions.broadcastIds.has(t.id)));
-
 const downTabCount = computed(
   () => sessions.tabs.filter((t) => t.status === "disconnected" || t.status === "error").length,
 );
 
 // ── 下拉面板开关 ──
-// 当前打开的下拉面板："sessions"（全部标签）/"broadcast"（广播组），或 null。
-// 同时只开一个；再点同一触发钮即关闭。
-type OpenPanel = "sessions" | "broadcast" | null;
-const openPanel = ref<OpenPanel>(null);
+// 2026-10-10：「当前会话」与「广播」两个触发钮合并为一个（两者列的都是标签页，
+// 只是口径不同，视图上确实重叠）。广播状态改为触发钮上的 📡 徽标 + 面板内的
+// 批量动作 / 行内开关。openPanel 因此退化成布尔量。
+const openPanel = ref(false);
 const anchor = ref<{ right: number; top: number } | null>(null);
 
 // 触发钮 DOM（组件根 button），作为面板定位锚点
 const sessionsTriggerRef = ref<{ $el: HTMLButtonElement } | null>(null);
-const broadcastTriggerRef = ref<{ $el: HTMLButtonElement } | null>(null);
-
-// 广播组清空时自动关闭广播面板（触发钮消失，面板会变孤儿）。标签数量变化
-// 不触发关闭：用户在会话面板里连续关标签时期望面板保持打开。
-watch(broadcastCount, (count) => {
-  if (openPanel.value === "broadcast" && count === 0) {
-    openPanel.value = null;
-  }
-});
-
-function togglePanel(which: Exclude<OpenPanel, null>, triggerEl: HTMLElement | null): void {
-  if (openPanel.value === which) {
-    openPanel.value = null;
-    return;
-  }
-  const rect = readAnchorRect(triggerEl);
-  if (rect) anchor.value = rect;
-  openPanel.value = which;
-}
 
 function toggleSessionsPanel(): void {
-  togglePanel("sessions", sessionsTriggerRef.value?.$el ?? null);
-}
-
-function toggleBroadcastPanel(): void {
-  togglePanel("broadcast", broadcastTriggerRef.value?.$el ?? null);
+  if (openPanel.value) {
+    openPanel.value = false;
+    return;
+  }
+  const rect = readAnchorRect(sessionsTriggerRef.value?.$el ?? null);
+  if (rect) anchor.value = rect;
+  openPanel.value = true;
 }
 
 // 窗口 resize / 任意容器 scroll（capture 覆盖标签条内滚动）时重算锚点，
 // 面板跟随触发钮。
 function recomputeAnchor(): void {
   if (!openPanel.value) return;
-  const inst = openPanel.value === "sessions" ? sessionsTriggerRef.value : broadcastTriggerRef.value;
-  const rect = readAnchorRect(inst?.$el ?? null);
+  const rect = readAnchorRect(sessionsTriggerRef.value?.$el ?? null);
   if (rect) anchor.value = rect;
 }
 
@@ -138,13 +114,28 @@ const sessionRows = computed<DropdownRow[]>(() =>
   })),
 );
 
+// 面板标题行的批量操作。合并「广播」面板后，广播的进出都收在这里：
+// 「全部广播」把已连接的 SSH 终端全塞进组，「退出全部广播」一键清空。
 const sessionBatchActions = computed<BatchAction[]>(() => {
   const actions: BatchAction[] = [];
   if (sessions.tabs.some((t) => t.status === "disconnected" || t.status === "error")) {
     actions.push({ label: "全部重连", title: "重连所有掉线的会话", onClick: () => void reconnectAll() });
   }
-  if (sessions.tabs.some((t) => t.type === "terminal" && t.connType === "ssh" && t.status === "connected")) {
-    actions.push({ label: "全部广播", title: "将所有已连接的 SSH 会话加入广播组", onClick: () => broadcastAll() });
+  if (
+    sessions.tabs.some((t) => t.type === "terminal" && t.connType === "ssh" && t.status === "connected")
+  ) {
+    actions.push({
+      label: "全部广播",
+      title: "将所有已连接的 SSH 会话加入广播组",
+      onClick: () => broadcastAll(),
+    });
+  }
+  if (broadcastCount.value > 0) {
+    actions.push({
+      label: "退出全部广播",
+      title: "移除所有广播组成员",
+      onClick: () => exitAllBroadcast(),
+    });
   }
   return actions;
 });
@@ -158,24 +149,6 @@ function rowSecondaryAction(tab: Tab): RowSecondaryActionInfo | undefined {
     active: sessions.broadcastIds.has(tab.id),
   };
 }
-
-// 广播面板行：主操作 = 退出广播组
-const broadcastRows = computed<DropdownRow[]>(() =>
-  broadcastTabs.value.map((t) => ({
-    tab: t,
-    actionLabel: "退出",
-    actionTitle: "退出广播组",
-    onAction: (tab) => toggleBroadcast(tab.id),
-  })),
-);
-
-const broadcastBatchActions = computed<BatchAction[]>(() => [
-  { label: "退出全部广播", title: "移除所有广播组成员", onClick: () => exitAllBroadcast() },
-]);
-
-const broadcastDownCount = computed(
-  () => broadcastTabs.value.filter((t) => t.status === "disconnected" || t.status === "error").length,
-);
 
 // ── 壳层动作 ──
 
@@ -204,15 +177,15 @@ function revokeSessionAllowed(): void {
   <header class="app-topbar" data-tauri-drag-region>
     <!-- 左：侧栏折叠 + 品牌区 -->
     <div class="topbar-left">
-      <button
-        type="button"
-        class="icon-btn"
+      <MyIconButton
         :title="ui.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
+        class="icon-btn"
+        :label="ui.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
+        size="17"
+        :name="ui.sidebarCollapsed ? 'Expand' : 'Fold'"
         :aria-expanded="!ui.sidebarCollapsed"
         @click="toggleSidebar"
-      >
-        <el-icon :size="17"><Expand v-if="ui.sidebarCollapsed" /><Fold v-else /></el-icon>
-      </button>
+      />
       <div class="brand">
         <!-- 内联矢量品牌标记 >_（与应用图标同款），随主题令牌变色 -->
         <svg class="brand-mark" viewBox="0 0 64 64" fill="none" role="img" aria-label="MyShell">
@@ -268,56 +241,62 @@ function revokeSessionAllowed(): void {
           </span>
 
           <!-- 状态指示（始终显示） -->
-          <span
+          <MyStatusDot
             class="tab-status"
-            :title="statusOf(tab).label"
-            :style="{ color: statusOf(tab).color, fontSize: `${statusOf(tab).fontSize}px` }"
-          >
-            <span :class="{ spinning: (tab.status || 'connected') === 'connecting' }">{{ statusOf(tab).icon }}</span>
-          </span>
+            :tone="statusOf(tab).tone"
+            :pulse="statusOf(tab).pulse"
+            :aria-label="statusOf(tab).label"
+          />
 
           <!-- 广播切换 -->
-          <span
-            v-if="canBroadcast(tab)"
-            class="tab-broadcast"
-            :class="{ 'in-group': sessions.broadcastIds.has(tab.id) }"
+          <MyIconButton
             :title="
               sessions.broadcastIds.has(tab.id)
                 ? `广播组中（共 ${broadcastCount} 个 tab）— 点击退出`
                 : '加入广播'
             "
+            v-if="canBroadcast(tab)"
+            class="tab-broadcast"
+            :label="
+              sessions.broadcastIds.has(tab.id)
+                ? `广播组中（共 ${broadcastCount} 个 tab）— 点击退出`
+                : '加入广播'
+            "
+            :active="sessions.broadcastIds.has(tab.id)"
+            size="12"
+            name="Promotion"
             @click.stop="toggleBroadcast(tab.id)"
-          >
-        <el-icon :size="12"><Promotion /></el-icon>
-          </span>
+          />
 
           <!-- 关闭钮 -->
-          <span class="tab-close" @click.stop="closeTab(tab.id)">✕</span>
+          <MyIconButton
+            title="关闭标签"
+            class="tab-close"
+            label="关闭标签"
+            size="12"
+            name="Close"
+            @click.stop="closeTab(tab.id)"
+          />
         </div>
       </div>
 
-      <!-- "当前会话"触发钮——常驻：标签再多也能一键看全量列表 -->
+      <!-- 「当前会话」触发钮（常驻：标签再多也能一键看全量列表）——
+           2026-10-10 起同时承载广播状态：有广播成员时整钮转强调色，
+           并在计数右侧挂一枚 📡 N 徽标。广播的增删在面板内完成。 -->
       <DropdownTrigger
         ref="sessionsTriggerRef"
         icon-name="Document"
         label="当前会话"
         :count="sessions.tabs.length"
-        :active="openPanel === 'sessions'"
-        title="查看/切换/关闭所有标签页"
+        :broadcast-count="broadcastCount"
+        :active="openPanel"
+        :accent="broadcastCount > 0"
+        :title="
+          broadcastCount > 0
+            ? `查看/切换/关闭所有标签页（共 ${sessions.tabs.length} 个，其中 ${broadcastCount} 个在广播组中）`
+            : '查看/切换/关闭所有标签页'
+        "
         @click="toggleSessionsPanel"
-      />
-
-      <!-- "广播"触发钮——取代旧的静态徽标：可点击打开广播组面板 -->
-      <DropdownTrigger
-        v-if="broadcastCount > 0"
-        ref="broadcastTriggerRef"
-        icon-name="Promotion"
-        label="广播"
-        :count="broadcastCount"
-        :active="openPanel === 'broadcast'"
-        :title="`${broadcastCount} 个标签页在广播组中，点击查看/管理`"
-        accent
-        @click="toggleBroadcastPanel"
       />
     </div>
 
@@ -325,43 +304,64 @@ function revokeSessionAllowed(): void {
     <div class="topbar-actions">
       <!-- 会话放行指示器：MCP 高危命令「本轮会话均允许」授权期间常驻显示，
            点击即可撤销（撤销后下一次高危命令重新弹窗确认） -->
-      <button
+      <MyButton
         v-if="ui.mcpSessionAllowed"
-        type="button"
+        variant="ghost-success"
+        size="small"
         class="session-allowed-chip"
         title="本轮会话已放行全部高危命令（点击撤销，撤销后重新弹窗确认）"
         @click="revokeSessionAllowed"
       >
-        <el-icon :size="13"><Unlock /></el-icon>
+        <MyIcon :size="13" name="Unlock" />
         <span>已放行高危</span>
-      </button>
-      <button type="button" class="icon-btn" title="多窗口" @click="ui.showMultiWindowPicker = true">
-        <el-icon :size="16"><Grid /></el-icon>
-      </button>
-      <button type="button" class="icon-btn" title="AI 助手" @click="ui.showAiPanel = !ui.showAiPanel">
-        <el-icon :size="16"><ChatDotRound /></el-icon>
-      </button>
-      <button type="button" class="icon-btn" title="快捷命令" @click="openQuickCommands">
-        <el-icon :size="16"><Lightning /></el-icon>
-      </button>
-      <button type="button" class="icon-btn" title="设置" @click="ui.showSettings = true">
-        <el-icon :size="16"><Setting /></el-icon>
-      </button>
+      </MyButton>
+      <MyIconButton
+        title="多窗口"
+        class="icon-btn"
+        label="多窗口"
+        size="16"
+        name="Grid"
+        @click="ui.showMultiWindowPicker = true"
+      />
+      <MyIconButton
+        title="AI 助手"
+        class="icon-btn"
+        label="AI 助手"
+        size="16"
+        name="Robot"
+        @click="ui.showAiPanel = !ui.showAiPanel"
+      />
+      <MyIconButton
+        title="快捷命令"
+        class="icon-btn"
+        label="快捷命令"
+        size="16"
+        name="Lightning"
+        @click="openQuickCommands"
+      />
+      <MyIconButton
+        title="设置"
+        class="icon-btn"
+        label="设置"
+        size="16"
+        name="Setting"
+        @click="ui.showSettings = true"
+      />
     </div>
 
     <!-- 右缘：窗口控制（无边框窗口自绘按钮，与顶栏同行，贴窗口右上角）。
          与保险库门禁页共用同一组件，避免两处逻辑漂移。 -->
     <WindowControls />
 
-    <!-- 下拉面板（锚定于各自触发钮） -->
+    <!-- 下拉面板（锚定到「当前会话」触发钮；广播组的进出也在此面板内完成） -->
     <SessionDropdownPanel
-      v-if="openPanel === 'sessions' && anchor"
+      v-if="openPanel && anchor"
       title="当前会话"
       icon-name="Document"
       :anchor-rect="anchor"
       :active-tab-id="sessions.activeTabId"
       :on-select="(t) => setActiveTab(t.id)"
-      :on-close="() => (openPanel = null)"
+      :on-close="() => (openPanel = false)"
       empty-hint="暂无打开的标签页"
       :on-close-disconnected="closeDisconnected"
       :disconnected-count="downTabCount"
@@ -369,20 +369,7 @@ function revokeSessionAllowed(): void {
       :batch-actions="sessionBatchActions"
       :row-secondary-action="rowSecondaryAction"
       :on-row-secondary-action="(t) => toggleBroadcast(t.id)"
-    />
-    <SessionDropdownPanel
-      v-if="openPanel === 'broadcast' && anchor"
-      title="广播组成员"
-      icon-name="Promotion"
-      :anchor-rect="anchor"
-      :active-tab-id="sessions.activeTabId"
-      :on-select="(t) => setActiveTab(t.id)"
-      :on-close="() => (openPanel = null)"
-      empty-hint="广播组为空"
-      :on-close-disconnected="closeDisconnected"
-      :disconnected-count="broadcastDownCount"
-      :rows="broadcastRows"
-      :batch-actions="broadcastBatchActions"
+      :broadcast-count="broadcastCount"
     />
   </header>
 </template>
@@ -398,8 +385,8 @@ function revokeSessionAllowed(): void {
   min-width: 0;
   overflow: hidden;
   background: var(--surface-translucent);
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 1));
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 1));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
   border-bottom: 1px solid var(--border-subtle);
 }
 
@@ -412,18 +399,14 @@ function revokeSessionAllowed(): void {
   flex-shrink: 0;
 }
 
+/* 顶栏动作钮：外观（悬停/按下/禁用/焦点环）由 MyIconButton 承担，
+   这里只固定尺寸与静止态次级文字色，并把悬停改成强调色系——
+   库的默认悬停是中性 bg-elevated，本项目一律「悬停变主色」。 */
 .icon-btn {
   width: 32px;
   height: 32px;
-  display: inline-grid;
-  place-items: center;
-  padding: 0;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
   flex-shrink: 0;
+  color: var(--text-secondary);
 }
 
 .icon-btn:hover {
@@ -547,48 +530,32 @@ function revokeSessionAllowed(): void {
   color: var(--success);
 }
 
+/* 状态点：尺寸与呼吸动画由 MyStatusDot 承担，这里只收紧密度。 */
 .tab-status {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.tab-status .spinning {
-  display: inline-block;
-  animation: spin 1s linear infinite;
-}
-
-.tab-broadcast {
-  font-size: 12px;
-  opacity: 0.4;
-  cursor: pointer;
-  padding: 2px 4px;
-  color: var(--text-muted);
-  transition: all var(--duration-fast) var(--ease-in-out);
-  border-radius: var(--radius-sm);
   flex-shrink: 0;
+  transform: scale(0.9);
 }
 
-.tab-broadcast.in-group {
-  opacity: 1;
-  color: var(--success);
+/* 广播开关与关闭钮：外观由 MyIconButton 承担（含 active 态与 aria-pressed），
+   这里只保留标签条密度与「在组内着成功色」的原有意图。 */
+.tab-broadcast {
+  flex-shrink: 0;
+  opacity: 0.55;
 }
 
-.tab-broadcast:not(.in-group):hover {
+.tab-broadcast:hover {
   opacity: 1;
-  background: var(--bg-surface-active);
 }
 
 .tab-close {
-  margin-left: 2px;
-  font-size: 14px;
-  opacity: 0.35;
-  cursor: pointer;
-  line-height: 1;
-  padding: 2px 4px;
-  border-radius: var(--radius-sm);
-  transition: all var(--duration-fast) var(--ease-in-out);
   flex-shrink: 0;
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--ease-in-out);
+}
+
+.tab-item:hover .tab-close,
+.tab-item.is-active .tab-close {
+  opacity: 1;
 }
 
 .tab-close:hover {
@@ -597,36 +564,49 @@ function revokeSessionAllowed(): void {
   color: var(--error);
 }
 
-/* ─── DropdownTrigger（组件根 button 继承本组件作用域 id；
-      内部 span 需 :deep） ─── */
+/* ─── DropdownTrigger（MyButton 的根 <button class="el-button dropdown-trigger">
+      继承本组件作用域 id；其内部的 .el-button__content 与各 span 需 :deep） ─── */
 .dropdown-trigger {
   height: 100%;
   padding: 0 14px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
   border: none;
   border-left: 1px solid var(--border-default);
+  border-radius: 0;
   background: transparent;
   color: var(--text-secondary);
   font-size: 11px;
   font-weight: 600;
-  cursor: pointer;
   white-space: nowrap;
   flex-shrink: 0;
-  font-family: inherit;
+  box-shadow: none;
   transition:
     background var(--duration-fast) var(--ease-in-out),
     color var(--duration-fast) var(--ease-in-out);
 }
 
+/* MyButton 把插槽内容包进 .el-button__content，原先挂在根节点上的
+   flex 布局必须下推到这一层，否则图标/文案/计数会退回 EP 的行内排版。 */
+.dropdown-trigger :deep(.el-button__content) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 状态色。⚠️ 这里必须每条都自带 :hover 变体：EP 的
+   `.el-button.is-text:not(.is-disabled):hover` 权重是 (0,4,0)，高于任何
+   不带 :hover 的状态规则（本组件作用域属性只贡献 1 个类权重）。少了 :hover
+   变体，「面板已打开时鼠标停在触发钮上」会被 EP 的 --el-fill-color-light
+   灰底压过去，强调色闪一下就没了。带 :hover 后同为 (0,4,0)，靠源码顺序取胜
+   （组件 CSS 在 EP 之后打包）。 */
 .dropdown-trigger.is-hover:not(.is-active):not(.is-accent) {
   background: var(--bg-surface-hover);
   color: var(--text-primary);
 }
 
 .dropdown-trigger.is-active,
-.dropdown-trigger.is-accent {
+.dropdown-trigger.is-active:hover,
+.dropdown-trigger.is-accent,
+.dropdown-trigger.is-accent:hover {
   background: var(--accent-primary-muted);
   color: var(--accent-primary);
 }
@@ -635,14 +615,20 @@ function revokeSessionAllowed(): void {
   font-size: 14px;
 }
 
+/* 两枚计数徽标形态必须一致：都是「图标 + 数字」的实心/淡底胶囊、同样的
+   padding / line-height / gap。2026-10-10 之前会话那枚只有数字、广播那枚带 📡，
+   并排时一胖一瘦读起来对不上号。 */
 .dropdown-trigger :deep(.trigger-count) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
   font-size: 11px;
   background: var(--bg-surface-active);
   color: var(--text-secondary);
   padding: 0 7px;
   border-radius: var(--radius-full);
   min-width: 20px;
-  text-align: center;
   line-height: 16px;
 }
 
@@ -651,6 +637,22 @@ function revokeSessionAllowed(): void {
   /* 旧版为白字；白不是令牌，统一用反色文本令牌 */
   background: var(--accent-primary);
   color: var(--text-inverse);
+}
+
+/* 广播徽标：合并「广播」触发钮后，组内会话数以实心成功色胶囊挂在计数右侧。
+   刻意用实心 —— 它要在一枚同样是胶囊的总数旁边被一眼区分开，描边态在强调色
+   按钮底上会和 .trigger-count 糊在一起。 */
+.dropdown-trigger :deep(.trigger-bcast) {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-inverse);
+  background: var(--success);
+  padding: 0 7px;
+  border-radius: var(--radius-full);
+  line-height: 16px;
 }
 
 /* ─── 右：壳层动作 ─── */

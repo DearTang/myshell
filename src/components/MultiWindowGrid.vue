@@ -5,8 +5,7 @@
      TerminalPanel 的接线契约见 src/App.vue 中的绑定。 -->
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { Grid } from "@element-plus/icons-vue";
-import { MyButton } from "myui";
+import { MyButton, MyIcon } from "myui";
 import TerminalPanel from "@/components/TerminalPanel.vue";
 import type { Tab } from "@/api";
 import {
@@ -117,7 +116,7 @@ function onOpenQuickCommandsManage(connectionId: string): void {
     <!-- Toolbar -->
     <div class="toolbar">
       <span class="toolbar-title">
-        <el-icon class="toolbar-icon" :size="14"><Grid /></el-icon>
+        <MyIcon class="toolbar-icon" :size="14" name="Grid" />
         多窗口模式（{{ ui.multiWindowIds.length }} 个会话{{ overflow ? `，仅展示前 ${capacity} 个，可滚动查看` : "" }}）
       </span>
       <div class="toolbar-actions">
@@ -133,7 +132,14 @@ function onOpenQuickCommandsManage(connectionId: string): void {
         <!-- Window title bar -->
         <div class="cell-titlebar">
           <span class="cell-title" :title="tab.name">{{ tab.name }}</span>
-          <button type="button" class="cell-remove" title="从多窗口移除" @click="onRemoveWindow(tab.id)">✕</button>
+          <MyIconButton
+            title="从多窗口移除"
+            class="cell-remove"
+            label="从多窗口移除"
+            size="12"
+            name="Close"
+            @click="onRemoveWindow(tab.id)"
+          />
         </div>
         <!-- Terminal -->
         <div class="cell-terminal">
@@ -151,8 +157,6 @@ function onOpenQuickCommandsManage(connectionId: string): void {
             :reconnect-snapshot="tab.reconnectSnapshot"
             @terminal-ready="registerTerminal"
             @terminal-gone="unregisterTerminal"
-            @open-ai="ui.showAiPanel = !ui.showAiPanel"
-            @open-multiwindow="ui.showMultiWindowPicker = true"
             @reconnect="reconnect(tab.id)"
             @snapshot-consumed="clearReconnectSnapshot(tab.id)"
             @disconnected="onDisconnected(tab.id)"

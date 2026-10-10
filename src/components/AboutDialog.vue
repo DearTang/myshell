@@ -10,10 +10,9 @@
      壳：MyDialog（旧版点遮罩关闭 → dismissable；@cancel → emit('close')）。 -->
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import { Bell, MagicStick } from "@element-plus/icons-vue";
 import MarkdownIt from "markdown-it";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { MyButton, MyDialog } from "myui";
+import { MyButton, MyDialog, MyIcon } from "myui";
 import {
   downloadUpdate,
   installUpdate,
@@ -170,13 +169,15 @@ function onDownloadClick(): void {
     align-center
     dismissable
     class="about-dialog"
+    body-class="about-dialog-body"
+    footer-class="about-dialog-footer"
     @cancel="emit('close')"
   >
     <template #header>
       <!-- Header -->
       <div v-if="isWhatsNew" class="whatsnew-head">
         <span class="whatsnew-icon">
-          <el-icon :size="28"><MagicStick /></el-icon>
+          <MyIcon :size="28" name="MagicStick" />
         </span>
         <div>
           <div class="whatsnew-title">MyShell 已更新到 v{{ version }}</div>
@@ -224,7 +225,7 @@ function onDownloadClick(): void {
         <div v-if="hasUpdate" class="update-banner">
           <div class="banner-row">
             <span class="banner-icon">
-              <el-icon :size="16"><Bell /></el-icon>
+              <MyIcon :size="16" name="Bell" />
             </span>
             <div class="banner-info">
               <div class="banner-title">发现新版本 {{ latestDisplay }}</div>
@@ -316,7 +317,7 @@ function onDownloadClick(): void {
   max-height: 86vh;
 }
 
-:global(.about-dialog .el-dialog__body) {
+:global(.about-dialog-body) {
   flex: 1;
   min-height: 0;
   display: flex;
@@ -555,7 +556,7 @@ function onDownloadClick(): void {
 }
 
 /* 让 #footer 分隔线紧贴 body 结束处（去掉 EP footer 自带的 padding-top） */
-:global(.about-dialog .el-dialog__footer) {
+:global(.about-dialog-footer) {
   padding-top: 0;
 }
 

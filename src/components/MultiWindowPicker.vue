@@ -5,8 +5,7 @@
      myui confirmDialog 确认，用户确认后 emit 全部 ids。 -->
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { Grid } from "@element-plus/icons-vue";
-import { confirmDialog, MyButton, MyCheckbox } from "myui";
+import { MyButton, MyCheckbox, MyIcon, confirmDialog } from "myui";
 import type { Tab } from "@/api";
 import { sessions } from "@/store/sessions";
 
@@ -79,14 +78,14 @@ async function onConfirmClick(): Promise<void> {
       <!-- Header -->
       <div class="header">
         <div class="header-title">
-          <el-icon class="header-icon" :size="14"><Grid /></el-icon>
+          <MyIcon class="header-icon" :size="14" name="Grid" />
           多窗口会话选择
         </div>
         <div class="header-right">
           <span class="count-text">已选 {{ selected.size }} / {{ candidates.length }}</span>
-          <button type="button" class="select-all-btn" @click="toggleAll">
+          <MyButton variant="ghost" size="small" class="select-all-btn" @click="toggleAll">
             {{ selected.size === candidates.length ? "取消全选" : "全选" }}
-          </button>
+          </MyButton>
         </div>
       </div>
 

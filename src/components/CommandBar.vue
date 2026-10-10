@@ -1,18 +1,19 @@
-<!-- 命令栏：命令输入 + 历史命令浮层 + 快捷命令浮层 + 多窗口/AI/截图/重连入口。
+<!-- 命令栏：命令输入 + 历史命令浮层 + 快捷命令浮层 + 截图/重连入口。
      从 src-legacy/components/CommandBar.tsx 逐行移植；
-     由 TerminalPanel 嵌（每 tab 一个实例），悬浮面板绝对定位于本栏上方，
-     互斥展开（与旧版点击置位逻辑一致）。 -->
+     悬浮面板绝对定位于本栏上方，互斥展开（与旧版点击置位逻辑一致）。
+     2026-10-10 三处调整：
+     ① 位置：从 TerminalPanel 内部提升到壳层底部行（App.vue 的 .shell-bottom），
+        与服务器状态栏一起贯穿整个窗口宽度。此前两者只在终端区那一列，
+        右侧 AI 栏自带的底部两行与之并排、互不对齐。
+        多窗口模式例外：那种布局里每个格子自带终端与命令栏，仍由 TerminalPanel
+        内嵌渲染（`command-bar` prop，默认开启）。
+     ② 删去「多窗口」「AI」两枚按钮 —— 二者在顶栏已有同名常驻入口。
+     ③ 布局改为「输入框占左半 + 工具钮靠右」。
+     历史列表的刷新回调改走 store 注册表（见 registerSelf）：本组件不再与
+     TerminalPanel 构成父子关系，原来那条 emit 直连已失效。 -->
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import {
-  Camera,
-  ChatDotRound,
-  Clock,
-  Grid,
-  Lightning,
-  RefreshRight,
-  Top,
-} from "@element-plus/icons-vue";
+import { MyButton, MyIcon, MyIconButton, MyInput, MyPopover } from "myui";
 import {
   addCommandHistory,
   clearCommandHistory,
@@ -25,6 +26,7 @@ import {
   sshSend,
 } from "@/api";
 import type { CommandHistoryItem, ConnType, QuickCommandExecItem, Tab } from "@/api";
+import { registerHistoryRefresher, unregisterHistoryRefresher } from "@/store/sessions";
 
 defineOptions({ name: "CommandBar" });
 
@@ -44,14 +46,9 @@ const props = withDefaults(
 );
 
 const emit = defineEmits<{
-  /** 把本栏的历史 reload 注册给父组件（TerminalPanel 的 onData 录入新命令后
-   * 触发刷新）。等价于旧版 onRegisterRefresh 回调。 */
-  (e: "register-refresh", fn: () => void): void;
   (e: "reconnect"): void;
   (e: "open-quick-commands-manage"): void;
-  (e: "open-ai"): void;
-  (e: "open-multiwindow"): void;
-  /** 截取终端视口 PNG（不含本栏）。保存到设置的附件目录。 */
+  /** 截取终端视口 PNG（不含底栏）。保存到设置的附件目录。 */
   (e: "screenshot"): void;
 }>();
 
@@ -144,6 +141,8 @@ const quickLoading = ref(false);
 // 内 —— 全局 querySelector 会命中第一个渲染的 tab 的输入栏，把焦点劫持到
 // 错误的 tab。
 const containerRef = ref<HTMLDivElement | null>(null);
+/** 命令输入框实例（MyInput 暴露 focus()/blur()） */
+const cmdInputRef = ref<InstanceType<typeof MyInput> | null>(null);
 // 窄幅模式：栏太窄（多窗口格子、小窗口）时隐藏按钮文字，防止输入框被挤扁。
 const showLabels = ref(true);
 let labelResizeObserver: ResizeObserver | null = null;
@@ -176,20 +175,31 @@ async function reload(): Promise<void> {
   }
 }
 
-// 挂载时加载一次并注册刷新回调（旧版 effect [reload, onRegisterRefresh]）。
-onMounted(() => {
+// 挂载 / connectionId 变化时加载一次，并把 reload 注册进 store 的历史刷新表。
+//
+// 旧版是 emit('register-refresh') 交给父组件存着、由 TerminalPanel 在录完命令后
+// 调用。2026-10-10 本组件被提升到壳层底部行（不再是 TerminalPanel 的子组件），
+// 这条 emit 直连断了，改走 store 的注册表。
+//
+// 注销要按"自己注册过的 key"来做：同一连接先挂 A 再挂 B 时，B 的注册会覆盖 A，
+// A 卸载时若按自己的 connectionId 注销就会把 B 的那条一起清掉。
+let registeredHistoryId = "";
+
+function registerSelf(): void {
+  if (registeredHistoryId) unregisterHistoryRefresher(registeredHistoryId);
+  registeredHistoryId = props.connectionId;
+  if (registeredHistoryId) registerHistoryRefresher(registeredHistoryId, reload);
   void reload();
-  emit("register-refresh", reload);
+}
+
+onMounted(registerSelf);
+
+onUnmounted(() => {
+  if (registeredHistoryId) unregisterHistoryRefresher(registeredHistoryId);
 });
 
 // connectionId 变化时旧版会因 useCallback 重建而重跑；这里等价补齐。
-watch(
-  () => props.connectionId,
-  () => {
-    void reload();
-    emit("register-refresh", reload);
-  },
-);
+watch(() => props.connectionId, registerSelf);
 
 async function handleExecute(cmd: string): Promise<void> {
   if (!cmd.trim()) return;
@@ -361,22 +371,23 @@ async function handleExecuteQuickCommand(command: string): Promise<void> {
 function handleSelectItem(cmd: string): void {
   input.value = cmd;
   panelOpen.value = false;
-  // 聚焦到输入框方便用户修改后回车执行。Scope to this CommandBar's
-  // container so focus stays in the active tab when several are open.
-  const inputEl = containerRef.value?.querySelector<HTMLInputElement>("[data-cmd-input]");
-  inputEl?.focus();
+  // 聚焦到输入框方便用户修改后回车执行。MyInput 暴露了 focus()，直接用组件
+  // 实例方法，不必再靠 data-* 属性 + querySelector 去捞 DOM。
+  cmdInputRef.value?.focus();
 }
 
-// ── 面板互斥开关（与旧版 onClick 置位逻辑一致） ──
-function toggleQuickPanel(): void {
-  panelOpen.value = false;
-  quickPanelOpen.value = !quickPanelOpen.value;
-}
+// ── 面板互斥（与旧版 toggle 置位逻辑一致） ──
+// 开关本身由 MyPopover 的 click trigger 驱动（EP 受控 visible），
+// 这里只负责"开一个必关另一个"这条互斥规则。
+// 迁移前两个面板是手搓 absolute 浮层：既无 click-outside 也无 Esc，
+// 只能靠这两个 toggle 互斥关闭——点面板外或按 Esc 都不关。
+watch(panelOpen, (open) => {
+  if (open) quickPanelOpen.value = false;
+});
 
-function toggleHistoryPanel(): void {
-  quickPanelOpen.value = false;
-  panelOpen.value = !panelOpen.value;
-}
+watch(quickPanelOpen, (open) => {
+  if (open) panelOpen.value = false;
+});
 
 function onScreenshotClick(): void {
   panelOpen.value = false;
@@ -405,151 +416,179 @@ function firstLine(cmd: string): string {
 <template>
   <div ref="containerRef" class="command-bar">
     <!-- Command input -->
-    <input
+    <MyInput
+      ref="cmdInputRef"
       v-model="input"
-      data-cmd-input
+      bare
+      size="small"
       class="cmd-input"
       placeholder="$ 输入命令..."
       @keydown="onInputKeyDown"
     />
 
+    <!-- 输入框与工具钮之间的弹性留白：输入框固定占左半，工具钮整体靠右。
+         没有它的话按钮会紧贴输入框右侧，栏的右半看起来是空的。 -->
+    <div class="bar-spacer" />
+
     <!-- Quick commands button -->
-    <button
-      type="button"
-      class="bar-btn"
-      :class="{ active: quickPanelOpen }"
-      title="快捷命令"
-      @click="toggleQuickPanel"
-    >
-      <el-icon :size="14"><Lightning /></el-icon>
-      <span v-if="showLabels">快捷</span>
-    </button>
+    <MyPopover v-model="quickPanelOpen" placement="top-end" trigger="click" popper-class="cb-popper">
+      <!-- 激活态不再自绘 .active 底色，改由 :variant 切到 primary：两态的
+           对比度、focus 环都由 myui 负责，工具栏不再维护第二套按钮配色。 -->
+      <MyButton
+        class="bar-btn"
+        :variant="quickPanelOpen ? 'primary' : 'secondary'"
+        size="small"
+        title="快捷命令"
+      >
+        <MyIcon :size="14" name="Lightning" />
+        <span v-if="showLabels">快捷</span>
+      </MyButton>
+
+      <template #content>
+        <div class="float-panel quick-panel">
+          <!-- Header -->
+          <div class="float-header">
+            <span class="float-title">快捷命令 <span v-if="quickLoading">(加载中...)</span></span>
+            <MyButton
+              class="link-btn manage"
+              variant="ghost-primary"
+              size="small"
+              title="管理快捷命令"
+              @click="onManageClick"
+            >管理</MyButton>
+          </div>
+
+          <!-- Grouped list -->
+          <div class="float-list">
+            <div v-if="quickCommands.length === 0" class="empty">暂无快捷命令</div>
+            <template v-else>
+              <div v-if="globalQuickCommands.length > 0" class="qc-group">
+                <div class="qc-group-title">全局命令</div>
+                <div
+                  v-for="item in globalQuickCommands"
+                  :key="item.id"
+                  class="qc-item"
+                  :title="item.command"
+                  @click="handleExecuteQuickCommand(item.command)"
+                >
+                  <MyIcon :size="12" name="ArrowRight" class="qc-arrow" />
+                  <div class="qc-text">
+                    <div class="qc-label">{{ item.label }}</div>
+                    <div class="qc-cmd">{{ firstLine(item.command) }}</div>
+                  </div>
+                </div>
+              </div>
+              <div v-if="serverQuickCommands.length > 0" class="qc-group">
+                <div class="qc-group-title">本服务器专属</div>
+                <div
+                  v-for="item in serverQuickCommands"
+                  :key="item.id"
+                  class="qc-item"
+                  :title="item.command"
+                  @click="handleExecuteQuickCommand(item.command)"
+                >
+                  <MyIcon :size="12" name="ArrowRight" class="qc-arrow" />
+                  <div class="qc-text">
+                    <div class="qc-label">{{ item.label }}</div>
+                    <div class="qc-cmd">{{ firstLine(item.command) }}</div>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+    </MyPopover>
 
     <!-- Screenshot button — captures the terminal viewport only (this
          CommandBar is excluded by the capture util). Saves to the
          attachment dir configured in Settings → MCP 支持. -->
-    <button type="button" class="bar-btn" title="截取当前终端（不含输入栏/工具栏）" @click="onScreenshotClick">
-      <el-icon :size="14"><Camera /></el-icon>
+    <MyButton
+      class="bar-btn"
+      size="small"
+      title="截取当前终端（不含输入栏/工具栏）"
+      @click="onScreenshotClick"
+    >
+      <MyIcon :size="14" name="Camera" />
       <span v-if="showLabels">截图</span>
-    </button>
+    </MyButton>
 
     <!-- History button -->
-    <button
-      type="button"
-      class="bar-btn"
-      :class="{ active: panelOpen }"
-      title="历史命令"
-      @click="toggleHistoryPanel"
-    >
-      <el-icon :size="14"><Clock /></el-icon>
-      <span v-if="showLabels">历史</span>
-    </button>
+    <MyPopover v-model="panelOpen" placement="top-end" trigger="click" popper-class="cb-popper">
+      <MyButton
+        class="bar-btn"
+        :variant="panelOpen ? 'primary' : 'secondary'"
+        size="small"
+        title="历史命令"
+      >
+        <MyIcon :size="14" name="Clock" />
+        <span v-if="showLabels">历史</span>
+      </MyButton>
 
-    <!-- Multi-window picker button -->
-    <button type="button" class="bar-btn" title="多窗口" @click="emit('open-multiwindow')">
-      <el-icon :size="14"><Grid /></el-icon>
-      <span v-if="showLabels">多窗口</span>
-    </button>
+      <template #content>
+        <div class="float-panel history-panel">
+          <!-- Header -->
+          <div class="float-header">
+            <span class="float-title">历史命令 <span v-if="loading">(加载中...)</span></span>
+            <MyButton class="link-btn" variant="ghost" size="small" title="清空未钉住的历史" @click="handleClearUnpinned">清空</MyButton>
+          </div>
 
-    <!-- AI assistant button — opens the docked right panel -->
-    <button type="button" class="bar-btn" title="AI 助手" @click="emit('open-ai')">
-      <el-icon :size="14"><ChatDotRound /></el-icon>
-      <span v-if="showLabels">AI</span>
-    </button>
+          <!-- List -->
+          <div class="float-list">
+            <div v-if="history.length === 0" class="empty">暂无历史记录</div>
+            <template v-else>
+              <div
+                v-for="item in history"
+                :key="item.id"
+                class="history-item"
+                @click="handleSelectItem(item.command)"
+              >
+                <!-- 钉住开关：myui v0.29.0 起改用 MyIconButton 的 active 态。
+                     此前是裸 button + opacity 0.4/1 区分两态——同图标仅靠深浅
+                     区分对低对比用户不可辨，也没有 aria-pressed，屏幕阅读器读不出
+                     状态；现由底色+前景色双通道表达。图标也从 Top（向上箭头，
+                     语义是"向上移动"）换成库自绘的 Pushpin（斜置 45° 经典图钉）。 -->
+                <MyIconButton
+                  :title="item.pinned ? '取消钉住' : '钉住'"
+                  class="pin-btn"
+                  :label="item.pinned ? '取消钉住' : '钉住'"
+                  :active="item.pinned"
+                  size="14"
+                  name="Pushpin"
+                  @click.stop="handlePin(item)"
+                />
+
+                <!-- Command text -->
+                <span class="cmd-text">{{ item.command }}</span>
+
+                <!-- Delete button -->
+                <MyIconButton
+                  title="删除"
+                  class="del-btn"
+                  label="删除"
+                  size="12"
+                  name="Close"
+                  @click.stop="handleDelete(item.id)"
+                />
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+    </MyPopover>
 
     <!-- Reconnect button (only when disconnected/error) -->
-    <button v-if="showReconnect" type="button" class="bar-btn reconnect" title="重新连接" @click="emit('reconnect')">
-      <el-icon :size="14"><RefreshRight /></el-icon>
+    <MyButton
+      v-if="showReconnect"
+      class="bar-btn reconnect"
+      variant="success"
+      size="small"
+      title="重新连接"
+      @click="emit('reconnect')"
+    >
+      <MyIcon :size="14" name="RefreshRight" />
       <span v-if="showLabels">重连</span>
-    </button>
-
-    <!-- Expanded history panel (floating overlay) -->
-    <div v-if="panelOpen" class="float-panel history-panel">
-      <!-- Header -->
-      <div class="float-header">
-        <span class="float-title">历史命令 <span v-if="loading">(加载中...)</span></span>
-        <button type="button" class="link-btn" title="清空未钉住的历史" @click="handleClearUnpinned">清空</button>
-      </div>
-
-      <!-- List -->
-      <div class="float-list">
-        <div v-if="history.length === 0" class="empty">暂无历史记录</div>
-        <template v-else>
-          <div
-            v-for="item in history"
-            :key="item.id"
-            class="history-item"
-            @click="handleSelectItem(item.command)"
-          >
-            <!-- Pin icon：EP 无 Pushpin，用 Top 代钉住形态。两种状态同图标 ——
-                 钉住全亮，未钉住靠 opacity 减淡。 -->
-            <button
-              type="button"
-              class="pin-btn"
-              :class="{ pinned: item.pinned }"
-              :title="item.pinned ? '取消钉住' : '钉住'"
-              @click.stop="handlePin(item)"
-            >
-              <el-icon :size="14"><Top /></el-icon>
-            </button>
-
-            <!-- Command text -->
-            <span class="cmd-text">{{ item.command }}</span>
-
-            <!-- Delete button -->
-            <button type="button" class="del-btn" title="删除" @click.stop="handleDelete(item.id)">✕</button>
-          </div>
-        </template>
-      </div>
-    </div>
-
-    <!-- Expanded quick commands panel (floating overlay) -->
-    <div v-if="quickPanelOpen" class="float-panel quick-panel">
-      <!-- Header -->
-      <div class="float-header">
-        <span class="float-title">快捷命令 <span v-if="quickLoading">(加载中...)</span></span>
-        <button type="button" class="link-btn manage" title="管理快捷命令" @click="onManageClick">管理</button>
-      </div>
-
-      <!-- Grouped list -->
-      <div class="float-list">
-        <div v-if="quickCommands.length === 0" class="empty">暂无快捷命令</div>
-        <template v-else>
-          <div v-if="globalQuickCommands.length > 0" class="qc-group">
-            <div class="qc-group-title">全局命令</div>
-            <div
-              v-for="item in globalQuickCommands"
-              :key="item.id"
-              class="qc-item"
-              :title="item.command"
-              @click="handleExecuteQuickCommand(item.command)"
-            >
-              <span class="qc-arrow">▶</span>
-              <div class="qc-text">
-                <div class="qc-label">{{ item.label }}</div>
-                <div class="qc-cmd">{{ firstLine(item.command) }}</div>
-              </div>
-            </div>
-          </div>
-          <div v-if="serverQuickCommands.length > 0" class="qc-group">
-            <div class="qc-group-title">本服务器专属</div>
-            <div
-              v-for="item in serverQuickCommands"
-              :key="item.id"
-              class="qc-item"
-              :title="item.command"
-              @click="handleExecuteQuickCommand(item.command)"
-            >
-              <span class="qc-arrow">▶</span>
-              <div class="qc-text">
-                <div class="qc-label">{{ item.label }}</div>
-                <div class="qc-cmd">{{ firstLine(item.command) }}</div>
-              </div>
-            </div>
-          </div>
-        </template>
-      </div>
-    </div>
+    </MyButton>
   </div>
 </template>
 
@@ -566,59 +605,41 @@ function firstLine(cmd: string): string {
   position: relative;
 }
 
+/* 命令输入框：外观（边框/圆角/聚焦环/字号）由 MyInput 的 bare+small 承担，
+   这里只定它的宽度策略 —— **固定占本栏左半**（可收缩，窄栏时优先让输入框
+   变窄而不是把按钮挤出可视区）。此前是 flex:1 撑满剩余空间，工具钮全被顶到
+   输入框右边贴着，栏的右半一片空白。 */
 .cmd-input {
+  flex: 0 1 50%;
+  min-width: 0;
+}
+
+/* 输入框与工具钮之间的弹性空档 */
+.bar-spacer {
   flex: 1;
   min-width: 0;
-  background: var(--bg-input);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  padding: 6px 10px;
-  color: var(--text-primary);
-  font-size: 13px;
-  font-family: inherit;
-  outline: none;
 }
 
+/* 工具栏按钮改用 MyButton 后，这里只剩排版：不换行、不被 flex 压扁、
+   图标与文字的间距（el-button 自身不给 gap）。配色 / 描边 / 圆角 /
+   hover / focus 环全部由 variant 承担。
+   激活态也不再自绘 .active 底色，改由 :variant 在 secondary ⇄ primary 间切。 */
 .bar-btn {
-  background: var(--bg-input);
-  color: var(--text-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  padding: 6px 12px;
   flex-shrink: 0;
   white-space: nowrap;
-  font-size: 12px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
   gap: 4px;
-  transition: all var(--duration-fast) var(--ease-in-out);
 }
 
-.bar-btn.active {
-  background: var(--accent-primary);
-  color: var(--text-inverse);
-}
-
-.bar-btn.reconnect {
-  background: var(--success-muted);
-  color: var(--success);
-  border: 1px solid var(--success);
-  border-radius: var(--radius-sm);
-  font-weight: 600;
-}
-
+/* 重连钮：配色交给 MyButton 的 success 变体，这里只留一点按下缩放的微动效
+   （纯 transform，不与 myui 的颜色/边框规则打架）。 */
 .bar-btn.reconnect:hover {
-  background: var(--success);
-  color: var(--text-inverse);
   transform: scale(1.05);
 }
 
-/* 浮层面板（历史 / 快捷命令） */
+/* 浮层面板（历史 / 快捷命令）
+   定位已交给 MyPopover（EP popper：teleport、视口碰撞翻转、点外关闭、Esc），
+   这里只保留面板自身的盒子与内部布局。 */
 .float-panel {
-  position: absolute;
-  bottom: 36px;
-  right: 8px;
   max-height: 60vh;
   background: var(--bg-surface);
   border: 1px solid var(--border-emphasis);
@@ -626,7 +647,18 @@ function firstLine(cmd: string): string {
   box-shadow: var(--shadow-xl);
   display: flex;
   flex-direction: column;
-  z-index: 10;
+  overflow: hidden;
+}
+
+/* popper 外壳中和：EP 默认给 .el-popover 加了 12px padding 与自己的边框/圆角，
+   面板自己有盒子，这里去掉避免双层。表面色由 myui 的 html.dark
+   --el-bg-color-overlay 提供（暗色下为深色），故只清 padding 与边框。 */
+:global(.cb-popper.el-popover) {
+  padding: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
 }
 
 .history-panel {
@@ -651,16 +683,11 @@ function firstLine(cmd: string): string {
   color: var(--text-secondary);
 }
 
+/* 浮层标题栏里的文字链按钮。myui small 尺寸的左右内边距相对 11px 字号
+   的标题行偏宽，收一档；「管理」那枚改用 ghost-primary 变体表达强调色，
+   不再自写 .link-btn.manage 的 color。 */
 .link-btn {
-  background: transparent;
-  border: none;
-  color: var(--text-muted);
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.link-btn.manage {
-  color: var(--accent-primary);
+  padding: 0 4px;
 }
 
 .float-list {
@@ -689,17 +716,10 @@ function firstLine(cmd: string): string {
   background: var(--bg-surface-hover);
 }
 
+/* 钉住钮只保留布局；选中/未选中的视觉差异交给 MyIconButton 的 active
+   （底色+前景色双通道，并输出 aria-pressed）。 */
 .pin-btn {
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  font-size: 14px;
-  opacity: 0.4;
-  padding: 0;
-}
-
-.pin-btn.pinned {
-  opacity: 1;
+  flex: none;
 }
 
 .cmd-text {
@@ -712,13 +732,10 @@ function firstLine(cmd: string): string {
   white-space: nowrap;
 }
 
+/* 删除钮：MyIconButton 提供按钮本体，这里只调尺寸感与默认色的弱化。 */
 .del-btn {
-  background: transparent;
-  border: none;
-  color: var(--text-muted);
-  font-size: 12px;
-  cursor: pointer;
-  opacity: 0.6;
+  flex: none;
+  opacity: 0.7;
 }
 
 .qc-group-title {
@@ -742,7 +759,7 @@ function firstLine(cmd: string): string {
 }
 
 .qc-arrow {
-  font-size: 11px;
+  flex: none;
   color: var(--accent-primary);
 }
 

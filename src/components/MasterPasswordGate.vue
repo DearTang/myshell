@@ -6,9 +6,8 @@
      setup 仅在"再次输入"框回车提交）。 -->
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import { Lock, Warning } from "@element-plus/icons-vue";
 import type { InputInstance } from "element-plus";
-import { MyButton } from "myui";
+import { MyButton, MyIcon } from "myui";
 import { setupVault, unlockVault, getLockoutInfo } from "@/api";
 import type { LockoutInfo } from "@/api";
 import { BROWSER_PREVIEW_NOTICE, isTauri } from "@/utils/environment";
@@ -174,7 +173,7 @@ function formatTime(timestamp: number | null): string {
           @keydown.enter="onPassEnter"
         >
           <template #prefix>
-            <el-icon :size="14"><Lock /></el-icon>
+            <MyIcon :size="14" name="Lock" />
           </template>
         </el-input>
         <!-- Strength Indicator - Only show in setup mode -->
@@ -200,7 +199,7 @@ function formatTime(timestamp: number | null): string {
           @keydown.enter="submit()"
         >
           <template #prefix>
-            <el-icon :size="14"><Lock /></el-icon>
+            <MyIcon :size="14" name="Lock" />
           </template>
         </el-input>
         <div v-if="mismatch" class="mismatch">两次输入不一致</div>
@@ -209,7 +208,7 @@ function formatTime(timestamp: number | null): string {
       <!-- Error Message -->
       <div v-if="err" class="err-box animate-fade-up">
         <span class="err-icon">
-          <el-icon :size="14"><Warning /></el-icon>
+          <MyIcon :size="14" name="Warning" />
         </span>
         {{ err }}
       </div>

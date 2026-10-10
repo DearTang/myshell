@@ -7,8 +7,7 @@
      同意/暂不的实际落库在壳层（App.vue 的 onStatsAgree/onStatsDecline → lib/usageStats），
      本组件只 emit（confirm→agree / cancel→decline）。 -->
 <script setup lang="ts">
-import { TrendCharts } from "@element-plus/icons-vue";
-import { MyDialog } from "myui";
+import { MyDialog, MyIcon } from "myui";
 
 defineOptions({ name: "StatsConsentDialog" });
 
@@ -33,7 +32,7 @@ const emit = defineEmits<{ agree: []; decline: [] }>();
     <template #header>
       <div class="dlg-head">
         <span class="icon">
-          <el-icon :size="28"><TrendCharts /></el-icon>
+          <MyIcon :size="28" name="TrendCharts" />
         </span>
         <span class="title">帮助 MyShell 变得更好</span>
       </div>

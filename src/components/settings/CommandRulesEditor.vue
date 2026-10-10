@@ -2,8 +2,7 @@
      （从旧 mcp 分区拆出）。active 语义沿用旧版：每次切入 MCP 类目重新拉取。 -->
 <script setup lang="ts">
 import { onMounted, ref, watch } from "vue";
-import { Search } from "@element-plus/icons-vue";
-import { MyButton, MyCheckbox, MyInput } from "myui";
+import { MyButton, MyCheckbox, MyIcon, MyInput } from "myui";
 import { getCommandRules, setCommandRules, type CommandRules } from "@/api";
 
 defineOptions({ name: "CommandRulesEditor" });
@@ -181,10 +180,11 @@ function filteredRules(key: RuleListVM["key"]): string[] {
       <div class="rule-block">
         <div class="rule-title" :class="list.tone">{{ list.title }}</div>
         <div class="rule-input-row">
-          <input
+          <MyInput
+            bare
             class="rule-input"
-            :value="inputOf(list.key)"
-            @input="setInput(list.key, ($event.target as HTMLInputElement).value)"
+            :model-value="inputOf(list.key)"
+            @update:model-value="setInput(list.key, $event)"
             @keydown="addRuleOnEnter(list.key, $event)"
             placeholder="输入正则后回车添加…"
           />
@@ -199,7 +199,7 @@ function filteredRules(key: RuleListVM["key"]): string[] {
           @update:model-value="setSearch(list.key, $event)"
         >
           <template #prefix>
-            <el-icon :size="12"><Search /></el-icon>
+            <MyIcon :size="12" name="Search" />
           </template>
         </MyInput>
         <div class="rule-listbox" :style="{ maxHeight: list.maxHeight + 'px' }">
@@ -210,7 +210,14 @@ function filteredRules(key: RuleListVM["key"]): string[] {
             :class="{ divided: i < rulesOf(list.key).length - 1 }"
           >
             <span class="rule-text" :class="list.tone">{{ rule }}</span>
-            <button class="rule-remove" type="button" title="删除" @click="removeRule(list.key, rule)">✕</button>
+            <MyIconButton
+              title="删除"
+              class="rule-remove"
+              label="删除"
+              size="12"
+              name="Close"
+              @click="removeRule(list.key, rule)"
+            />
           </div>
           <div v-if="rulesOf(list.key).length === 0" class="rule-empty">暂无规则</div>
         </div>
