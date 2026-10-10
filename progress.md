@@ -6407,3 +6407,106 @@ label / error 文案），`ElInput` 的边框 / 圆角 / 聚焦环原样保留�
 | 什么可能导致偏离？ | ① 只在 UI 层打补丁（给 AI 面板算一个"减去底栏高度"的外边距）而不去改壳层网格 —— 那样底栏仍然分列两侧，根因还在；② 拆掉父子关系后忘了补连线，让 `register-refresh` / `screenshot` 变成永远没人调的 emit；③ 注册表只在 onMounted 写一次，忘了 sessionId 会随重连变化；④ 可选布尔 prop 没给默认值就当"默认开启"用。 |
 | 下一步最小可验证动作？ | 打开一个终端标签：命令栏与服务器状态栏连成一条贯穿窗口的底栏、AI 面板底边停在底栏上沿；点 📷 能存截图并弹"已保存"提示；在终端敲一条命令后打开历史浮层能看到它；切到 SFTP 标签底栏收起；进多窗口模式每个格子自带命令栏。 |
 | 目标是什么？ | 结构问题要在结构上解决：两条底栏本就是窗口级的东西，就不该塞在某一列里。 |
+
+## 阶段 176：发布 v2.16.4
+
+### 一、版本判定
+
+按发版规则机械判定：`RELEASE_NOTES_STAGING.md` 的 38 条待发布条目里
+0 条 ✨新增 / 24 条 🛠️优化 / 12 条 🐛修复 / 0 条 🔒安全 —— 没有 ✨ 新增，
+故取 **patch**，2.16.3 → **2.16.4**。不因为改动量大就自作主张提 minor。
+
+### 二、完整性校验
+
+以 staging 里的 `baseline: v2.16.3`（即 HEAD `184a700 release: v2.16.3`）
+为起点跑 `git diff --stat`，40 个文件 / +3194 −1583。逐项核对发现三处问题并已修正：
+
+1. **漏记** —— 阶段 175 的主体改动（底部两行提升为壳层底栏）没进 staging；
+2. **漏记** —— 会话计数徽标补终端图标没进 staging；
+3. **过时描述** —— AI 图标那条原写「命令栏四处统一」，但阶段 174 已经把命令栏上的
+   AI 按钮删了，实际只剩三处，措辞改为「三处统一」。
+
+教训：完整性校验不能只数条目条数，得逐条对着 diff 看 ——「改了什么」和「记了什么」
+是两个独立的集合，两边都得核对。
+
+### 三、预检
+
+- `npx vue-tsc --noEmit` EXIT=0 —— 这是项目的真实类型门（`npm run build` 与
+  `test:ts` 用的都是它）。
+- `npx tsc --noEmit` EXIT=2，报 3 个 `TS2307`（`src/main.ts:16` 的 `./App.vue`，
+  `src/debug-shell.ts:12,13`）。**判定为既有状态，不阻塞**：本项目的
+  `src/vite-env.d.ts` 里没有 `*.vue` 模块 shim，裸 `tsc` 从来就跑不通，每一处
+  `.vue` 导入都会报。**没有**为此改 tsconfig 或补 shim —— 那属于超出发版范围的改动。
+- `cargo check` EXIT=0（5m26s），38 条 warning、0 error，全是既有的未用变量 /
+  Win32 FFI 结构体非 snake_case / dead code。
+- 构建前确认无运行中的 `myshell.exe`（避开上一轮踩过的 `os error 1224` 文件占用）。
+
+### 四、两处流程文档与实际不符（已报告，未擅自修改）
+
+1. **CLAUDE.md 写的「`npm run build` — `tsc && vite build`」与「`npx tsc --noEmit`
+   — type-check only」与实际不符**。`package.json` 里 `build` 实际是
+   `node scripts/sync-version.mjs && vue-tsc --noEmit && vite build`，裸 `tsc`
+   从来不是类型门的构成。这就是每次发版跑到预检都会撞出 3 个假报警的根源。
+2. **发版流程第 6 步要求 stage `package-lock.json`，但本项目没有这个文件**。
+   本项目用 `pnpm-lock.yaml`（pnpm 布局，`node_modules/.pnpm/`），而 pnpm 锁文件
+   不存根包版本号 —— 版本同步实际只影响 `Cargo.toml` + `package.json` 两处。
+
+顺带发现：`pnpm-lock.yaml` 在本次提交里第一次出现实质改动 —— myui
+**0.27.2 → 0.30.1** 的依赖锁此前一直没跟着 `package.json` 提交（阶段 162~175
+期间升过两次：0.27.2 → 0.29.2 → 0.30.1）。这次一并入库，否则从仓库 clone 下来
+装到的仍是旧版 myui。
+
+### 五、发布分支问题（已征询，用户选定维持现状）
+
+`scripts/publish-gitee-release.mjs` 硬编码 `target_commitish: "main"`，但代码全在
+「界面更新」分支上：
+
+- `origin/main` = `a3384a2`（`chore: clear release staging after v2.16.2`）
+- `origin/界面更新` = 本地 HEAD，`rev-list --count` 为 `0 0`（完全同步）
+- `rev-list --left-right --count origin/main...HEAD` = `0 1` —— main 是 HEAD 的祖先，
+  快进推送安全、无需 force。
+
+也就是说**代码早已推到 `origin/界面更新`，只是从 v2.16.3 起没再同步到 main**，而
+Gitee release 的 tag 打的是 main HEAD，于是 v2.16.3 的 tag 指向了不含 v2.16.3 代码的
+`a3384a2`，v2.16.4 重蹈覆辙。
+
+已把三个选项摆给用户（快进推 main / 改 `target_commitish` / 维持现状），**用户选定
+「维持现状不改」**。本次发布因此只推 `origin/界面更新`，脚本不动。已知代价：v2.16.4
+的 tag 与 v2.16.3 一样指向 `a3384a2`，从 tag 检出的代码不含本次改动。要修的话是
+一行 `git push origin 界面更新:main` 或改脚本的 `target_commitish` —— 随时可补。
+
+### 六、构建与发布结果
+
+- `npm run tauri:build` EXIT=0：前端 2173 modules / 49.23s，Rust release 5m01s。
+- 构建期 `sync-version` 回读为「already at 2.16.4 (Cargo.toml is the source)」——
+  打包脚本没有把版本覆回旧值。
+- 产物 `G:\Rust\cargo_target\release\bundle\nsis\MyShell_2.16.4_x64-setup.exe`，
+  12.77 MB（13,393,128 字节），SHA256
+  `5C74A06245D29CA01F930DCAD5F9B64B2D4EF36B72C38D7B4507F6D1111F38E9`。
+- `release: v2.16.4`（`30631ff`，43 文件 / +3281 −1586）→ 推 `origin/界面更新`。
+- Gitee release id `1194597`，安装包已上传：
+  https://gitee.com/argustang/myshell/releases/tag/v2.16.4
+- `chore: clear release staging after v2.16.4`（`8991768`）→ staging 清空至 971 字节、
+  无 BOM、18 行纯 LF，baseline 更新为 `v2.16.4`。
+
+### 七、三个未入库的文件（非发布内容，已向用户报告）
+
+1. 仓库根的 `console.log('wait')` —— **0 字节**，10/09 09:32 生成，是某次 PowerShell
+   重定向写错造成的误产物，与项目无关。
+2. `src/debug-shell.ts`（1266 字节）+ `debug-shell.html`（824 字节）—— 10/06 的调试
+   脚手架，`index.html` / `vite.config.ts` 都没引用。因为 `tsconfig.include` 是
+   `["src"]`，`debug-shell.ts` 在本地会被 `vue-tsc` 扫到，但它不在仓库里，所以从
+   仓库 clone 后构建也不会因它失败。
+3. `.zcode/` 下 248 个脚本与日志临时文件。
+
+三者都没有进本次发布提交。
+
+## 五问重启检查（阶段 176）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 176 —— 走完整发版流程，发布 **v2.16.4**（patch）。已推 `origin/界面更新`、Gitee release id `1194597`、安装包已上传、staging 已清空。 |
+| 我要去哪里？ | 等用户实测 v2.16.4；然后处理阶段 171 问题四（AI 模型选择器选不到模型，根因仍未定位）、`FeedbackDialog` / `CommandRulesEditor` 里剩下两处 `MyCheckbox` 的「标签在上」写法、`WindowControls` 的 Tauri 兜底。 |
+| 什么可能导致偏离？ | ① 发版时只看条目类型机械判版本，忘了逐条对 diff 做完整性校验；② 预检跑裸 `tsc` 看到红就以为代码坏了，去改 tsconfig 补 shim —— 那是既有状态，真类型门是 `vue-tsc`；③ 只推了工作分支却没注意 release 脚本的 `target_commitish: "main"`，tag 悄悄指到旧代码；④ 发现文档与实现不符就顺手改 CLAUDE.md，把一次发版扩成了改文档。 |
+| 下一步最小可验证动作？ | 装上 `MyShell_2.16.4_x64-setup.exe`，打开一个终端标签：确认命令栏与服务器状态栏连成一条贯穿整个窗口宽度的底栏（AI 栏下方也是）、AI 面板输入区在底栏之上、📷 截图能存并弹提示、命令历史浮层能立刻看到刚敲的命令。 |
+| 目标是什么？ | 发版流程的价值不在于跑完 9 步，而在于每一步都留下可核对的证据（退出码、字节数、SHA256、release id、commit hash），以及把流程里撞见的真实问题记下来而不是绕过。 |
