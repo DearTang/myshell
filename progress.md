@@ -6510,3 +6510,723 @@ Gitee release 的 tag 打的是 main HEAD，于是 v2.16.3 的 tag 指向了不�
 | 什么可能导致偏离？ | ① 发版时只看条目类型机械判版本，忘了逐条对 diff 做完整性校验；② 预检跑裸 `tsc` 看到红就以为代码坏了，去改 tsconfig 补 shim —— 那是既有状态，真类型门是 `vue-tsc`；③ 只推了工作分支却没注意 release 脚本的 `target_commitish: "main"`，tag 悄悄指到旧代码；④ 发现文档与实现不符就顺手改 CLAUDE.md，把一次发版扩成了改文档。 |
 | 下一步最小可验证动作？ | 装上 `MyShell_2.16.4_x64-setup.exe`，打开一个终端标签：确认命令栏与服务器状态栏连成一条贯穿整个窗口宽度的底栏（AI 栏下方也是）、AI 面板输入区在底栏之上、📷 截图能存并弹提示、命令历史浮层能立刻看到刚敲的命令。 |
 | 目标是什么？ | 发版流程的价值不在于跑完 9 步，而在于每一步都留下可核对的证据（退出码、字节数、SHA256、release id、commit hash），以及把流程里撞见的真实问题记下来而不是绕过。 |
+
+## 阶段 177：重装撞锁（myshell-mcp.exe）与浮层窗口控制钮位置
+
+用户装 v2.16.4 时报了两个问题，本阶段一并处理。
+
+### 一、重装撞锁：「无法打开要写入的文件 myshell-mcp.exe」
+
+#### 症状与现场
+
+截图显示安装走到「解压缩 .myshell-cli.exe 100%」后弹窗，目标是
+`E:\Program Files\MyShell\myshell-mcp.exe`。查安装目录的时间戳印证了失败位置：
+`myshell-cli.exe`(10/10 14:33) 与 `myshell.exe`(14:35) 都写成功了，
+**只有 `myshell-mcp.exe` 仍是 10/9 的旧文件**；`uninstall.exe`(14:45) 说明卸载
+流程走过了。同时本机当时有 **3 个 `myshell-mcp.exe` 进程 + 1 个 `myshell.exe`** 在跑。
+
+#### 为什么已有的两道检查没挡住
+
+`installer.nsi` 里本来就有检查（文件头第 2、5 项）：安装开头一次、复制 binaries
+前再一次，`CheckIfAppIsRunning` 检测到就弹框、用户确认即 `RmForceShutdown` 强杀。
+用户反馈「还是存在重装无法停止 mcp 的情况」—— 关键在**"停止不了"**这件事本身：
+AI 客户端（Claude / Cursor / ZCode 等）对 MCP server 有监督，会自动重拉。
+杀掉后毫秒内又起一个，所以复制前一行刚检查并强杀过也没用。
+
+这不是检测失效，是**在和对方的重启机制赛跑，这条路本身走不通**。
+
+#### 换思路：不碰锁，改名让路
+
+Windows 允许**重命名正在运行的 exe**（删除不行 —— 镜像节在用）。
+本机实测确认：复制一份 `powershell.exe` 后带 `Start-Sleep` 跑起来，
+`Rename-Item` 成功，原路径消失、新路径存在。
+
+于是不再依赖「检测进程 + 杀」，改为在**复制 binaries 前一刻**把旧文件改名让出路径：
+
+```nsi
+Delete "$INSTDIR\myshell-mcp.exe.myshell-old"      ; 先清上一代残留
+Rename "$INSTDIR\myshell-mcp.exe" "$INSTDIR\myshell-mcp.exe.myshell-old"
+; ↑ 路径已空，随后的 File 指令必成
+```
+
+- **改名失败才回退**到原来的 `CheckIfAppIsRunning` 提示式强杀（极少数：杀软独占句柄）。
+- **旧副本清理由下一次安装开头兜底**，最多留一代，不会无限累积；卸载段也补了
+  `/REBOOTOK` 删除 —— 必须删，否则末尾 `RMDir "$INSTDIR"` 会因目录非空失败。
+- **附带好处**：旧进程继续跑改名后的副本，用户正在进行的 AI 会话不被打断
+  （很可能正是发起这次安装的那个会话）。代价是 MCP 要等 AI 客户端下次拉起进程
+  才切到新版本 —— 已在 `DetailPrint` 里明说，不让用户以为装完就立刻生效。
+- 后缀选 `.myshell-old` 而非 `.old`：本机已有一个阶段 120 手工改名留下的
+  `myshell-mcp.exe.old`（9/5 的文件），换后缀避免与既有残留混淆。
+
+#### 教训
+
+**有些「检测 + 强杀」的补救是在和对方的重启机制赛跑**，检测做得再对也只是把
+失败概率往后推。真正稳的做法是绕开冲突本身（改名，而非删除/覆盖）。
+判断标准：如果对方的重启是它设计的一部分（AI 客户端的 MCP 监督就是如此），
+就不要试图让它停下来。
+
+### 二、浮层窗口控制钮浮在窗口正中
+
+#### 症状
+
+门禁页「解锁 MyShell」与启动加载页上，─ □ ✕ 三个按钮浮在**窗口垂直正中**
+（用户截图红框），而不是右上角。
+
+#### 成因
+
+`WindowControls.vue` 的样式分两层：
+
+```css
+.window-controls { height: 100%; }                              /* (0,1,0) */
+.window-controls :deep(.my-window-controls__btn) { height: 100%; }
+```
+
+顶栏那处 `.window-controls` 是 44px 顶栏的 flex 子元素，`height:100%` = 44px，
+**正确**。而两处浮层（`MasterPasswordGate` 的 `.gate`、`App.vue` 的
+`.vault-splash`）父容器都是 `position: fixed; inset: 0` 的全屏覆盖层，
+而 `.is-overlay` 自己 `position: absolute; top:0; right:0` 且**没有覆盖高度** ——
+绝对定位元素的 `height:100%` 参照的是**包含块**，于是解析成**整窗高**。
+根元素撑成整窗高后，里面每个 `height:100%` 的按钮也是整窗高，字形被各自居中到
+按钮的垂直中点 → 三个字形落在窗口正中。
+
+根子上是**一条为 44px 顶栏写的规则被无条件套用到了全屏浮层**。
+2026-10-09 切 myui 的 `MyWindowControls` 时引入 —— 此前本组件自绘定尺寸的按钮，
+没有这条 `height:100%`。
+
+#### 修法
+
+`.is-overlay` 显式把根高度钉回 `--ui-topbar-h`（app.css 里已有该令牌，
+定义在 `:root, html.dark, html.light` 块内，深浅主题都可用）。
+按钮的 `height:100%` 随之解析成 44px，与栏等高。
+
+#### 教训
+
+`height: 100%` 看着「自适应父容器」，但对**绝对定位元素**它的参照是包含块，
+而包含块不一定是那个「看起来的父容器」。凡是浮层 / 覆盖层这类
+`position: fixed; inset: 0` 的场景，凡是用 `100%` 撑高度的，
+都要单独确认参照的到底是谁。
+
+### 三、验证
+
+- `npx vue-tsc --noEmit` EXIT=0。
+- `npx vite build` EXIT=0（2173 modules / 54.11s）。
+- NSIS 模板改动只能由 `npm run tauri:build` 出新安装器才能端到端验证
+  （makensis 会渲染 + 编译整份模板），本阶段同批出包。
+- 模板里新增的中文 `DetailPrint` 安全性已核实：tauri-bundler 调 makensis 时带
+  `-INPUTCHARSET UTF8`，且渲染后的 installer.nsi 以 UTF-8 BOM 写出。
+
+### 四、遗留 / 待用户实测
+
+1. **重装**：开着 AI 客户端（让 `myshell-mcp.exe` 真的在跑）跑新安装包，
+   确认一路装完不再撞锁，且安装后 `E:\Program Files\MyShell\myshell-mcp.exe`
+   是新版、时间戳为本次安装时刻。
+2. **改名残留**：装完若 `myshell-mcp.exe.myshell-old` 还在属正常（进程仍锁着），
+   下次安装开头会被清掉。需确认它不会无限累积。
+3. **窗口控制钮**：门禁页与启动加载页上 ─ □ ✕ 应贴在右上角、与栏等高。
+4. 阶段 171 问题四（AI 模型选择器选不到具体模型）仍未定位。
+5. 本机 `E:\Program Files\MyShell\myshell-mcp.exe.old`（9/5，阶段 120 手工改名
+   的遗留）仍躺在安装目录里，与本次改动无关，可择机手删。
+
+## 五问重启检查（阶段 177）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 177 —— 修两处：① 重装撞锁，mcp/cli 从「检测进程再强杀」改为「复制前改名让出路径」；② 门禁页 / 启动页的窗口控制三联钮浮在窗口垂直正中，`.is-overlay` 显式钉回 `--ui-topbar-h`。均已过 `vue-tsc` + `vite build`，NSIS 改动随本批安装器做端到端验证。 |
+| 我要去哪里？ | 等用户实测重装与两处浮层的按钮位置；之后处理阶段 171 问题四、剩下两处 `MyCheckbox` 的「标签在上」写法、`WindowControls` 的 Tauri 兜底。 |
+| 什么可能导致偏离？ | ① 继续在「怎么把 MCP 杀掉」上使劲（检测、再检测、加延迟），而不用改名绕开锁本身；② 改名时用了 `.old` 后缀，与本机既有的手工残留重名混淆；③ 忘了卸载段的清理，让 `.old` 留在目录里把末尾 `RMDir` 顶失败；④ 只修了门禁页、漏掉 `App.vue` 的 `.vault-splash`（两处同样是 `fixed inset:0`）。 |
+| 下一步最小可验证动作？ | 开着 AI 客户端装一次新版：装完不再弹「无法打开要写入的文件」，且安装目录里 `myshell-mcp.exe` 的时间戳为本次安装时刻；再打开未设密码时的门禁页，确认 ─ □ ✕ 在右上角。 |
+| 目标是什么？ | 重装不该需要用户去跟自己的 AI 客户端抢进程所有权；结构上的解法（改名让路）优于和对方的重启机制赛跑。 |
+
+## 阶段 178：底栏不再压侧栏、命令输入框占半栏、模型选择器三处修正
+
+用户装完 v2.16.4 后提三个问题，均为阶段 175 壳层重构与阶段 174 底部操作栏调整
+的连带后果。
+
+### 一、底栏压到左侧菜单栏底下
+
+#### 症状
+
+命令栏与系统信息栏**贯穿整个窗口宽度**，左侧菜单栏被压到只剩上半截，
+页脚（版本号 + 邮件钮）停在底栏上沿、像被"顶"上去半截。
+
+#### 成因
+
+阶段 175 把壳层第三行定义成了：
+
+```css
+"topbar topbar topbar" var(--ui-topbar-h)
+"side   work   ai" 1fr
+"bottom bottom bottom" auto      /* ← 占满三列 */
+```
+
+`side` 只出现在第二行，侧栏因此只到第二行。当时把"侧栏页脚被顶上去"记成了
+已知取舍（阶段 175 遗留第 2 条），用户现在明确否决。
+
+#### 修法
+
+第三行左侧留空、侧栏贯通 2~3 行：
+
+```css
+"topbar topbar topbar" var(--ui-topbar-h)
+"side   work   ai" 1fr
+"side   bottom bottom" auto
+```
+
+CSS Grid 里同名 area 出现在多个格子时会合成一个矩形，`grid-area: side` 自动把侧栏
+放进这两行，不需要额外的 `grid-row`。`.no-ai` 分支同步改为
+`"side work" / "side bottom"`。
+
+AI 栏（`grid-area: ai`，只在第二行）的底边仍停在底栏上沿 —— 阶段 175 想要的
+那条对齐关系没有被破坏，改的只是"底栏要不要压到侧栏底下"。
+
+### 二、命令输入框没有占满本栏一半
+
+#### 症状
+
+`.cmd-input { flex: 0 1 50% }` 写着，但输入框实际只占本栏约 15%。
+
+#### 成因（本阶段最值得记的一条）
+
+读 myui 的编译产物才看清：`MyInput` 是 `inheritAttrs: !1`，且它把 `t.$attrs`
+**显式 mergeProps 给了内层的 `ElInput`**，根节点（`MyFieldShell` 的 `div.my-field`）
+什么都没接。于是 `class="cmd-input"` 落到了 **ElInput 的根**上，而那是
+`.command-bar` 的**孙节点**，根本不是 flex 子元素 —— `flex` 属性写在非 flex 子元素上，
+浏览器直接忽略。
+
+再叠加一层：`MyFieldShell` 在 `bare` 态下是 `.my-field--bare{display:block}`
+（编译自 myui-lib.css），块级 flex 子元素在没有 flex 属性时宽度由内容决定，
+于是输入框退回"多宽就多宽"。
+
+对照物能说明问题：`MyWindowControls` 同样是 `inheritAttrs: !1`，但它的根节点
+**显式写了 `mergeProps({class:"my-window-controls"}, t.$attrs)`**，所以 class 落得到
+根上、`.window-controls{height:100%}` 才生效。同一个 myui 包里，两种写法
+导致完全相反的结果 —— **`inheritAttrs:false` 本身不决定 class 去向，
+根节点有没有 mergeProps 才决定。**
+
+#### 修法
+
+不赌 class 落在哪一层，加一层**块级**包裹 div 把宽度控制在外面：
+
+```html
+<div class="cmd-slot"><MyInput ... /></div>
+```
+
+```css
+.cmd-slot { flex: 0 1 50%; min-width: 0; }
+```
+
+`.cmd-slot` 保持块级（**不能**改成 `display:flex`，那样 `.my-field` 又会退回按内容
+收缩）；内部链 `.my-field--bare`（block）→ `.my-field__control`（普通 div）→
+`.el-input`（EP 侧编译为 `display:flex`，块级）在块上下文里逐级撑满，
+因此**一个 `:deep()` 都不用**。
+
+#### 教训
+
+**封装组件的 `class` 落在根还是内层，取决于它有没有在根上 mergeProps，
+不能靠"Vue 会自动合并到根"来推断** —— `inheritAttrs:false` 的组件普遍是后者。
+给这类组件设布局属性（flex/width/height）前，先确认属性落在了 flex 子元素上；
+不确定就加一层包裹，把布局握在自己手里。
+
+### 三、模型选择器三处
+
+#### ① 切换模型时"框有点晃"
+
+按钮宽度完全由文字驱动：`.el-button__content` 是 inline-flex，
+`.picker-label{flex:1}` 在里面没有可分配余量（外层按钮按内容定宽），等于按内容定宽。
+每换一个模型、名字长一点短一点，按钮与整条工具条一起重排。
+
+修法：`.picker-toggle` 钉死 `width: 190px`（配 `max-width: 58%` 兜窄面板），
+同时给 `.el-button__content` 补 `width:100%` + `justify-content:flex-start` ——
+content 占满按钮后标签吃下多余空间、箭头落到右端，两者相对位置才稳定。
+
+#### ② 那枚薄荷高亮
+
+`.picker-toggle` 用的是 `variant="secondary"`，而 myui 的 `MyButton` 把
+`secondary` 映射成 EP 的 `type="default"`（**填充底色**）、`ghost` 映射成
+`text:true`（透明）。同栏的「附带选区」用的是 `ghost`，所以这一枚比邻居重出一截，
+浮层展开时尤其像一枚发亮的药丸。改为 `variant="ghost"`，与同栏控件统一。
+
+#### ③「OpenAI兼容」徽标
+
+`.provider-chip` 显示 `providerLabel(activeModel.provider)`。但 `pickerLabel` 里
+本来就带了供应商名（形如「智谱GLMCodingPlan / glm-5.2」），徽标既重复供应商信息、
+又混进了协议细节，而盒子本身已经足够醒目。删除徽标，连带删掉只剩这一处调用的
+`providerLabel()` 函数与 `.provider-chip` 样式。
+
+> 模型列表行里的 `sm.label / sm.modelId` 仍可能含「OpenAI兼容」字样 —— 那是用户
+> 在设置里自己填的模型名，属模型身份数据，不在本次删除范围内。
+
+### 四、验证
+
+- `npx vue-tsc --noEmit` EXIT=0。
+- `npx vite build` EXIT=0（2173 modules / 44.05s）。
+- 删掉 `providerLabel()` 后全库 grep 确认无残留引用（`activeModel` 仍被
+  `activeModelIdLabel` / `pickerLabel` / `modelRowActive` 使用，无悬空）。
+- 三处都是**布局/配色**改动，**必须由用户实测**。
+
+### 五、待用户实测
+
+1. 底栏是否回到侧栏右侧、不再压住菜单栏；侧栏页脚是否回到窗口左下角。
+2. AI 面板底边是否仍与底栏上沿对齐（这条不能被本次改动破坏）。
+3. 命令输入框是否约占本栏左半，「快捷 / 截图 / 历史」是否贴到右缘。
+4. 模型选择器：切换模型时是否不再位移；是否与「附带选区」同一套观感；
+   徽标是否已消失；长模型名是否走省略号而不是把按钮撑宽。
+
+## 五问重启检查（阶段 178）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 178 —— 三处连带修正：底栏从"贯穿整个窗口宽度"收回为"侧栏右侧两列"（侧栏贯通 2~3 行）；命令输入框宽度改由块级包裹层控制（此前 flex 写在非 flex 子元素上无效）；模型选择器去高亮（secondary→ghost）、删「OpenAI兼容」徽标、钉死宽度止抖。均已过 `vue-tsc` + `vite build`。 |
+| 我要去哪里？ | 等用户实测这四处布局/配色；之后处理阶段 171 问题四、剩下两处 `MyCheckbox` 的「标签在上」写法、`WindowControls` 的 Tauri 兜底。 |
+| 什么可能导致偏离？ | ① 把底栏改回"侧栏右侧"时顺手把 AI 栏的底边对齐也弄坏；② 以为 `inheritAttrs:false` 的组件 class 一定落在根上（MyInput 就是反例），下一次又给 MyInput/MyTextArea 挂 flex；③ 把 `.cmd-slot` 改成 `display:flex`"顺便对齐一下"，`.my-field` 立刻退回按内容收缩；④ 只删了徽标模板没删 `providerLabel()`，留下死代码。 |
+| 下一步最小可验证动作？ | 装新包：菜单栏恢复满高、底栏只占右侧；命令输入框约占本栏一半；模型选择器在"智谱GLMCodingPlan / glm-5.2"与更长/更短模型名之间切换时纹丝不动。 |
+| 目标是什么？ | 结构改动要连带检查它的每一条"当初被默许的代价"；封装组件的 class 归属与 variant 语义都不能靠猜，要读编译产物。 |
+
+## 阶段 179：浮层溢出窗口、侧栏 ⋯ 靠左、配色卡片排版、设置关闭钮不可见
+
+用户实测上一版测试包后提四个问题，分属三个文件，成因各不相同。
+
+### 一、快捷命令 / 历史命令浮层溢出到窗口外
+
+#### 成因
+
+`.quick-panel { width: 420px }` 与 `.history-panel { width: 480px }` 是**写死的宽度**，
+且没有视口上限；而触发钮（快捷 / 截图 / 历史）贴着窗口右缘，浮层以 `top-end` 右对齐。
+窗口一旦窄到「按钮右偏移 + 面板宽」放不下，面板左边缘就被顶出 webview ——
+溢出部分被直接裁掉，滚轮也够不着。
+
+`.float-panel` 本来就有 `max-height: 60vh`（纵向有界），缺的只是横向。
+
+#### 修法
+
+```css
+.history-panel { width: 480px; max-width: calc(100vw - 32px);
+                 max-height: min(60vh, calc(100vh - 96px)); }
+.quick-panel   { width: 420px; max-width: calc(100vw - 32px);
+                 max-height: min(60vh, calc(100vh - 96px)); }
+```
+
+选 `100vw - 32px` 而不是更小的余量，是因为数学上它足以保证左边缘 ≥ 4px：
+`top-end` 是右对齐，面板宽 ≤ 视口宽 - 32 时 `按钮右偏移(=视口宽-28) - 面板宽 ≥ 4`。
+**这样即使 popper 完全不做位移修正也不会溢出**，不依赖 floating-ui 的行为。
+纵向由 `.float-list`（已有 `flex:1` + `overflow-y:auto`）内部滚动。
+
+> 未验证项：用户截图的具体窗口尺寸无法从图中确定，本条是按「面板宽于可用空间」
+> 这一条路径修的。若装包后仍溢出，说明成因另有其人（见五问「可能导致偏离」）。
+
+### 二、侧栏连接行「⋯」太靠左
+
+`.conn-row` 的 `padding: 8px 16px 8px 24px` + `margin: 1px 6px`，加上
+`MyIconButton`（默认 36×36）自身的内边距，「⋯」字形离侧栏右缘约 30px。
+侧栏只有 264px，这点空档对连接名是实打实的损失：长名（形如「火山_115.190.136…」）
+提前被截断，而右侧看着仍是空的。
+
+先排除了两个「结构在偷宽度」的可能：行内只有 图标 / `.conn-main`(flex:1) / ⋯
+三个子元素，没有隐藏占位；`MyDropdown` 也只是把 default 插槽交给 `ElDropdown`
+（EP 仅包一层 `display:inline-flex` 的 `.el-dropdown`），不抢宽度。
+确认是纯 padding 后，右内边距 16px → 6px，腾出的 10px 全给连接名。
+
+`.folder-row` 保持 `7px 16px` 不动：文件夹行右端没有元素，名称自然延伸到位，
+跟着收紧反而会让文件夹名比连接名多伸一截。
+
+### 三、设置页配色卡片：色板与名称并排、色板顶出卡片
+
+#### 成因（与阶段 178 的命令输入框同一类）
+
+`.preset-card` 是 `MyButton`，而 `MyButton` 的 default 插槽被 EP 包进
+`<span class="el-button__content">`。卡片本该是「色板在上、名称在下」的纵向排布，
+但 `display:flex; flex-direction:column` 挂在**按钮根**上只作用到那一个 span ——
+span 内部仍是行内流，色板（`display:inline` 的 span）与名称于是并排成一行；
+再叠加行内盒的基线对齐，32px 的色板被顶到卡片上沿之外。
+
+修法与 `.picker-toggle` 一致，把纵向排布下推：
+
+```css
+.preset-card :deep(.el-button__content) {
+  display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 0;
+}
+```
+
+顺带给 `.preset-dot` 补 `flex: none`，防止它作为纵向 flex 子项被压扁。
+
+**这条印证了阶段 178 的结论：封装组件的插槽会被再包一层，任何"排版类"
+布局属性（flex-direction / justify-content / align-items / gap）挂在组件根上
+都只作用到那唯一的包裹元素，必须下推到内部层。**
+
+### 四、设置页右上角关闭 ✕ 看不见
+
+逐层排查：组件不是 `inheritAttrs:false`（class 正常落到根 `<button>`）；
+`color` 经 `MyIconButton` 透传给 `MyIcon`，`MyIcon` 内联写
+`--my-icon-color: currentColor`，链路正常；`Close` 在 myui 运行时注册表里确有条目
+（`index.ts.js` 中 `Close:` 真实存在，不是只出现在注释里）。
+
+真正的成因是**对比度**：`--text-tertiary: #6e7681` 在 `--bg-elevated`（≈#21262d）
+上只有约 3.1:1 —— 低于 WCAG AA 正文 4.5:1，而 ✕ 是 14px 的细笔画字形，
+在这个对比度下等于不可见（同文件里的 `.panel-subtitle` 用同一令牌但字号 12px、
+字重常规，加上位于视线中心，才勉强可读）。
+
+修法：色值改 `--text-secondary`（#8b949e，~5.5:1）、图标 14 → 16px、
+补一层极淡的常驻底（`--bg-surface`）+ 描边（`--border-subtle`）。
+**此前只有 hover 才显形**，等于要先找到位置才知道这里能点；常驻底让它自带可点性。
+
+### 五、验证
+
+- `npx vue-tsc --noEmit` EXIT=0。
+- `npx vite build` 见构建日志。
+- 四处均为布局/配色，**必须由用户实测**。
+
+### 六、待用户实测
+
+1. 快捷 / 历史浮层是否完整落在窗口内；窗口拉窄到极限（如 900px 以下）再看一次。
+2. 侧栏「⋯」是否贴到右缘；长连接名是否比之前多露一截。
+3. 配色卡片的色板是否回到名称上方、不再顶出卡片。
+4. 设置页右上角关闭 ✕ 是否可见可点。
+
+## 五问重启检查（阶段 179）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 179 —— 四处：浮层补视口宽高上限；侧栏「⋯」右内边距收到 6px；配色卡片纵向排布下推到 `.el-button__content`；设置关闭钮换更亮的色值 + 常驻底。`vue-tsc` EXIT=0。 |
+| 我要去哪里？ | 等用户实测；若浮层仍溢出，说明成因不是「面板宽于可用空间」，需转查 popper 定位本身（`popper-options` / reference 测量时机）。 |
+| 什么可能导致偏离？ | ① 只给浮层加 `max-width` 就以为 popper 不用管——若真是定位错，宽度上限救不了；② 把 `.folder-row` 的 padding 也一起收紧，结果文件夹名比连接名多伸一截；③ 关闭钮只改字号不改色值，3.1:1 对比度下 16px 细笔画依旧偏淡；④ 又把纵向 flex 挂回组件根上，忘了插槽会被 `.el-button__content` 再包一层。 |
+| 下一步最小可验证动作？ | 打开设置页 → 配色方案的色板是否在名称上方、右上角 ✕ 是否可见；再打开历史浮层并把窗口拖窄，确认面板完整在窗内。 |
+| 目标是什么？ | 排版类属性必须确认它作用在哪个元素上；可见性问题先量对比度再改字号。 |
+
+
+### 阶段 180 —— 上一轮三处「改了没反应」的真实根因（全部由产物 + 浏览器实测反查得出）
+
+用户反馈阶段 178/179 的三处修复**完全没有生效**。这一轮不再靠读源码推测，
+改用两条硬证据链：① 从**构建产物**里反查规则是否真的打包进去；② 搭**几何探针页**
+在真实浏览器里量 `getBoundingClientRect()`。三条缺陷的共同点是——**规则确实进了
+产物，但那条规则从一开始就没有匹配到任何元素**。
+
+---
+
+### 一、设置页关闭 ✕ 不渲染 —— myui 组件漏 import，Vue 静默退化
+
+**根因：`SettingsDrawer.vue` 根本没 import `MyIconButton`。**
+
+`src/main.ts` 里没有 `app.use(MyUI)` —— myui 组件必须逐个 SFC 显式 import。
+一旦漏掉，Vue **不报错**，而是把 `<MyIconButton>` 当成未知自定义元素渲染成
+`<myiconbutton>`；此时写在组件上的 class 照常生效，于是关闭钮变成
+「有 32×32 底色、有 1px 描边、**里面什么都没有**」的空盒子 ——
+与用户截图完全一致。
+
+这一条同时推翻了阶段 179 第四节的结论：**不是对比度问题**，图标是真的没被画出来。
+
+全仓扫描后发现同类问题共 **11 处 / 6 个文件**：
+
+| 文件 | 缺失 |
+|------|------|
+| `SettingsDrawer.vue` | `MyIconButton` ×1 |
+| `FeedbackDialog.vue` | `MyIconButton` ×1 |
+| `MultiWindowGrid.vue` | `MyIconButton` ×1 |
+| `QuickCommandsPanel.vue` | `MyIconButton` ×4 |
+| `settings/CommandRulesEditor.vue` | `MyIconButton` ×1 |
+| `TerminalPanel.vue` | `MyButton` ×3 |
+
+全部补齐。
+
+**为什么类型检查抓不到**：Volar 无法判断某个标签是否会在运行时被**全局注册**，
+未知标签一律放行 —— 于是 `vue-tsc --noEmit` 一直是 EXIT=0，
+这批空盒子就这么发了出去。
+
+**新增 `scripts/audit-myui-imports.mjs`**（从仓库根运行）：扫全部 `.vue`，
+比对「模板里用到的 myui 组件」与「实际 import 的名字」，只报真正漏掉的。
+已验证：修复前报 6 文件 11 处，修复后 `OK — every myui component used in a
+template is imported.`
+
+> 注意扫描脚本要**合并所有 `<script>` 块**：`FontField.vue` 同时有 options 块与
+> `<script setup>` 块，只取第一个会误报。
+
+### 二、配色卡片排版 —— `:deep(.el-button__content)` 在 EP 2.14.5 里根本不存在
+
+查 `node_modules/element-plus/es/components/button/src/button.vue_vue_type_script_setup_true_lang.mjs`，
+EP 2.14.5 包 default 插槽的是：
+
+```js
+_ctx.$slots.default
+  ? createElementBlock("span", {
+      class: normalizeClass({ [ns.em("text", "expand")]: shouldAddSpace })
+    }, [renderSlot(_ctx.$slots, "default")], 2)
+  : createCommentVNode("v-if", true)
+```
+
+即类名是 `.el-button__text`，**而且只有 `shouldAddSpace` 为真时才会真的带上**（否则那个
+span 根本没有 class）。`el-button.css` 里 `el-button__content` 出现 **0 次**。
+
+所以阶段 179 写的 `:deep(.el-button__content)` 是一条**永远匹配不到任何元素的死规则** ——
+规则在产物里，改动完全无效。
+
+**修法（不再打穿 EP 内部类名）**：在自己的插槽内容里包一层，插槽内容由本组件编译、
+自带 scope id，普通 scoped 选择器即可命中：
+
+- `AppearanceSection` → `.preset-body`
+- `AiPanel`（模型选择器）→ `.picker-row`
+- `AppTopBar` / `SessionDropdownPanel`（顶栏下拉触发钮）→ `.trigger-row`
+
+后两处此前也在用同一个死选择器（`.picker-label{flex:1}` 从未生效，
+箭头一直被顶在标签右边而非右端；顶栏触发钮的图标/文案/计数一直退回行内排版、没有 gap），
+一并修掉。
+
+**第二层病因：EP `.el-button { height: 32px }` 是写死的。** 纵向排布修好后，
+卡片盒子仍然只有 32px 高，内容（32 色板 + 6 间距 + 13 名称 ≈ 51px）照样溢出。
+补 `.preset-card { height: auto }`。
+
+探针实测（挂载真实 `AppearanceSection`）：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 卡片高 | 32px | 75px |
+| 色板顶出上沿 | **9.5px ❌** | 内缩 12px ✅ |
+| 色板在名称上方 | ❌ 并排 | ✅ |
+
+### 三、历史 / 快捷命令浮层溢出窗口右缘 —— 宽度给错了元素
+
+阶段 179 的判断（面板宽于可用空间 → 加 `max-width`）也是错的。探针实测直接量出真相：
+
+```
+popper  {"left":312,"right":462,"width":150}     ← 外壳只有 150px
+panel   {"left":312.7,"right":742,"width":429.3}  ← 面板 429px
+>>> PANEL OVERFLOWS RIGHT by 281.0px
+popper inline style: ... width: 150px;
+```
+
+EP 的 `.el-popover.el-popper { min-width: 150px }` 让 popper **外壳**收敛到 150px，
+面板以 480px 自己的 `width` 溢出外壳 281px；而 popper.js 定位 / `preventOverflow`
+用的是**外壳尺寸**，判定「150px 放得下」，于是面板右半截直接顶出 webview。
+`max-width` 设在面板上当然没用——问题从来不是面板太宽。
+
+**修法：宽度必须给到外壳。** 两个 `MyPopover` 加 `:popper-style`，
+面板自身只占满外壳：
+
+```html
+:popper-style="{ width: 'min(480px, calc(100vw - 32px))' }"   <!-- 历史 -->
+:popper-style="{ width: 'min(420px, calc(100vw - 32px))' }"   <!-- 快捷 -->
+```
+
+`MyPopover` 经 `$attrs` → `ElPopover.popperStyle`，
+而 EP 的 `contentStyle` 合并顺序是 `[zIndex, popperStyles, popperStyle]`，
+**`popperStyle` 在最后**，能覆盖 popper.js 写回的内联 `width`。
+`min(定宽, 100vw - 32px)` 让窗口够宽时用定宽、够窄时自动收窄并由 popper.js 平移。
+
+探针实测：溢出 **281.0px → 0.3px**（亚像素），popper 外壳被正确量到 429px
+并平移到视口内。
+
+### 四、这一轮为什么必须上探针
+
+阶段 178/179 连续两轮「改了没反应」，根因都是**规则在产物里，但从没匹配到元素**。
+纯读源码推不出来（`el-button__content` 看着完全合理；`max-width` 数学上也够），
+必须回到浏览器量真实几何。故新增三个探针页（沿用仓库既有 `debug-shell.*` 先例）：
+
+- `/popover-probe.html` + `src/popover-probe.ts` —— 浮层几何（popper 外壳 vs 面板）
+- `/preset-probe.html` + `src/preset-probe.ts` —— 配色卡片（真实 `AppearanceSection`）
+- `/drawer-probe.html` + `src/drawer-probe.ts` —— 设置关闭钮 DOM（真实 `SettingsDrawer`）
+
+跑法：`npm run dev` 后在浏览器打开对应页，页面左上角输出实测数据。
+`drawer-probe` 实测结果：`<button class="my-icon-button close-btn">` + 16×16 `<svg>`
++ 1 条 path，fill `rgb(139,148,158)` —— 字形正常渲染。
+
+### 五、验证
+
+- `npx vue-tsc --noEmit` EXIT=0
+- `npx vite build` EXIT=0
+- `node scripts/audit-myui-imports.mjs` → OK
+- 产物 `dist/assets/index-*.css` 中 `el-button__content` 出现 **0 次**（三条死规则已清零），
+  `.preset-body` / `.preset-card{height:auto}` / `min(480px` / `min(420px` 均在
+- 三处几何均由浏览器实测数据确认（见上）
+
+### 六、待用户实测
+
+1. 设置页右上角 ✕ 是否显示为可见字形（不再只是空方框）。
+2. 配色卡片：色板是否在名称上方、完整落在卡片内；卡片整体变高属预期。
+3. 历史 / 快捷命令浮层是否完整落在窗口内；窗口拖窄再看一次。
+4. 顶栏下拉触发钮（会话数 / 广播）的图标、文案、计数之间是否有了间距。
+5. AI 面板的模型选择器：箭头是否稳定贴在右端（`.picker-label{flex:1}` 此前从未生效）。
+
+## 五问重启检查（阶段 180）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 180 —— 三处「改了没反应」的根因全部查出：① 11 处 myui 组件漏 import，Vue 静默退化成未知原生元素（空盒子）；② `:deep(.el-button__content)` 在 EP 2.14.5 不存在（实为 `.el-button__text` 且仅 `shouldAddSpace` 时才有），3 条死规则；③ 浮层宽度给错了元素——popper 外壳被 EP `min-width:150px` 收敛并被 popper.js 写回内联宽度，面板溢出外壳 281px。另补 EP `.el-button{height:32px}` 写死导致卡片溢出。 |
+| 我要去哪里？ | 等用户实测五项；随后把探针页的用法写进 README 开发者段落。 |
+| 什么可能导致偏离？ | ① 只看「规则有没有进产物」就下结论——规则在 ≠ 规则生效，必须确认它匹配得到元素；② 又去 `:deep()` 打穿 EP 内部类名（换版本即静默失效），正确做法是在自己插槽里包一层；③ 面板/浮层类问题第一反应还是加 `max-width`，没先量外壳与内容的真实 rect；④ 以为 `vue-tsc` EXIT=0 就等于模板没问题——Volar 放行未注册组件。 |
+| 下一步最小可验证动作？ | `npm run dev` → 依次打开 `/drawer-probe.html`、`/preset-probe.html`、`/popover-probe.html`，看左上角实测输出是否全绿。 |
+| 目标是什么？ | **规则进了产物 ≠ 规则生效**。改动排版前先确认选择器匹配得到元素；作用域组件（漏 import、全局注册不确定）要专门审计，不能靠类型检查兜底。 |
+
+
+### 阶段 181 —— 侧栏收起/展开钮归位 myui、底栏顶线对齐、连接行「⋯」贴右缘
+
+用户据截图提三项：① 顶部收起/展开按钮要放到亮色模式切换钮**左边**，且**折叠后也要看得见**；
+② 底部几块的线条高度不一致，要一样高；③ 连接行「⋯」右边还有大片空白，继续右移。
+
+### 一、收起/展开钮：骑跨右缘的浮钮 → 头部动作行第一枚
+
+此前是一枚**手写** `<button class="toggle-btn">`：`position:absolute; right:-13px;
+top:50%`，一枚圆形浮钮骑跨在侧栏右缘垂直中央，折叠态与展开态各写了一份。
+两个毛病：它在窄条（44px）里必然骑到窗口左缘外被裁掉半边；即便没裁，它也不在
+头部动作行里，与 ☀ / ⟳ / 🗑 那排不在同一条基线上。
+
+改法：删掉两份手写标记与 `.toggle-btn` / `.chevron-svg` 全部样式，
+改用 `MyIconButton`：
+
+- 展开态：作为 `.header-actions` 的**第一个**子元素，正好落在主题切换钮左边；
+- 折叠态：`.collapsed-toggle` 随 Logo 正常流排布（`.side-collapsed` 本就
+  `align-items:center`），一眼可见，不再依赖「骑跨 + 溢出」定位。
+
+**顺带撤掉一条历史例外**：README 里记着「仅余侧栏折叠钮两枚保留手写——它骑跨右缘靠
+溢出定位，装不进 `MyIconButton` 的固定盒子」。不骑跨之后这条理由不成立，
+**全站按钮至此已无自建实现**，README 同步改写。
+
+探针实测（折叠态 44px 窄条）：
+`.collapsed-toggle` = `<button class="my-icon-button icon-btn collapsed-toggle">`
+28×28、内含 svg，完全落在窄条内且完全在窗口内；旧 `.toggle-btn` 残留检测 = 已移除。
+
+探针实测（展开态）：
+
+| 位置 | 按钮 | rect |
+|---|---|---|
+| [0] | 收起侧栏 | left 8, right 36 |
+| [1] | 切换到亮色模式 | left 38, right 66 |
+
+收起钮 `right=36 ≤ 主题钮 left=38` → 顺序正确；两者同为 28px、top 56 / bottom 84
+→ 同一基线。
+
+### 二、底栏顶线高低不齐：版本页脚高度由内容撑出
+
+底栏这一排并排三块，各自带一条 `border-top`：
+
+| 块 | 高度声明 |
+|---|---|
+| `CommandBar` `.command-bar` | `height: 36px` |
+| `ServerInfoPanel` `.server-info` | `height: 36px` |
+| `AppSidebar` `.footer`（版本页脚） | **无**，只有 `padding: 9px 16px` |
+
+`.footer` 高度纯由内容撑出（约 35px），于是它那条 `border-top` 比相邻两条低 1~2px，
+整条底栏看着是歪的。改法：`height: 36px; min-height: 36px; padding: 0 16px`
+（全局 `box-sizing: border-box`，1px 上边框计入 36px 总高）。实测 `.footer` = 36px、
+`border-top: 1px`，与另两块对齐。
+
+### 三、连接行「⋯」继续右移
+
+阶段 178 已把 `padding-right` 从 16px 收到 6px，但用户仍看到大片空白——因为
+**还有两段空白没算进去**：
+
+1. 行的 `margin: 1px 6px` 的**右**外边距 6px；
+2. `.conn-more` 是 `MyIconButton`，默认 **36px 盒、字形居中**，光盒子自身就在右缘
+   空出 6px，再加行内距 6px。
+
+合计约 30px。改法：行右外边距清零（`margin: 1px 0 1px 6px`）、右内距收到 2px，
+`.conn-more` 自身收窄到 `width: 24px; padding: 0`。
+
+实测：`.conn-more` 右缘距侧栏右缘 = **3.0px**（盒宽 36→24px）。
+
+### 四、验证
+
+- `npx vue-tsc --noEmit` EXIT=0
+- `node scripts/audit-myui-imports.mjs` → OK
+- `npx tauri build` EXIT=0
+- 上述四项几何均由浏览器探针实测确认（见上）
+
+探针页新增 `sidebar-probe.html` + `src/sidebar-probe.ts`：依次测折叠态可见性、
+展开态按钮顺序与基线、「⋯」到右缘的距离、页脚高度。挂载真实 `AppSidebar`，
+需补 `setupMyUII18n(i18n)`（`MyEmpty` 走 `useI18n`）与 `reloadConnections()`
+（连接是 App.vue 拉取的，AppSidebar 自己不拉），并把 `ui.appVersion` 置上让页脚渲染。
+
+### 五、待用户实测
+
+1. 收起/展开钮是否已在 ☀ 左边；折叠成窄条后是否一眼可见（不再被窗口左缘裁掉）。
+2. 底部那几条顶线是否齐平。
+3. 连接行「⋯」是否已贴到侧栏右缘；长连接名是否比之前多露一截。
+
+## 五问重启检查（阶段 181）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 181 —— 侧栏收起/展开钮从骑跨右缘的手写浮钮改为 `MyIconButton`（展开态排头部动作行首位、折叠态随 Logo 正常流），顺带撤掉「仅余两枚手写按钮」这条历史例外；版本页脚高度钉死 36px 与底栏另两块对齐；连接行右外边距清零 + `.conn-more` 收窄到 24px，「⋯」到右缘 3.0px。四项均由浏览器探针实测。 |
+| 我要去哪里？ | 等用户实测三项；确认后进 2.16.5 或下一版发布。 |
+| 什么可能导致偏离？ | ① 只改 `.conn-row` 的内距忘了 `MyIconButton` 自身 36px 盒的字形居中留白；② 删了手写按钮却忘了同步 README 里那条「保留手写」的例外说明；③ 页脚只加 `height` 不把 `padding: 9px` 清零，36px 装不下内容反而溢出；④ 折叠态把按钮放进 `.header-actions`——44px 窄条放不下 7 个动作钮。 |
+| 下一步最小可验证动作？ | `npm run dev` → 打开 `/sidebar-probe.html`，看左上角四段实测输出。 |
+| 目标是什么？ | 组件归位 myui 后，每处 UI 都能在一条选择器链上解释清楚；高度类对齐必须拿实测数值，不靠目测。 |
+
+
+### 阶段 182 —— 侧栏「折叠」改为「完全隐藏」，收起入口只留顶栏一枚
+
+用户据截图（阶段 181 那枚刚加进侧栏头部的按钮被红框标出）要求：**这个按钮不要了，
+只保留最顶上那个，点击隐藏，左侧栏完全隐藏。**
+
+### 一、语义变更：`sidebarCollapsed` 从「收成 44px 窄条」改成「完全隐藏」
+
+窄条态（44px，只有一枚品牌 Logo + 展开钮）现在没有任何存在理由：能展开它的
+那枚钮已被要求删掉，留下的 44px 就是一条谁也用不上的死区。
+
+壳层 `app.css`：
+
+```css
+.app-shell.sidebar-collapsed        { grid-template-columns: 0 minmax(0,1fr) auto; }
+.app-shell.sidebar-collapsed.no-ai  { grid-template-columns: 0 minmax(0,1fr); }
+/* 隐藏态用 display:none 而非只把宽度设 0：宽度为 0 但仍可聚焦，会让键盘
+   用户 Tab 进看不见的连接行/动作钮。组件仍挂在树上（display:none 不卸载）。 */
+.app-shell.sidebar-collapsed > .shell-side { display: none; }
+```
+
+探针实测隐藏态：`.shell-side` = `display:none`、占位宽度 **0.0px**，
+`.shell-work` 左缘 **0**（工作区顶到窗口左缘），侧栏内 11 个可聚焦元素
+不进 Tab 序；切回显示后 `.side` 恢复 264px，连接名仍在树上（状态未丢）。
+
+### 二、删掉的两枚按钮与随之变成死代码的东西
+
+1. **侧栏头部那枚**（阶段 181 刚加的 `MyIconButton`）——删。
+2. **窄条里那枚** `.collapsed-toggle` —— 连同整个 44px 窄条模板一起删。
+3. `AppSidebar.toggleCollapsed()` —— 侧栏不再有任何收起入口，函数连同
+   `persistUi` import 一起删。
+4. 随之失效的 CSS：`.side-collapsed` / `.collapse-label` / `.brand-logo` /
+   `.collapsed-toggle`。
+5. 随之失效的 `brandGradId`（只有窄条里那枚内联渐变 Logo 在用）。
+
+模板上侧栏从「`v-if` 窄条 / `v-else` 展开」两块并存的写法，**收敛为单一根元素**
+——过去之所以要分叉，只是因为窄条是完全不同的内容。
+
+### 三、顺带纠正的几处注释
+
+- `store/ui.ts` 的 `sidebarCollapsed` 字段注释原写「侧栏折叠与宽度」，改为
+  「侧栏是否隐藏 + 宽度」，并注明早期版本是窄条语义。
+- 顶栏那枚 ☰ 的 title / aria-label 从「收起/展开侧栏」改为「隐藏/显示侧栏」——
+  它现在真的是隐藏，不是折叠。
+- `app.css` 里 `.shell-side` 的 `min-height:0` 说明原写「侧栏根元素被模板内联了
+  `overflow:visible`（骑跨右缘的折叠按钮不能被裁）」。该内联样式随窄条一起删除，
+  但 `.side` 默认 overflow 本来就是 visible，**`min-height:0` 的必要性不变**
+  （非 hidden 的 grid 项目在块轴上会恢复自动最小尺寸），注释按实际原因重写，
+  避免以后有人照着删掉这条关键约束。
+
+### 四、验证（浏览器实测，非目测）
+
+`/sidebar-probe.html` 改为挂载真实 `AppTopBar` + `AppSidebar` + 真实
+`.app-shell` 网格（此前只挂侧栏，量不到壳层列宽与隐藏态）：
+
+| 检查项 | 结果 |
+|---|---|
+| 侧栏头部按钮 | 6 个，**无**收起/展开钮 ✅ |
+| 顶栏左侧按钮 | 1 个：`隐藏侧栏 [aria-expanded=true]` ✅ |
+| 旧 `.toggle-btn` / `.side-collapsed` | 均无 ✅ |
+| 「⋯」盒右缘距侧栏右缘 | 3.0px ✅（阶段 181 成果保持） |
+| 版本页脚 | 36px + 1px 上边框 ✅（阶段 181 成果保持） |
+| 隐藏态侧栏占位 | 0.0px / `display:none` ✅ |
+| 隐藏态工作区左缘 | 0 ✅ |
+| 切回显示 | 恢复 264px，连接树状态未丢 ✅ |
+
+### 五、待用户实测
+
+1. 点顶栏最左的 ☰，侧栏是否**完全消失**（不是收成窄条），工作区是否顶到左缘。
+2. 再点一次能否原样回来，连接树的展开状态是否还在。
+3. 侧栏头部确认没有多余按钮。
+
+## 五问重启检查（阶段 182）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 182 —— `sidebarCollapsed` 语义由「折叠成 44px 窄条」改为「完全隐藏」（壳层第一列归零 + `display:none`）；删除侧栏头部的收起钮、整个窄条模板、`toggleCollapsed` 与随之失效的 CSS/常量；收起入口只剩顶栏最左一枚 ☰。隐藏态实测占位 0px、工作区左缘 0、切回后状态不丢。 |
+| 我要去哪里？ | 等用户实测；确认后进 2.16.5 发布。 |
+| 什么可能导致偏离？ | ① 只把列宽设 0 而不加 `display:none`，键盘 Tab 会走进看不见的连接行；② 删了窄条却忘了 `syncGridWidth` 之类依赖 `sidebarCollapsed` 的逻辑；③ 顺手把 `.shell-side` 的 `min-height:0` 当死代码删掉（注释里的理由变了，但约束本身没变）；④ 用 `v-if` 卸载侧栏，导致隐藏再显示后连接树展开态丢失。 |
+| 下一步最小可验证动作？ | `npm run dev` → `/sidebar-probe.html` 点看四段实测；或直接点顶栏 ☰ 收起/展开各一次。 |
+| 目标是什么？ | 一个动作只留一个入口；隐藏态要真的「不在」（宽度 + 焦点序），不只是「看不见」。 |

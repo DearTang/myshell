@@ -7,7 +7,7 @@
      - 所有 tab 面板常驻挂载（App.vue 用绝对定位 + visibility 切换），
        xterm 容器必须保持真实尺寸。 -->
 <script setup lang="ts">
-import { MyIcon, toast } from "myui";
+import { MyButton, MyIcon, toast } from "myui";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";

@@ -64,24 +64,6 @@ function shellHintFor(connType?: ConnType): string {
   return connType === "local" ? "powershell" : "bash";
 }
 
-/** Provider display label for the model switcher. */
-function providerLabel(provider: string): string {
-  switch (provider) {
-    case "claude":
-      return "Claude";
-    case "openai":
-      return "OpenAI";
-    case "ollama":
-      return "Ollama";
-    case "openai_compatible":
-      return "OpenAI兼容";
-    case "anthropic_compatible":
-      return "Anthropic兼容";
-    default:
-      return provider;
-  }
-}
-
 /** Read the last `n` non-empty lines from the normal buffer (skips blank
  * trailing rows). In an alternate buffer (vim/claude TUI) scrollback is empty,
  * so this just returns the current screen — fine for "what's on screen". */
@@ -587,19 +569,32 @@ Enter 发送 ● Shift+Enter 换行"
           trigger="click"
           popper-class="ai-picker-popper"
         >
+          <!-- variant 用 ghost 而非 secondary：secondary 映射到 EP type="default"，
+               是**填充底色**的一颗按钮，在工具条里比旁边同为控件的「附带选区」
+               （ghost）重出一截，浮层展开时尤其像一枚发亮的药丸。ghost 两态
+               都是透明底，与同栏控件同一套观感。 -->
           <MyButton
             class="picker-toggle"
-            variant="secondary"
+            variant="ghost"
             size="small"
             title="点击切换 AI 模型（先选供应商，再选模型）"
           >
-            <span class="picker-label">{{ pickerLabel }}</span>
-            <span v-if="activeModel" class="provider-chip">{{ providerLabel(activeModel.provider) }}</span>
-            <MyIcon
-              class="picker-arrow"
-              :size="10"
-              :name="modelPickerOpen ? 'ArrowUp' : 'ArrowDown'"
-            />
+            <!-- picker-row 承担这一层的 flex 排版。MyButton 底层是 EP ElButton，default
+         插槽外面套了一层 EP 自己的 span（2.14.5 里叫 .el-button__text，而且
+         只有 shouldAddSpace 为真时才真的带这个类名）。此前这里写的是
+         :deep(.el-button__content)，而该类名在 EP 2.14.5 里根本不存在 ——
+         规则永远匹配不到，.picker-label{flex:1} 从来没生效过，箭头一直是被
+         内容顶在标签右边而不是右端。改为在自己的插槽内容里包一层，插槽内容
+         由本组件编译、自带 scope id，普通 scoped 选择器即可命中，
+         不依赖任何 EP 内部结构。 -->
+            <span class="picker-row">
+              <span class="picker-label">{{ pickerLabel }}</span>
+              <MyIcon
+                class="picker-arrow"
+                :size="10"
+                :name="modelPickerOpen ? 'ArrowUp' : 'ArrowDown'"
+              />
+            </span>
           </MyButton>
 
           <template #content>
@@ -963,7 +958,7 @@ Enter 发送 ● Shift+Enter 换行"
 }
 
 /* ── 模型选择器 ── */
-/* 从「输入区底边」改成「工具条右侧的一枚紧凑胶囊」：
+/* 从「输入区底边」改成「工具条右侧的一枚控件」：
    原来它带 border-left/right/bottom + 圆角 + border-top，刻意做成输入框的
    外框底边（那是为了和输入框拼成一个整框）；现在输入框由 ElInput 自身的
    边框独立成框（MyTextArea 的 bare 只去掉了外层字段标签，不影响控件边框），
@@ -974,7 +969,12 @@ Enter 发送 ● Shift+Enter 换行"
   align-items: center;
   gap: 6px;
   margin-left: auto;
-  flex-shrink: 1;
+  flex: 0 0 auto;
+  /* 宽度必须钉死。此前按钮宽度完全由文字驱动（插槽外那层 span 是 inline，
+     .picker-label{flex:1} 在里面没有可分配余量，等于按内容定宽），于是每换一个
+     模型、名字长一点短一点，按钮与整条工具条一起重排 —— 观感上就是"框在晃"。
+     固定宽度后长名称走 ellipsis，工具条其余部分不再位移。max-width 兜住窄面板。 */
+  width: 190px;
   max-width: 58%;
   padding: 2px 8px;
   text-align: left;
@@ -982,6 +982,7 @@ Enter 发送 ● Shift+Enter 换行"
 
 .picker-label {
   flex: 1;
+  min-width: 0;
   font-size: 12px;
   font-weight: 500;
   color: var(--text-primary);
@@ -990,30 +991,21 @@ Enter 发送 ● Shift+Enter 换行"
   white-space: nowrap;
 }
 
-.provider-chip {
-  font-size: 10px;
-  padding: 1px 5px;
-  border-radius: var(--radius-full);
-  background: var(--bg-surface);
-  color: var(--text-tertiary);
-  border: 1px solid var(--border-default);
-}
-
 .picker-arrow {
   flex: none;
   color: var(--text-tertiary);
 }
 
-/* MyButton 底层是 EP ElButton，它会把 default 插槽包进一个
-   <span class="el-button__content">（inline）。于是本组件原本挂在
-   .picker-toggle 上的 display:flex/gap 作用在这一层内层上，
-   .picker-label{flex:1} 也失去意义 —— 箭头会被顶到标签右边而不是右端。
-   这里把 flex 布局下推到 content 层（不再撑满按钮宽度：胶囊尺寸随内容）。 */
-.picker-toggle :deep(.el-button__content) {
+/* 排版落在插槽内自包的 .picker-row 上（原因见模板注释）。
+   width:100% + justify-content:flex-start 配套 .picker-toggle 的固定宽度：
+   row 占满按钮后，标签吃下多余空间、箭头落到右端，两者相对位置才稳定。 */
+.picker-row {
   display: flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 6px;
   min-width: 0;
+  width: 100%;
 }
 
 /* 定位（absolute / 上下左右锚定）交给 popper；这里只留面板自身的盒子。

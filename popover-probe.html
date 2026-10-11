@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MyShell Popover Geometry Probe</title>
+    <script>
+      let __cb = 0;
+      window.__TAURI_INTERNALS__ = {
+        metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
+        plugins: {},
+        invoke: (cmd) => {
+          if (cmd === "get_connections") return [];
+          if (cmd === "list_folders") return [];
+          if (cmd === "list_quick_commands") return [];
+          if (cmd === "list_command_history") return [];
+          return null;
+        },
+        transformCallback: () => ++__cb,
+      };
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <pre id="out" style="position:fixed;left:0;top:0;z-index:99999;background:#000;color:#0f0;font:11px monospace;padding:8px;max-width:100%;white-space:pre-wrap"></pre>
+    <script type="module" src="/src/popover-probe.ts"></script>
+  </body>
+</html>

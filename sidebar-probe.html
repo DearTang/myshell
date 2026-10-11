@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>MyShell Sidebar Probe</title>
+    <script>
+      let __cb = 0;
+      window.__TAURI_INTERNALS__ = {
+        metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
+        plugins: {},
+        invoke: (cmd) => {
+          if (cmd === "get_connections")
+            return [
+              { id: "c1", name: "火山_115.190.136.69", host: "115.190.136.69", port: 22, conn_type: "ssh", group_path: "/" },
+              { id: "c2", name: "腾讯云_43.136.77.45", host: "43.136.77.45", port: 22, conn_type: "ssh", group_path: "/" },
+            ];
+          if (cmd === "list_folders") return ["/自用", "/sftp"];
+          if (cmd === "get_app_version") return "2.16.4";
+          return null;
+        },
+        transformCallback: () => ++__cb,
+      };
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <pre id="out" style="position:fixed;left:0;top:0;z-index:99999;background:#000;color:#0f0;font:11px monospace;padding:8px;max-width:100%;white-space:pre-wrap"></pre>
+    <script type="module" src="/src/sidebar-probe.ts"></script>
+  </body>
+</html>

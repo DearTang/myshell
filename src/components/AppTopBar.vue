@@ -177,10 +177,12 @@ function revokeSessionAllowed(): void {
   <header class="app-topbar" data-tauri-drag-region>
     <!-- 左：侧栏折叠 + 品牌区 -->
     <div class="topbar-left">
+      <!-- 全站唯一的侧栏收起/展开入口（用户指定）。此前侧栏头部另有一枚同功能按钮，
+         隐藏态下那枚根本点不到，留着只是重复入口 —— 已删除。 -->
       <MyIconButton
-        :title="ui.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
+        :title="ui.sidebarCollapsed ? '显示侧栏' : '隐藏侧栏'"
         class="icon-btn"
-        :label="ui.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
+        :label="ui.sidebarCollapsed ? '显示侧栏' : '隐藏侧栏'"
         size="17"
         :name="ui.sidebarCollapsed ? 'Expand' : 'Fold'"
         :aria-expanded="!ui.sidebarCollapsed"
@@ -564,8 +566,9 @@ function revokeSessionAllowed(): void {
   color: var(--error);
 }
 
-/* ─── DropdownTrigger（MyButton 的根 <button class="el-button dropdown-trigger">
-      继承本组件作用域 id；其内部的 .el-button__content 与各 span 需 :deep） ─── */
+/* ─── DropdownTrigger（本组件的 <button class="el-button dropdown-trigger">
+      继承本组件作用域 id；内部由 SessionDropdownPanel 渲染的元素不带本组件
+      作用域 id，需 :deep 命中） ─── */
 .dropdown-trigger {
   height: 100%;
   padding: 0 14px;
@@ -584,9 +587,10 @@ function revokeSessionAllowed(): void {
     color var(--duration-fast) var(--ease-in-out);
 }
 
-/* MyButton 把插槽内容包进 .el-button__content，原先挂在根节点上的
-   flex 布局必须下推到这一层，否则图标/文案/计数会退回 EP 的行内排版。 */
-.dropdown-trigger :deep(.el-button__content) {
+/* flex 布局落在 SessionDropdownPanel 自包的 .trigger-row 上（原因见该组件注释）。
+   此前这里写的是 `:deep(.el-button__content)`，而该类名在 EP 2.14.5 里不存在，
+   规则从未命中。:deep 现在只用于命中**我们自己的**类，不穿透 EP 内部结构。 */
+.dropdown-trigger :deep(.trigger-row) {
   display: flex;
   align-items: center;
   gap: 8px;

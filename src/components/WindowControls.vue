@@ -84,8 +84,11 @@ onUnmounted(() => {
 <style scoped>
 /* ── MyWindowControls 之上叠两处 MyShell 的刻意偏离 ──
 
-   1) 按钮全高：库默认 46×32（贴合常见标题栏），本项目顶栏 44px、
-      门禁页覆盖层 44px，按钮需 `height: 100%` 才与栏等高。
+   1) 按钮全高：库默认 46×32（贴合常见标题栏），本项目顶栏与门禁页覆盖层
+      都是 44px，按钮需 `height: 100%` 才与栏等高。**注意这条只对顶栏成立**
+      —— 浮层的父容器是全屏的 `position: fixed; inset: 0`，绝对定位元素的
+      `height: 100%` 会解析成整窗高，故 `.is-overlay` 必须显式把根高度钉回
+      `--ui-topbar-h`（见下）。
    2) 关闭钮悬停用系统红 `#e81123` 而非库默认的 `var(--danger)`——
       用户对 ─ □ ✕ 的红有肌肉记忆，主题色会认不出。这是早于 myui
       接入就存在的刻意选择，保留。
@@ -116,13 +119,21 @@ onUnmounted(() => {
   color: #fff;
 }
 
-/* 浮层（门禁页）形态：按钮贴在覆盖层右上角，底色是深色渐变而非顶栏毛玻璃，
-   因此默认色提亮一档，并给一层极淡的底以便与渐变背景分离。 */
+/* 浮层（门禁页 / 启动页）形态：按钮贴在覆盖层右上角，底色是深色渐变而非
+   顶栏毛玻璃，因此默认色提亮一档，并给一层极淡的底以便与渐变背景分离。 */
 .window-controls.is-overlay {
   position: absolute;
   top: 0;
   right: 0;
   z-index: 1;
+
+  /* height 必须在这里钉死，不能继承上面 .window-controls 的 100%。
+     顶栏那条 height:100% 是对的——父容器 .topbar 就 44px 高。但两处浮层的
+     父容器（MasterPasswordGate 的 .gate、App.vue 的 .vault-splash）都是
+     `position: fixed; inset: 0` 的全屏覆盖层，绝对定位元素的 height:100%
+     会相对它解析成**整窗高**；按钮再 `height:100%` 继承，三个字形就被
+     各自居中到按钮的垂直中点，于是 ─ □ ✕ 浮在窗口正中而不是右上角。 */
+  height: var(--ui-topbar-h);
 }
 
 .window-controls.is-overlay :deep(.my-window-controls__btn) {

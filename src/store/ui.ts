@@ -9,7 +9,9 @@ interface UiState {
   themeChoice: ThemeChoice;
   isDark: boolean;
   locale: "zh-CN" | "en";
-  /** 侧栏折叠与宽度（宽度持久化 key 沿用旧版） */
+  /** 侧栏是否隐藏 + 宽度（宽度持久化 key 沿用旧版）。
+   *  注意语义：早期版本是「折叠成 44px 窄条」，现改为**完全隐藏**
+   *  （壳层第一列归零 + display:none），入口只有顶栏最左一枚 ☰。 */
   sidebarCollapsed: boolean;
   sidebarWidth: number;
   /** AI 面板 */

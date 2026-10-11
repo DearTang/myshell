@@ -100,30 +100,39 @@ export const DropdownTrigger = defineComponent({
         },
         {
           default: () => [
-            h(MyIcon, { size: 14, name: props.iconName, class: "trigger-icon", decorative: true }),
-            h("span", { class: "trigger-label" }, props.label),
-            // 两枚计数徽标都带图标，构成一对：「N 个终端会话」与「其中 N 个在广播组」。
-            // 此前只有广播那枚有图标（📡 纸飞机），会话那枚是光秃秃的数字，两枚
-            // 形态不一致、读起来对不上号。会话数用 Terminal 图标 —— 它数的正是终端
-            // 会话，且与 📡（发往）构成「发往这 N 个」的语义对照。
-            h(
-              "span",
-              { class: ["trigger-count", { "is-hot": props.active || props.accent }] },
-              [h(MyIcon, { size: 10, name: "Terminal", decorative: true }), String(props.count)],
-            ),
-            props.broadcastCount > 0
-              ? h(
-                  "span",
-                  {
-                    class: "trigger-bcast",
-                    title: `${props.broadcastCount} 个标签页在广播组中`,
-                  },
-                  [
-                    h(MyIcon, { size: 10, name: "Promotion", decorative: true }),
-                    String(props.broadcastCount),
-                  ],
-                )
-              : null,
+            // trigger-row 承担触发钮内部的 flex 排版。MyButton 底层是 EP ElButton，
+            // default 插槽外面套了一层 EP 自己的 span（2.14.5 叫 .el-button__text，
+            // 且只有 shouldAddSpace 为真时才真的带该类名）。AppTopBar 此前把 flex
+            // 布局写成了 `:deep(.el-button__content)`，而该类名在 2.14.5 里根本
+            // 不存在 → 规则从未命中，图标/文案/计数一直退回 EP 的行内排版、
+            // 没有 gap。这里自己包一层；类名归本组件所有，AppTopBar 用
+            // :deep(.trigger-row) 命中即可，不依赖任何 EP 内部结构。
+            h("span", { class: "trigger-row" }, [
+              h(MyIcon, { size: 14, name: props.iconName, class: "trigger-icon", decorative: true }),
+              h("span", { class: "trigger-label" }, props.label),
+              // 两枚计数徽标都带图标，构成一对：「N 个终端会话」与「其中 N 个在广播组」。
+              // 此前只有广播那枚有图标（📡 纸飞机），会话那枚是光秃秃的数字，两枚
+              // 形态不一致、读起来对不上号。会话数用 Terminal 图标 —— 它数的正是终端
+              // 会话，且与 📡（发往）构成「发往这 N 个」的语义对照。
+              h(
+                "span",
+                { class: ["trigger-count", { "is-hot": props.active || props.accent }] },
+                [h(MyIcon, { size: 10, name: "Terminal", decorative: true }), String(props.count)],
+              ),
+              props.broadcastCount > 0
+                ? h(
+                    "span",
+                    {
+                      class: "trigger-bcast",
+                      title: `${props.broadcastCount} 个标签页在广播组中`,
+                    },
+                    [
+                      h(MyIcon, { size: 10, name: "Promotion", decorative: true }),
+                      String(props.broadcastCount),
+                    ],
+                  )
+                : null,
+            ]),
           ],
         },
       );

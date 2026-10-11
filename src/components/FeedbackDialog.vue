@@ -7,7 +7,7 @@
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { zipSync, strToU8 } from "fflate";
-import { MyButton, MyCheckbox, MyDialog, MyIcon, MyInput, MySegmented, MyTextArea } from "myui";
+import { MyButton, MyCheckbox, MyDialog, MyIcon, MyIconButton, MyInput, MySegmented, MyTextArea } from "myui";
 import {
   clearFeedbackDir,
   getFeedbackLog,

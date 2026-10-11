@@ -18,6 +18,7 @@
 ;      升级时不关会占用文件，触发 NSIS "无法打开要写入的文件" 报错。
 ;      该宏检测到占用即弹确认框：用户点确定则强制结束该进程（Restart Manager
 ;      RmForceShutdown），点取消则中止安装；静默安装(/S)跳过确认直接结束。
+;      [已被第 6 项取代 —— 见那里为什么"检查再强杀"这条路走不通]
 ;
 ;   3. 卸载 Delete 主程序及 binaries 加 /REBOOTOK：进程占用无法立即删除时
 ;      登记为重启后删除，卸载不再因此卡住或残留。
@@ -43,6 +44,23 @@
 ;      （例如 G:\...\debug\myshell-mcp.exe），对安装器反而更稳妥。
 ;      二次检查用于堵 TOCTOU: AI 客户端可能在开头检查通过后、文件复制前重新
 ;      拉起 MCP 进程，导致复制再次撞锁。仍是"确认后强杀"，不做静默 taskkill。
+;      [二次检查已被第 6 项取代 —— 复制前 1 行才检查也堵不住毫秒级的重启]
+;
+;   6. mcp/cli 改为「改名让位」，不再依赖"检查进程再强杀"（2026-10-10）。
+;      起因: 第 2/5 项的真机复现证明这套办法必然失败 —— 用户在跑
+;      MyShell_2.16.4 安装包时仍撞「无法打开要写入的文件 myshell-mcp.exe」，
+;      且用户明确表示**无法让 MCP 停下来**：AI 客户端带监督、会自动重拉
+;      MCP server，杀掉后毫秒内又起一个，复制前 1 行刚检查并强杀过也没用。
+;      与其和重启赛跑，不如绕开锁本身：Windows 允许**重命名正在运行的 exe**
+;      （删除不行 —— 镜像节在用）。故先把旧文件改名让出路径，再写新文件。
+;      本机实测（复制 powershell.exe 后带 Start-Sleep 运行，Rename-Item 成功、
+;      原路径消失新路径存在）确认该行为成立。
+;      附带好处: 旧进程继续跑改名后的副本，用户正在进行的 AI 会话不被打断
+;      （很可能正是发起这次安装的那个会话）；代价是 AI 客户端下次拉起 MCP
+;      才会用上新版本，这一点在下方 DetailPrint 里明说。
+;      改名失败（极少数：杀软独占等）才回退到第 2 项的提示式强杀。
+;
+;      注: 本文件由 Tauri 用 Handlebars 渲染，注释里不能出现双花括号。
 ;
 ; 维护须知（接管模板的代价）:
 ;   升级 Tauri（如 2.12）后，若官方改动了 installer.nsi，需 re-sync ——
@@ -689,13 +707,9 @@ Section Install
 
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
-  ; MyShell 改动: mcp/cli 二进制同样会被写入 $INSTDIR，若运行中会占用文件导致
-  ; "无法打开要写入的文件" 报错（mcp 常被 AI 客户端作为子进程常驻拉起），
-  ; 故安装/升级前一并检查；检测到占用时用户确认即强制结束该进程。
-  ; 参数必须是裸文件名: FindProcess 只按进程名匹配，全路径恒返回"未找到"
-  ; （见文件头改动 5 的实测记录）。
-  !insertmacro CheckIfAppIsRunning "myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
-  !insertmacro CheckIfAppIsRunning "myshell-cli.exe" "${PRODUCTNAME} (CLI)"
+  ; MyShell 改动（文件头第 6 项）: mcp/cli 二进制同样会被写入 $INSTDIR。原先
+  ; 在这里对二者各做一次 CheckIfAppIsRunning，但「检查后强杀」挡不住 AI 客户端
+  ; 的自动重拉（详见文件头第 2/5/6 项），故改为在复制前一刻改名让位。
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
@@ -708,18 +722,46 @@ Section Install
     File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
   {{/each}}
 
+  ; MyShell 改动（文件头第 6 项）: 复制 binaries 前把旧的 mcp/cli 改名让出路径。
+  ; Windows 允许重命名运行中的 exe（删除不行），所以这一步无论 MCP 是否在跑
+  ; 都能把路径腾空 —— 不再和 AI 客户端的重启赛跑。
+  ; 放在"复制前一刻"而非安装开头，是为了和写入之间不留多余窗口。
+  ;
+  ; 先删上一代残留（没被占用的直接清掉，最多留一代，不会无限累积）；
+  ; Rename 目标已存在会失败，所以必须先 Delete。
+  Delete "$INSTDIR\myshell-mcp.exe.myshell-old"
+  Delete "$INSTDIR\myshell-cli.exe.myshell-old"
+  ClearErrors
+
+  Rename "$INSTDIR\myshell-mcp.exe" "$INSTDIR\myshell-mcp.exe.myshell-old"
+  ${If} ${Errors}
+    ; 改名被拦（极少数：安全软件独占句柄等）→ 回退到原先的提示式强杀。
+    ClearErrors
+    !insertmacro CheckIfAppIsRunning "myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
+  ${EndIf}
+
+  Rename "$INSTDIR\myshell-cli.exe" "$INSTDIR\myshell-cli.exe.myshell-old"
+  ${If} ${Errors}
+    ClearErrors
+    !insertmacro CheckIfAppIsRunning "myshell-cli.exe" "${PRODUCTNAME} (CLI)"
+  ${EndIf}
+  ClearErrors
+
   ; Copy external binaries (myshell-mcp.exe / myshell-cli.exe: Tauri 按 workspace
   ; [[bin]] 目标自动注入 binaries 列表，展开为绝对路径 File 指令；无需手写)
-
-  ; MyShell 改动: 复制 binaries 前二次检查。AI 客户端可能在开头检查通过后、
-  ; 文件复制前重新拉起 MCP 进程（MCP 使用面广时被频繁触发），复制时再次撞锁。
-  ; 仍是"确认后强杀"，不做静默 taskkill；进程未运行时宏直接跳过，不打扰用户。
-  !insertmacro CheckIfAppIsRunning "myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
-  !insertmacro CheckIfAppIsRunning "myshell-cli.exe" "${PRODUCTNAME} (CLI)"
-
   {{#each binaries}}
     File "/oname={{this}}" "{{no-escape @key}}"
   {{/each}}
+
+  ; 新文件已就位。旧副本此刻多半还锁在运行中的进程里，删不掉也不影响 ——
+  ; 留着，下一次安装开头会被上面的 Delete 收走。删掉了则这一代就此清零。
+  Delete "$INSTDIR\myshell-mcp.exe.myshell-old"
+  Delete "$INSTDIR\myshell-cli.exe.myshell-old"
+  ClearErrors
+
+  ; 让用户知道 MCP 何时才会用上新版本：正在跑的那份是改名后的旧副本，
+  ; 要等 AI 客户端下次拉起进程才会换成新的。
+  DetailPrint "MCP Server 若正在运行，将在 AI 客户端下次启动时自动切换到新版本。"
 
   ; Create file associations
   {{#each file_associations as |association| ~}}
@@ -860,6 +902,11 @@ Section Uninstall
   {{#each binaries}}
     Delete /REBOOTOK "$INSTDIR\\{{this}}"
   {{/each}}
+
+  ; MyShell 改动（文件头第 6 项）: 删掉安装时改名让位留下的旧副本。
+  ; 必须删 —— 否则末尾的 RMDir "$INSTDIR" 会因目录非空而失败、留下残目录。
+  Delete /REBOOTOK "$INSTDIR\myshell-mcp.exe.myshell-old"
+  Delete /REBOOTOK "$INSTDIR\myshell-cli.exe.myshell-old"
 
   ; Delete app associations
   {{#each file_associations as |association| ~}}

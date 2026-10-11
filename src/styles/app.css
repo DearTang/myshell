@@ -210,43 +210,59 @@ body {
 
 /* ═══════════════ App Shell 布局 ═══════════════
    顶栏横贯顶部；左侧连接树；中央工作区；右侧 AI 面板（可选）；
-   最底一行是**贯穿整个窗口宽度**的底栏（命令栏 + 服务器状态栏）。
+   最底一行是**命令栏 + 服务器状态栏**，只占侧栏右侧的两列。
 
    2026-10-10 新增 bottom 行。此前命令栏嵌在 TerminalPanel 内部、状态栏是
    .shell-work 的最后一个子元素，两者都只占"工作区"那一列；右侧 AI 栏与工作区
    同高、自带底部两行，于是同一条高度上并排着两种底栏（红框那种混排）。
    把它们提升为壳层的第三行后，AI 栏（grid-area: ai，只在第二行）的底边自动
-   停在底栏上沿，输入区上移到底栏之上。 */
+   停在底栏上沿，输入区上移到底栏之上。
+
+   2026-10-10 再调：bottom 行原是 "bottom bottom bottom" **贯穿整个窗口宽度**，
+   压到了侧栏底下 —— 侧栏因此只到第二行、页脚（版本号 + 邮件钮）悬在底栏上沿，
+   像被"顶"上去半截。现改为第三行左侧留空、侧栏贯通 2~3 行，
+   bottom 只占第 2~3 列：底栏回到侧栏右侧，AI 栏底边仍停在底栏上沿。 */
 .app-shell {
   display: grid;
   grid-template:
     "topbar topbar topbar" var(--ui-topbar-h)
     "side   work   ai" 1fr
-    "bottom bottom bottom" auto
+    "side   bottom bottom" auto
     / var(--ui-sidebar-w) minmax(0, 1fr) auto;
   height: 100%;
   transition: grid-template-columns 0.2s var(--ease-in-out);
   overflow: hidden;
 }
 
+/* 侧栏「隐藏」态：第一列宽度直接归零，侧栏本身 display:none。
+   此前是收成 44px 窄条，靠一枚骑跨右缘的圆形浮钮才能展开；那枚钮已删除
+   （收起/展开只保留顶栏最左一枚 ☰），窄条既没有展开入口也没有信息量，
+   留着等于一条 44px 的死区。display:none 而非只把宽度设 0，是为了连带把
+   侧栏里那一堆可聚焦的连接行 / 动作钮从 Tab 序与无障碍树里摘掉——
+   宽度为 0 但仍可聚焦，会让键盘用户走进看不见的地方。
+   组件仍挂在树上（display:none 不卸载），连接树展开态 / 搜索词都不丢。 */
 .app-shell.sidebar-collapsed {
-  grid-template-columns: 44px minmax(0, 1fr) auto;
+  grid-template-columns: 0 minmax(0, 1fr) auto;
 }
 
 .app-shell.no-ai {
   grid-template:
     "topbar topbar" var(--ui-topbar-h)
     "side   work" 1fr
-    "bottom bottom" auto
+    "side   bottom" auto
     / var(--ui-sidebar-w) minmax(0, 1fr);
 }
 
 .app-shell.sidebar-collapsed.no-ai {
-  grid-template-columns: 44px minmax(0, 1fr);
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
+.app-shell.sidebar-collapsed > .shell-side {
+  display: none;
 }
 
 /* 底栏容器：命令栏 + 服务器状态栏。两者都可能不渲染（SFTP/欢迎页/多窗口模式），
-   此时整行高度为 0，不留空带。 */
+   此时整行高度为 0，不留空带。只占侧栏右侧的两列（第 2~3 列）。 */
 .app-shell > .shell-bottom {
   grid-area: bottom;
   display: flex;
@@ -259,11 +275,11 @@ body {
 .app-shell > .shell-side {
   grid-area: side;
   min-width: 0;
-  /* min-height:0 是滚动的前提，不是保险。侧栏根元素被模板内联了
-     overflow:visible（骑跨右缘的折叠按钮不能被裁），而 overflow 非 hidden
-     的 flex/grid 项目在块轴上会恢复"自动最小尺寸"= 内容完整高度 ——
-     .side 因此被连接列表撑破、溢出网格行，里面的 .list(flex:1) 永远不滚动，
-     连接多时直接顶出界面外且无法滚动。与 .shell-work 保持同一套约束。 */
+  /* min-height:0 是滚动的前提，不是保险。.side 未显式设置 overflow（默认
+     visible），而 overflow 非 hidden 的 grid 项目在块轴上会恢复「自动最小
+     尺寸」= 内容完整高度 —— .side 会被连接列表撑破、溢出网格行，里面的
+     .list(flex:1) 永远不滚动，连接多时直接顶出界面外且无法滚动。
+     与 .shell-work 保持同一套约束。 */
   min-height: 0;
   overflow: hidden;
   position: relative;

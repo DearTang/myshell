@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>MyShell Preset Card Probe</title>
+    <script>
+      let __cb = 0;
+      window.__TAURI_INTERNALS__ = {
+        metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
+        plugins: {},
+        invoke: (cmd) => {
+          if (cmd === "get_connections") return [];
+          if (cmd === "list_folders") return [];
+          return null;
+        },
+        transformCallback: () => ++__cb,
+      };
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <pre id="out" style="position:fixed;left:0;top:0;z-index:99999;background:#000;color:#0f0;font:11px monospace;padding:8px;max-width:100%;white-space:pre-wrap"></pre>
+    <script type="module" src="/src/preset-probe.ts"></script>
+  </body>
+</html>

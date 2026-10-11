@@ -35,7 +35,7 @@ import {
 } from "@/api";
 import { connectionsStore, reloadConnections } from "@/store/connections";
 import { connect } from "@/store/sessions";
-import { openConnectionDialog, persistUi, setThemeChoice, ui } from "@/store/ui";
+import { openConnectionDialog, setThemeChoice, ui } from "@/store/ui";
 import { updateInfo } from "@/composables/useUpdateCheck";
 import { useConnectionDrag } from "@/composables/useConnectionDrag";
 
@@ -523,13 +523,8 @@ function rowMenuDelete(c: ConnectionConfig): void {
 }
 
 // ── 壳层入口 ────────────────────────────────────────────────────────────────
-function toggleCollapsed(): void {
-  ui.sidebarCollapsed = !ui.sidebarCollapsed;
-  // Persist. The equivalent toggle in the top bar calls persistUi()
-  // (AppTopBar.vue), so collapsing from the sidebar's own ✕ button did not
-  // survive a restart while collapsing from the top bar did.
-  persistUi();
-}
+// 侧栏的收起/展开入口只保留顶栏最左一枚 ☰（AppTopBar.vue toggleSidebar），
+// 侧栏自身不再提供 —— 隐藏态下这里整个不可见，留着也没人点得到。
 function openQuickCommands(): void {
   ui.qcInitialConnectionId = null;
   ui.showQuickCommands = true;
@@ -547,75 +542,23 @@ const dragHintTarget = computed<string | null>(() => {
   const p = dragState.value?.hoverFolderPath ?? null;
   return p && p !== "/" ? (p.startsWith("/") ? p.slice(1) : p) : null;
 });
-
-// 品牌Logo 渐变 id（内联 SVG，需全局唯一防冲突）
-const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 </script>
 
 <template>
-  <!-- 折叠态：44px 窄条（仅 Logo / 竖排标题 / 展开按钮）。
-       overflow:visible 与展开态同理（AppSidebar.vue 展开模板的内联覆盖）：
-       壳层 .shell-side 是 overflow:hidden，不放开会把骑跨右缘的
-       .toggle-btn（right:-13px）裁掉一半，展开按钮只剩弧形不可点。 -->
-  <div v-if="ui.sidebarCollapsed" class="side side-collapsed" :style="{ overflow: 'visible' }">
-    <svg
-      class="brand-logo"
-      width="26"
-      height="26"
-      viewBox="0 0 64 64"
-      fill="none"
-      role="img"
-      aria-label="MyShell"
-    >
-      <defs>
-        <linearGradient :id="brandGradId" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" style="stop-color: var(--accent-primary-hover)" />
-          <stop offset="0.5" style="stop-color: var(--accent-primary)" />
-          <stop offset="1" style="stop-color: var(--accent-secondary)" />
-        </linearGradient>
-      </defs>
-      <!-- chevron `>` — vertex on the left, opens right -->
-      <path
-        d="M35 19 L16 32 L35 45"
-        :stroke="`url(#${brandGradId})`"
-        stroke-width="6.5"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-      />
-      <!-- cursor `_` -->
-      <rect x="37" y="42" width="13" height="5" rx="2.5" style="fill: var(--accent-secondary)" />
-    </svg>
-    <button
-      type="button"
-      class="toggle-btn"
-      :title="ui.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
-      :aria-label="ui.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
-      @click.stop="toggleCollapsed"
-    >
-      <svg
-        width="12"
-        height="12"
-        viewBox="0 0 24 24"
-        fill="none"
-        aria-hidden="true"
-        class="chevron-svg"
-        :class="{ rotated: ui.sidebarCollapsed }"
-      >
-        <!-- Left-pointing chevron; rotates 180° to point right when collapsed -->
-        <path d="M15 6l-6 6 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-      </svg>
-    </button>
-  </div>
-
-  <!-- 展开态 -->
+  <!-- 侧栏本体。
+       此前的「折叠态」是一整块 44px 窄条模板（品牌 Logo + 一枚展开钮），
+       现在 `ui.sidebarCollapsed` 的语义改为**完全隐藏**（壳层第一列归零 +
+       display:none），窄条随之删除 —— 收起/展开只由顶栏最左的 ☰ 负责，
+       侧栏里不该再有第二个入口。
+       组件本身没有 v-if：壳层用 display:none 隐藏，组件仍留在树上，
+       连接树的展开态 / 搜索词 / 右键菜单状态在隐藏再显示后原样还在。 -->
   <div
-    v-else
     class="side"
-    :style="{ width: `${ui.sidebarWidth}px`, minWidth: `${ui.sidebarWidth}px`, overflow: 'visible' }"
+    :style="{ width: `${ui.sidebarWidth}px`, minWidth: `${ui.sidebarWidth}px` }"
     @click="closeMenu"
     @contextmenu="onBlankContext"
   >
-    <!-- 头部：动作图标行（myui/EP 单色图标体系） -->
+      <!-- 头部：动作图标行（myui/EP 单色图标体系） -->
     <div class="side-header">
       <div class="header-actions">
         <MyIconButton
@@ -887,27 +830,6 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 
     <!-- 右缘宽度拖拽手柄 -->
     <div class="resize-handle" title="拖动调整侧栏宽度" @mousedown="onResizeStart"></div>
-
-    <!-- 折叠切换按钮（骑跨右缘） -->
-    <button
-      type="button"
-      class="toggle-btn"
-      :title="ui.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
-      :aria-label="ui.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
-      @click.stop="toggleCollapsed"
-    >
-      <svg
-        width="12"
-        height="12"
-        viewBox="0 0 24 24"
-        fill="none"
-        aria-hidden="true"
-        class="chevron-svg"
-        :class="{ rotated: ui.sidebarCollapsed }"
-      >
-        <path d="M15 6l-6 6 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-      </svg>
-    </button>
   </div>
 </template>
 
@@ -922,24 +844,6 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   display: flex;
   flex-direction: column;
 }
-.side-collapsed {
-  width: 44px;
-  min-width: 44px;
-  align-items: center;
-  padding: 12px 0;
-}
-.collapse-label {
-  font-size: 10px;
-  writing-mode: vertical-rl;
-  margin-top: 16px;
-  letter-spacing: 2px;
-  color: var(--text-muted);
-  opacity: 0.7;
-}
-.brand-logo {
-  display: block;
-}
-
 /* ── 头部 ── */
 .side-header {
   /* 横向 padding 收窄（16→8）：侧栏最窄 200px 时 6 个 28px 图标 + gap2
@@ -1087,9 +991,15 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   transform-origin: right center;
 }
 
-/* 连接行 */
+/* 连接行。
+   右侧内边距与行外边距都收到最小：此前是 padding-right 6px + 行 margin-right 6px
+   再加 MyIconButton 自身的 36px 盒（字形居中 ⇒ 右侧还空 18px），「⋯」的字形离
+   侧栏右缘仍有约 30px 空白。用户要求「右边留一点点」——把行的右外边距清零、
+   内边距收到 2px，并让 .conn-more 自身收窄，使字形几乎贴住右缘；腾出的宽度
+   全部让给连接名（侧栏只有 264px，长名形如「火山_115.190.136…」本来就常被截断）。
+   左侧的 padding-left 由模板按层级 depth 动态覆盖，不受此处影响。 */
 .conn-row {
-  padding: 8px 16px 8px 24px;
+  padding: 8px 2px 8px 24px;
   cursor: grab;
   display: flex;
   align-items: center;
@@ -1099,7 +1009,7 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   outline: none;
   transition: background var(--duration-fast) var(--ease-in-out), box-shadow var(--duration-fast) var(--ease-in-out);
   border-radius: var(--radius-md);
-  margin: 1px 6px 1px 6px;
+  margin: 1px 0 1px 6px;
   /* 会话=叶子节点，比文件夹(菜单)权重更高：文件名主色已是最亮，
      再用 600 字重把它从"目录标题"里拎出来 */
   font-weight: 600;
@@ -1153,10 +1063,15 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
   white-space: nowrap;
 }
 /* 连接行「⋯」触发钮：盒子与焦点环由 MyIconButton 承担，这里只保留
-   静止态次级色与「悬停转强调色」的项目惯例（库默认悬停是中性底）。 */
+   静止态次级色与「悬停转强调色」的项目惯例（库默认悬停是中性底）。
+   宽度收到 24px：MyIconButton 默认 36px 盒、字形居中，光是盒子自身就在
+   右缘留出 6px 空白，再叠加行的 2px 内边距就又是 8px；收窄后字形才真正
+   贴住侧栏右缘（悬停底色也随之内收，不再溢出到行外）。 */
 .conn-more {
   color: var(--text-secondary);
   flex: none;
+  width: 24px;
+  padding: 0;
 }
 
 .conn-more:hover {
@@ -1202,10 +1117,17 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 /* ── 版本页脚 ── */
+/* 高度必须钉死 36px，与右侧 CommandBar / ServerInfoPanel 一致。
+   此前只有 `padding: 9px 16px`、高度由内容撑出（约 35px），于是这条
+   border-top 比同排相邻两条线低 1~2px，整条底栏看着是「歪」的
+   （用户反馈"底部的线条高度不一致"）。三者同为 36px + 1px 上边框，
+   box-sizing:border-box 下总高一致，顶线自然对齐。 */
 .footer {
+  height: 36px;
+  min-height: 36px;
   flex-shrink: 0;
   border-top: 1px solid var(--border-subtle);
-  padding: 9px 16px;
+  padding: 0 16px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1328,45 +1250,5 @@ const brandGradId = `brandGrad-${Math.random().toString(36).slice(2, 10)}`;
 }
 .resize-handle:hover {
   background: var(--accent-primary-muted);
-}
-.toggle-btn {
-  position: absolute;
-  right: -13px;
-  top: 50%;
-  width: 26px;
-  height: 26px;
-  transform: translateY(-50%);
-  border-radius: var(--radius-full);
-  background: var(--bg-surface);
-  border: 1px solid var(--border-emphasis);
-  color: var(--text-tertiary);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
-  padding: 0;
-  box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  transition:
-    background var(--duration-normal) var(--ease-out-expo),
-    color var(--duration-normal) var(--ease-out-expo),
-    border-color var(--duration-normal) var(--ease-out-expo),
-    box-shadow var(--duration-normal) var(--ease-out-expo),
-    transform var(--duration-normal) var(--ease-out-expo);
-}
-.toggle-btn:hover {
-  background: var(--accent-primary-muted);
-  border-color: var(--border-accent);
-  color: var(--accent-primary);
-  transform: translateY(-50%) scale(1.1);
-  box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.08);
-}
-.chevron-svg {
-  display: block;
-  transform: rotate(0deg);
-  transition: transform var(--duration-normal) var(--ease-out-expo);
-}
-.chevron-svg.rotated {
-  transform: rotate(180deg);
 }
 </style>

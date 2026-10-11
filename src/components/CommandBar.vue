@@ -3,8 +3,9 @@
      悬浮面板绝对定位于本栏上方，互斥展开（与旧版点击置位逻辑一致）。
      2026-10-10 三处调整：
      ① 位置：从 TerminalPanel 内部提升到壳层底部行（App.vue 的 .shell-bottom），
-        与服务器状态栏一起贯穿整个窗口宽度。此前两者只在终端区那一列，
-        右侧 AI 栏自带的底部两行与之并排、互不对齐。
+        与服务器状态栏一起占侧栏右侧的两列。此前两者只在终端区那一列，
+        右侧 AI 栏自带的底部两行与之并排、互不对齐。同日再把底栏从"贯穿整个
+        窗口宽度"收回为"侧栏右侧"，不再压到侧栏底下。
         多窗口模式例外：那种布局里每个格子自带终端与命令栏，仍由 TerminalPanel
         内嵌渲染（`command-bar` prop，默认开启）。
      ② 删去「多窗口」「AI」两枚按钮 —— 二者在顶栏已有同名常驻入口。
@@ -415,23 +416,45 @@ function firstLine(cmd: string): string {
 
 <template>
   <div ref="containerRef" class="command-bar">
-    <!-- Command input -->
-    <MyInput
-      ref="cmdInputRef"
-      v-model="input"
-      bare
-      size="small"
-      class="cmd-input"
-      placeholder="$ 输入命令..."
-      @keydown="onInputKeyDown"
-    />
+    <!-- Command input.
+         外层 div 不是多余的包装：MyInput 是 inheritAttrs:false 且把 $attrs
+         **显式转给了内层 ElInput**，所以 class 落在 ElInput 的根上，而不是
+         .command-bar 的直接 flex 子项（div.my-field.my-field--bare）。把
+         flex:0 1 50% 直接挂在 MyInput 上，等于写在非 flex 子元素上 —— 完全不
+         生效，输入框退回内容自适应宽度（实测约占本栏 15%）。
+         宽度改由这层**块级**包裹 div 控制：.my-field--bare / .my-field__control /
+         .el-input 在块上下文里逐级撑满，无需 :deep() 就能打穿到控件宽度。 -->
+    <div class="cmd-slot">
+      <MyInput
+        ref="cmdInputRef"
+        v-model="input"
+        bare
+        size="small"
+        placeholder="$ 输入命令..."
+        @keydown="onInputKeyDown"
+      />
+    </div>
 
     <!-- 输入框与工具钮之间的弹性留白：输入框固定占左半，工具钮整体靠右。
          没有它的话按钮会紧贴输入框右侧，栏的右半看起来是空的。 -->
     <div class="bar-spacer" />
 
     <!-- Quick commands button -->
-    <MyPopover v-model="quickPanelOpen" placement="top-end" trigger="click" popper-class="cb-popper">
+    <!-- popper-style 承担面板宽度：宽度必须给到 popper **外壳**上，不能只给
+         面板自己。EP 的 .el-popover 有 `min-width: 150px` 且 position:absolute，
+         外壳按 shrink-to-fit 收敛到 150px 就再也不长（面板反而溢出外壳 281px，
+         见 progress.md 阶段 180 的实测数据）；popper.js 定位/防溢出用的是外壳
+         尺寸，于是 150px 的外壳被判定"放得下"，面板右半截直接顶出 webview。
+         EP 的 contentStyle 合并顺序是 [zIndex, popperStyles, popperStyle]，
+         popperStyle 在最后 —— 能覆盖 popper.js 写回的内联 width。
+         min(定宽, 100vw - 32px)：窗口够宽用定宽，够窄自动收窄并由 popper.js 平移。 -->
+    <MyPopover
+      v-model="quickPanelOpen"
+      placement="top-end"
+      trigger="click"
+      popper-class="cb-popper"
+      :popper-style="{ width: 'min(420px, calc(100vw - 32px))' }"
+    >
       <!-- 激活态不再自绘 .active 底色，改由 :variant 切到 primary：两态的
            对比度、focus 环都由 myui 负责，工具栏不再维护第二套按钮配色。 -->
       <MyButton
@@ -514,7 +537,13 @@ function firstLine(cmd: string): string {
     </MyButton>
 
     <!-- History button -->
-    <MyPopover v-model="panelOpen" placement="top-end" trigger="click" popper-class="cb-popper">
+    <MyPopover
+      v-model="panelOpen"
+      placement="top-end"
+      trigger="click"
+      popper-class="cb-popper"
+      :popper-style="{ width: 'min(480px, calc(100vw - 32px))' }"
+    >
       <MyButton
         class="bar-btn"
         :variant="panelOpen ? 'primary' : 'secondary'"
@@ -608,8 +637,14 @@ function firstLine(cmd: string): string {
 /* 命令输入框：外观（边框/圆角/聚焦环/字号）由 MyInput 的 bare+small 承担，
    这里只定它的宽度策略 —— **固定占本栏左半**（可收缩，窄栏时优先让输入框
    变窄而不是把按钮挤出可视区）。此前是 flex:1 撑满剩余空间，工具钮全被顶到
-   输入框右边贴着，栏的右半一片空白。 */
-.cmd-input {
+   输入框右边贴着，栏的右半一片空白。
+
+   必须挂在 .cmd-slot（包裹层）而不是 MyInput 上，理由见模板处注释：MyInput 的
+   class 会被转给内层 ElInput，而 flex 属性只对 .command-bar 的直接子元素生效。
+   .cmd-slot 保持块级（不要改成 display:flex —— 那样 .my-field 又会退回按内容
+   收缩），内部的 my-field--bare / my-field__control / .el-input 在块上下文里
+   逐级撑满，无需 :deep()。 */
+.cmd-slot {
   flex: 0 1 50%;
   min-width: 0;
 }
@@ -661,12 +696,19 @@ function firstLine(cmd: string): string {
   overflow: visible;
 }
 
+/* 面板宽度改由 MyPopover 的 :popper-style 给到 popper 外壳（见模板注释），
+   面板自身只占满外壳。这里**不能**再写死 width —— 外壳 150px / 面板 480px
+   的错配正是「浮层溢出窗口右缘」的根因。
+   max-height 同理：top-end 是底对齐，面板过高时顶边会越过窗口上沿；
+   限高后由 .float-list（已有 flex:1 + overflow-y:auto）内部滚动。 */
 .history-panel {
-  width: 480px;
+  width: 100%;
+  max-height: min(60vh, calc(100vh - 96px));
 }
 
 .quick-panel {
-  width: 420px;
+  width: 100%;
+  max-height: min(60vh, calc(100vh - 96px));
 }
 
 .float-header {

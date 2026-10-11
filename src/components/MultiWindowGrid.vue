@@ -5,7 +5,7 @@
      TerminalPanel 的接线契约见 src/App.vue 中的绑定。 -->
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { MyButton, MyIcon } from "myui";
+import { MyButton, MyIcon, MyIconButton } from "myui";
 import TerminalPanel from "@/components/TerminalPanel.vue";
 import type { Tab } from "@/api";
 import {

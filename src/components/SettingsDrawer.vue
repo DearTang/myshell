@@ -5,7 +5,7 @@
      左侧类目导航用 myui MyNav（el-menu 封装），图标用注册表内置名。 -->
 <script setup lang="ts">
 import { reactive, ref } from "vue";
-import { MyNav, type NavGroup } from "myui";
+import { MyIconButton, MyNav, type NavGroup } from "myui";
 import AppearanceSection from "@/components/settings/AppearanceSection.vue";
 import AiSection from "@/components/settings/AiSection.vue";
 import McpSection from "@/components/settings/McpSection.vue";
@@ -82,7 +82,7 @@ function onNavSelect(key: string): void {
           <div class="panel-subtitle">管理应用配置与安全设置</div>
         </div>
         <MyIconButton
-          title="关闭设置" class="close-btn" label="关闭设置" size="14" name="Close" @click="emit('close')" />
+          title="关闭设置" class="close-btn" label="关闭设置" size="16" name="Close" @click="emit('close')" />
       </div>
 
       <!-- 主内容区 -->
@@ -203,9 +203,14 @@ function onNavSelect(key: string): void {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: transparent;
-  border: none;
-  color: var(--text-tertiary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  /* 关闭钮原来用 --text-tertiary（#6e7681），在 --bg-elevated（≈#21262d）上
+     对比度只有 ~3.1:1 —— 14px 的细笔画 ✕ 在这个对比度下几乎等于不可见，
+     用户反馈"右上角的关闭设置 x 看不到"。改用 --text-secondary（~5.5:1），
+     并给一层极淡的常驻底，让它在整屏浮层的右上角自带可点性（此前只有 hover
+     才显形，等于要先找到位置才知道这里能点）。 */
+  color: var(--text-secondary);
   font-size: 18px;
   cursor: pointer;
   border-radius: var(--radius-md);
@@ -214,6 +219,7 @@ function onNavSelect(key: string): void {
 
 .close-btn:hover {
   background: var(--bg-surface-hover);
+  border-color: var(--border-default);
   color: var(--text-primary);
 }
 

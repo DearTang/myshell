@@ -212,21 +212,23 @@ function onRendererChange(v: string | number | boolean): void {
         :title="preset.name"
         @click="choosePreset(preset.id)"
       >
-        <span
-          class="preset-dot"
-          :style="{ background: presetVariant(preset).terminal.background }"
-        >
-          <!-- 色板底部的强调色条 -->
+        <span class="preset-body">
           <span
-            class="preset-dot-bar"
-            :style="{
-              background:
-                presetVariant(preset).ui?.['--accent-primary'] ||
-                (ui.isDark ? '#6366f1' : '#4f46e5'),
-            }"
-          />
+            class="preset-dot"
+            :style="{ background: presetVariant(preset).terminal.background }"
+          >
+            <!-- 色板底部的强调色条 -->
+            <span
+              class="preset-dot-bar"
+              :style="{
+                background:
+                  presetVariant(preset).ui?.['--accent-primary'] ||
+                  (ui.isDark ? '#6366f1' : '#4f46e5'),
+              }"
+            />
+          </span>
+          <span class="preset-name">{{ preset.name }}</span>
         </span>
-        <span class="preset-name">{{ preset.name }}</span>
       </MyButton>
     </div>
 
@@ -383,6 +385,11 @@ function onRendererChange(v: string | number | boolean): void {
    强调底会盖掉卡片里那张真实的配色预览图（这正是选中态要展示的东西），
    所以这里刻意保留淡强调底 + 强调色描边。 */
 .preset-card {
+  /* EP 的 .el-button 写死了 height:32px（`.el-button{...height:32px...}`），
+     卡片内容（32px 色板 + 6px 间距 + 13px 名称 ≈ 51px）撑破这个固定高度，
+     于是在按钮盒子上方溢出 9.5px —— 正是用户看到的"色板顶出卡片上沿"。
+     纵向排版改由插槽内的 .preset-body 负责后，卡片自身必须按内容长高。 */
+  height: auto;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -402,12 +409,33 @@ function onRendererChange(v: string | number | boolean): void {
 }
 
 .preset-dot {
+  /* flex:none：作为 content 层（纵向 flex）的子项时不被压扁，色板始终是正方块 */
+  flex: none;
   width: 32px;
   height: 32px;
   border-radius: var(--radius-md);
   border: 1px solid var(--border-default);
   position: relative;
   overflow: hidden;
+}
+
+/* MyButton 底层是 EP ElButton，default 插槽外面包了**一层我们自己看不见的
+   span**（EP 2.14.5 里是 `.el-button__text`，且只有 shouldAddSpace 为真时才
+   真的带这个类名；此前这里写的是 `.el-button__content`，在 2.14.5 中根本不存在，
+   规则永远匹配不到任何元素 —— 这就是「改了没反应」的原因）。
+
+   纵向排布因此不再下推到 EP 内部层（打穿第三方内部类名本就不该做，且换个 EP
+   版本就静默失效），而是在插槽内容里自己包一个 .preset-body：插槽内容由本组件
+   编译，自带 scope id，普通 scoped 选择器即可命中，不依赖任何 EP 内部结构。
+   卡片本该是「色板在上、名称在下」的纵向排布；此前色板与名称并排成一行，
+   且行内盒的基线对齐把 32px 的色板顶出卡片上沿（用户反馈"图标和颜色名称的
+   方框不协调"）。 */
+.preset-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 
 .preset-dot-bar {

@@ -2,7 +2,7 @@
      （从旧 mcp 分区拆出）。active 语义沿用旧版：每次切入 MCP 类目重新拉取。 -->
 <script setup lang="ts">
 import { onMounted, ref, watch } from "vue";
-import { MyButton, MyCheckbox, MyIcon, MyInput } from "myui";
+import { MyButton, MyCheckbox, MyIcon, MyIconButton, MyInput } from "myui";
 import { getCommandRules, setCommandRules, type CommandRules } from "@/api";
 
 defineOptions({ name: "CommandRulesEditor" });

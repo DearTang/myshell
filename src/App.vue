@@ -251,7 +251,7 @@ function onOpenQuickCommandsManage(cid?: string): void {
 
       <!-- 标签页堆叠：保持所有 tab 面板挂载（xterm 尺寸不变量）。
            work-panes 就是工作区的全部高度；命令栏与服务器状态栏已移出，
-           现在统一待在壳层底栏 .shell-bottom（贯穿整个窗口宽度）。 -->
+           现在统一待在壳层底栏 .shell-bottom（侧栏右侧的两列）。 -->
       <template v-else>
         <div class="work-panes">
           <div
@@ -322,11 +322,14 @@ function onOpenQuickCommandsManage(cid?: string): void {
       </template>
     </main>
 
-    <!-- ── 底栏：贯穿整个窗口宽度（含 AI 栏下方）。
+    <!-- ── 底栏：占侧栏右侧的两列（第 2~3 列），不压到侧栏底下。
          2026-10-10 从 .shell-work 内部提升到这里。此前命令栏嵌在 TerminalPanel
          里、状态栏是 work 区的最后一个子元素，两者都只占工作区那一列，右侧 AI
          栏自带的底部两行与之并排、互不对齐。提升为壳层第三行后，AI 栏的底边
-         自动停在底栏上沿。多窗口模式下两者都不渲染（该模式由每个格子自带）。 -->
+         自动停在底栏上沿。
+         同日再调：第三行原是 "bottom bottom bottom" 贯穿整个窗口宽度，把侧栏压
+         成了只到第二行、页脚悬在底栏上沿。现第三行左侧留空、侧栏贯通 2~3 行。
+         多窗口模式下两者都不渲染（该模式由每个格子自带）。 -->
     <div class="shell-bottom">
       <CommandBar
         v-if="bottomCommandTab"
