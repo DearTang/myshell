@@ -1013,10 +1013,13 @@ const dragHintTarget = computed<string | null>(() => {
   /* 同 .folder-row：左侧缩进去掉行的 6px 外边距，内边距 24→12。
      连接名在此之后右移 18px，264px 侧栏下长名多露一截（阶段 181 的右缘
      贴边结论保持不变 —— 这里只动左边）。 */
-  /* 纵向内边距 8→5：连接行实测约 54px（16px 内边距 + 19.5px 主名 +
-     2px gap + 15px 副标题 + 2px 行间距），一屏能放的连接数因此偏少。
-     收到 5 后约 45px，仍高于 32px 的可点下限，图标与两行文字都不挤。 */
-  padding: 5px 2px 5px 12px;
+  /* 纵向内边距收到 2px —— 行高完全由文字撑出，上下只留 2px 呼吸位。
+     树形视图下连接行是**单行**（`.conn-host` 受 `v-if="showGroupPath"` 控制，
+     只有搜索结果才显示 IP 副标题），文字块 13px × 1.25 ≈ 19px，
+     实测行高从 29px 降到 23px，一屏可多放约 2 条连接。
+     注意：必须同时放开 `.conn-more` 的高度（见下），否则 36px 的按钮盒
+     反而成为新瓶颈，行高卡在 29px 下不去 —— padding 改成 2px 却看不出变化。 */
+  padding: 2px 2px 2px 12px;
   cursor: grab;
   display: flex;
   align-items: center;
@@ -1098,6 +1101,11 @@ const dragHintTarget = computed<string | null>(() => {
   flex: none;
   width: 24px;
   padding: 0;
+  /* 高度放开（阶段 193）：MyIconButton 默认 36px 盒，比 23px 的行还高，
+     在 padding 收到 2px 之后它就成了行高的唯一决定者。改成 height:auto
+     后按钮随行高收缩，"⋯" 的可点区从 36×24 变为 23×24 ——
+     横向未变，纵向随行高收紧，是这次降低密度的必要代价。 */
+  height: auto;
 }
 
 .conn-more:hover {
