@@ -7623,3 +7623,37 @@ AI 客户端（使用方）提交了一份 13 条的意见书，附现场失败�
 | 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。 |
 | 什么可能导致偏离？ | ① 顺手把右边也改了 —— 阶段 181 用户已确认右侧贴边，改了算回退；② 改缩进时忘了 `.conn-row` 的 `padding-left` 由模板内联覆盖（CSS 里的值对连接行无效，只对文件夹行生效），两处必须一起改。 |
 | 下一步最小可验证动作？ | 打开真实应用，展开「生产」看子项层级缩进是否仍清晰。 |
+
+
+### 阶段 189 —— 发布 v2.17.0
+
+**做了什么**：按 `打包` 规则走完发布流水线。
+- 版本 2.16.5 → **2.17.0**（staging 含 ✨新增 → minor bump）；`Cargo.toml` 为单一真相源，`npm run version:sync` 同步 `package.json`
+- 预检查双通过：`cargo check` 0 error、`npm run test:ts` exit 0
+- 构建：`npm run tauri:build`（release 8m03s）→ `MyShell_2.17.0_x64-setup.exe`（13.4 MB）
+- 提交 `release: v2.17.0` + 推送 **Gitee / GitHub** 双远端
+- 双平台发布：Gitee release id 1205518、GitHub release id 412658021，资产均上传完成
+- 清空 staging 缓冲、`baseline` 更新为 v2.17.0，`chore: clear release staging after v2.17.0` 推送双远端
+
+**发布中发现的两件事**：
+1. **Gitee 积压 3 个版本**：远端停在 v2.16.2（`a3384a2`），本地已有 v2.16.3/4/5 —— 前几次发布只推了 GitHub，漏了 Gitee。本轮推送后两远端已同步到 `3aa1fc7`。
+2. **`git push` 连续两次误报 non-fast-forward**：当时 `git ls-remote` 显示远端是本地祖先、`git merge-base --is-ancestor` 也确认可 fast-forward。改用显式 refspec `git push origin HEAD:refs/heads/main` 后成功。教训：fetch 未完成时的 push 拒绝信息不可信，先 `ls-remote` 核对真实 ref 再下结论。
+
+**踩到的坑**：
+- **`.zcode/` 有 44 个文件已被 git 跟踪**（历史遗留），且该目录未被 gitignore。因此**绝不能用 `git add .`** —— 本轮逐个 `git add` 具体文件，确保 `.zcode/` 与 `.gitee-token` / `.github-token` 不进提交。
+- **cargo 不在 bash PATH**，`npm run tauri:build` 直接报 `program not found`；`export PATH=/c/Users/argus/.cargo/bin:$PATH` 在 bash 里无效（`which cargo` 仍为空），须用 `cmd.exe /c "set PATH=C:\Users\argus\.cargo\bin;%PATH% && npm run tauri:build"`。
+
+**遗留的安全隐患（未处理，需用户决定）**：
+`.git/config` 里 `github` remote 的 URL **嵌了明文 PAT**：
+`https://DearTang:github_pat_11AGIIL...@github.com/DearTang/myshell.git`
+任何能读该目录的进程都能取到该 token。建议改用 credential helper（`git config --global credential.helper store`）或 SSH remote。本轮未擅自改动 —— 改 remote 属于凭据管理变更，应由用户决定。
+
+**五问重启检查**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 完成 v2.17.0 全流程发布：构建、双远端推送、双平台 release、staging 清空。 |
+| 什么是我没做的？ | 未处理 `.git/config` 里的明文 PAT；未修 Gitee 历史漏推的根因（发布脚本只推 GitHub）。 |
+| 我想去哪里？ | 让发布脚本同时推双远端，避免再积压。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。 |
+| 什么可能导致偏离？ | ① 用 `git add .` 把 `.zcode/` 和 token 文件带进提交；② 信 fetch 未完成时的 push 拒绝信息；③ 在 bash 里 export Windows 路径到 PATH（无效）。 |
+| 下一步最小可验证动作？ | 下载 Gitee 或 GitHub 的 v2.17.0 安装包，确认版本号显示正确。 |
