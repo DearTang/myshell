@@ -926,8 +926,10 @@ const dragHintTarget = computed<string | null>(() => {
   /* 左侧缩进只保留一处。此前是 margin-left:6px + padding-left:16px 叠加出 22px，
      行首 chevron 之前留出一条空列（见 feedback 截图），侧栏最窄 200px 时白扔
      1/10 宽度。这里去掉行的左外边距，内边距压到 8px —— 与右侧 16px 相比
-     刻意更窄，因为左侧还要叠 depth*12px 的层级缩进，两者相加才接近视觉平衡。 */
-  padding: 7px 16px 7px 8px;
+     刻意更窄，因为左侧还要叠 depth*12px 的层级缩进，两者相加才接近视觉平衡。
+     纵向 7→5，与连接行同步收紧（阶段 190）：文件夹行是单行文字，原 7px 会
+     让它比连接行矮一截，列表密度不统一。 */
+  padding: 5px 16px 5px 8px;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -939,8 +941,9 @@ const dragHintTarget = computed<string | null>(() => {
   transition: background var(--duration-fast) var(--ease-out-expo), color var(--duration-fast) var(--ease-in-out);
   border-radius: var(--radius-md);
   /* 只保留右外边距：hover/drop 高亮的圆角背景靠它与右缘保持 6px 呼吸位，
-     左侧则由 padding-left 统一承担缩进，不再叠加（见上方注释）。 */
-  margin: 1px 6px 1px 0;
+     左侧则由 padding-left 统一承担缩进，不再叠加（见上方注释）。
+     行间距同样收到 0（阶段 190）。 */
+  margin: 0 6px;
 }
 /* drop target 高亮只在 isDropTarget 时生效；非 target 时保持 hover 背景 */
 .folder-row:not(.drop-target):hover {
@@ -1010,7 +1013,10 @@ const dragHintTarget = computed<string | null>(() => {
   /* 同 .folder-row：左侧缩进去掉行的 6px 外边距，内边距 24→12。
      连接名在此之后右移 18px，264px 侧栏下长名多露一截（阶段 181 的右缘
      贴边结论保持不变 —— 这里只动左边）。 */
-  padding: 8px 2px 8px 12px;
+  /* 纵向内边距 8→5：连接行实测约 54px（16px 内边距 + 19.5px 主名 +
+     2px gap + 15px 副标题 + 2px 行间距），一屏能放的连接数因此偏少。
+     收到 5 后约 45px，仍高于 32px 的可点下限，图标与两行文字都不挤。 */
+  padding: 5px 2px 5px 12px;
   cursor: grab;
   display: flex;
   align-items: center;
@@ -1020,7 +1026,8 @@ const dragHintTarget = computed<string | null>(() => {
   outline: none;
   transition: background var(--duration-fast) var(--ease-in-out), box-shadow var(--duration-fast) var(--ease-in-out);
   border-radius: var(--radius-md);
-  margin: 1px 0;
+  /* 行间距 1→0：行高已收窄，再留 1px 只会让密度看起来仍偏松。 */
+  margin: 0;
   /* 会话=叶子节点，比文件夹(菜单)权重更高：文件名主色已是最亮，
      再用 600 字重把它从"目录标题"里拎出来 */
   font-weight: 600;
@@ -1051,9 +1058,14 @@ const dragHintTarget = computed<string | null>(() => {
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  /* 主名与副标题（IP / 分组路径）的间距 2→1px：配合收紧的上下内边距，
+     副标题仍与主名有可辨的分组，不至于糊成一行。 */
+  gap: 1px;
 }
 .conn-name {
+  /* 显式行高 1.25（默认 1.5 ⇒ 19.5px）：这是连接行变高的主要来源。
+     13px 字号下 1.25 仍留出正常的字面呼吸，不会上下贴边。 */
+  line-height: 1.25;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1061,6 +1073,7 @@ const dragHintTarget = computed<string | null>(() => {
 }
 .conn-group {
   font-size: 10px;
+  line-height: 1.3;
   color: var(--text-tertiary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1068,6 +1081,8 @@ const dragHintTarget = computed<string | null>(() => {
 }
 .conn-host {
   font-size: 10px;
+  /* 副标题同样收行高（默认 1.5 ⇒ 15px → 1.3 ⇒ 13px）。 */
+  line-height: 1.3;
   color: var(--text-tertiary);
   overflow: hidden;
   text-overflow: ellipsis;

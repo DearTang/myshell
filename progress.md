@@ -7657,3 +7657,74 @@ AI 客户端（使用方）提交了一份 13 条的意见书，附现场失败�
 | 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。 |
 | 什么可能导致偏离？ | ① 用 `git add .` 把 `.zcode/` 和 token 文件带进提交；② 信 fetch 未完成时的 push 拒绝信息；③ 在 bash 里 export Windows 路径到 PATH（无效）。 |
 | 下一步最小可验证动作？ | 下载 Gitee 或 GitHub 的 v2.17.0 安装包，确认版本号显示正确。 |
+
+
+### 阶段 190 —— 侧栏列表行高收紧（连接行 51px → 40px）
+
+**改了什么**（用户据截图反馈「连接的高度感觉过高了」）：
+- `.conn-row`：`padding: 8px → 5px`（纵向）、`margin: 1px 0 → 0`
+- `.conn-name` 显式 `line-height: 1.25`（默认 1.5 ⇒ 13px 字号下 19.5px）
+- `.conn-host` / `.conn-group` 显式 `line-height: 1.3`（默认 1.5 ⇒ 10px 字号下 15px）
+- `.conn-main` 的 `gap: 2px → 1px`
+- `.folder-row` 同步：`padding: 7px → 5px`、`margin: 1px 6px 1px 0 → 0 6px`
+
+**为什么**：高度的主要来源不是内边距而是**行高** —— 13px 主名在默认 `line-height:1.5` 下占 19.5px、10px 副标题占 15px，加上 16px 内边距、2px gap、2px 行间距，带副标题的连接行实测 **51px**。侧栏一屏放不下几条连接，纵向空间大量浪费在字与字之间的呼吸上。显式收行高是唯一能真正压下来的手段（收内边距只动了 6px）。
+
+**为什么文件夹行也改**：它原为 7px 内边距 + 单行 12px 文字（约 31px），比连接行矮但只矮 20px，列表密度不统一；同步收到 5px 后为 27px，与连接行的层级差更清晰（菜单 vs 会话）。
+
+**为什么不动左/右内边距**：左侧缩进（阶段 188）与右侧贴边（阶段 181）都是用户已确认的结论，本次只改纵向。
+
+**验证**（真实 Chromium 量像素，按源码 CSS 值构建等价行盒）：
+
+| 行类型 | 修复前 | 修复后 | 回收 |
+|---|---|---|---|
+| 连接行（带 IP 副标题） | 51px | **40px** | −11px（−22%） |
+| 文件夹行 | 31px | 27px | −4px |
+
+截图复核：40px 未见拥挤或裁切，主名/副标题分层清晰，长连接名省略号截断正常。40px 仍高于 32px 的可点下限。
+
+**踩到的坑**：应用需 Tauri runtime，浏览器里仍停在保险库门禁（与阶段 188 同）；且发布流程后 `npm run dev` 已停止，需 `cmd.exe /c "start /b npm run dev"` 重起，且 Chrome DevTools MCP 的 pageId 会失效（需重新 `new_page`）。
+
+**五问重启检查**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 连接行 51px→40px、文件夹行 31px→27px，主要靠显式收 line-height 而非收内边距。 |
+| 什么是我没做的？ | 未改字号（13px 是可读性下限）；未动左/右内边距（用户已确认）。 |
+| 我想去哪里？ | 若还嫌高，下一步是折叠副标题为 hover 显示（信息更少但行更矮）——那是行为变更，需用户点头。 |
+| 我要去哪里？ | 发布脚本补 Gitee 推送（阶段 189 发现 Gitee 积压 3 版）；`.git/config` 明文 PAT 治理。 |
+| 什么可能导致偏离？ | ① 只收内边距不动 line-height（压不下来）；② 忘了文件夹行要同步，否则密度不统一；③ 收到 40px 以下仍继续收，牺牲可点面积。 |
+| 下一步最小可验证动作？ | 真实应用里展开「生产」，看 40px 行在长列表中的观感。 |
+
+
+### 阶段 191 —— 发布流程加固：凭据出 URL、`.zcode/` 出索引、漏推变可检测
+
+**背景**：用户要求处理阶段 189 遗留的两项待办。查证后发现**第三项**（Gitee 积压 3 个版本）的根因与我原先的猜测不同。
+
+**待办一：`.git/config` 内嵌明文 PAT —— 已处理**
+`.git/config` 里 GitHub remote 是 `https://DearTang:github_pat_11AGIIL...@github.com/...`，任何能读该目录的进程都能取到该 token。
+查证后确认**它本来就是多余的**：全局 `credential.helper=manager`（`E:\Program Files\Git\mingw64\bin\git-credential-manager.exe`）已在提供凭据，URL 里再带一份只是多一处泄漏面。
+改法：`git remote set-url github https://github.com/DearTang/myshell.git`，随后 `git ls-remote github HEAD` 验证认证仍正常（返回 `ff5a2a3...`）。写入 `AGENTS.md` Notes 段作为长期约束。
+
+**待办二：`.zcode/` 有 44 个文件被 git 跟踪 —— 已处理**
+此前 `.gitignore` 只忽略 `*.exe`/`*.obj`/`*.pdb` 三类产物，脚本/截图/日志全部漏网。这是「发布时只能用 `git add <具体文件>`、不能 `git add .`」这一人工纪律的根源 —— 通配式暂存会把 44 个一次性文件（部分含本机绝对路径）连同 token 文件一起带进发布提交。
+改法：`.gitignore` 改为整目录忽略 + `git rm -r --cached .zcode`（磁盘文件保留）。此后 `git add .` 不再有泄漏风险，但流水线文档仍保留逐文件暂存的要求（防御性）。
+
+**待办三：Gitee 积压 —— 根因与我的推测不同**
+我原以为「发布脚本只推 GitHub」。**查证证伪**：两个 publish 脚本（`publish-gitee-release.mjs` / `publish-github-release.mjs`）**都不含任何 git push 逻辑**，grep `push|git ` 只匹配到安装包路径探测。真正的根因是**我在阶段 189 执行 `AGENTS.md` 流水线第 6 步时漏了 Gitee** —— 文档明明写了「push to **both**」，是执行时没照做。**代码没问题，是流程缺乏校验。**
+改法（不写脚本，靠文档里的可执行校验让漏推不可能靠记忆避免）：
+- push 后统一跑 `git ls-remote origin refs/heads/main; git ls-remote github refs/heads/main; git rev-parse HEAD`，**三个 SHA 必须一致**，不一致就是漏推，补推后再发布
+- 补记阶段 189 的教训：push 报 `non-fast-forward` 时先 `git ls-remote` 核对真实远端 ref 再下结论 —— fetch 未完成时的拒绝信息不可信（当时 `merge-base --is-ancestor` 确认可 fast-forward，push 仍连拒两次，改用显式 refspec `git push origin HEAD:refs/heads/main` 才成功）
+
+**顺带发现**：`src-tauri/Cargo.lock` 此前停在 `2.16.5`（阶段 189 bump 版本时漏提交该文件），本轮一并修正。
+
+**发现但未动**（用户的东西）：工作区有 `debug-shell.html` 与 `src/debug-shell.ts`（时间戳 10 月 6 日，早于本会话），是复现五区壳层布局的浏览器调试脚手架。未跟踪、未纳入提交，是否提交或删除交由用户决定。
+
+**五问重启检查**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 移除 remote 内嵌 PAT、`.zcode/` 整目录移出索引、给发布流水线加「三 SHA 必须一致」的漏推检测。 |
+| 什么是我没做的？ | 未写自动发布脚本（判断为不必要：一次季度级操作，文档校验已够）；未处理 `debug-shell.*` 两个用户文件。 |
+| 我想去哪里？ | 若再发版，直接按新增的校验跑一遍，确认规则真的可执行。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。 |
+| 什么可能导致偏离？ | ① 又凭推测断言根因而不 grep 证伪（「脚本只推 GitHub」就是错的）；② 把 `.zcode/` 删到磁盘（那是用户的调试脚手架，只该 untrack）；③ 加了校验但不真的执行 —— 校验不跑等于没有。 |
+| 下一步最小可验证动作？ | `git ls-remote` 三个 SHA 逐一比对，确认双远端一致。 |

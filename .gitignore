@@ -32,7 +32,9 @@ desktop.ini
 .gitee-token
 .github-token
 
-# ZCode scratch — local test build artifacts (regenerable via .zcode/build-c-test.bat)
-.zcode/*.exe
-.zcode/*.obj
-.zcode/*.pdb
+# ZCode scratch — 全部忽略。此前只忽略了 *.exe/*.obj/*.pdb 三类产物，
+# 结果 .zcode/ 下有 44 个脚本/截图/日志被 git 跟踪，其中包含一次性探针
+# 与含本机路径的临时文件。发布时只能用 `git add <具体文件>`，
+# 绝不能 `git add .` —— 这是发布流程反复需要人工核对的隐患根源。
+# 目录内容全部可再生（脚本、探针、截图、dev server 日志）。
+.zcode/

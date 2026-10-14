@@ -189,6 +189,14 @@ Git remotes: `origin` = Gitee (`gitee.com/argustang/myshell`), `github` = GitHub
 4. **Pre-check** — `npm run test:ts` (vue-tsc) and `cargo check` (in `src-tauri/`). Both must pass.
 5. **Build the installer** — `npm run tauri:build` from repo root. Long (~10+ min first time); background it. Output: `src-tauri/target/release/bundle/nsis/MyShell_X.Y.Z_x64-setup.exe`.
 6. **Commit + push (both remotes)** — stage `Cargo.toml`, `package.json`, `package-lock.json`, `CHANGELOG.md`, `README.md`, `progress.md`, `RELEASE_NOTES_STAGING.md` (and feature code), commit `release: vX.Y.Z`, then push to **both** `origin` (Gitee) and `github`. Don't commit `.gitee-token` / `.github-token`. The host classifier may gate push-to-default-branch → ask the user to authorize or run `! git push origin main && git push github main`.
+
+     - **逐个 `git add <具体文件>`，绝不用 `git add .` / `git add -A`。** 历史教训：`.zcode/` 曾有 44 个一次性探针被 git 跟踪，通配式暂存会把它们连同 token 文件一起带进发布提交。
+     - **push 后必须核对两个远端，不靠记忆**：Gitee 曾积压 3 个版本（v2.16.3 / 4 / 5 只推了 GitHub），因为本流水线只写了「push both」而执行时被漏。收尾统一跑：
+       ```bash
+       git ls-remote origin refs/heads/main; git ls-remote github refs/heads/main; git rev-parse HEAD
+       ```
+       三个 SHA 必须一致；不一致就是漏推，补推后再进入发布步骤。
+     - push 报 `non-fast-forward` 时，**先 `git ls-remote` 核对真实远端 ref 再下结论** —— fetch 未完成时的拒绝信息不可信（阶段 189 实测：`merge-base --is-ancestor` 确认可 fast-forward，push 仍连拒两次；改用显式 refspec `git push origin HEAD:refs/heads/main` 才成功）。
 7. **Publish releases (both platforms)** — run both scripts (sequentially, either order):
    - `node scripts/publish-gitee-release.mjs <version> <temp-notes-file>`
    - `node scripts/publish-github-release.mjs <version> <temp-notes-file>`
@@ -200,4 +208,5 @@ Git remotes: `origin` = Gitee (`gitee.com/argustang/myshell`), `github` = GitHub
 - If a release for the tag already exists on either platform, the publish step will error on create — that's fine, report it; don't delete-and-recreate silently.
 - This rule authorizes git commit + push + public release **only** as part of this explicit `打包` flow. It does not extend to other tasks.
 - Never read, log, or print the token value; the scripts read them directly.
+- **凭据管理（阶段 191）**：`.git/config` 里 remote URL **不得内嵌 PAT**。Git Credential Manager（全局 `credential.helper=manager`）会自动提供凭据，URL 里再带一份只是多一处泄漏面。发现内嵌 PAT 时用 `git remote set-url github https://github.com/DearTang/myshell.git` 清除，随后 `git ls-remote github HEAD` 验证仍能认证。仓库内的 `.gitee-token` / `.github-token` 仅供发布**脚本**读文件用（不经过 git），已 gitignore。
 
