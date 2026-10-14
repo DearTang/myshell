@@ -1148,6 +1148,78 @@ mod tests {
         }
     }
 
+    /// 回归闸门（阶段 187 审计）：以下形态每一个都曾让危险命令绕过确认。
+    /// 它们的共同点是「危险命令不在段首」或「拆成多段」，靠整串正则看不见。
+    /// 任何一条回退为 false 都是安全回归，必须让本测试变红。
+    #[test]
+    fn bypass_shapes_still_require_confirmation() {
+        let shapes: &[(&str, &str)] = &[
+            ("控制关键字包裹", "do rm -rf /tmp/x"),
+            ("时间戳前缀", "timeout 30 rm -rf /tmp/x"),
+            ("nohup 包裹", "nohup rm -rf /tmp/x"),
+            ("env 赋值前缀", "env FOO=1 rm -rf /tmp/x"),
+            ("xargs 包裹", "echo /tmp/x | xargs rm -f"),
+            ("单引号包住命令名", "'rm' -rf /tmp/x"),
+            ("双引号包住命令名", "\"rm\" -rf /tmp/x"),
+            ("绝对路径", "/bin/rm -rf /tmp/x"),
+            ("子 shell 包裹", "( rm -rf /tmp/x )"),
+            ("大括号分组", "{ rm -rf /tmp/x; }"),
+            ("if 体内", "if true; then rm -rf /tmp/x; fi"),
+            ("安全命令在前", "echo hi; rm -rf /tmp/x"),
+            ("管道后半段", "echo /tmp/x | rm -rf /"),
+            ("反引号替换", "echo `rm -rf /tmp/x`"),
+            ("$() 替换", "echo $(rm -rf /tmp/x)"),
+            ("写重定向", "echo x > /etc/crontab"),
+            ("zsh MULTIOS 变体", "echo x >&/etc/crontab"),
+            ("chmod 递归", "chmod -R 000 /etc"),
+            ("mkfs", "mkfs.ext4 /dev/sdb1"),
+            ("dd 覆写设备", "dd if=/dev/zero of=/dev/sda"),
+            ("shutdown", "shutdown -h now"),
+            ("killall", "killall -9 java"),
+            ("sudo 提权", "sudo rm -rf /var/lib"),
+        ];
+        let mut missed = Vec::new();
+        for (label, cmd) in shapes {
+            if !command_needs_confirmation(cmd, &r()) {
+                missed.push(format!("{label}: {cmd}"));
+            }
+        }
+        assert!(missed.is_empty(), "以下形态未触发确认（安全回归）:\n{}", missed.join("\n"));
+    }
+
+    /// 反向闸门：日常只读命令不得被误伤成弹窗，否则确认噪音会训练用户
+    /// 「闭眼点确认」，反而降低真正危险操作时的警惕性。
+    ///
+    /// 已知取舍：`systemctl` 整体在黑名单里，不区分 status/restart 子命令——
+    /// 停服务就是一次可用性事故，按前缀匹配是保守方向。若将来要消噪，需要在
+    /// `command_position_view` 里解析子命令，那是独立特性，不在此处顺手做。
+    #[test]
+    fn read_only_commands_stay_confirmation_free() {
+        for cmd in [
+            "uptime",
+            "free -m",
+            "ss -lntp",
+            "df -h /",
+            "ps aux | grep java",
+            "ls -la /var/log",
+            "cat /etc/hostname",
+            "grep -c error /var/log/syslog",
+            "journalctl -u sshd -n 50 --no-pager",
+            "top -bn1 | head -20",
+            "netstat -an | grep LISTEN",
+            "id && whoami",
+            "docker ps",
+            "kubectl get pods -A",
+            "git status",
+            "echo hello",
+        ] {
+            assert!(
+                !command_needs_confirmation(cmd, &r()),
+                "只读命令不应弹确认: {cmd}"
+            );
+        }
+    }
+
     #[test]
     fn reasons_empty_for_safe_command() {
         assert!(command_danger_reasons("ps aux | grep sftp", &r()).is_empty());

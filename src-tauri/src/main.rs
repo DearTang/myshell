@@ -1984,6 +1984,59 @@ fn check_command_danger_reasons(command: String) -> Result<Vec<String>, String> 
     ))
 }
 
+// ============ MCP file-op confirmation (GUI-rendered) ============
+//
+// `exec_in_tab` commands confirm inside the GUI already. The destructive
+// FILE tools (sftp_upload / sftp_remove / sftp_rename / upload_project /
+// download_project / zmodem_upload) used to raise a native MB_SYSTEMMODAL box
+// from the MCP process, which is invisible to a user working inside MyShell —
+// and a missed prompt on an irreversible operation is a missed confirmation.
+// These now ask the GUI to render the same dialog and report back here.
+type PendingConfirmMap = std::sync::Mutex<HashMap<String, oneshot::Sender<String>>>;
+
+/// How long a file-op confirmation may stay open before we answer "deny".
+/// Long enough for a human to read a one-line summary and click, short
+/// enough that an unattended prompt does not wedge the MCP client forever.
+const MCP_CONFIRM_TIMEOUT_SECS: u64 = 180;
+
+struct PendingConfirm {
+    map: PendingConfirmMap,
+    /// Latched while a dialog is on screen so a second request is rejected
+    /// instead of replacing the first (which would orphan its resolver).
+    busy: std::sync::atomic::AtomicBool,
+}
+
+/// Drop a pending confirmation entry and clear the busy latch.
+///
+/// Takes `&State<PendingConfirm>` rather than `&AppHandle`: `state()` returns
+/// a guard borrowing the handle, so storing it across branches does not
+/// compile. One helper keeps every exit path (emit failed, socket clone
+/// failed, decision received, timeout) doing the same two steps.
+fn clear_pending_confirm(app: &tauri::AppHandle, request_id: &str) {
+    let state = app.state::<PendingConfirm>();
+    state.busy.store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut pending = state.map.lock().unwrap_or_else(|e| e.into_inner());
+    pending.remove(request_id);
+}
+
+/// Called by the frontend to deliver the user's decision for an `mcp_confirm`
+/// request. `decision` is `allow` / `deny` / `session`.
+#[tauri::command]
+fn mcp_confirm_result(app: tauri::AppHandle, request_id: String, decision: String) {
+    let tx = app
+        .state::<PendingConfirm>()
+        .map
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&request_id);
+    if let Some(tx) = tx {
+        app.state::<PendingConfirm>()
+            .busy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = tx.send(decision);
+    }
+}
+
 /// Called by the frontend to deliver the result of an `exec_in_tab` request
 /// back to the waiting IPC listener thread. The listener registered a oneshot
 /// sender under `request_id`; we look it up, send the result, and clean up.
@@ -5167,6 +5220,10 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
+        .manage(PendingConfirm {
+            map: std::sync::Mutex::new(HashMap::new()),
+            busy: std::sync::atomic::AtomicBool::new(false),
+        })
         .invoke_handler(tauri::generate_handler![
             vault_status,
             setup_vault,
@@ -5203,6 +5260,7 @@ pub fn run() {
             get_app_settings,
             set_app_settings,
             mcp_exec_result,
+            mcp_confirm_result,
             write_frontend_log,
             get_connections,
             save_connection,
@@ -5722,6 +5780,115 @@ fn handle_ipc_connection(
                             // right in the user's face — without this the
                             // gate can sit in the background while the user
                             // wonders why the AI seems stuck.
+                            // MCP needs a human decision for a DESTRUCTIVE
+                            // file operation (upload overwrite / remove /
+                            // rename / project transfer / zmodem upload).
+                            //
+                            // These used to confirm via a native
+                            // MB_SYSTEMMODAL MessageBoxW raised from the MCP
+                            // process. That dialog is invisible whenever the
+                            // user is working inside MyShell — it grabs focus
+                            // from behind the window they are looking at, and
+                            // for irreversible operations (overwrite, delete)
+                            // a missed dialog means a missed confirmation. So
+                            // we render the same decision in the GUI, where it
+                            // is already the established pattern for
+                            // exec_in_tab commands, and keep the native box
+                            // only as the headless fallback (handled by the
+                            // MCP server when this action is unavailable).
+                            //
+                            // Returns {ok:true, decision:"allow"|"deny"|"session"}.
+                            "mcp_confirm" => {
+                                let operation = cmd["operation"].as_str().unwrap_or("").to_string();
+                                let connection_name =
+                                    cmd["connection_name"].as_str().unwrap_or("").to_string();
+                                let detail = cmd["detail"].as_str().unwrap_or("").to_string();
+                                if operation.is_empty() || connection_name.is_empty() || detail.is_empty() {
+                                    let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"missing operation/connection_name/detail\"}}");
+                                    return;
+                                }
+                                // A second prompt would replace the first and
+                                // orphan its resolver in the frontend.
+                                if ipc_handle
+                                    .state::<PendingConfirm>()
+                                    .busy
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"another confirmation is already pending\"}}");
+                                    return;
+                                }
+                                // The dialog is rendered by the frontend from
+                                // the emitted event (same path as exec_in_tab);
+                                // the reply comes back through the
+                                // mcp_confirm_result Tauri command.
+                                let request_id = uuid::Uuid::new_v4().to_string();
+                                let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+                                {
+                                    let state = ipc_handle.state::<PendingConfirm>();
+                                    state.busy.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    let mut pending =
+                                        state.map.lock().unwrap_or_else(|e| e.into_inner());
+                                    pending.insert(request_id.clone(), tx);
+                                }
+                                if let Some(window) = ipc_handle.get_webview_window("main") {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
+                                let payload = serde_json::json!({
+                                    "action": "mcp_confirm",
+                                    "request_id": request_id,
+                                    "operation": operation,
+                                    "connection_name": connection_name,
+                                    "detail": detail,
+                                });
+                                if let Err(e) = ipc_handle.emit("mcp-gui-command", payload) {
+                                    clear_pending_confirm(&ipc_handle, &request_id);
+                                    let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"emit failed: {}\"}}", e);
+                                    return;
+                                }
+                                // Wait on its own thread so the accept loop
+                                // keeps serving other IPC traffic (a user may
+                                // be watching several tabs while deciding).
+                                let mut writer = match reader.get_ref().try_clone() {
+                                    Ok(w) => w,
+                                    Err(_) => {
+                                        clear_pending_confirm(&ipc_handle, &request_id);
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":false,\"error\":\"cannot clone socket\"}}");
+                                        return;
+                                    }
+                                };
+                                let confirm_app = ipc_handle.clone();
+                                std::thread::spawn(move || {
+                                    let decision = match tokio::runtime::Runtime::new() {
+                                        Ok(rt) => rt.block_on(async move {
+                                            tokio::time::timeout(
+                                                std::time::Duration::from_secs(MCP_CONFIRM_TIMEOUT_SECS),
+                                                rx,
+                                            )
+                                            .await
+                                            .ok()
+                                            .and_then(|r| r.ok())
+                                        }),
+                                        Err(_) => None,
+                                    };
+                                    clear_pending_confirm(&confirm_app, &request_id);
+                                    match decision {
+                                        Some(d) => {
+                                            let _ = writeln!(writer, "{{\"ok\":true,\"decision\":\"{}\"}}", d);
+                                        }
+                                        None => {
+                                            // No decision in time == DENY.
+                                            // A timed-out confirmation must
+                                            // never fall through to "allow":
+                                            // for irreversible operations the
+                                            // safe reading of "the user did
+                                            // not say yes" is "no".
+                                            let _ = writeln!(writer, "{{\"ok\":true,\"decision\":\"deny\"}}");
+                                        }
+                                    }
+                                });
+                            }
+
                             "focus_unlock" => {
                                 if let Some(window) = ipc_handle.get_webview_window("main") {
                                     let _ = window.show();

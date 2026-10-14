@@ -81,6 +81,7 @@
 
 ### 诊断与日志
 - **结构化日志**：关键路径（启动、SSH 生命周期、连接管理、快捷命令）记录 `info` / `warn` / `error` 级日志，按天落盘，便于事后定位问题
+- **MCP 独立日志**：AI 助手通过 MCP 使用 MyShell 时，MCP 服务器写入**两个**按天滚动的文件（文件名里的数字是距 1970 的天数，与主程序日志同一套命名）—— `mcp-<日期>.log`（启动、工具调用、连接与决策的正常轨迹）与 `mcp-error-<日期>.log`（工具失败、协议解析错误、任务失败、GUI/IPC 异常），报障只需提供 error 文件。日志目录与主程序一致，同样保留 7 天、启动时清理超期文件
 - **日志自动清理**：默认保留 **7 天**，每次启动自动清理超期日志
 - **动态调试**：需要更详细输出时设置环境变量 `RUST_LOG=myshell=debug` 提升日志级别
 - **用户反馈**：左下角「反馈与建议」入口，可提交问题报告 / 功能建议（支持截图与本地图片，自动附带脱敏后的运行日志），通过邮箱送达开发者；提交失败时自动打包本地反馈包兜底
@@ -187,9 +188,29 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 ```
 
 > **安全模型**：MCP server 不存储 vault 密码，也不持有解密密钥。所有服务器访问必须经过 MyShell GUI——ssh_exec 在 GUI 终端标签页内执行（用户已在 GUI 中解锁 vault），SFTP 工具通过 IPC 向 GUI 请求解密后的连接凭证。GUI↔MCP 的 localhost IPC 桥要求**每条命令携带随机会话令牌**（写入用户配置目录的端口文件中，受用户目录 ACL 保护；令牌缺失/错误一律在分发动作前拒绝），本机其他用户的进程无法再窃取凭证。**所有工具（除任务状态查询）都要求保险库已解锁**：GUI 未运行时 MCP 自动拉起应用（含识别并清理崩溃残留的 IPC 端口文件）；保险库锁定时立即返回明确的「保险库未解锁」错误并把 MyShell 窗口置顶（密码门正对用户），不做静默等待——解锁后重试即恢复。锁定状态下连 `list_connections` 都不可用，AI 无法获取任何连接元数据。
-暴露 15 个 MCP 工具：`list_connections`、`ssh_exec`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过；命令类确认（`ssh_exec` / `ssh_run`）会逐条列出命中的黑名单规则及具体危害说明，弹窗出现时 MyShell 窗口自动置顶、聚焦并闪烁任务栏，避免人工审核被遗漏；用户点「取消」拒绝时返回硬性停止（HARD STOP）错误——AI 必须立即停止当前任务的所有后续操作（不重试、不换工具绕过）、向用户输出任务进度说明，并等待用户明确确认是否继续（`ssh_run` 后台任务拒绝后经 `ssh_status` 同样处理）。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz -r`/`rz`（lrzsz）走 ZMODEM 协议传输文件，双向支持目录递归（zmodem_download 子树按相对路径镜像到 local_dir；zmodem_upload 目录展开后按相对路径 offer，远端 rz 重建目录树），用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 zmodem_*，技术性失败（如远端无 lrzsz）时再回退 sftp_*。
+暴露 21 个 MCP 工具：`vault_status`、`list_connections`、`ssh_exec`、`ssh_run`、`ssh_status`、`ssh_cancel`、`ssh_read_text`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`、`zmodem_status`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。 `vault_status` 是唯一的免门禁只读探针：返回 `gui_running`/`initialized`/`unlocked` 三个布尔与 `vault_state`，让 AI 每 5 秒轮询一次等待主密码解锁（约 2 分钟上限），而不是让某个工具调用卡着等 —— 客户端普遍 30s 砍请求，隐式等待必然双重失败。上传覆盖 / 删除 / 重命名 / 项目传输 / zmodem 上传这六类不可逆操作的确认弹窗现在渲染在 MyShell 界面内（此前是系统原生对话框，会藏在窗口后面，漏看即等于漏掉确认）；180 秒无响应一律按「拒绝」处理。**为 AI 调用方做的稳定性设计**（接入前请读 [MCP 接入规范](docs/mcp-integration-spec.md)）：命令行既可用 `command` 也可用 `command_b64`（base64 免转义，含引号/反斜杠/`$`/正则花括号的复杂命令不再因 JSON 转义而失败）；`ssh_read_text` 直接读远端文本文件（优先 SFTP，无 SFTP 自动回退 shell 并正确转义路径），不必再手拼 `cat`；工具输出统一剥离终端控制序列（CSI 颜色 / OSC 标题与超链接），返回值补 `duration_ms` / `timed_out` / `truncated` / `command` 回显；任何失败都带机器可读的 `error_kind`（permission_denied、timeout、busy、connection_lost 等 10 类）与下一步 `hint`；慢命令不再阻塞整个服务器——每个工具调用独立执行（期间 `ssh_status` / `ssh_cancel` 与其他连接的调用照常响应）。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过；命令类确认（`ssh_exec` / `ssh_run`）会逐条列出命中的黑名单规则及具体危害说明，弹窗出现时 MyShell 窗口自动置顶、聚焦并闪烁任务栏，避免人工审核被遗漏；用户点「取消」拒绝时返回硬性停止（HARD STOP）错误——AI 必须立即停止当前任务的所有后续操作（不重试、不换工具绕过）、向用户输出任务进度说明，并等待用户明确确认是否继续（`ssh_run` 后台任务拒绝后经 `ssh_status` 同样处理）。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz -r`/`rz`（lrzsz）走 ZMODEM 协议传输文件，双向支持目录递归（zmodem_download 子树按相对路径镜像到 local_dir；zmodem_upload 目录展开后按相对路径 offer，远端 rz 重建目录树），用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 zmodem_*，技术性失败（如远端无 lrzsz）时再回退 sftp_*。
 
 ## 更新日志
+
+### v2.17.0（2026-10-14）
+
+针对 **AI 接入安全边界**的审计整改。审计推翻了我方上一轮的核心推测，转而修复三处真实问题。
+
+**🔒 安全**
+
+- MCP 确认门不再依赖错误文案的措辞：判定「可见确认框是否出现过」原先靠中文错误文本匹配，改个错字就会让高危命令静默执行；现改为类型化错误，可达性由类型携带
+- 确认超时按「拒绝」处理（不可逆操作里「用户没说好」必须读作「不」）
+
+**✨ 新增**
+
+- 不可逆文件操作（上传/删除/重命名/项目传输/zmodem 上传）的确认改在 MyShell 界面内渲染，不再弹出藏在窗口后面的系统对话框
+- `vault_status` 只读工具：返回三个布尔与 `vault_state`，不泄漏任何连接元数据
+
+**🛠️ 优化**
+
+- 登录门禁给出可轮询的等待契约：返回结构化 `error_kind: vault_locked` + `vault_state`，AI 每 5 秒轮询一次后重试同一工具；仍不做隐式等待（客户端普遍 30s 砍请求）
+- 侧栏连接树左侧空白收敛：文件行前空 22px → 8px、连接行 30px → 12px（缩进原由外边距与内边距双重叠加）
+- 新增 4 组安全回归测试（23 种命令绕过形态、只读命令不误弹、错误类型可达性映射、门禁状态可读）
 
 ### v2.16.5（2026-10-11）
 
@@ -634,7 +655,7 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 ### v2.5.2（2026-07-25）
 
 #### ✨ 新增
-- **MCP 工具调用等待保险库解锁**：AI 调用 ssh_exec / sftp_* 时若 GUI 未解锁，每 3s 轮询一次、最多等 30s，给用户输入主密码的时间。超时才报错。`list_connections` 不受影响。
+- **MCP 工具调用等待保险库解锁**：AI 调用 ssh_exec / sftp_* 时若 GUI 未解锁，返回 `error_kind: vault_locked`（含 `vault_state`）并立即置顶 MyShell 的密码门；**不做隐式等待**，由 AI 调 `vault_status` 轮询后再重试同一个工具。`list_connections` 同样受门禁。
 
 
 ### v2.5.1（2026-07-25）
@@ -1071,6 +1092,7 @@ myShell/
 - [统一应用主界面原型](docs/ui-prototype/index.html)：可直接打开的高保真交互原型，包含收缩侧栏、全局顶栏、版本升级提示、亮暗主题、国际化、设置抽屉、右侧辅助区与响应式布局。
 - [统一界面 Vue + MyUI 实现](F:/personalProject/MyUI/src/views/cases/unified-ui)：MyUI 中的统一界面参考实现（五区壳层、命令面板、设置抽屉、升级弹窗、i18n、主题持久化）。
 - [原型使用说明](docs/ui-prototype/README.md)：区域职责、交互清单及复用到其他软件的方法。
+- [MyShell MCP 接入规范](docs/mcp-integration-spec.md)：给客户端适配层的参数编码规范（命令用 base64 免转义）、三层超时语义、`error_kind` 分支、并发与串行约定、接入自检清单。
 
 ## 快速开始
 
@@ -1163,7 +1185,7 @@ npm run test:compile
 | `dek.enc` | 加密的 DEK（数据加密密钥） |
 | `vault.kdf` | KDF 算法与迭代数元数据（旧版本缺失，首次解锁自动生成） |
 | `lockout.json` | 密码错误锁定状态 |
-| `logs/` | 按天滚动的运行日志（`myshell-YYYY-MM-DD.log`，默认保留 7 天） |
+| `logs/` | 按天滚动的运行日志（`myshell-YYYY-MM-DD.log`；MCP 另有 `mcp-*.log` / `mcp-error-*.log`，默认保留 7 天） |
 | `backups/` | 版本备份目录 |
 
 ## 快捷键

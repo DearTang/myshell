@@ -7329,3 +7329,297 @@ v2.16.5 的改动**尚未经用户实测**（确认门前已告知，用户选�
 | 什么可能导致偏离？ | ① 只看条目类型机械判版本、忘了逐条对 diff 做完整性校验；② 预检看到警告就当代码坏了去「顺手修」，把一次发版扩成改 Rust；③ 推了工作分支却没注意 release 脚本的 `target_commitish: "main"`，tag 继续悄悄指到旧代码；④ 把探针页之类的开发工具塞进 staging 凑条目数，把发版记录污染成流水账。 |
 | 下一步最小可验证动作？ | 装 `MyShell_2.16.5_x64-setup.exe`，按上面「八、待用户实测」的 7 条走一遍；重点是设置页 ✕ 与顶栏 ☰ 这两处「以前点了没反应」的入口。 |
 | 目标是什么？ | 把「规则进了产物 ≠ 规则生效」这一类只能靠实测发现的问题，在发版前全部查清并修掉；发版流程本身每一步都留下可核对的证据（退出码、字节数、SHA256、release id、commit hash）。 |
+## 阶段 184：MCP 日志重做与执行链缺陷修复（2026-10-14）
+
+用户报「MCP 参数 JSON 没发出去」（`xd://mcp__myshell_ssh_exec expects a JSON args object as content (JSON Parse error: Unterminated string)`），顺手要求「检查 MCP 有没有日志，没有就加上，基础日志与报错日志分开、默认留 7 天，并修一下 MCP 的问题」。查证结论：**日志有，但三项要求全部不达标；贴出的那个报错与 MCP 无关。**
+
+### 一、日志现状（改造前）
+
+| 项 | 实测 | 证据 |
+|---|---|---|
+| 文件 | `%APPDATA%\myshell\logs\mcp.log` 单文件 | 3.19 MB / 46809 行 |
+| 保留 | **无**：只追加，从不轮转、从不清理 | 最早的 `MCP server starting` 与最新交错在同一文件 |
+| 分级 | **无**：37 处调用点全走同一个 `log()` | 失败与正常启停混写 |
+| 实现 | 每行 `open`+写+关（约 4.7 万次 open），写失败静默吞 | 旧 `fn log` |
+| 目录 | `dirs::data_dir()`，GUI 用 `dirs::config_dir()` | Windows 同目录（都指 Roaming），**Linux 会分家** |
+
+顺带澄清：用户贴的 `Unterminated string` 发生在**调用侧 content JSON**，参数根本没到 MCP —— `mcp.log` 显示该时段最后一次启动（15:42:43）后只收到 `initialize` / `tools/list`，**零条 `tools/call`**。
+
+### 二、日志改造（新）
+
+- `mcp-<epoch-day>.log`（基础：启停、工具调用、GUI 启动与 IPC、任务生命周期）与 `mcp-error-<epoch-day>.log`（工具失败、JSON 解析失败、read_line 错误、ssh_run / zmodem_* 任务失败、`show_in_gui` 失败、数据库初始化失败）**互斥不重复**——报障只需给后者。
+- 按天滚动（沿用 GUI 的 day 公式），启动时清理 `mcp*.log` 中超过 **7 天**的文件（含历史遗留的裸 `mcp.log`）；GUI 的 `myshell-*.log` 不在清理范围内。
+- 目录统一 `dirs::config_dir()/myshell/logs`，修掉 Linux 上与 GUI 分家的问题。
+- writer 常驻（跨天重开），写失败闩死静默——stdout 是 JSON-RPC 独占，日志绝不能外溢或让会话崩掉。
+- 单行超长内容按 UTF-8 边界截断（`LOG_LINE_MAX = 4000`）：旧日志里一条 heredoc 命令就能写进数 KB。
+- `zmodem_progress` / `zmodem_raw` / `ssh_output` 不再逐条落盘（一次会话 1332 行进度噪音），保留 start/offer/file-complete/end/error 等决策事件。
+
+### 三、顺带修掉的 MCP 缺陷（均有日志证据）
+
+| # | 问题 | 证据 | 修法 |
+|---|---|---|---|
+| P1 | 前端执行锁陈旧阈值固定 60s，与命令 timeout 脱钩。AI 传 `timeout=300/3600` 时，命令跑到 60s 锁即被强杀，第二条命令注入同一 PTY → sentinel 串台、输出错配 | `useMcpBridge.ts:33` 旧值 `60_000` | 阈值 = `max(60s, timeout + 10s)` |
+| P2 | 前端执行链无兜底：硬超时 `setTimeout` 注册在 `await sshSend` **之后**，且 `runExec` 异常无统一收敛 → 前端对这条请求永久沉默，GUI 只能等 `timeout+10s` 回一个模糊的 `exec timeout (Xs)` | 日志 34 次 `exec timeout (Xs)` 且**零次**中文超时（中文超时才是前端回的） | 硬超时前移；新增覆盖全链路的看门狗（`timeout+9s`，早于 Rust 的 +10s）；`finishExec` 改为幂等且唯一出口，统一解绑 IPC 监听、释放锁、回传结果；sshSend 异常改为回 `命令发送失败`；`reconnectOne` 补 rejection 处理 |
+| P3 | 锁冲突只回「上一条仍在执行」，AI 只能盲目重试 | 100 次撞锁（最高频失败） | 附已运行时长与最多还需等待秒数 |
+| P4 | 上传时 `let _ = rf.flush().await` 吞掉落盘错误：远端磁盘满/超配额时工具仍回「已上传」 | `sftp_upload_file` | 改为 `?` 冒泡；下载侧补本地 `flush()` 失败检测 |
+| P5 | 建连预算用整个命令 timeout（`maxAttempts = timeoutMs/500`）：一条 `timeout=60s` 的调用可能 60s 全耗在等连上 | 日志多条 `连接超时，无法建立终端会话` | 单独封顶 30s |
+
+### 四、验证（全部实跑）
+
+1. `cargo check --bin myshell-mcp`、`cargo build --bin myshell-mcp` 通过。
+2. `cargo test --bin myshell-mcp` → **13 passed**，含新增 4 条日志测试：bas/err 分流不串写、7 天清理（且不动 GUI 日志）、超长行 UTF-8 边界截断、目录不可写时静默闩死不 panic。
+3. **直接驱动新二进制走 stdio 协议**（阶段 143 既有手法）：喂 `initialize` → `tools/list` → 未知工具调用 → 坏 JSON 行 → `ping` → `tools/list`。结果：stdout **零污染**（逐帧 JSON.parse 通过）、坏行后进程存活、错误以 `isError:true` 内联回给 AI；落盘实测 —— `mcp-20740.log` 只含正常轨迹，`mcp-error-20740.log` 只含三条失败（两条工具 Err + 一条解析失败）；预先植入的 30 天前 `mcp-99999.log` / `mcp-error-99999.log` 被清掉，GUI 日志未被触碰。
+4. `npm run test:ts` 通过。
+5. 副作用清理：冒烟时 MCP 的自动启动逻辑拉起了一个 **debug 版 GUI（PID 51072，端口 41283）**，已 `taskkill` 并删除它留下的 `gui-ipc-port`，避免与用户真实实例撞单实例。
+
+### 五、本轮未做 / 留给用户的实测
+
+- P1/P2/P3 的前端路径**需要真实 SSH 会话**才能端到端复现（MCP 桥无法脱离 GUI 单测）：建议用已保存连接跑一条 `timeout=300` 的命令，确认第二条命令被拒绝时错误文案带等待秒数；再手动制造一次 sshSend 失败（断开 tab）确认拿到「命令发送失败」而不是干等。
+- 历史 `mcp.log`（3.2 MB）会在下次 MCP 启动满 7 天后被自动清掉，本次未手动删除。
+
+## 五问重启检查（阶段 184）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 184 —— MCP 日志改造（基础/错误分离、按天滚动、7 天保留、目录统一）+ 5 项执行链缺陷修复；`cargo test --bin myshell-mcp` 13 项全绿，新二进制 stdio 冒烟通过。 |
+| 我要去哪里？ | 等用户实测前端三项（长 timeout 锁阈值、发送失败回执、锁冲突文案）。之后仍排队：阶段 171 问题四（AI 模型选择器选不到模型）、`MyCheckbox` 标签在上、`WindowControls` 的 Tauri 兜底。 |
+| 什么可能导致偏离？ | ① 把「有日志文件」当成「日志合格」——本轮三项要求（分级、保留、分离）没有一项被满足，只有实测行数与文件清单才看得出；② 只改 `log()` 的写法而不改调用点，错误仍会混进基础日志；③ 断言「前端超时文案存在」却不查日志里到底出现哪一条（34 次英文 `exec timeout` vs 0 次中文，正是前端从未回结果的确证）；④ 忘了 MCP 会**自动拉起 GUI**，冒烟后留下一个 debug 实例污染用户环境。 |
+| 下一步最小可验证动作？ | 让 AI 客户端重连 MCP（进程重启才会加载新二进制），查 `%APPDATA%\myshell\logs\` 是否出现 `mcp-error-<日期>.log`；随后跑一条长命令验证锁阈值。 |
+| 目标是什么？ | 让 MCP 出问题时**有据可查且能一眼分流**：正常轨迹与错误各自成文件、7 天自动收敛、错误带足够上下文（谁失败、等待多久、命令是否已发出）让人和 AI 都能据此行动。 |
+
+## 阶段 185：按调用方反馈补齐 MCP 可观测性与「第一次就能发出去」（2026-10-14）
+
+AI 客户端（使用方）提交了一份 13 条的意见书，附现场失败样本。逐条评估后按「该做的做、不该做的说明理由」实施。**核心判断：意见书里最痛的三件事里，只有一件真正属于 MyShell 的职责范围。**
+
+### 一、先厘清责任边界（这条决定了大半取舍）
+
+| 反馈 | 归属 | 处置 |
+|---|---|---|
+| `content` JSON 转义炸（5 次）、请换 JSON5 / 支持纯对象 / 报错带字段定位 | **调用方 harness**（`xd://` 工具封装层）—— MyShell 收到的是已解析的 JSON-RPC，那层字符串化不在本仓库 | 改不了那层，于是**从根上消除需求**：加 `command_b64`（base64 无任何需转义字符） |
+| `Request timeout after 30000ms (stage: receive)` | 调用方自己的接收超时 | 写进工具说明，并给出规避路径（>30s 用 `ssh_run`） |
+| 其余 10 条（超时语义、ANSI 污染、结构化字段、错误分类、批量并发、免转义读文件…） | MyShell | 实施 |
+
+**不做 `confirm: false` / `readonly_hint`（明确拒绝）**：两者本质都是「让 AI 自己声明已获授权」，与确认门的设计前提（AI 不能自我放行）直接冲突。使用方抱怨的 `free` / `ss` / `journalctl` 实际上**早已在默认白名单里免弹窗**，属配置可见性问题，不是能力缺失。同理不加 `sudo -n` 开关：`sudo -n` 直接写进命令即可生效且已被确认门覆盖。
+
+### 二、实施内容
+
+**消除转义地狱（对应反馈 #1 / #10）**
+- `command_b64`：`ssh_exec` / `ssh_run` 接受 base64 命令，解码后走原路径；两个参数都给时 b64 优先。直接消灭引号/反斜杠/`$`/反引号/正则花括号这一类失败。
+- 新增工具 `ssh_read_text`（第 20 个工具）：免转义读远端文本文件。优先走 SFTP（完全不经 shell），无 SFTP 时回退 `wc -c` + `head -c`，路径经既有 `shell_quote` 单引号转义。返回 `content` / `bytes` / `truncated` / `lines` / `method`。
+
+**可观测性（对应反馈 #2 / #3 / #6 / #7 / #8 / #13）**
+- 所有工具失败统一带 `error_kind`（10 类）+ `hint`，在结果渲染边界用 `classify_error` 一次性分类 —— 不去改动几百个 `?` 站点的类型。
+- `ssh_exec` 结果补 `duration_ms` / `timed_out` / `truncated` / `command` 回显 / `exit_code_source`；超时明确回 `possible_remote_still_running: true`（远端进程未被杀）。
+- GUI 路径失败带上耗时与 `command_sent`，不再只回一句「exec timeout (Xs)」。
+- 说明文档补「三种超时」的区分与串行锁的行为（busy 附已运行秒数与最长等待）。
+
+**输出净化（对应反馈 #5）**
+- 新增 `strip_ansi`：CSI 颜色 / OSC 标题与超链接 / 裸 ESC 序列全部剥除，中文与制表换行原样保留。GUI 路径与 headless 路径、`ssh_run` 的三个收尾分支都已接入。**终端显示不受影响**（剥离只发生在回给 AI 的文本上）。
+
+**并发（对应反馈 #9）**
+- 主循环改为每 `tools/call` 独立 tokio 任务，响应经 `Mutex<BufWriter<Stdout>>` 串行写出；stdin 关闭后最多等 30 秒让在途调用回传结果。此前一条慢命令会让服务器「失聪」——期间的 `ssh_status` / `ssh_cancel` 全在管道里排队。
+
+### 三、实施中自己踩到并修掉的 bug（重要）
+
+改成并发后，冒烟立刻暴露一个**旧代码里就存在、但被串行掩盖**的缺陷：三个并发工具调用在 GUI 未运行时**各自拉起一个 `myshell.exe`**，第 2、3 个会撞上单实例「覆盖启动」弹窗。给 `ensure_gui_running` 加进程内锁（`ensure_gui_running_locked`）后复测：日志里 `启动 GUI:` 由 3 次降为 1 次。
+
+顺带修掉：修 instructions 时**连续两次**把 `"` 写进 Rust 字符串字面量（第一次整个常量炸掉、第二次 `error_kind: "busy"` 炸），两次都是编译器直接定位。教训：往已有长字符串里插入含引号的文案，先确认转义层数再写。
+
+### 四、验证（全部实跑）
+
+1. `cargo test --bin myshell-mcp` → **17 passed**（新增 4 条：base64 往返含折行与非法输入、ANSI 剥离 5 组样本、错误分类 11 条含顺序敏感性、每个 error_kind 都有非空 hint）。
+2. `cargo build --bin myshell-mcp` 通过；`npm run test:ts` 通过。
+3. **stdio 端到端冒烟**（脚本驱动新二进制，见下）：6 帧全部合法 JSON、stdout 无 ESC 泄漏、`tools/list` 报 20 个工具且 `ssh_exec` schema 含 `command_b64`、未知工具返回 `isError:true` + `error_kind` + 非空 `hint`、base64 命令成功解码后才因保险库未解锁而失败（证明解码环节正确，而非转义炸在门口）。
+4. GUI 启动锁：日志确认重复启动消失。
+
+### 五、留给用户的实测
+
+- `ssh_read_text` 对真实服务器的两种路径（有 SFTP / 无 SFTP 的 shell 回退）都要各试一次。
+- `command_b64` 用一条含 `'` `"` `$` `\` 的复杂命令走一遍 `ssh_exec`。
+- 并发：同时对两台已保存连接发 `ssh_exec`，确认互不阻塞。
+- 超时语义：故意跑一条超过 `timeout` 的命令，确认返回 `timed_out: true` + `possible_remote_still_running: true`。
+
+> 本次冒烟又自动拉起过一个 debug 版 GUI（`G:\Rust\...\myshell.exe`），已 `taskkill` 并清理 `gui-ipc-port`。**用户机器上 `E:\Program Files\MyShell\` 下常驻的 7 个 `myshell-mcp.exe` 是 AI 客户端的真实进程，全程未触碰。**
+
+## 五问重启检查（阶段 185）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 185 —— 按调用方 13 条反馈实施 MCP 可观测性与免转义能力：`command_b64`、新工具 `ssh_read_text`、`error_kind`/`hint`、结构化返回值、ANSI 剥离、主循环并发；`cargo test --bin myshell-mcp` 17 项全绿，stdio 冒烟通过。 |
+| 我要去哪里？ | 等用户实测（`ssh_read_text` 双路径、`command_b64` 复杂命令、并发、超时语义）。之后仍排队：阶段 171 问题四（AI 模型选择器）、`MyCheckbox` 标签在上、`WindowControls` 的 Tauri 兜底。 |
+| 什么可能导致偏离？ | ① 把调用方 harness 的问题当成 MCP 的 bug 去改 MCP（`content` 解析、30s 接收超时都不在本仓库）；② 为了讨好反馈而放开确认门（`confirm:false` / `readonly_hint`）——那是安全设计的地基，不是体验问题；③ 以为「串行循环只是慢」而忽略它同时也是**掩盖并发缺陷的盖子**（本轮 GUI 三重启动就是拆掉盖子后立刻现形的）；④ 往 Rust 长字符串里插含 `"` 的文案不查转义层数（本轮犯了两次）。 |
+| 下一步最小可验证动作？ | 重启 AI 客户端的 MCP（进程重启才加载新二进制），跑 `ssh_read_text` 读一个真实配置文件，再用 `command_b64` 执行一条含引号与 `$` 的命令。 |
+| 目标是什么？ | 让调用方「第一次就能发出去、失败了也能定位」：发命令不必赌转义、读文件不必赌引号、失败不必猜类别、慢命令不再让整个服务器失聪 —— 同时**不因为体验压力松开安全门禁**。 |
+
+## 阶段 186：把「免转义」从能力升级为规范（2026-10-14）
+
+用户对阶段 185 提了一条方法论层面的追问：**「content 转义」这类问题，是否应该在 MCP 里作为规范沉淀下来，给后续接入方说明？** 判断成立，且比我上一轮的做法更完整 —— 上一轮我只提供了能力（`command_b64`），没立规范，等于把「知道要用它」这件事留给了运气。
+
+### 一、先厘清一个决定性的技术事实
+
+那 5 次失败发生在**调用方 harness 内部**，MyShell 根本没收到请求（阶段 185 的日志证据：零条 `tools/call` 到达）。这决定了规范的落点：
+
+**「写文档给接入方看」必要但不充分** —— 真正读说明的是**运行时的 agent**，不是写适配器的人。所以规范必须同时落在三个层次：
+
+| 层次 | 读者 | 载体 | 本次动作 |
+|---|---|---|---|
+| 运行时 | AI agent | `initialize` 返回的 `instructions` | 把一句提示升级为 **ARGUMENT ENCODING — NORMATIVE** 规范段 |
+| 接入期 | 写适配层的人 | 工具 `inputSchema` + 仓库文档 | schema 修正为 `anyOf`；新增 `docs/mcp-integration-spec.md` |
+| 事后 | 排障的人 | 错误信息 / 日志 | 说明「客户端侧报错服务端收不到」，避免接入方去翻服务端日志 |
+
+### 二、规范正文（写入 instructions）
+
+- **规范性条款**：命令含 `"` `'` `\` `$` 反引号 `{` `}` `|` `;` 换行中**任意一个**时，一律用 `command_b64`；并说明理由是「JSON 字符串层与 shell 层两层转义不可组合，一个字符错就静默截断」。
+- 明确 **`command` 未废弃**（简单命令继续用），避免接入方误以为必须全面改写。
+- 明确 **malformed-JSON 报错由客户端在请求发出前抛出**，服务端无从诊断，修法在调用方 —— 这条直接来自本次事故的教训。
+- 指向 `ssh_read_text`（读文件不必拼 shell）。
+
+### 三、顺带修掉一个我自己引入的真实缺陷
+
+阶段 185 加了 `command_b64`，但 `ssh_exec` 的 schema 仍写 `required: ["connection","command"]` —— **做严格 schema 校验的客户端会拒掉一个完全合法的 `command_b64` 调用**。这正是「规范与实现不一致」的实例，比没有规范更糟。
+
+修法：`required: ["connection"]` + `anyOf: [{required:[command]}, {required:[command_b64]}]`（`ssh_run` 同步），并新增单元测试 `command_tools_accept_either_command_form` 把两者一致性锁死。
+
+### 四、验证（走真实协议，不只看单测）
+
+1. `cargo test --bin myshell-mcp` → **19 passed**（新增 2 条：schema 双形态一致性、instructions 必须含规范关键词）。
+2. **协议级验证**（脚本驱动新二进制，解析客户端实际收到的 JSON）：
+   - `instructions` 长度 7337 字符，6 项关键词全部命中（规范段、字符集、未废弃声明、客户端侧报错说明、`ssh_read_text`、`error_kind`）；
+   - `ssh_exec` / `ssh_run` 的 `required` 与 `anyOf` 均符合新规范。
+
+### 五、本轮第三次踩同一个坑（记录教训）
+
+往 Rust 长字符串 `SERVER_INSTRUCTIONS` 里插含 `"` 的文案，**本轮第三次**把双引号写炸（前两次在阶段 185）。前两次靠编译器定位手工改；这次改用脚本对常量体内所有未转义 `"` 统一转义 —— 但脚本连**开头定界符**一起转了，多花一轮修复。结论：这类修改应当**先看清字面量的定界与转义层数**，再动脚本；批量正则要排除首尾定界符。
+
+### 六、留给接入方
+
+- 按 `docs/mcp-integration-spec.md` 的「接入自检清单」逐条过一遍适配层（8 条，含「参数不做二次字符串化」「接收超时 > 传入 timeout」）。
+- 已在运行的接入方：把含引号的命令改为 `command_b64` 即可，无需其他改动。
+
+## 五问重启检查（阶段 186）
+
+| 问题 | 答案 |
+|------|------|
+| 我在哪里？ | 阶段 186 —— 把免转义能力沉淀为**规范**：`instructions` 增加 ARGUMENT ENCODING 规范段、新增《MCP 接入规范》文档、修正 `ssh_exec`/`ssh_run` schema 的 `required`/`anyOf` 不一致；`cargo test --bin myshell-mcp` 19 项全绿，协议级验证 instructions 与 schema 均符合规范。 |
+| 我要去哪里？ | 接入方按规范调整适配层（把复杂命令改走 `command_b64`）。仓库内仍排队：阶段 171 问题四（AI 模型选择器）、`MyCheckbox` 标签在上、`WindowControls` 的 Tauri 兜底。 |
+| 什么可能导致偏离？ | ① 把规范只写进 README 就以为完成 —— 运行时读的是 `instructions`，写错地方等于没写；② 只加能力不写规范（阶段 185 的做法），把「知道要用」留给运气；③ 规范与 schema 不一致，比没有规范更糟（严格校验客户端会拒掉合法调用）；④ 批量改 Rust 长字符串时正则误伤定界符（本轮实际发生）。 |
+| 下一步最小可验证动作？ | 接入方按 `docs/mcp-integration-spec.md` 自检清单改适配层后，用一条含引号与 `$` 的命令走 `command_b64` 调一次 `ssh_exec`，确认直达远端执行。 |
+| 目标是什么？ | 让**下一批**接入方默认就不会踩这个坑：规范跟着协议下发（agent 读得到）、文档写清边界（人读得懂）、schema 与实现一致（工具不会骗人）。 |
+
+
+### 阶段 184 —— MCP 日志重做（按天滚动 + 双文件分流 + 常驻 writer）
+
+**改了什么**：MCP 日志从单文件追加改为 `mcp-<day>.log` / `mcp-error-<day>.log` 双文件，按天滚动，7 天自动清理，行长截断 `LOG_LINE_MAX=4000`，写入器常驻避免每次 open/close。
+
+**为什么**：单文件无限增长 + 错误信息混在正常日志里排障困难；4000 字符上限防超长行（远端 `cat` 大文件）撑爆内存。
+
+---
+
+### 阶段 185 —— MCP 错误结构化 + 主循环并发（协议层加固）
+
+**改了什么**：
+- `ssh_read_text` 工具（受限读取，防大文件灌满上下文）
+- `command_b64`（`ssh_exec`/`ssh_run` 双编码入参，绕开 shell 转义地狱）
+- `error_kind`（10 类常量）+ `hint`（`tool_error()` 统一出口）
+- `strip_ansi()` + `classify_error()` + 结构化返回（`duration_ms`/`timed_out`/`truncated`/`command`/`exit_code_source`）
+- 主循环每个 `tools/call` 用 `tokio::spawn` 并发，响应经 `Arc<Mutex<BufWriter<Stdout>>>` + `write_out()` 串行写出，stdin EOF 后最多等 30s 让在途调用回传
+- `ensure_gui_running` 启动锁（`GUI_LAUNCH_LOCK`）
+
+**为什么**：串行主循环让一个 60 秒的命令把整个 MCP 进程堵死；无 `error_kind` 时 AI 只能靠中文字符串猜该重试还是放弃。
+
+---
+
+### 阶段 186 —— 参数编码规范写入运行时 instructions
+
+**改了什么**：`SERVER_INSTRUCTIONS` 增加 `ARGUMENT ENCODING — NORMATIVE` 段 + 新建 `docs/mcp-integration-spec.md` + `AGENTS.md` 增加 `Argument-encoding norm` 段。
+
+**为什么**：规范只写进 README 等于没写 —— agent 读的是运行时 `instructions`。schema 与实现必须一致，否则严格校验客户端会拒掉合法调用。
+
+---
+
+### 阶段 187 —— OCR 审计：确认门从「文案即策略」改为类型化 + 文件操作确认回到 GUI 内
+
+**审计怎么做的**：`ocr delegate rule src-tauri/src/command_rules.rs src-tauri/src/bin/myshell-mcp.rs src/composables/useMcpBridge.ts`（Alibaba `@alibaba-group/open-code-review` v1.13.0，全局已装；`delegate` 模式不需要 LLM 端点，规则解析交 OCR、评审在我这边跑，代码不出本地）。
+
+**审计推翻了我自己上一轮的核心推测**（重要）：
+上一轮我写「若前端与 `command_rules.rs` 的规则集出现任何偏差，同一条命令在 GUI 路径会弹框、在 headless 路径会静默跑掉」，并据此计划「GUI 不可达时强制重跑完整确认判定」。
+**实测证伪**：`src-tauri/src/main.rs:1968` 的 `check_command_confirmation` 直接调用 `myshell_core::command_rules::command_needs_confirmation` —— 前端与 MCP 服务端**共用同一个函数、同一份 `mcp-command-rules.json`**，不存在两份策略漂移。源码注释还明写了「历史上客户端重实现策略正是白名单被绕过的根源」。
+→ 原计划的「headless 强制重判」是在修一个不存在的洞，**已撤销**。
+
+**改了什么（三处真问题）**：
+
+1. **「文案即安全策略」改为类型化**（中等）
+   旧代码用中文错误文本判定 GUI 可达性：
+   ```rust
+   let gui_unreachable = e.message.contains("未找到 myshell.exe")
+       || e.message.contains("GUI 启动超时")
+       || e.message.contains("无法定位");
+   ```
+   这条链决定「可见确认框有没有出现过」，进而决定能否回落无头执行 —— 也就是**确认门本身**靠错误措辞支撑。改一个错字、加一个分支，都会让判定翻转，高危命令静默执行。
+   新增 `enum GuiLaunchError { NotInstalled, LocateFailed, SpawnFailed, StartupTimeout, IpcUnresponsive }` + `fn gui_reachable(&self)`；`GuiExecError` 增加 `gui_reachable: bool` 字段，`From<GuiLaunchError>` 导出，`From<String>` 恒为 `true`（那些 `?` 全在 GUI 就绪之后）。字符串匹配三处全删。
+   `ensure_vault_ready` 同样纳入 `enum VaultGateError { GuiUnavailable, NotInitialized, Locked, IpcUnresponsive }`，`state()` 提供机器可读状态。
+
+2. **不可逆文件操作的确认回到 GUI 内渲染**（低-中，行为变更）
+   `sftp_upload` / `sftp_remove` / `sftp_rename` / `upload_project` / `download_project` / `zmodem_upload` 六处确认此前由 MCP 进程弹原生 `MB_SYSTEMMODAL` MessageBoxW —— 用户在 MyShell 窗口里操作时那个框藏在**后面**并抢焦点，而这六类恰恰不可逆（覆盖 / 删除），漏看一次框就等于漏掉一次确认，而 AI 会一直等。
+   改为 GUI 内 `McpConfirmDialog`（复用命令确认的既有组件）。新增 IPC action `mcp_confirm`（带 `PendingConfirm.busy` 原子闸门拒绝并发第二个弹窗、oneshot 回传、180s 超时）与 Tauri 命令 `mcp_confirm_result`；前端 `useMcpBridge.ts` 新增 `mcp_confirm` 分支。GUI 完全不可达时才回退原生框。
+   **超时一律按 deny 处理**：不可逆操作里「用户没说好」必须读作「不」，读作「是」则等待超时反而变成放行。
+
+3. **登录门禁轮询契约**（低）
+   新增 `vault_status` 只读工具（豁免门禁 —— 门禁拦住它就自相矛盾），只返 `gui_running`/`initialized`/`unlocked` 三个布尔 + `vault_state`，不泄漏任何连接元数据（维持「锁定时 AI 连连接名都看不到」）。门禁失败改为结构化返回：`error_kind: "vault_locked"` + `vault_state`（`locked`/`not_initialized`/`gui_unavailable`/`ipc_unresponsive`）+ hint（重试**同一个**工具，不要改用其他工具）。
+   **不做隐式等待**：客户端普遍 30s 砍请求，MCP 端死等必然双重失败；等待由 AI 通过显式 `vault_status` 轮询承担（每 5s，约 2 分钟上限），进度可见。
+
+**测试**（新增 4 个，均为会真实变红的闸门）：
+- `command_rules::bypass_shapes_still_require_confirmation` —— 23 种绕过形态（`do rm`/`timeout 30 rm`/`nohup rm`/`env FOO=1 rm`/`xargs rm`/`'rm'`/`/bin/rm`/`( rm )`/`{ rm; }`/`if…fi`/`echo hi; rm`/管道后半段/反引号/`$()`/`>&`/`chmod -R`/`mkfs`/`dd`/`shutdown`/`killall`/`sudo`…），任一回退为 false 即安全回归。
+- `command_rules::read_only_commands_stay_confirmation_free` —— 反向闸门，确认噪音会训练用户「闭眼点确认」。
+- `myshell-mcp::gui_reachability_comes_from_type_not_wording` —— 锁住「可达性来自类型不来自措辞」。
+- `myshell-mcp::vault_gate_states_are_machine_readable` —— 四种状态的 `state()` 映射。
+基线 19 → **21 passed**（bin）、**108 passed**（lib）。
+
+**踩到的坑（复用价值高）**：
+- `Tauri::State` 借出函数外不编译（E0716 / E0521）。四个错误点全改成先在块内 `let state = ipc_handle.state::<PendingConfirm>();` 再用，或抽 `fn clear_pending_confirm(app: &AppHandle, …)` 内部自取。写这个 IPC 时会连续踩四次。
+- 我第一版反向测试把 `systemctl status nginx` 列为「只读不该弹框」，实测失败。查证后确认 `systemctl` **整体**在黑名单里不分子命令 —— 这是有意的保守设计（停服务就是可用性事故），错的是我的测试用例，不是实现。已换成真正只读的 `top`/`netstat`/`id && whoami`，并在测试上留注释说明这个取舍。
+- `bash` 里的 cargo 测试超时 1200s 被后台化拿不到输出，短测试应显式给足超时并等结果。
+
+**五问重启检查**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | OCR 审计推翻自己上一轮的推测，改为类型化错误 + 文件操作确认回到 GUI + vault_status 轮询契约；新增 4 个测试闸门。 |
+| 什么是我没做的？ | 阶段 184-186 上一轮没落盘到 progress.md，本轮补齐。未做「headless 强制重判」（已证伪不需要）。 |
+| 我想去哪里？ | stdio 协议级实测 `vault_status` 锁定态行为 + 文件操作确认弹窗的实际渲染。 |
+| 我要去哪里？ | 阶段 188 起：`command_rules` 里 `systemctl` 子命令解析消噪（独立特性，不顺手做）。 |
+| 什么可能导致偏离？ | ① 再次凭推测下结论而不先证伪（本轮审计正是这么纠回来的）；② 改安全逻辑时不查上游是否已有共用实现（会重复造轮子）；③ `confirm` 超时被读成「放行」而非「拒绝」。 |
+| 下一步最小可验证动作？ | 用 stdio 喂 `tools/call vault_status`，确认锁定时返回 `vault_state: "locked"` 且三个布尔为 false。 |
+
+
+### 阶段 188 —— 侧栏左侧双重缩进收敛（回收 14–18px）
+
+**改了什么**：连接树行的左侧缩进从「双重叠加」改为「单处承担」。
+- `.folder-row`：删掉 `margin-left: 6px`，`padding: 7px 16px` → `7px 16px 7px 8px`
+- `.conn-row`：删掉 `margin-left: 6px`，`padding-left: 24px` → `12px`
+- 模板内联缩进：文件夹 `16 + depth*14` → `8 + depth*12`；连接 `24 + depth*14` → `12 + depth*12`
+- `.search-box`：`padding: 8px 12px` → `8px`（与列表行左缘对齐，否则输入框像多缩进一级）
+
+**为什么**：此前每行的左缩进由**两处叠加**——行 `margin-left: 6px` + 自身 `padding-left`，深度节点再叠加 `depth * 14px`。depth 0 的文件夹行 chevron 前空 22px、连接行空 30px（侧栏最窄 200px 时白白浪费 1/10 宽度），用户截图红框标注的正是这一列。层级缩进 `depth*14` 本身对 12px 字号过宽（14px ≈ 一个图标宽），收到 12px 层级感不变而总宽更省。
+
+**注意**：阶段 181 已把**右侧**留白收到最小（「⋯」贴右缘，用户当时确认）。本次**只动左边**，右缘结论不变。
+
+**验证**：应用需 Tauri runtime，浏览器里渲染不出（停在保险库门禁）。改为在真实 Chromium 里按源码里的 CSS 值构建等价的行盒模型量像素：
+
+| 行类型 | 修复前 | 修复后 |
+|---|---|---|
+| 文件夹 depth 0 | 22px | **8px** |
+| 连接 depth 0 | 30px | **12px** |
+
+截图复核：文件行与搜索框左缘同列，连接行仅多缩进一级（层级清晰），badge 贴右。
+
+**踩到的坑**：本机未装 playwright（`require.resolve('playwright')` 抛错），且 `npm run dev` 前台跑会被 120s 超时杀掉——改用已挂载的 Chrome DevTools MCP + `cmd.exe /c "start /b npm run dev"` 起服务。
+
+**五问重启检查**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 侧栏左侧缩进去掉 margin/padding 双重叠加，文件行 -14px、连接行 -18px；同步搜索框左缘。 |
+| 什么是我没做的？ | 未做侧栏宽度可拖拽/折叠（阶段 182 已是完全隐藏），未动右侧布局。 |
+| 我想去哪里？ | 用真实 Tauri 应用（非浏览器 replica）复核一次长连接名截断表现。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。 |
+| 什么可能导致偏离？ | ① 顺手把右边也改了 —— 阶段 181 用户已确认右侧贴边，改了算回退；② 改缩进时忘了 `.conn-row` 的 `padding-left` 由模板内联覆盖（CSS 里的值对连接行无效，只对文件夹行生效），两处必须一起改。 |
+| 下一步最小可验证动作？ | 打开真实应用，展开「生产」看子项层级缩进是否仍清晰。 |

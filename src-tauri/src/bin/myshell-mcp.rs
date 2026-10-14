@@ -78,7 +78,62 @@ fn confirm_or_session_allowed(tool: &str, detail: &str) -> bool {
         log(&format!("会话已授权，跳过确认: {}", tool));
         return true;
     }
-    confirm_dangerous_operation(tool, detail)
+    // Prefer the GUI-rendered dialog: the native MB_SYSTEMMODAL box raised
+    // from THIS process is invisible to a user working inside MyShell — it
+    // steals focus from behind their window, and for irreversible file
+    // operations (overwrite / delete / rename) a prompt nobody saw is a
+    // confirmation nobody gave. Falls back to the native box only when the
+    // GUI cannot render it at all (not installed / wedged), which is the one
+    // case where an invisible modal is still the best available option.
+    match confirm_via_gui(tool, detail) {
+        Some(allowed) => allowed,
+        None => {
+            log(&format!(
+                "[confirm] GUI 不可用，回退原生弹窗: {}",
+                tool
+            ));
+            confirm_dangerous_operation(tool, detail)
+        }
+    }
+}
+
+/// Ask the user to confirm `tool`/`detail` inside the GUI. Returns `None` when
+/// the GUI cannot render the prompt (no IPC endpoint, no reply) — the caller
+/// then decides on the headless fallback. A user who does not answer inside
+/// the GUI's own 180s budget counts as **deny**: for irreversible operations,
+/// "the user did not say yes" must read as "no".
+fn confirm_via_gui(tool: &str, detail: &str) -> Option<bool> {
+    use std::io::{BufRead, BufReader, Write};
+    let ep = ensure_gui_running().ok()?;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", ep.port)).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(200))).ok()?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
+    // The connection name is part of `detail` already; the GUI uses this
+    // field for the dialog title, so pass the tool label when we have no
+    // separate connection name (these call sites only carry a detail string).
+    let cmd = ipc_cmd(
+        &ep,
+        serde_json::json!({
+            "action": "mcp_confirm",
+            "operation": tool,
+            "connection_name": "MyShell",
+            "detail": detail,
+        }),
+    );
+    writeln!(stream, "{}", cmd).ok()?;
+    stream.flush().ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if v["ok"].as_bool() != Some(true) {
+        return None;
+    }
+    match v["decision"].as_str() {
+        Some("allow") | Some("session") => Some(true),
+        // Explicit deny, and the GUI's own timeout, both mean "no".
+        _ => Some(false),
+    }
 }
 
 /// Pop a Windows MessageBox asking the user to confirm a dangerous operation.
@@ -118,7 +173,7 @@ fn confirm_dangerous_operation(tool: &str, detail: &str) -> bool {
 #[cfg(not(windows))]
 fn confirm_dangerous_operation(_tool: &str, _detail: &str) -> bool {
     // Non-Windows: log and deny (MCP server is Windows-only for now)
-    log("高危操作确认需要 Windows 环境，已拒绝");
+    log_err("高危操作确认需要 Windows 环境，已拒绝");
     false
 }
 
@@ -176,7 +231,7 @@ fn read_message_raw(stdin: &mut impl BufRead) -> Option<Value> {
         let n = match stdin.read_line(&mut line) {
             Ok(n) => n,
             Err(e) => {
-                log(&format!("read_line error: {}", e));
+                log_err(&format!("read_line error: {}", e));
                 return None;
             }
         };
@@ -202,13 +257,13 @@ fn read_message_raw(stdin: &mut impl BufRead) -> Option<Value> {
             let _ = stdin.read_line(&mut sep);
             let mut body = vec![0u8; len];
             if stdin.read_exact(&mut body).is_err() {
-                log("read_exact failed for body");
+                log_err("read_exact failed for body");
                 return None;
             }
             return match serde_json::from_slice(&body) {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    log(&format!("JSON parse failed (framed): {}", e));
+                    log_err(&format!("JSON parse failed (framed): {}", e));
                     None
                 }
             };
@@ -217,7 +272,7 @@ fn read_message_raw(stdin: &mut impl BufRead) -> Option<Value> {
         return match serde_json::from_str(trimmed) {
             Ok(v) => Some(v),
             Err(e) => {
-                log(&format!("JSON parse failed (ndjson): {} — line: {}", e, trimmed.chars().take(120).collect::<String>()));
+                log_err(&format!("JSON parse failed (ndjson): {} — line: {}", e, trimmed.chars().take(120).collect::<String>()));
                 // Keep reading the next line instead of dying — one bad line
                 // shouldn't take down the whole session.
                 continue;
@@ -240,11 +295,11 @@ fn write_message_raw(stdout: &mut impl Write, msg: &Value) {
     // messages must not contain embedded newlines, and the line terminator
     // is just `\n`).
     if write!(stdout, "{}\n", body).is_err() {
-        log("write body failed");
+        log_err("write body failed");
         std::process::exit(0);
     }
     if stdout.flush().is_err() {
-        log("flush failed");
+        log_err("flush failed");
         std::process::exit(0);
     }
 }
@@ -296,22 +351,41 @@ WORKFLOW:\n\
 2. Pass the name / group-path / host to `ssh_exec` / `sftp_list` / etc. The tool auto-disambiguates by type: ssh_exec prefers ssh connections, sftp_* prefers sftp.\n\
 3. For `ssh_exec`: each invocation is a fresh non-interactive session — no cwd/memory between calls. Use absolute paths or chain commands with && if state matters.\n\
 \n\
+ARGUMENT ENCODING — NORMATIVE (follow this by default, not only when something breaks):\n\
+Pass shell commands as `command_b64` (standard base64 of the UTF-8 command) rather than `command`, whenever the command contains ANY of: double quote, single quote, backslash, `$`, backtick, `{`, `}`, `|`, `;`, newline. Rationale: a shell command embedded in a JSON string has two escaping layers that do not compose — the JSON string layer and the shell layer — and a single mis-escaped character silently truncates the argument. Base64 has no character that requires escaping in either layer, so this class of failure disappears at the source. `command` (plain) remains supported for trivial commands (e.g. `uptime`, `ls /var/log`) — it is not deprecated.\n\
+To read a file, use `ssh_read_text` — never build `cat`/`echo`/heredoc pipelines for that.\n\
+NOTE ON FAILURES: malformed-JSON errors (\"Unterminated string\", \"Invalid escape character\") are raised by the MCP CLIENT before the request reaches this server, so no server-side error can explain them. Because of that, this server cannot diagnose them — the fix belongs in the caller (switch to `command_b64`, or transport the arguments as a real JSON object instead of a stringified one).\n\
+\n\
+TIMEOUTS — three different deadlines exist, do not confuse them:\n\
+- Per-call transport timeout (client-side, often 30-60s): a \"Request timeout ... stage: receive\" means the CLIENT gave up — the remote command may still be running. Use `ssh_run` for anything that could exceed ~30s.\n\
+- SSH handshake/dial timeout (~10s): connecting to the host failed. Retry once; if it repeats, call `test_connection` (TCP + handshake + auth only, runs no command).\n\
+- Command timeout (`ssh_exec` `timeout`, default 60s): the result carries `timed_out: true` and `possible_remote_still_running: true`. The remote process was NOT killed — poll its log or use `ssh_run` (then `ssh_cancel` to stop it).\n\
+\n\
 SAFETY: ssh_exec uses a **configurable whitelist/blacklist** to decide which commands need human confirmation. Read-only commands (ps, ls, cat, grep, df, ...) run WITHOUT a dialog. Dangerous commands (rm, kill, sudo, shutdown, write-redirects, pipe-to-shell, ...) trigger a NATIVE OS confirmation dialog the USER must click — you cannot bypass it. Before calling a dangerous command, briefly tell the user a dialog is coming. If they click Cancel, the tool returns a HARD STOP error ('⛔ 用户已拒绝高危操作'): immediately stop ALL further operations — do NOT retry the command, do NOT switch tools/paths/connections to work around it, do NOT continue to the next step of the task. Instead, output a summary of the current task (what you were doing, which steps are done, which step was rejected, what remains) and WAIT for the user to explicitly decide whether to continue. The sftp tools (sftp_upload/remove/rename) ALWAYS confirm regardless of rules, and the same hard-stop policy applies to every confirmation dialog.\n\
 \n\
 FILE TRANSFER (strict two-step policy):\n\
 1. ALWAYS try `zmodem_download`/`zmodem_upload` FIRST for any file upload/download request (ZMODEM over the remote `sz`/`rz` programs). It works in restricted environments where the SFTP channel is unavailable.\n\
 2. If the zmodem task FAILS for a TECHNICAL reason, fall back to `sftp_download`/`sftp_upload`. Common zmodem failure reasons: the remote lacks lrzsz (`sz`/`rz` not installed — the task fails after ~20s), transfer timeout, or the remote refuses the SSH channel. Tell the user: 'zmodem 失败，改用 SFTP 方式传输'.\n\
-3. NEVER use `ssh_exec` to transfer file content via base64/echo/heredoc/cat workaround — it is fragile, slow, and breaks on binary/large files. If both zmodem and sftp fail, tell the user and stop; do NOT invent a workaround.\n\
+3. To READ a file's content into the conversation, use `ssh_read_text` (it handles quoting and encoding internally) — never build a `cat`/`echo`/base64 workaround by hand. To TRANSFER a file (upload/download to local disk), use the two-step transfer policy above; NEVER — it is fragile, slow, and breaks on binary/large files. If both zmodem and sftp fail, tell the user and stop; do NOT invent a workaround.\n\
 \n\
 VAULT GATE (applies to EVERY tool except ssh_status/ssh_cancel/zmodem_status): MyShell stores all connection credentials in an encrypted vault. If the MyShell GUI isn't running, the tool AUTO-LAUNCHES it. If the vault is locked, the tool FAILS IMMEDIATELY (no waiting) with '保险库未解锁' and brings the MyShell window to the front. When you see this error: tell the user to enter their master password in the MyShell window, then RETRY the same tool — do NOT switch to a different approach. The zmodem → sftp fallback only applies when the failure is about ZMODEM availability (e.g. lrzsz missing on the remote), NOT about the vault and NOT about a user-denied confirmation dialog.\n\
 \n\
 ZMODEM IS ASYNC: `zmodem_upload`/`zmodem_download` return IMMEDIATELY with a `task_id` (status=`running`); the transfer (including GUI launch, vault-unlock wait, and the confirmation dialog) runs in the background. You MUST then poll `zmodem_status` with the `task_id` every 5-10 seconds until `status` is `done` or `failed`. Do not report success until you see `done`.\n\
+\n\
+EVERY tool failure carries a machine-readable `error_kind` (`permission_denied` | `user_denied` | `timeout` | `busy` | `connection_lost` | `connect_failed` | `vault_locked` | `bad_request` | `not_found` | `internal`) plus a `hint` naming the next action. Branch on `error_kind`, not on the Chinese prose.\n\
+\n\
+SERIALIZATION: a connection's terminal runs one command at a time. A second `ssh_exec` on the same connection while the first is still running returns `error_kind: \"busy\"` with how long it has been running and the longest remaining wait — do NOT blind-retry; wait that long, or switch to `ssh_run` (asynchronous, exempt from this lock). Different connections run fully in parallel.\n\
 \n\
 ENCOUNTERING ERRORS: '保险库未解锁' means the user must enter their master password in the (now foregrounded) MyShell window — tell them, wait for them to confirm, then RETRY the same tool. '保险库尚未初始化' means first-time setup is needed in the GUI. Both are instant errors by design: the tools never hang waiting for the vault.";
 
 fn tool_definitions() -> Value {
     json!({
         "tools": [
+            {
+                "name": "vault_status",
+                "description": "Check whether the MyShell vault is unlocked, WITHOUT executing anything and WITHOUT exposing any connection data. Returns only booleans (`gui_running`, `initialized`, `unlocked`) and a `vault_state` string.\n\nWHEN TO USE: any tool just returned `error_kind: vault_locked`. Do not blind-retry it and do not switch to another tool (switching changes semantics — a read-only probe is not a substitute for the operation you actually need). Query this tool every ~5 seconds until `vault_state` is `unlocked` (or ~2 minutes have passed), then retry THE SAME tool.\n\nWHY THIS EXISTS: MyShell never blocks a single tool call waiting for a password. Most MCP clients abandon a call after ~30s, so an in-request wait would fail twice over — the client gives up before the user could plausibly type a master password. The wait therefore belongs to you, in explicit poll steps, where progress is visible.\n\nSECURITY: returns booleans only. While the vault is locked you still cannot see any connection names, hosts or credentials — that gate is unchanged.",
+                "inputSchema": { "type": "object", "properties": {}, "required": [] }
+            },
             {
                 "name": "list_connections",
                 "description": "List all SSH/SFTP/FTP connections saved in this user's MyShell client.\n\nWHEN TO USE: Always call this FIRST when the user mentions a remote server by name, nickname, alias, OR IP address — even if you think you know the name. Call this when the user asks 'what servers do I have', 'show my connections', or wants to know if a specific host is already configured. Knowing the full list helps you pick the right `connection` value for other tools.\n\nWHEN NOT TO USE: Don't use this for connections the user is defining on the fly (e.g. 'ssh to user@1.2.3.4'). MyShell tools only work with pre-saved connections.\n\nOUTPUT: JSON array, each item has `name`, `conn_type` (ssh/sftp/ftp/local), `group_path`. For security, host/port/username are NOT included - they are encrypted.\n\nIMPORTANT: other tools accept the connection `name` or the group-prefixed path ('/production/prod-db'). IP-based lookup requires the vault unlocked (IPs are encrypted). Passwords are never included, for security.\n\nVAULT REQUIRED: this call FAILS INSTANTLY with '保险库未解锁' when the MyShell vault is locked (the MyShell window is brought to the front for the user) — tell the user to enter their master password, then retry. The GUI auto-launches when it isn't running.",
@@ -324,10 +398,12 @@ fn tool_definitions() -> Value {
                     "type": "object",
                     "properties": {
                         "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
-                        "command": { "type": "string", "description": "Shell command to run. Executed via `bash -c` semantics on the remote. Avoid commands that read from stdin or wait for input." },
-                        "timeout": { "type": "integer", "description": "Max seconds to wait before killing the command (default 60, max 3600=1h). For tasks longer than ~5min, prefer `ssh_run` + `ssh_status` polling instead of raising this.", "default": 60, "minimum": 1, "maximum": 3600 }
+                        "command": { "type": "string", "description": "Shell command to run. Executed via `bash -c` semantics on the remote. Avoid commands that read from stdin or wait for input (sudo without -n will hang until the timeout; use `sudo -n` to fail fast instead)." },
+                        "command_b64": { "type": "string", "description": "Base64-encoded shell command. PREFERRED when the command contains many quotes, backslashes, `$`, backticks or regex braces — base64 has no character that needs JSON escaping, so this eliminates the entire class of malformed-JSON failures. Provide EITHER `command` or `command_b64` (if both, `command_b64` wins)." },
+                        "timeout": { "type": "integer", "description": "Max seconds to wait before killing the command (default 60, max 3600=1h). For tasks longer than ~5min, prefer `ssh_run` + `ssh_status` polling instead of raising this. On timeout the result carries `timed_out: true` and `possible_remote_still_running: true` — the command is NOT killed remotely.", "default": 60, "minimum": 1, "maximum": 3600 }
                     },
-                    "required": ["connection", "command"]
+                    "required": ["connection"],
+                    "anyOf": [{ "required": ["command"] }, { "required": ["command_b64"] }]
                 }
             },
             {
@@ -337,9 +413,11 @@ fn tool_definitions() -> Value {
                     "type": "object",
                     "properties": {
                         "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
-                        "command": { "type": "string", "description": "Shell command to run. Executed via `bash -c` semantics on the remote. Avoid commands that read from stdin or wait for input. For long tasks, consider redirecting output to a log file (`> /tmp/run.log 2>&1`) and then `sftp_download` it after — keeps the live output small." }
+                        "command": { "type": "string", "description": "Shell command to run. Executed via `bash -c` semantics on the remote. Avoid commands that read from stdin or wait for input. For long tasks, consider redirecting output to a log file (`> /tmp/run.log 2>&1`) and then `sftp_download` it after — keeps the live output small." },
+                        "command_b64": { "type": "string", "description": "Base64-encoded shell command (same semantics as on `ssh_exec`). Use when the command has heavy quoting/escaping; mutually exclusive with `command`." }
                     },
-                    "required": ["connection", "command"]
+                    "required": ["connection"],
+                    "anyOf": [{ "required": ["command"] }, { "required": ["command_b64"] }]
                 }
             },
             {
@@ -362,6 +440,19 @@ fn tool_definitions() -> Value {
                         "task_id": { "type": "string", "description": "The task_id returned by `ssh_run` (must still be in Running/Connecting/Confirming state — not yet Done/Failed)." }
                     },
                     "required": ["task_id"]
+                }
+            },
+            {
+                "name": "ssh_read_text",
+                "description": "Read a remote text file's content, returned directly as a string — NO shell quoting, NO base64, NO SFTP round-trip to your side. Prefer this over `ssh_exec 'cat file'` for inspecting configs and logs.\n\nWHEN TO USE: You need to SEE a remote file's content — config files (sshd_config, nginx.conf, my.cnf, application.yaml), log excerpts, small scripts. This is the escape-free path: the path is passed as a JSON string parameter and handled entirely inside MyShell, so no shell metacharacter in the path or the content can break the call.\n\nWHEN NOT TO USE:\n- Binary files — this tool decodes UTF-8 and replaces invalid bytes; use `zmodem_download` / `sftp_download` instead.\n- Very large files (>1 MB by default) — set `max_bytes`, or download the file and read it locally.\n- Searching across many files (`grep -r`) — `ssh_exec` is the right tool there.\n\nIMPLEMENTATION NOTE: reads via the SFTP subsystem when available; if the server has no SFTP, it transparently falls back to a shell read with correct quoting. You do not need to care which path was used — the result reports it in `method`.\n\nOUTPUT: JSON with `content` (string), `bytes` (total file size), `truncated` (true if only the head was returned), `lines` (number of lines returned), `method` (`sftp` or `shell`).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
+                        "remote_path": { "type": "string", "description": "Absolute path to the remote text file (e.g. '/etc/ssh/sshd_config'). '~' is expanded." },
+                        "max_bytes": { "type": "integer", "description": "Maximum bytes to return (default 1048576 = 1 MiB, max 8 MiB). Larger files are truncated from the end; `truncated: true` and `bytes` tell you the real size.", "default": 1048576 }
+                    },
+                    "required": ["connection", "remote_path"]
                 }
             },
             {
@@ -806,7 +897,7 @@ async fn resolve_config_for_task(
     // vault got locked in between (auto-lock timer), we fail the task fast
     // instead of silently waiting.
     if let Err(e) = ensure_vault_ready() {
-        fail(e);
+        fail(e.to_string());
         return None;
     }
     // Resolve the connection id (plaintext DB lookup).
@@ -871,6 +962,221 @@ fn ambiguous_error(
 
 // ============ Tool dispatch ============
 
+/// Strip terminal escape sequences from remote output before it reaches the
+/// AI. The GUI path captures a real PTY, so stdout carries the shell's prompt,
+/// window-title OSC, grep's SGR colors and OSC-8 hyperlinks. Those bytes are
+/// meaningless to an agent (it cannot render them), inflate the payload, and
+/// used to break callers whose JSON pipeline chokes on raw ESC bytes.
+///
+/// Covers: CSI (`ESC [ ... final`), OSC (`ESC ] ... BEL|ESC \`), and short
+/// `ESC <one byte>` sequences. Tab/newline/CR are preserved (they carry
+/// structure a human reading the transcript still wants).
+fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            // ESC [ ... final byte in 0x40..=0x7E
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                i += 1; // consume the final byte
+                continue;
+            }
+            // ESC ] ... BEL or ESC \
+            if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            // Any other ESC: drop the escape plus the following byte.
+            i += 2;
+            continue;
+        }
+        // Walk one UTF-8 char so multibyte text (中文) survives intact.
+        let ch_len = utf8_len(bytes[i]);
+        let end = (i + ch_len).min(bytes.len());
+        out.push_str(&input[i..end]);
+        i = end;
+    }
+    out
+}
+
+/// Byte length of the UTF-8 char starting with `b` (1 on malformed input).
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
+}
+
+/// Decode a base64-encoded command. Callers that generate JSON
+/// programmatically can send `command_b64` instead of `command` — base64
+/// contains none of `"` `'` `\` `$` `` ` `` so the entire class of
+/// escaping failures (an unescaped quote or backslash silently truncating the
+/// JSON string) disappears at the source.
+fn decode_command_b64(raw: &str) -> Result<String, String> {
+    use base64::Engine as _;
+    let cleaned: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(cleaned.as_bytes())
+        .map_err(|e| {
+            format!(
+                "command_b64 不是合法 base64（原始内容无引号/反斜杠，无需转义）: {}",
+                e
+            )
+        })?;
+    String::from_utf8(bytes).map_err(|e| format!("command_b64 解码结果不是合法 UTF-8: {}", e))
+}
+
+/// Resolve the command argument, accepting either `command` or `command_b64`.
+///
+/// The base64 form exists because agents that build tool arguments by string
+/// interpolation keep mutilating shell commands: every quote, backslash,
+/// `$` or regex brace inside the JSON string is a chance to produce invalid
+/// JSON, and the resulting parse error names neither the field nor the offset.
+fn resolve_command_arg(args: &Value) -> Result<String, String> {
+    if let Some(b64) = args["command_b64"].as_str() {
+        if !b64.trim().is_empty() {
+            return decode_command_b64(b64);
+        }
+    }
+    if let Some(cmd) = args["command"].as_str() {
+        return Ok(cmd.to_string());
+    }
+    Err("缺少 command 参数（或改用 command_b64，base64 编码，免转义）".to_string())
+}
+
+/// Machine-readable failure class, so a caller can branch without regex-ing
+/// Chinese prose. Every tool error carries one of these.
+mod error_kind {
+    /// Remote/relay refused for lack of privilege (sudo, polkit, dmesg).
+    pub const PERMISSION_DENIED: &str = "permission_denied";
+    /// The human clicked Cancel / Deny on a confirmation dialog.
+    pub const USER_DENIED: &str = "user_denied";
+    /// Our own deadline elapsed; the remote may still be running it.
+    pub const TIMEOUT: &str = "timeout";
+    /// The connection's single-exec slot is occupied by an earlier command.
+    pub const BUSY: &str = "busy";
+    /// SSH session dropped, or reconnected but the channel was gone.
+    pub const CONNECTION_LOST: &str = "connection_lost";
+    /// Could not reach/authenticate the host at all.
+    pub const CONNECT_FAILED: &str = "connect_failed";
+    /// The vault is locked / not initialised (user action required).
+    pub const VAULT_LOCKED: &str = "vault_locked";
+    /// Bad arguments (missing field, malformed base64, unknown tool).
+    pub const BAD_REQUEST: &str = "bad_request";
+    /// Remote path/file missing.
+    pub const NOT_FOUND: &str = "not_found";
+    /// Anything else.
+    pub const INTERNAL: &str = "internal";
+}
+
+/// Classify a free-text failure message into an `error_kind`.
+///
+/// The MCP protocol has no error-code slot in a tool result, and every
+/// meaningful failure in this codebase flows through `Err(String)`. Rather
+/// than re-plumb hundreds of `?` sites into a typed enum, we map the message
+/// once, at the boundary where the result is rendered. Order matters: the
+/// more specific patterns are tested first.
+fn classify_error(msg: &str) -> &'static str {
+    let m = msg;
+    if m.contains("用户已拒绝") || m.contains("用户取消") || m.contains("用户通过 ssh_cancel") {
+        return error_kind::USER_DENIED;
+    }
+    if m.contains("保险库未解锁") || m.contains("保险库尚未初始化") {
+        return error_kind::VAULT_LOCKED;
+    }
+    if m.contains("Permission denied")
+        || m.contains("permission denied")
+        || m.contains("Authorization failed")
+        || m.contains("polkit")
+        || m.contains("Operation not permitted")
+        || m.contains("拒绝访问")
+    {
+        return error_kind::PERMISSION_DENIED;
+    }
+    if m.contains("上一条命令仍在该服务器") || m.contains("一次只能跑一条命令") {
+        return error_kind::BUSY;
+    }
+    if m.contains("超时") || m.contains("timeout") || m.contains("timed out") {
+        return error_kind::TIMEOUT;
+    }
+    if m.contains("会话已断开") || m.contains("重连") || m.contains("Session command channel closed") {
+        return error_kind::CONNECTION_LOST;
+    }
+    if m.contains("连接失败") || m.contains("连接超时") || m.contains("dial") || m.contains("握手") {
+        return error_kind::CONNECT_FAILED;
+    }
+    if m.contains("缺少") || m.contains("不存在或已过期") || m.contains("未知工具") || m.contains("不是合法") {
+        return error_kind::BAD_REQUEST;
+    }
+    if m.contains("No such file") || m.contains("not found") || m.contains("不存在") {
+        return error_kind::NOT_FOUND;
+    }
+    error_kind::INTERNAL
+}
+
+/// Wrap a tool failure as an MCP tool result carrying a machine-readable
+/// `error_kind` plus a `hint` telling the caller what to try next.
+fn tool_error(kind_override: Option<&str>, msg: String) -> Value {
+    let kind = kind_override.unwrap_or_else(|| classify_error(&msg));
+    let hint = match kind {
+        error_kind::PERMISSION_DENIED => {
+            "远端拒绝了该操作（权限/策略原因，不是确认弹窗被取消）。可尝试 `sudo -n <命令>`（非交互式，失败会立刻返回而不是卡住），或换一个有权限的连接。"
+        }
+        error_kind::USER_DENIED => {
+            "用户明确拒绝了该操作，属硬性停止：不要重试、不要换路径绕过，输出当前任务进展后等待用户决定。"
+        }
+        error_kind::TIMEOUT => {
+            "命令可能仍在远端运行。用 `ssh_run` + `ssh_status` 轮询（可 `ssh_cancel` 取消），或在命令里重定向到日志并轮询该文件。"
+        }
+        error_kind::BUSY => {
+            "该连接的终端正被上一条命令占用。等待上面提示的秒数后重试，或改用 `ssh_run`（异步，不受此锁限制）。"
+        }
+        error_kind::CONNECTION_LOST => {
+            "会话已断开。重试一次通常会自动重连；仍失败则调 `test_connection` 确认可达性。"
+        }
+        error_kind::CONNECT_FAILED => {
+            "建议先调 `test_connection` 确认该连接可达（它只做 TCP+握手+认证，不执行任何命令）。"
+        }
+        error_kind::VAULT_LOCKED => {
+            "请在 MyShell 窗口中输入主密码解锁保险库，然后重试同一工具（不要改用其他工具）。"
+        }
+        error_kind::BAD_REQUEST => {
+            "检查参数名与取值；命令若含大量引号/反斜杠，改用 `command_b64`（base64，免转义）。"
+        }
+        error_kind::NOT_FOUND => "确认远端路径拼写；可用 `sftp_list` 查看目录实际内容。",
+        _ => "可查看 MyShell 的 MCP 错误日志（`mcp-error-<日期>.log`）获取完整上下文。",
+    };
+    json!({
+        "content": [{ "type": "text", "text": format!("错误: {}", msg) }],
+        "isError": true,
+        "error_kind": kind,
+        "hint": hint,
+    })
+}
+
 async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, String> {
     // ── Vault-unlock gate (fail-fast, applies to EVERY tool except task
     // status/cancel) ────────────────────────────────────────────────────
@@ -885,13 +1191,88 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
     // touch credentials and must stay reachable so the AI can observe and
     // clean up tasks that failed ON this very gate.
     match name {
-        "ssh_status" | "ssh_cancel" | "zmodem_status" => {}
+        // `vault_status` joins the exemptions deliberately: the AI needs a way
+        // to POLL for the unlock (see the gate contract in SERVER_INSTRUCTIONS)
+        // without waiting inside a single request — most clients cut a call at
+        // ~30s, so an in-request wait is a guaranteed double failure. It
+        // returns booleans only, never credentials or connection metadata.
+        "ssh_status" | "ssh_cancel" | "zmodem_status" | "vault_status" => {}
         _ => {
-            ensure_vault_ready()?;
+            let gate = ensure_vault_ready();
+            if let Err(e) = gate {
+                // Structured so the caller can branch on `vault_state` and knows
+                // retrying the SAME tool after unlocking is the expected move,
+                // instead of blind-retrying or switching tools.
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": format!("错误: {}", e.message()) }],
+                    "isError": true,
+                    "error_kind": error_kind::VAULT_LOCKED,
+                    "vault_state": e.state(),
+                    "hint": format!(
+                        "{} 解锁后请重试【同一个工具】—— 不要改用其他工具、也不要反复盲调。可先用 `vault_status` 查询状态（{}）。",
+                        match e.state() {
+                            "locked" => "请在 MyShell 窗口中输入主密码解锁保险库。",
+                            "not_initialized" => "请在 MyShell 中设置主密码完成初始化。",
+                            "gui_unavailable" => "请先手动打开 MyShell 桌面应用。",
+                            _ => "请确认 MyShell 桌面应用正在运行。",
+                        },
+                        e.state()
+                    ),
+                }));
+            }
         }
     }
 
     match name {
+        "vault_status" => {
+            // Read-only state probe for the unlock handshake. Exempt from the
+            // gate above (it can never succeed while locked, so gating it would
+            // be self-defeating), and it deliberately exposes ONLY two booleans
+            // — never connection names, hosts, or anything else gated behind
+            // the master password.
+            let probe = ensure_gui_running();
+            let (gui_up, initialized, unlocked) = match probe {
+                Err(_) => (false, false, false),
+                Ok(ep) => {
+                    let mut st = None;
+                    for _ in 0..3 {
+                        if let Some(s) = query_gui_vault_status(&ep) {
+                            st = Some(s);
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    match st {
+                        Some((i, u)) => (true, i, u),
+                        None => (true, false, false),
+                    }
+                }
+            };
+            let state = if !gui_up {
+                "gui_unavailable"
+            } else if !initialized {
+                "not_initialized"
+            } else if !unlocked {
+                "locked"
+            } else {
+                "unlocked"
+            };
+            let next = match state {
+                "locked" => "请用户在 MyShell 窗口输入主密码解锁，然后重试原工具。",
+                "not_initialized" => "请用户在 MyShell 中完成主密码初始化。",
+                "gui_unavailable" => "请先打开 MyShell 桌面应用。",
+                _ => "保险库已解锁，可直接执行原工具。",
+            };
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!("vault_status = {}；{}", state, next) }],
+                "vault_state": state,
+                "gui_running": gui_up,
+                "initialized": initialized,
+                "unlocked": unlocked,
+                "hint": "每 5 秒查询一次，最多约 2 分钟；期间不要反复重试原工具（会重复弹确认窗）。",
+            }))
+        }
+
         "list_connections" => {
             // SECURITY: the vault gate at the top of call_tool has already
             // verified the GUI is running and the vault is unlocked — without
@@ -915,7 +1296,8 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             "ssh_exec" => {
             let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
-            let command = args["command"].as_str().ok_or("缺少 command 参数")?;
+            let command = resolve_command_arg(args)?;
+            let command = command.as_str();
             // Default 60s (up from 30s) — gives 2x headroom for typical ops
             // (apt update, system health checks, log scans) without forcing
             // every AI call to override. For genuinely long tasks (>5min) use
@@ -954,16 +1336,9 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                         // command as no-confirm and let the headless fallback run.
                         let needs_confirm = !session_allowed()
                             && command_rules::command_needs_confirmation(command, &rules);
-                        // Detect whether the GUI was actually reachable. If
-                        // ensure_gui_running failed (GUI not installed / won't
-                        // start), the error message mentions myshell.exe or
-                        // startup timeout — in that case the GUI dialog was
-                        // never shown, so headless fallback (with its own OS
-                        // confirm) is legitimate.
-                        let gui_unreachable = e.message.contains("未找到 myshell.exe")
-                            || e.message.contains("GUI 启动超时")
-                            || e.message.contains("无法定位");
-                        let gui_attempted = !gui_unreachable;
+                        // Whether the GUI was actually reachable comes from
+                        // the error TYPE now, not from matching its text.
+                        let gui_attempted = e.gui_reachable;
 
                         // P1-15: the command may ALREADY have run in the visible
                         // tab — the GUI writes it to the PTY first and only then
@@ -972,11 +1347,15 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                         // second time on a fresh SSH session, invisibly to the
                         // user. Surface the original error instead.
                         if e.command_sent {
-                            log(&format!(
-                                "GUI 已把命令送入终端后才报错，不再无头重跑（避免同一命令执行两次）: {}",
-                                e.message
+                            log_err(&format!(
+                                "GUI 已把命令送入终端后才报错（耗时 {}ms），不再无头重跑（避免同一命令执行两次）: {}",
+                                e.elapsed_ms, e.message
                             ));
-                            return Err(e.message);
+                            return Err(format!(
+                                "{}（命令已发送到远端终端，耗时约 {} 秒；它可能仍在运行，请先确认再决定是否重试）",
+                                e.message,
+                                e.elapsed_ms / 1000
+                            ));
                         }
 
                         if gui_attempted && needs_confirm {
@@ -984,18 +1363,23 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                             // confirm in time, cancelled, or a session error).
                             // Don't fall through to headless — that would pop a
                             // second confirmation dialog. Surface the error.
-                            log(&format!(
-                                "show_in_gui 失败且命令需确认，不再回退 headless（避免重复弹窗）: {}",
-                                e.message
+                            log_err(&format!(
+                                "show_in_gui 失败且命令需确认（耗时 {}ms），不再回退 headless（避免重复弹窗）: {}",
+                                e.elapsed_ms, e.message
                             ));
-                            return Err(e.message);
+                            return Err(format!(
+                                "{}（未在 {} 秒内完成；命令已发送到远端：{}）",
+                                e.message,
+                                e.elapsed_ms / 1000,
+                                if e.command_sent { "是" } else { "否" }
+                            ));
                         }
                         // Either the GUI was unreachable (legitimate fallback)
                         // or the command doesn't need confirmation (headless
                         // won't pop anything). Fall through.
                         log(&format!(
-                            "show_in_gui 失败，回退到静默模式: {}",
-                            e.message
+                            "show_in_gui 失败（耗时 {}ms），回退到静默模式: {}",
+                            e.elapsed_ms, e.message
                         ));
                     }
                 }
@@ -1016,6 +1400,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 log(&format!("ssh_exec 免确认（白名单/非危险）: {}", command));
             }
 
+            let started = std::time::Instant::now();
             let config = state.resolve_via_gui(conn_name, Some("ssh"))?;
 
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
@@ -1025,27 +1410,37 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 .map_err(|e| format!("打开通道失败: {}", e))?;
             channel.exec(true, command).await.map_err(|e| format!("exec 失败: {}", e))?;
 
+            // Per-stream output cap — declared outside the collect block so the
+            // `truncated` flag below can compare against it.
+            let max_output = ssh_max_output_bytes();
             let collect = async {
                 use russh::ChannelMsg;
                 let mut stdout: Vec<u8> = Vec::new();
                 let mut stderr: Vec<u8> = Vec::new();
                 let mut exit_code: Option<u32> = None;
-                // Per-stream cap is configurable via MCP_SSH_MAX_OUTPUT_BYTES;
-                // reads from an atomic so we can adjust at startup without
-                // paying a mutex on every chunk.
-                let max = ssh_max_output_bytes();
+                let mut truncated = false;
                 loop {
                     match channel.wait().await {
                         Some(ChannelMsg::Data { ref data }) => {
-                            if stdout.len() < max {
-                                let room = max - stdout.len();
+                            if stdout.len() < max_output {
+                                let room = max_output - stdout.len();
                                 stdout.extend_from_slice(&data[..data.len().min(room)]);
+                                if data.len() > room {
+                                    truncated = true;
+                                }
+                            } else {
+                                truncated = true;
                             }
                         }
                         Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => {
-                            if stderr.len() < max {
-                                let room = max - stderr.len();
+                            if stderr.len() < max_output {
+                                let room = max_output - stderr.len();
                                 stderr.extend_from_slice(&data[..data.len().min(room)]);
+                                if data.len() > room {
+                                    truncated = true;
+                                }
+                            } else {
+                                truncated = true;
                             }
                         }
                         Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status),
@@ -1053,17 +1448,46 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                         Some(_) => {}
                     }
                 }
-                (stdout, stderr, exit_code)
+                (stdout, stderr, exit_code, truncated)
             };
 
-            let (stdout, stderr, code) = tokio::time::timeout(
+            let (stdout, stderr, code, truncated) = match tokio::time::timeout(
                 std::time::Duration::from_secs(timeout),
                 collect,
             )
             .await
-            .map_err(|_| format!("命令超时（{}秒）", timeout))?;
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    // Timeout is a first-class outcome, not a bare string: the
+                    // caller needs to know the remote may STILL be running this
+                    // command (so it can poll a log or use ssh_run + kill)
+                    // rather than blindly retrying and stacking a second copy.
+                    let _ = handle.disconnect(russh::Disconnect::ByApplication, "timeout", "en").await;
+                    let payload = json!({
+                        "error": format!("命令超时（{}秒未完成）", timeout),
+                        "error_kind": error_kind::TIMEOUT,
+                        "hint": "命令可能仍在远端运行。用 `ssh_run` + `ssh_status` 轮询（可 `ssh_cancel` 取消），或在命令里重定向到日志并轮询该文件。",
+                        "timed_out": true,
+                        "possible_remote_still_running": true,
+                        "command": command,
+                        "duration_ms": started.elapsed().as_millis() as u64,
+                        "timeout_secs": timeout,
+                        "exit_code": serde_json::Value::Null,
+                    });
+                    return Ok(json!({
+                        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap_or_default() }],
+                        "isError": true,
+                        "error_kind": error_kind::TIMEOUT,
+                        "timed_out": true,
+                    }));
+                }
+            };
 
             let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+            let stdout = strip_ansi(&String::from_utf8_lossy(&stdout));
+            let stderr = strip_ansi(&String::from_utf8_lossy(&stderr));
+            let duration_ms = started.elapsed().as_millis() as u64;
 
             // A missing ExitStatus is NOT exit code 0. It means the channel
             // ended without one: the connection dropped, or the remote process
@@ -1074,22 +1498,44 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             let Some(code) = code else {
                 let result = json!({
                     "error": "远端未返回退出码：连接中断或进程被信号终止，结果未知（不能视为成功）",
+                    "error_kind": error_kind::CONNECTION_LOST,
+                    "hint": "不要把这个结果当成成功。重试一次；仍失败则调 `test_connection` 确认连接状态。",
                     "exit_code": serde_json::Value::Null,
-                    "stdout": String::from_utf8_lossy(&stdout),
-                    "stderr": String::from_utf8_lossy(&stderr),
+                    "command": command,
+                    "duration_ms": duration_ms,
+                    "timed_out": false,
+                    "truncated": truncated,
+                    "stdout": stdout,
+                    "stderr": stderr,
                 });
                 return Ok(json!({
-                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }],
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
                     "isError": true,
+                    "error_kind": error_kind::CONNECTION_LOST,
+                    "exit_code": serde_json::Value::Null,
                 }));
             };
 
             let result = json!({
                 "exit_code": code,
-                "stdout": String::from_utf8_lossy(&stdout),
-                "stderr": String::from_utf8_lossy(&stderr),
+                "stdout": stdout,
+                "stderr": stderr,
+                // The caller must be able to tell an exit code the SHELL
+                // reported (which is the last pipeline stage's status, not the
+                // whole command's verdict) from one the transport produced.
+                "exit_code_source": "remote_process",
+                "command": command,
+                "duration_ms": duration_ms,
+                "timed_out": false,
+                "truncated": truncated,
             });
-            Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] }))
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                "exit_code": code,
+                "duration_ms": duration_ms,
+                "timed_out": false,
+                "truncated": truncated,
+            }))
         }
 
         "ssh_run" => {
@@ -1104,7 +1550,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // as zmodem_*. direction="exec" tells ssh_status how to render the
             // status text.
             let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?.to_string();
-            let command = args["command"].as_str().ok_or("缺少 command 参数")?.to_string();
+            let command = resolve_command_arg(args)?;
 
             // GUI/vault pre-flight has already run at the top of call_tool
             // (auto-launch + fail-fast unlock check), so there is nothing
@@ -1281,6 +1727,123 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 "task_id": task_id,
                 "ok": true,
                 "status": "cancelling"
+            }))
+        }
+
+        "ssh_read_text" => {
+            // Escape-free file read. Two paths, picked by what the server
+            // offers: SFTP when the subsystem is available (no shell at all,
+            // so nothing to quote), else a plain `cat` over an exec channel —
+            // which is safe here because the only variable part is the path,
+            // and we single-quote it ourselves in `shell_quote`.
+            let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
+            let remote_path = args["remote_path"].as_str().ok_or("缺少 remote_path 参数")?;
+            let max_bytes = args["max_bytes"]
+                .as_u64()
+                .unwrap_or(1024 * 1024)
+                .clamp(1024, 8 * 1024 * 1024) as usize;
+
+            let config = state.resolve_via_gui(conn_name, Some("ssh")); 
+            let config = match config {
+                Ok(c) => c,
+                // SFTP-only connections are legitimate targets for a file read.
+                Err(e) => match state.resolve_via_gui(conn_name, Some("sftp")) {
+                    Ok(c) => c,
+                    Err(_) => return Err(e),
+                },
+            };
+
+            let started = std::time::Instant::now();
+            let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
+
+            // Preferred: SFTP. Falls back to a shell read when the subsystem
+            // is unavailable (restricted shells, jump hosts, embedded devices).
+            let (bytes, content, method) = match open_sftp(&handle).await {
+                Ok(sftp) => match sftp.metadata(remote_path).await {
+                    Ok(meta) => {
+                        let size = meta.size.unwrap_or(0);
+                        match sftp.open(remote_path).await {
+                            Ok(mut file) => {
+                                use tokio::io::AsyncReadExt;
+                                let mut buf = Vec::new();
+                                let take = (size as usize).min(max_bytes);
+                                let mut chunk = vec![0u8; 32 * 1024];
+                                let mut read_total = 0usize;
+                                loop {
+                                    if read_total >= take {
+                                        break;
+                                    }
+                                    let limit = (take - read_total).min(chunk.len());
+                                    match file.read(&mut chunk[..limit]).await {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            buf.extend_from_slice(&chunk[..n]);
+                                            read_total += n;
+                                        }
+                                        Err(e) => {
+                                            return Err(format!("读取远端文件失败: {}", e));
+                                        }
+                                    }
+                                }
+                                (size, String::from_utf8_lossy(&buf).into_owned(), "sftp")
+                            }
+                            Err(e) => return Err(format!("打开远端文件失败: {}", e)),
+                        }
+                    }
+                    Err(e) => return Err(format!("读取远端文件信息失败（文件不存在?）: {}", e)),
+                },
+                Err(_) => {
+                    // Shell fallback: `wc -c` for the true size + `head -c` for
+                    // the content. The path is the only interpolated value and
+                    // it goes through a proper single-quote escape.
+                    let quoted = shell_quote(remote_path);
+                    let cmd = format!(
+                        "wc -c < {q} 2>/dev/null | tr -d ' \\t'; printf '\\n'; head -c {n} {q}",
+                        q = quoted,
+                        n = max_bytes
+                    );
+                    let mut channel = handle
+                        .channel_open_session()
+                        .await
+                        .map_err(|e| format!("打开通道失败: {}", e))?;
+                    channel
+                        .exec(true, cmd.as_str())
+                        .await
+                        .map_err(|e| format!("exec 失败: {}", e))?;
+                    let (out, err, code) = collect_channel_output(&mut channel, ssh_max_output_bytes())
+                        .await;
+                    if code != Some(0) && out.is_empty() {
+                        return Err(format!(
+                            "读取失败（shell 回退路径）: {}",
+                            if err.trim().is_empty() { "文件不存在或无读取权限".to_string() } else { err }
+                        ));
+                    }
+                    // First line is the true size from wc; the rest is content.
+                    let (size_line, body) = match out.split_once('\n') {
+                        Some((a, b)) => (a.trim().to_string(), b.to_string()),
+                        None => (String::new(), out.clone()),
+                    };
+                    let size: u64 = size_line.parse().unwrap_or(body.len() as u64);
+                    (size, strip_ansi(&body), "shell")
+                }
+            };
+
+            let truncated = (bytes as usize) > content.len();
+            let lines = content.lines().count();
+            let payload = json!({
+                "content": content,
+                "bytes": bytes,
+                "truncated": truncated,
+                "lines": lines,
+                "method": method,
+                "duration_ms": started.elapsed().as_millis() as u64,
+                "remote_path": remote_path,
+            });
+            let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+            Ok(json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap_or_default() }],
+                "bytes": bytes,
+                "truncated": truncated,
             }))
         }
 
@@ -1740,7 +2303,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             }
         }
 
-        _ => Err(format!("未知工具: {}", name)),
+        _ => { log_err(&format!("未知工具: {}", name)); Err(format!("未知工具: {}", name)) }
     }
 }
 
@@ -1770,6 +2333,45 @@ fn load_command_rules() -> command_rules::CommandRules {
         Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
         Err(_) => command_rules::CommandRules::default(),
     }
+}
+
+/// Run `channel` to completion, returning (stdout, stderr, exit_code).
+/// (`shell_quote`, defined near the zmodem helpers, is the one canonical
+/// quoting helper — reuse it, don't add a second one.)
+/// Output is capped at `max` bytes per stream; the cap is reported by the
+/// caller via its own `truncated` computation where it matters.
+async fn collect_channel_output(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    max: usize,
+) -> (String, String, Option<u32>) {
+    use russh::ChannelMsg;
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut exit_code: Option<u32> = None;
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { ref data }) => {
+                if stdout.len() < max {
+                    let room = max - stdout.len();
+                    stdout.extend_from_slice(&data[..data.len().min(room)]);
+                }
+            }
+            Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => {
+                if stderr.len() < max {
+                    let room = max - stderr.len();
+                    stderr.extend_from_slice(&data[..data.len().min(room)]);
+                }
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status),
+            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+            Some(_) => {}
+        }
+    }
+    (
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code,
+    )
 }
 
 // ============ GUI IPC client (open_in_gui) ============
@@ -1887,7 +2489,82 @@ fn get_config_from_gui(conn_id: &str) -> Result<ConnectionConfig, String> {
 /// file behind, which used to make every tool call die with a confusing IPC
 /// timeout). Otherwise, spawn `myshell.exe` from the same directory as this
 /// MCP binary and poll for the port file to appear (up to 30s).
-fn ensure_gui_running() -> Result<GuiIpcEndpoint, String> {
+fn ensure_gui_running() -> Result<GuiIpcEndpoint, GuiLaunchError> {
+    // Serialize the whole discover-or-launch sequence. Tool calls now run
+    // concurrently, so three parallel calls on a not-yet-running GUI used to
+    // each observe "no port file" and each spawn their own myshell.exe — the
+    // later two hit the single-instance "覆盖启动?" dialog. One lock, one
+    // launch; the others re-enter and find the file the winner just wrote.
+    static GUI_LAUNCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = GUI_LAUNCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_gui_running_locked()
+}
+
+/// Why the GUI could not be reached.
+///
+/// SECURITY: the caller uses `gui_reachable()` to decide whether the visible
+/// confirmation dialog was ever on screen — which decides whether falling
+/// back to a headless run is legitimate. That decision used to be made by
+/// substring-matching the Chinese error text, which makes the *wording* of an
+/// error message a load-bearing part of the confirmation gate: reword a string
+/// and a dangerous command silently stops asking for confirmation. The
+/// property now travels in the type instead of the prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuiLaunchError {
+    /// `myshell.exe` not found next to `myshell-mcp.exe` (not installed).
+    NotInstalled(std::path::PathBuf),
+    /// Could not resolve our own path / install directory.
+    LocateFailed(String),
+    /// The process exists but could not be spawned.
+    SpawnFailed(String),
+    /// Launched, but no IPC port file appeared within 30s.
+    StartupTimeout,
+    /// A listener is bound on the recorded port but does not answer IPC.
+    /// The GUI may be alive-but-wedged; we must NOT start a second one.
+    IpcUnresponsive,
+}
+
+impl GuiLaunchError {
+    /// True when a GUI process was confirmed up and answering IPC, i.e. the
+    /// frontend was reachable and any confirmation dialog it would have shown
+    /// actually got a chance to appear.
+    fn gui_reachable(&self) -> bool {
+        match self {
+            // A bound-but-wedged GUI: nothing was shown, but we also must not
+            // relaunch — treat as reachable so the headless fallback asks the
+            // user rather than proceeding silently.
+            GuiLaunchError::IpcUnresponsive => true,
+            // Everything else means we never got a working GUI.
+            GuiLaunchError::NotInstalled(_)
+            | GuiLaunchError::LocateFailed(_)
+            | GuiLaunchError::SpawnFailed(_)
+            | GuiLaunchError::StartupTimeout => false,
+        }
+    }
+}
+
+impl std::fmt::Display for GuiLaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GuiLaunchError::NotInstalled(p) => write!(
+                f,
+                "未找到 myshell.exe（期望位置: {}）。请手动打开 MyShell。",
+                p.display()
+            ),
+            GuiLaunchError::LocateFailed(e) => write!(f, "无法定位自身路径或安装目录: {}", e),
+            GuiLaunchError::SpawnFailed(e) => write!(f, "启动 myshell.exe 失败: {}", e),
+            GuiLaunchError::StartupTimeout => {
+                write!(f, "GUI 启动超时（30 秒内未就绪）。请手动打开 MyShell 后重试。")
+            }
+            GuiLaunchError::IpcUnresponsive => write!(
+                f,
+                "MyShell GUI 正在运行但 IPC 无响应（进程可能已挂起）。请在任务管理器中检查 myshell.exe，必要时手动重启 MyShell 后重试。"
+            ),
+        }
+    }
+}
+
+fn ensure_gui_running_locked() -> Result<GuiIpcEndpoint, GuiLaunchError> {
     if let Some(ep) = read_gui_ipc_endpoint() {
         // Distinguish two failure modes by whether ANYTHING is listening:
         //
@@ -1906,10 +2583,7 @@ fn ensure_gui_running() -> Result<GuiIpcEndpoint, String> {
             if query_gui_vault_status(&ep).is_some() {
                 return Ok(ep);
             }
-            return Err(
-                "MyShell GUI 正在运行但 IPC 无响应（进程可能已挂起）。请在任务管理器中检查 myshell.exe，必要时手动重启 MyShell 后重试。"
-                    .to_string(),
-            );
+            return Err(GuiLaunchError::IpcUnresponsive);
         }
         log(&format!(
             "[gui] 陈旧的 gui-ipc-port 文件（端口 {} 无监听）— 删除并重新启动 GUI",
@@ -1920,23 +2594,20 @@ fn ensure_gui_running() -> Result<GuiIpcEndpoint, String> {
 
     // Find myshell.exe — it lives in the same directory as myshell-mcp.exe.
     let mcp_exe = std::env::current_exe()
-        .map_err(|e| format!("无法定位自身路径: {e}"))?;
+        .map_err(|e| GuiLaunchError::LocateFailed(e.to_string()))?;
     let gui_exe = mcp_exe
         .parent()
-        .ok_or("无法定位安装目录")?
+        .ok_or_else(|| GuiLaunchError::LocateFailed("无法定位安装目录".to_string()))?
         .join("myshell.exe");
 
     if !gui_exe.exists() {
-        return Err(format!(
-            "未找到 myshell.exe（期望位置: {}）。请手动打开 MyShell。",
-            gui_exe.display()
-        ));
+        return Err(GuiLaunchError::NotInstalled(gui_exe));
     }
 
     log(&format!("启动 GUI: {}", gui_exe.display()));
     std::process::Command::new(&gui_exe)
         .spawn()
-        .map_err(|e| format!("启动 myshell.exe 失败: {e}"))?;
+        .map_err(|e| GuiLaunchError::SpawnFailed(e.to_string()))?;
 
     // Poll for the port file (GUI writes it on startup once the IPC listener
     // binds). Give it up to 30 seconds — the GUI needs to boot WebView2.
@@ -1947,7 +2618,7 @@ fn ensure_gui_running() -> Result<GuiIpcEndpoint, String> {
             return Ok(ep);
         }
     }
-    Err("GUI 启动超时（30 秒内未就绪）。请手动打开 MyShell 后重试。".to_string())
+    Err(GuiLaunchError::StartupTimeout)
 }
 
 /// Delete the GUI's IPC port-discovery file. Only called when we have proven
@@ -2026,10 +2697,8 @@ fn send_gui_focus_unlock(ep: &GuiIpcEndpoint) {
 /// source of "the tool hung forever, then vaguely suggested the password
 /// might be missing" reports. Failing fast surfaces the prompt within
 /// milliseconds; the AI relays it, the user unlocks, the retry succeeds.
-fn ensure_vault_ready() -> Result<(), String> {
-    let ep = ensure_gui_running().map_err(|e| {
-        format!("MyShell GUI 未运行且无法自动启动：{}。请手动打开 MyShell 桌面应用，然后重试。", e)
-    })?;
+fn ensure_vault_ready() -> Result<(), VaultGateError> {
+    let ep = ensure_gui_running().map_err(|e| VaultGateError::GuiUnavailable(e.to_string()))?;
 
     // Right after auto-launch the IPC listener may need a moment; retry the
     // status query briefly before concluding the GUI is unreachable.
@@ -2044,21 +2713,68 @@ fn ensure_vault_ready() -> Result<(), String> {
 
     match status {
         Some((_, true)) => Ok(()),
-        Some((false, _)) => Err(
-            "保险库尚未初始化：请先在 MyShell GUI 中设置主密码（首次启动时会引导设置），然后重新调用此工具。"
-                .to_string(),
-        ),
+        Some((false, _)) => Err(VaultGateError::NotInitialized),
         Some((true, false)) => {
             send_gui_focus_unlock(&ep);
-            Err(
+            Err(VaultGateError::Locked)
+        }
+        None => Err(VaultGateError::IpcUnresponsive),
+    }
+}
+
+/// Outcome of the vault gate, as a type rather than prose.
+///
+/// The `error_kind` returned to the caller (`vault_locked`) and the
+/// `vault_state` hint are both derived from this variant, so a rewording can
+/// never silently reclassify a gate failure — and `vault_status` can report
+/// the same state to a polling caller without re-deriving it from text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VaultGateError {
+    /// No working GUI at all (not installed / won't launch / wedged).
+    GuiUnavailable(String),
+    /// The GUI is up but has no vault configured yet.
+    NotInitialized,
+    /// Vault exists and the user has not entered the master password.
+    Locked,
+    /// GUI reachable at launch, then IPC stopped answering.
+    IpcUnresponsive,
+}
+
+impl VaultGateError {
+    /// Machine-readable state for the caller. `error_kind` stays `vault_locked`
+    /// for all variants — from the caller's perspective the fix is always
+    /// "the user must unlock in MyShell, then retry".
+    fn state(&self) -> &'static str {
+        match self {
+            VaultGateError::Locked => "locked",
+            VaultGateError::NotInitialized => "not_initialized",
+            VaultGateError::GuiUnavailable(_) => "gui_unavailable",
+            VaultGateError::IpcUnresponsive => "ipc_unresponsive",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            VaultGateError::GuiUnavailable(e) => format!(
+                "MyShell GUI 未运行且无法自动启动：{}。请手动打开 MyShell 桌面应用，然后重试。",
+                e
+            ),
+            VaultGateError::NotInitialized =>
+                "保险库尚未初始化：请先在 MyShell GUI 中设置主密码（首次启动时会引导设置），然后重新调用此工具。"
+                    .to_string(),
+            VaultGateError::Locked =>
                 "保险库未解锁：MyShell 窗口已置顶，请在其中输入主密码解锁保险库，解锁后重新调用此工具即可。"
                     .to_string(),
-            )
+            VaultGateError::IpcUnresponsive =>
+                "无法查询 MyShell GUI 的保险库状态（IPC 无响应）。请确认 MyShell 桌面应用正在运行后重试。"
+                    .to_string(),
         }
-        None => Err(
-            "无法查询 MyShell GUI 的保险库状态（IPC 无响应）。请确认 MyShell 桌面应用正在运行后重试。"
-                .to_string(),
-        ),
+    }
+}
+
+impl std::fmt::Display for VaultGateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message())
     }
 }
 
@@ -2082,6 +2798,7 @@ async fn exec_in_gui_tab(
 
     // Ensure the GUI is running (auto-start if needed).
     let ep = ensure_gui_running()?;
+    let started = std::time::Instant::now();
 
     // 直接发送 exec_in_tab。前端的 handler 自己会处理三种情况：
     //   1. 该连接已有 connected 的 terminal tab → 直接复用（秒级）
@@ -2132,18 +2849,38 @@ async fn exec_in_gui_tab(
     }
 
     if resp["ok"].as_bool() == Some(true) {
-        let stdout = resp["stdout"].as_str().unwrap_or("");
+        // ANSI/OSC stripping happens here, at the boundary: the GUI captured
+        // this from a real PTY (prompt, window-title OSC, grep colors), and
+        // raw escape bytes are noise for an agent that cannot render them.
+        let stdout = strip_ansi(resp["stdout"].as_str().unwrap_or(""));
         let exit_code = resp["exit_code"].as_i64().unwrap_or(0);
+        // Snapshot once: two `started.elapsed()` calls a few microseconds
+        // apart would report different durations for the same execution.
+        let duration_ms = started.elapsed().as_millis() as u64;
         let result = json!({
             "exit_code": exit_code,
             "stdout": stdout,
             "stderr": "",
+            // Honest signalling: the caller must be able to tell a real exit
+            // code from "the shell printed $? of the last pipeline stage".
+            "exit_code_source": "shell_last_status",
+            "duration_ms": duration_ms,
+            "timed_out": false,
+            "truncated": false,
+            "command": command,
+            "executed_in": "gui_terminal",
         });
-        Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }] }))
+        Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "timed_out": false,
+            "command": command,
+        }))
     } else {
         let err_msg = resp["error"].as_str().unwrap_or("未知错误");
-        // If there's partial stdout, include it.
-        let stdout = resp["stdout"].as_str().unwrap_or("");
+        // If there's partial stdout, include it (stripped, same as the OK path).
+        let stdout = strip_ansi(resp["stdout"].as_str().unwrap_or(""));
         let message = if !stdout.is_empty() {
             format!("{}（部分输出: {}）", err_msg, stdout)
         } else {
@@ -2152,6 +2889,9 @@ async fn exec_in_gui_tab(
         Err(GuiExecError {
             message,
             command_sent: resp["command_sent"].as_bool() == Some(true),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            // We got a real IPC response, so the GUI is up and reachable.
+            gui_reachable: true,
         })
     }
 }
@@ -2164,9 +2904,32 @@ async fn exec_in_gui_tab(
 /// teardown). Re-running the command headlessly in that case executes it a
 /// SECOND time, invisibly — the user watches one command in the visible tab
 /// while an identical one runs behind their back.
+#[derive(Debug)]
 struct GuiExecError {
     message: String,
     command_sent: bool,
+    /// Wall-clock time spent inside `exec_in_gui_tab` before the failure —
+    /// lets the caller tell "failed instantly" from "failed after burning the
+    /// whole timeout", which decides whether retrying is worthwhile.
+    elapsed_ms: u64,
+    /// Whether a working GUI was confirmed up when this failed. SECURITY:
+    /// this gates the headless fallback — `false` means the visible
+    /// confirmation dialog could not have appeared, so falling back is only
+    /// legitimate for commands that would not have needed one. Derived from
+    /// the error TYPE (never from its wording).
+    gui_reachable: bool,
+}
+
+impl From<GuiLaunchError> for GuiExecError {
+    fn from(e: GuiLaunchError) -> Self {
+        let gui_reachable = e.gui_reachable();
+        GuiExecError {
+            message: e.to_string(),
+            command_sent: false,
+            elapsed_ms: 0,
+            gui_reachable,
+        }
+    }
 }
 
 impl From<String> for GuiExecError {
@@ -2178,6 +2941,11 @@ impl From<String> for GuiExecError {
         GuiExecError {
             message,
             command_sent: false,
+            elapsed_ms: 0,
+            // Every `?` that produces a plain String runs AFTER
+            // ensure_gui_running succeeded, so the frontend was reachable and
+            // could have shown its dialog.
+            gui_reachable: true,
         }
     }
 }
@@ -2242,14 +3010,20 @@ impl McpZmodemSink {
 
 impl EventSink for McpZmodemSink {
     fn emit_raw(&self, event: &str, payload: Value) {
-        // DEBUG: log every event to the MCP log file for upload-path diagnosis.
-        let preview = if event == "zmodem_raw" || event == "ssh_output" {
-            let len = payload["data"].as_array().map(|a| a.len()).unwrap_or(0);
-            format!("<{} bytes>", len)
-        } else {
-            format!("{}", payload)
-        };
-        log(&format!("[McpZmodemSink] event={} {}", event, preview));
+        // Only low-frequency, decision-bearing events are logged. The byte
+        // firehose (zmodem_raw / ssh_output) and per-chunk progress used to be
+        // logged verbatim — 1332 progress lines in one session, and a
+        // `bytesTransferred` line per network chunk on top; that noise is what
+        // made the old mcp.log unreadable when diagnosing a failure. Start /
+        // offer / file-complete / end / error still land, and those are the
+        // ones a transfer post-mortem actually needs.
+        match event {
+            "zmodem_raw" | "ssh_output" | "zmodem_progress" => {}
+            _ => {
+                let preview = format!("{}", payload);
+                log(&format!("[McpZmodemSink] event={} {}", event, preview));
+            }
+        }
 
         let parsed = match event {
             "zmodem_raw" => payload["data"]
@@ -2330,6 +3104,252 @@ fn sanitize_relative_path(name: &str) -> Option<String> {
 mod tests {
     use super::sanitize_relative_path;
     use super::TransferProgress;
+    use super::{compose_line, open_log, prune_old_logs, strip_ansi, write_line, LogFiles, LOG_LINE_MAX};
+
+    /// 调用方反馈的头号问题：JSON 转义。`command_b64` 必须能在不破坏任何字符的
+    /// 前提下还原 shell 命令 —— 尤其是引号、反斜杠、`$` 与花括号。
+    #[test]
+    fn base64_command_round_trips_awkward_shell() {
+        use super::decode_command_b64;
+        use base64::Engine as _;
+        let original = r#"grep -n 'HeartbeatThread\|Controller' /x.conf; awk '{for(i=2;i<=NF;i++) print $i}' | sed 's/\$$//'"#;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(original.as_bytes());
+        assert_eq!(decode_command_b64(&b64).unwrap(), original);
+        // 空白/换行容错（调用方常按 76 列折行）
+        let wrapped = format!("{}\n{}", &b64[..10], &b64[10..]);
+        assert_eq!(decode_command_b64(&wrapped).unwrap(), original);
+        // 非法输入必须报错而不是静默给空串
+        assert!(decode_command_b64("not base64!!!").is_err());
+    }
+
+    /// 采集层剥 ANSI：CSI 颜色、OSC 标题/超链接、裸 ESC 全清掉，中文与
+    /// 制表/换行必须原样保留（AI 读的是内容，不是终端渲染）。
+    #[test]
+    fn strip_ansi_removes_escapes_but_keeps_text() {
+        let cases = [
+            ("\u{1b}]0;ustc@bigdata62:~\u{7}$ ls", "$ ls"),
+            ("\u{1b}[01;31m\u{1b}[K60018\u{1b}[m\u{1b}[K", "60018"),
+            ("\u{1b}]8;;http://x/y\u{1b}\\link\u{1b}]8;;\u{1b}\\", "link"),
+            ("中文\t保留\n第二行", "中文\t保留\n第二行"),
+            ("no escapes at all", "no escapes at all"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(strip_ansi(input), want, "input={input:?}");
+        }
+    }
+
+    /// 错误分类要落在正确的机器可读类别上 —— 调用方靠它分支，不靠中文散文。
+    #[test]
+    fn classify_error_maps_known_failures() {
+        use super::{classify_error, error_kind};
+        assert_eq!(classify_error("⛔ 用户已拒绝高危操作：ssh_exec"), error_kind::USER_DENIED);
+        assert_eq!(classify_error("保险库未解锁：..."), error_kind::VAULT_LOCKED);
+        assert_eq!(classify_error("bash: dmesg: Permission denied"), error_kind::PERMISSION_DENIED);
+        assert_eq!(classify_error("Interactive authentication required. polkit"), error_kind::PERMISSION_DENIED);
+        assert_eq!(classify_error("命令超时（60秒未完成）"), error_kind::TIMEOUT);
+        assert_eq!(classify_error("exec timeout (60s)"), error_kind::TIMEOUT);
+        assert_eq!(
+            classify_error("上一条命令仍在该服务器的终端中执行。"),
+            error_kind::BUSY
+        );
+        assert_eq!(classify_error("会话已断开且重连失败：..."), error_kind::CONNECTION_LOST);
+        assert_eq!(classify_error("缺少 connection 参数"), error_kind::BAD_REQUEST);
+        assert_eq!(classify_error("无法提取文件名"), error_kind::INTERNAL);
+        // 顺序敏感：权限拒绝消息里若也含「超时」二字，必须仍判成权限类别
+        assert_eq!(
+            classify_error("Permission denied（读取超时）"),
+            error_kind::PERMISSION_DENIED
+        );
+    }
+
+    /// schema 与实现必须一致：服务端接受 `command_b64`，因此 `ssh_exec` /
+    /// `ssh_run` 的 required 不能写死 `command` —— 否则做严格校验的客户端会
+    /// 拒掉一个完全合法的调用。（这个不一致真实存在过，见阶段 186。）
+    #[test]
+    fn command_tools_accept_either_command_form() {
+        let defs = super::tool_definitions();
+        for tool in ["ssh_exec", "ssh_run"] {
+            let t = defs["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == tool)
+                .unwrap_or_else(|| panic!("{tool} 未定义"));
+            let schema = &t["inputSchema"];
+            let props = &schema["properties"];
+            assert!(
+                props.get("command").is_some() && props.get("command_b64").is_some(),
+                "{tool} 应同时暴露 command 与 command_b64"
+            );
+            let required: Vec<&str> = schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert!(
+                !required.contains(&"command"),
+                "{tool} 不得把 command 列为必填（command_b64 也是合法形态）"
+            );
+            assert!(required.contains(&"connection"), "{tool} 必须要求 connection");
+            assert!(
+                schema["anyOf"].as_array().map(|a| a.len() == 2).unwrap_or(false),
+                "{tool} 应声明 anyOf: [command, command_b64]"
+            );
+        }
+    }
+
+    /// 编码规范必须真的出现在下发给客户端的 instructions 里 —— 规范写进
+    /// 文档但没写进 instructions，对运行时 agent 等于不存在。
+    #[test]
+    fn instructions_state_the_encoding_norm() {
+        let text = super::SERVER_INSTRUCTIONS;
+        for needle in ["command_b64", "ARGUMENT ENCODING", "ssh_read_text", "error_kind"] {
+            assert!(text.contains(needle), "instructions 缺少 {needle}");
+        }
+        // 「客户端抛出、服务端收不到」这一事实必须写明，否则接入方会去找服务端日志
+        assert!(text.contains("before the request reaches this server") || text.contains("CLIENT"));
+    }
+
+    /// 审计不变量（阶段 187）：GUI 可达性必须来自错误**类型**，不能来自
+    /// 错误**文案**。这条闸门锁住「改一个字就可能让高危命令静默执行」的结构。
+    #[test]
+    fn gui_reachability_comes_from_type_not_wording() {
+        use super::{GuiLaunchError, GuiExecError};
+        // 不可达 ⇒ 可见确认框从未出现 ⇒ headless 回退是合法的
+        for e in [
+            GuiLaunchError::NotInstalled("C:\\x\\myshell.exe".into()),
+            GuiLaunchError::LocateFailed("boom".into()),
+            GuiLaunchError::SpawnFailed("boom".into()),
+            GuiLaunchError::StartupTimeout,
+        ] {
+            assert!(!e.gui_reachable(), "{e:?} 应判定为 GUI 不可达");
+            let ge: GuiExecError = e.into();
+            assert!(!ge.gui_reachable, "转换后仍应为不可达: {ge:?}");
+        }
+        // 监听存在但无响应 ⇒ 也算「可达」：绝不能因为无响应就静默改走无头
+        assert!(GuiLaunchError::IpcUnresponsive.gui_reachable());
+        // 普通字符串错误全部发生在 GUI 就绪之后
+        assert!(GuiExecError::from("whatever".to_string()).gui_reachable);
+    }
+
+    /// 门禁状态必须能脱离文案被机器读取（vault_status 轮询契约的基础）。
+    #[test]
+    fn vault_gate_states_are_machine_readable() {
+        use super::VaultGateError;
+        assert_eq!(VaultGateError::Locked.state(), "locked");
+        assert_eq!(VaultGateError::NotInitialized.state(), "not_initialized");
+        assert_eq!(VaultGateError::GuiUnavailable("x".into()).state(), "gui_unavailable");
+        assert_eq!(VaultGateError::IpcUnresponsive.state(), "ipc_unresponsive");
+        // 四种状态的消息都必须是可行动的中文提示，而非内部代号
+        for e in [
+            VaultGateError::Locked,
+            VaultGateError::NotInitialized,
+            VaultGateError::GuiUnavailable("x".into()),
+            VaultGateError::IpcUnresponsive,
+        ] {
+            let m = e.message();
+            assert!(m.chars().count() > 10, "message 太短: {m}");
+        }
+    }
+
+    /// 每个 error_kind 都要有非空 hint —— 只说「失败了」的错误等于没信息。
+    #[test]
+    fn every_error_kind_carries_a_hint() {
+        use super::{error_kind, tool_error};
+        for kind in [
+            error_kind::PERMISSION_DENIED, error_kind::USER_DENIED, error_kind::TIMEOUT,
+            error_kind::BUSY, error_kind::CONNECTION_LOST, error_kind::CONNECT_FAILED,
+            error_kind::VAULT_LOCKED, error_kind::BAD_REQUEST, error_kind::NOT_FOUND,
+            error_kind::INTERNAL,
+        ] {
+            let v = tool_error(Some(kind), "boom".to_string());
+            assert_eq!(v["error_kind"], kind);
+            assert_eq!(v["isError"], true);
+            let hint = v["hint"].as_str().unwrap_or("");
+            assert!(hint.len() > 10, "kind {kind} 的 hint 太短: {hint:?}");
+        }
+    }
+
+    /// 基础日志与错误日志必须落到两个文件，且互不串写 —— 用户拿到报障时
+    /// 只需要给 error 文件，base 文件仍是干净的会话轨迹。
+    #[test]
+    fn base_and_error_go_to_separate_files() {
+        let dir = std::env::temp_dir().join(format!("myshell-mcp-logtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut files = LogFiles::default();
+        write_line(&mut files, &dir, false, "正常流程：MCP server starting");
+        write_line(&mut files, &dir, true, "错误：数据库初始化失败");
+        drop(files);
+
+        let day = super::log_day();
+        let base = std::fs::read_to_string(dir.join(format!("mcp-{}.log", day))).unwrap();
+        let err = std::fs::read_to_string(dir.join(format!("mcp-error-{}.log", day))).unwrap();
+        assert!(base.contains("正常流程"), "base 应含普通日志: {base}");
+        assert!(!base.contains("数据库初始化失败"), "base 不得混入错误: {base}");
+        assert!(err.contains("数据库初始化失败"), "error 文件应含错误: {err}");
+        assert!(!err.contains("正常流程"), "error 文件不得混入普通日志: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 超过保留窗口的 mcp*.log 要被清掉，窗口内的必须留下；非 mcp 日志
+    /// （GUI 的 myshell-<day>.log）绝不能被 MCP 删。
+    #[test]
+    fn prune_removes_only_expired_mcp_logs() {
+        let dir = std::env::temp_dir().join(format!("myshell-mcp-prunetest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stale = dir.join("mcp-1.log");
+        let stale_err = dir.join("mcp-error-1.log");
+        let fresh = dir.join("mcp-999999.log");
+        let gui = dir.join("myshell-999999.log");
+        for p in [&stale, &stale_err, &fresh, &gui] {
+            std::fs::write(p, "x").unwrap();
+        }
+        // 把两个 mcp 文件的时间戳推到 30 天前。
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 60 * 60);
+        for p in [&stale, &stale_err] {
+            let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.set_modified(old).unwrap();
+        }
+
+        prune_old_logs(&dir);
+
+        assert!(!stale.exists(), "超期基础日志应被清理");
+        assert!(!stale_err.exists(), "超期错误日志应被清理");
+        assert!(fresh.exists(), "保留窗口内的日志不得删除");
+        assert!(gui.exists(), "GUI 的日志不归 MCP 清理");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 超长行必须被截断且不撕裂多字节字符 —— 旧实现会把整条 heredoc 命令
+    /// 原样写盘，一次会话就能把日志撑到数 MB。
+    #[test]
+    fn long_line_is_truncated_on_char_boundary() {
+        let msg = format!("命令：{}", "中文".repeat(LOG_LINE_MAX));
+        let line = compose_line(&msg);
+        assert!(line.contains("truncated"), "应标注截断: {}", &line[..80.min(line.len())]);
+        assert!(line.len() < LOG_LINE_MAX + 200, "截断后长度应受控，实际 {}", line.len());
+        // 仍是合法 UTF-8（String 保证），且保留原文开头。
+        assert!(line.contains("命令：中"));
+    }
+
+    /// 目录不可写时不能 panic 也不能卡住：log 是 best-effort 的旁路。
+    #[test]
+    fn unwritable_dir_disables_logging_without_panic() {
+        let missing = std::env::temp_dir().join(format!("myshell-mcp-nodir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let mut files = LogFiles::default();
+        write_line(&mut files, &missing, false, "这条无法写盘");
+        write_line(&mut files, &missing, false, "第二条也应被静默跳过");
+        assert!(files.disabled, "打开失败后应闩死，避免每行都做一次系统调用");
+        assert!(open_log(&missing, super::log_day(), false).is_none());
+    }
 
     /// 真机验证抓到的那个 bug 的最小复现：单文件、2 MiB，走
     /// Offer → Progress → FileComplete → End。
@@ -2548,7 +3568,7 @@ async fn run_download_task(
                 task.error = Some(msg.clone());
             }
         });
-        log(&format!("zmodem_download [{}] failed: {}", task_id, msg));
+        log_err(&format!("zmodem_download [{}] failed: {}", task_id, msg));
     };
 
     mark(TaskPhase::Connecting, 0, 0);
@@ -2802,7 +3822,7 @@ async fn run_upload_task(
                 task.error = Some(msg.clone());
             }
         });
-        log(&format!("zmodem_upload [{}] failed: {}", task_id, msg));
+        log_err(&format!("zmodem_upload [{}] failed: {}", task_id, msg));
     };
 
     // The task is in Confirming. Pop the OS dialog here (blocks the background
@@ -3040,7 +4060,7 @@ async fn run_ssh_exec_task(
     // parameter — the partial-output tracking lives in the structured
     // result field of the task entry, updated by the streaming loop.
     let fail = |msg: String| {
-        log(&format!("ssh_run [{}] failed: {}", task_id, msg));
+        log_err(&format!("ssh_run [{}] failed: {}", task_id, msg));
         let mut tasks = tasks.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = tasks.get_mut(task_id) {
             t.phase = TaskPhase::Failed;
@@ -3121,6 +4141,7 @@ async fn run_ssh_exec_task(
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
     let mut exit_code: Option<u32> = None;
+    let mut truncated = false;
     // Per-stream cap is configurable via MCP_SSH_MAX_OUTPUT_BYTES — see
     // the matching note in the ssh_exec collect block.
     let max = ssh_max_output_bytes();
@@ -3149,12 +4170,22 @@ async fn run_ssh_exec_task(
                     if stdout.len() < max {
                         let room = max - stdout.len();
                         stdout.extend_from_slice(&data[..data.len().min(room)]);
+                        if data.len() > room {
+                            truncated = true;
+                        }
+                    } else {
+                        truncated = true;
                     }
                 }
                 Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => {
                     if stderr.len() < max {
                         let room = max - stderr.len();
                         stderr.extend_from_slice(&data[..data.len().min(room)]);
+                        if data.len() > room {
+                            truncated = true;
+                        }
+                    } else {
+                        truncated = true;
                     }
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status),
@@ -3183,15 +4214,17 @@ async fn run_ssh_exec_task(
                 ));
                 t.result = Some(json!({
                     "cancelled": true,
-                    "stdout": String::from_utf8_lossy(&stdout).into_owned(),
-                    "stderr": String::from_utf8_lossy(&stderr).into_owned(),
+                    "stdout": strip_ansi(&String::from_utf8_lossy(&stdout)),
+                    "stderr": strip_ansi(&String::from_utf8_lossy(&stderr)),
                 }));
             } else if let Some(code) = exit_code {
                 t.phase = TaskPhase::Done;
                 t.result = Some(json!({
                     "exit_code": code,
-                    "stdout": String::from_utf8_lossy(&stdout).into_owned(),
-                    "stderr": String::from_utf8_lossy(&stderr).into_owned(),
+                    "stdout": strip_ansi(&String::from_utf8_lossy(&stdout)),
+                    "stderr": strip_ansi(&String::from_utf8_lossy(&stderr)),
+                    "truncated": truncated,
+                    "duration_ms": t.started_at.elapsed().as_millis() as u64,
                 }));
             } else {
                 // No ExitStatus: the channel ended without one — connection
@@ -3207,8 +4240,9 @@ async fn run_ssh_exec_task(
                 );
                 t.result = Some(json!({
                     "exit_code": serde_json::Value::Null,
-                    "stdout": String::from_utf8_lossy(&stdout).into_owned(),
-                    "stderr": String::from_utf8_lossy(&stderr).into_owned(),
+                    "stdout": strip_ansi(&String::from_utf8_lossy(&stdout)),
+                    "stderr": strip_ansi(&String::from_utf8_lossy(&stderr)),
+                    "truncated": truncated,
                 }));
             }
         }
@@ -3424,6 +4458,9 @@ async fn sftp_download_file(sftp: &russh_sftp::client::SftpSession, remote: &str
         if n == 0 { break; }
         lf.write_all(&buf[..n]).await.map_err(|e| format!("写入失败: {}", e))?;
     }
+    // 本地句柄也要显式冲刷并在失败时报错 —— 否则「已下载」可能在磁盘满 /
+    // 权限问题时对一份残缺文件成立。
+    lf.flush().await.map_err(|e| format!("本地落盘失败（磁盘空间?）: {}", e))?;
     Ok(())
 }
 
@@ -3439,16 +4476,179 @@ async fn sftp_upload_file(sftp: &russh_sftp::client::SftpSession, local: &str, r
         if n == 0 { break; }
         rf.write_all(&buf[..n]).await.map_err(|e| format!("写入失败: {}", e))?;
     }
-    let _ = rf.flush().await;
+    // flush() 等待所有在途写确认。旧代码写的是 `let _ = rf.flush().await;` ——
+    // 远端磁盘满 / 超配额时这个错误被吞掉，工具照样回「已上传」，AI 与用户都
+    // 以为文件完整。落盘失败必须冒泡成全量失败。
+    rf.flush()
+        .await
+        .map_err(|e| format!("远端落盘失败（磁盘空间或配额?）: {}", e))?;
     Ok(())
 }
 
 // ============ Logging to file (stdout is reserved for JSON-RPC only) ============
+//
+// Two files, both rotated daily by epoch-day (same day formula as the GUI's
+// logger) and pruned on startup to a 7-day retention window:
+//
+//   <config_dir>/myshell/logs/mcp-<day>.log        — base (info/正常流程)
+//   <config_dir>/myshell/logs/mcp-error-<day>.log  — errors only
+//
+// Error entries go to the error file ONLY (never duplicated into the base
+// file): a support report can then be sent as just the error file, and the
+// base file keeps a clean trace of what the session actually did.
+//
+// The directory is `dirs::config_dir()` — the same one the GUI uses — so on
+// Linux the two processes no longer log into different roots (the previous
+// `dirs::data_dir()` only coincided with it on Windows).
+//
+// Every write is best-effort: a failed log must never break the JSON-RPC
+// session (a panic here kills the AI client's connection). The writer is kept
+// open across calls (a day rollover reopens it) instead of the old
+// open-append-close per line.
 
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-static LOG_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+/// Retention window, mirroring the GUI's 7-day policy.
+const LOG_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Cap on a single log line. Tool-call args can embed multi-KB heredocs; with
+/// no cap a full session produced a 3.1 MB file. Tail dropped, length reported
+/// (git-style).
+const LOG_LINE_MAX: usize = 4000;
+
+/// Log directory resolved once: `<config_dir>/myshell/logs` — the same root
+/// the GUI logger uses (the previous `dirs::data_dir()` only coincided with it
+/// on Windows). `None` = logging disabled (dir uncreatable). Creation also
+/// prunes files past the retention window, so a long-idle install cleans up on
+/// its next start.
+static LOG_DIR: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+    let dir = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("myshell")
+        .join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    prune_old_logs(&dir);
+    Some(dir)
+});
+
+/// Best-effort deletion of `mcp*.log` files (base, error, and the pre-rotation
+/// bare `mcp.log`) last modified more than the retention window ago.
+fn prune_old_logs(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let cutoff = match std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(LOG_RETENTION_SECS)) {
+        Some(c) => c,
+        None => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("mcp") || !name.ends_with(".log") {
+            continue;
+        }
+        if entry.metadata().and_then(|m| m.modified()).map(|mt| mt < cutoff).unwrap_or(false) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Epoch-day index (seconds / 86400) — the shared day formula, and the suffix
+/// in the file names (`mcp-<day>.log` / `mcp-error-<day>.log`).
+fn log_day() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86400)
+        .unwrap_or(0)
+}
+
+/// Open (append/create) one of the two daily files. `error=false` → base file.
+fn open_log(dir: &std::path::Path, day: u64, error: bool) -> Option<std::fs::File> {
+    let name = if error {
+        format!("mcp-error-{}.log", day)
+    } else {
+        format!("mcp-{}.log", day)
+    };
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(name))
+        .ok()
+}
+
+/// The two open handles for the current day. A day rollover drops and reopens
+/// them. `disabled` latches after an open failure so a read-only disk doesn't
+/// cost an open() syscall per log line.
+#[derive(Default)]
+struct LogFiles {
+    day: u64,
+    base: Option<std::fs::File>,
+    error: Option<std::fs::File>,
+    disabled: bool,
+}
+
+static LOG_FILES: LazyLock<Mutex<LogFiles>> = LazyLock::new(|| Mutex::new(LogFiles::default()));
+
+/// Write one line, timestamped, to the daily base or error file under `dir`.
+/// Errors go to the error file exclusively — a support report can then be just
+/// that file, and the base file stays a clean trace of the session. Unwritable
+/// log files are fatal to nothing: this is called from the JSON-RPC loop and a
+/// panic here would take the client's connection down with it.
+fn write_line(files: &mut LogFiles, dir: &std::path::Path, error: bool, msg: &str) {
+    if files.disabled {
+        return;
+    }
+    let day = log_day();
+    if files.day != day {
+        files.day = day;
+        files.base = None;
+        files.error = None;
+    }
+    let slot = if error { &mut files.error } else { &mut files.base };
+    if slot.is_none() {
+        match open_log(dir, day, error) {
+            Some(f) => *slot = Some(f),
+            None => {
+                files.disabled = true;
+                return;
+            }
+        }
+    }
+    let line = compose_line(msg);
+    let Some(target) = slot.as_mut() else { return };
+    let _ = target.write_all(line.as_bytes());
+    let _ = target.write_all(b"\n");
+}
+
+fn log_to(error: bool, msg: &str) {
+    let Some(dir) = LOG_DIR.as_ref() else { return };
+    let mut files = LOG_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    write_line(&mut files, dir, error, msg);
+}
+
+/// `[HH:MM:SS] <msg>`, truncated on a UTF-8 boundary when over `LOG_LINE_MAX`.
+fn compose_line(msg: &str) -> String {
+    let head = chrono::Local::now().format("%H:%M:%S");
+    if msg.len() <= LOG_LINE_MAX {
+        return format!("[{}] {}", head, msg);
+    }
+    let mut cut = LOG_LINE_MAX;
+    while cut > 0 && !msg.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("[{}] {}… [truncated, {} chars total]", head, &msg[..cut], msg.len())
+}
+
+/// Base log: normal lifecycle, tool calls, decisions.
+fn log(msg: &str) {
+    log_to(false, msg);
+}
+
+/// Error log: failures the user should be able to hand over for diagnosis.
+fn log_err(msg: &str) {
+    log_to(true, msg);
+}
 
 /// Per-stream stdout/stderr cap for ssh_exec and ssh_run. Configurable via
 /// the `MCP_SSH_MAX_OUTPUT_BYTES` env var (read once at startup); defaults
@@ -3471,18 +4671,15 @@ fn ssh_max_output_bytes() -> usize {
 }
 
 fn log_init() {
-    if let Some(dir) = dirs::data_dir() {
-        let log_dir = dir.join("myshell").join("logs");
-        let _ = std::fs::create_dir_all(&log_dir);
-        let path = log_dir.join("mcp.log");
-        let _ = LOG_PATH.set(path);
-    }
+    // Force the log dir + retention prune now so startup is deterministic
+    // (LazyLock would otherwise initialize on the first log call).
+    LazyLock::force(&LOG_DIR);
 
     // Pick up the per-stream output cap from MCP_SSH_MAX_OUTPUT_BYTES. Env
     // var is read once at startup so the read path stays a cheap atomic
     // load. Clamped to [64 KiB, 1 GiB] — below 64 KiB is useless for any
     // real command, above 1 GiB would risk OOM on a chatty job. Invalid
-    // values are silently ignored (the default sticks); we log a warning
+    // values are silently ignored (the default sticks); we log the reason
     // so the operator knows.
     if let Ok(raw) = std::env::var("MCP_SSH_MAX_OUTPUT_BYTES") {
         match raw.trim().parse::<usize>() {
@@ -3490,28 +4687,15 @@ fn log_init() {
                 SSH_MAX_OUTPUT_BYTES.store(n, Ordering::Relaxed);
                 log(&format!("MCP_SSH_MAX_OUTPUT_BYTES = {} bytes", n));
             }
-            Ok(_) => log(&format!(
+            Ok(_) => log_err(&format!(
                 "MCP_SSH_MAX_OUTPUT_BYTES={} 越界，保持默认 4 MiB（合法范围 64 KiB ~ 1 GiB）",
                 raw
             )),
-            Err(e) => log(&format!(
+            Err(e) => log_err(&format!(
                 "MCP_SSH_MAX_OUTPUT_BYTES={:?} 解析失败，保持默认 4 MiB：{}",
                 raw, e
             )),
         }
-    }
-}
-
-fn log(msg: &str) {
-    if let Some(path) = LOG_PATH.get() {
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S"), msg)
-            });
     }
 }
 
@@ -3526,7 +4710,7 @@ async fn main() {
     let conn = match db::init_db() {
         Ok(c) => c,
         Err(e) => {
-            log(&format!("数据库初始化失败: {}", e));
+            log_err(&format!("数据库初始化失败: {}", e));
             std::process::exit(1);
         }
     };
@@ -3551,24 +4735,33 @@ async fn main() {
     // connection config via IPC (get_connection_secrets). The DEK here stays
     // None permanently — the MCP server cannot access any server on its own.
 
-    let state = McpState {
+    let state = Arc::new(McpState {
         app,
         tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         exec_controls: Arc::new(Mutex::new(std::collections::HashMap::new())),
-    };
+    });
     log("MCP server ready — waiting for first message on stdin");
 
     // MCP stdio loop.
     //
-    // We hold the stdin lock for the entire process lifetime (single-threaded
-    // loop anyway). For stdout we wrap in BufWriter for efficiency but flush
-    // explicitly after every write_message call — buffering without flush is
-    // exactly what causes client-side initialize timeouts.
+    // stdin is read inline (blocking); each `tools/call` runs in its own task
+    // so a slow command no longer deafens the server. Previously the loop
+    // awaited every call, so while one `ssh_exec` ran (up to an hour), a
+    // second request — including `ssh_status` / `ssh_cancel` — sat unread in
+    // the pipe until it finished. Clients that issue parallel tool calls now
+    // get real parallelism, and cancellation stays reachable.
+    //
+    // stdout is shared behind a Mutex: responses from concurrent tasks must
+    // never interleave mid-line. We still flush inside write_message_raw —
+    // buffering without flush is exactly what causes client-side initialize
+    // timeouts.
     let stdin = std::io::stdin();
     let stdin_lock = stdin.lock();
     let mut reader = std::io::BufReader::new(stdin_lock);
-    let stdout = std::io::stdout();
-    let mut writer = std::io::BufWriter::new(stdout.lock());
+    let writer = Arc::new(Mutex::new(std::io::BufWriter::new(std::io::stdout())));
+    // In-flight tool calls: on EOF we let them deliver their responses instead
+    // of exiting out from under a client that half-closed stdin.
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     while let Some(msg) = read_message_raw(&mut reader) {
         let method = msg["method"].as_str().unwrap_or("").to_string();
@@ -3592,7 +4785,7 @@ async fn main() {
                     },
                     "instructions": SERVER_INSTRUCTIONS
                 }));
-                write_message_raw(&mut writer, &response);
+                write_out(&writer, &response);
                 log(&format!("sent: initialize response id={}", id));
             }
 
@@ -3602,7 +4795,7 @@ async fn main() {
 
             "tools/list" => {
                 let response = jsonrpc_response(&id, tool_definitions());
-                write_message_raw(&mut writer, &response);
+                write_out(&writer, &response);
                 log(&format!("sent: tools/list response id={}", id));
             }
 
@@ -3611,24 +4804,28 @@ async fn main() {
                 let args = msg["params"]["arguments"].clone();
                 log(&format!("tool call: {} args={}", tool_name, args));
 
-                match call_tool(&state, &tool_name, &args).await {
-                    Ok(result) => {
-                        let response = jsonrpc_response(&id, result);
-                        write_message_raw(&mut writer, &response);
-                    }
-                    Err(e) => {
-                        let response = jsonrpc_response(&id, json!({
-                            "content": [{ "type": "text", "text": format!("错误: {}", e) }],
-                            "isError": true
-                        }));
-                        write_message_raw(&mut writer, &response);
-                    }
-                }
+                let state = Arc::clone(&state);
+                let writer = Arc::clone(&writer);
+                let in_flight = Arc::clone(&in_flight);
+                in_flight.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let result = match call_tool(&state, &tool_name, &args).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // The AI sees the error inline; the error log keeps
+                            // the record after the conversation is gone.
+                            log_err(&format!("tool {} 失败: {}", tool_name, e));
+                            tool_error(None, e)
+                        }
+                    };
+                    write_out(&writer, &jsonrpc_response(&id, result));
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                });
             }
 
             "ping" => {
                 let response = jsonrpc_response(&id, json!({}));
-                write_message_raw(&mut writer, &response);
+                write_out(&writer, &response);
                 log(&format!("sent: ping response id={}", id));
             }
 
@@ -3637,11 +4834,31 @@ async fn main() {
                 // ignore unknown notifications (no id).
                 if !id.is_null() {
                     let response = jsonrpc_error(&id, -32601, &format!("Method not found: {}", method));
-                    write_message_raw(&mut writer, &response);
+                    write_out(&writer, &response);
                     log(&format!("sent: method-not-found id={} method={}", id, method));
                 }
             }
         }
     }
+    // stdin closed. Give in-flight calls a bounded grace period to deliver
+    // their responses (a client that half-closes stdin but still waits for a
+    // result would otherwise lose it), then exit. The cap keeps a hung remote
+    // command from pinning this process forever after the client is gone.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while in_flight.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if in_flight.load(Ordering::SeqCst) > 0 {
+        log_err("stdin 已关闭，仍有未完成的工具调用；超过 30 秒宽限期后退出");
+    }
     log("stdin loop ended — exiting");
+}
+
+/// Serialize concurrent responses through one writer. Held only for the
+/// duration of a single write+flush, so it never becomes a bottleneck.
+fn write_out(writer: &Arc<Mutex<std::io::BufWriter<std::io::Stdout>>>, msg: &Value) {
+    match writer.lock() {
+        Ok(mut w) => write_message_raw(&mut *w, msg),
+        Err(_) => {}
+    }
 }

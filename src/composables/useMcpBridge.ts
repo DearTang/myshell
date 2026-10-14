@@ -5,6 +5,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   checkCommandConfirmation,
   checkCommandDangerReasons,
+  mcpConfirmResult,
   mcpExecResult,
   onSshOutput,
   sshSend,
@@ -24,11 +25,20 @@ interface McpGuiCommand {
   timeout?: number;
   /** MCP 侧已获会话授权（用户此前选过「本轮会话均允许」）→ 跳过确认弹窗 */
   session_allowed?: boolean;
+  /** `mcp_confirm`（不可逆文件操作确认）：被请求的操作名称，如「上传文件（可能覆盖）」 */
+  operation?: string;
+  /** `mcp_confirm`：目标连接名，用于弹窗标题 */
+  connection_name?: string;
+  /** `mcp_confirm`：完整详情（路径、目标对象），展示给用户判断影响面 */
+  detail?: string;
 }
 
 // 每连接执行锁：连接 id → 加锁时刻。交互式 PTY 串行执行，上一条没跑完时
-// 拒绝注入下一条（避免命令字节交错 / sentinel 串台）。超过 MCP_LOCK_STALE_MS
-// 的陈旧锁强制释放（自愈，见旧 App.tsx 注释）。
+// 拒绝注入下一条（避免命令字节交错 / sentinel 串台）。
+//
+// 陈旧锁自愈阈值不是固定值：MCP 侧允许 AI 传 timeout（默认 60s，最大 3600s），
+// 固定 60s 会在长命令仍在跑时把锁强释，第二条命令随即注入同一条 PTY —— 正是
+// 锁要防的 sentinel 串台。阈值 = max(MCP_LOCK_STALE_MS, 本请求 timeout + 10s)。
 const mcpExecLocks = new Map<string, number>();
 const MCP_LOCK_STALE_MS = 60_000;
 
@@ -52,20 +62,25 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
       const command = event.payload.command;
       const timeoutMs = (event.payload.timeout || 30) * 1000;
 
-      // 互斥锁检查 + 陈旧锁自愈
+      // 互斥锁检查 + 陈旧锁自愈（阈值随本请求 timeout 放大）
+      const lockStaleMs = Math.max(MCP_LOCK_STALE_MS, timeoutMs + 10_000);
       const existingLockAt = mcpExecLocks.get(connection_id);
       if (existingLockAt !== undefined) {
         const lockAge = Date.now() - existingLockAt;
-        if (lockAge > MCP_LOCK_STALE_MS) {
+        if (lockAge > lockStaleMs) {
           console.warn(`[mcp-exec] stale lock on ${connection_id} (${lockAge}ms old), force-releasing`);
           mcpExecLocks.delete(connection_id);
         } else {
+          const remainSec = Math.ceil((lockStaleMs - lockAge) / 1000);
           mcpExecResult(requestId, {
             ok: false,
             error:
-              "上一条命令仍在该服务器的终端中执行。交互式终端一次只能跑一条命令。" +
-              "如需运行耗时命令，请用 nohup 后台执行（如 `nohup pip install -e . > /tmp/log 2>&1 &`），" +
-              "然后轮询日志文件查看结果。",
+              `上一条命令仍在该服务器的终端中执行（已运行约 ${Math.round(lockAge / 1000)} 秒）。` +
+              "交互式终端一次只能跑一条命令，请等待上一条结束后重试" +
+              (remainSec > 0 ? `（预计最多再等 ${remainSec} 秒）` : "") +
+              "。命令未发送到远端，可以安全重试。" +
+              "后续如需运行耗时命令，请改用 `ssh_run`（异步，不受此锁限制，可用 `ssh_cancel` 取消），" +
+              "或用 nohup 后台执行（如 `nohup pip install -e . > /tmp/log 2>&1 &`）后轮询日志文件。",
           });
           return;
         }
@@ -86,13 +101,40 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
       // command_sent 必须如实反映「命令是否已经写进 PTY」——MCP 侧据此决定
       // 能不能无头重跑：已经发出去的命令再跑一次，会在用户看不见的地方执行两遍。
       let commandSent = false;
+      let settled = false;
+      // 兜底看门狗句柄：在 finishExec 之前声明，任何完成路径都能取消它。
+      let watchdog: number | undefined;
+      // 输出订阅的解绑钩子，由 runExec 在挂好监听后装入。finishExec 统一调用它，
+      // 保证「看门狗超时」「硬超时」「正常收尾」三条路径都不会漏掉 IPC 监听。
+      let stopOutput: (() => void) | null = null;
       const finishExec = (result: { ok: boolean; stdout?: string; exit_code?: number; error?: string }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(watchdog);
+        stopOutput?.();
         mcpExecLocks.delete(connection_id);
         const payload: Record<string, unknown> = { ...result, command_sent: commandSent };
         if (sessionAllowedGranted) payload.session_allowed = true;
         if (sessionRevoked) payload.session_revoked = true;
         mcpExecResult(requestId, payload);
       };
+
+      // 兜底看门狗：从拿到锁的这一刻起计时，覆盖确认弹窗、重连/建连、命令执行
+      // 全链路。Rust 侧从 IPC 发出后就等待 timeout+10s，超时只会回一个信息量
+      // 很低的 `exec timeout (Xs)`；这里把预算设在它之前（timeout+9s），保证 AI
+      // 拿到的是一条可行动的中文原因。同时任何未预见的挂起（对话框无人点击、
+      // sshSend 抛错、sentinel 丢失）都必然经由 finishExec 释放锁 —— 旧实现里
+      // 这类挂起会让该连接一直锁到前端下一次超时，期间所有命令都被拒绝。
+      watchdog = setTimeout(() => {
+        finishExec({
+          ok: false,
+          error:
+            `命令在本机 GUI 侧未能在 ${Math.round((timeoutMs + 9_000) / 1000)} 秒内完成` +
+            `（可能原因：确认弹窗未处理、会话重连失败或终端长时间无输出）。` +
+            `命令是否已执行：${commandSent ? "已发送到远端，可能仍在运行" : "尚未发送"}。` +
+            "请重试，或改用 nohup 后台执行 + 轮询日志。",
+        });
+      }, timeoutMs + 9_000);
 
       const existingTab = sessions.tabs.find((t) => t.connectionId === connection_id && t.type === "terminal");
 
@@ -156,7 +198,6 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
         // 输出收尾：截 sentinel、归一化换行、剥命令回显与 helper 行（保留 ANSI 颜色）
         const finalizeOutput = (exitCode: number | null) => {
           done = true;
-          unlistenOutput();
           let stdout = outputBuf;
           const sentinelRe = new RegExp(sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ":(\\d+)");
           const sentinelMatch = stdout.match(sentinelRe);
@@ -223,18 +264,47 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
           outputBuf = outputBuf.slice(0, matchIndex);
           finalizeOutput(exitCode);
         });
+        // 监听已挂好 —— 交给 finishExec 统一解绑（看门狗/硬超时/正常收尾都走它）。
+        stopOutput = unlistenOutput;
 
-        // 监听挂好后再发命令（先订阅后发送，避免快命令输出丢失）
-        await sshSend(sessionId, command + "\n");
-        // 从这一刻起命令已经在远端跑了——后续任何失败（硬超时、sentinel 丢失、
-        // IPC 断开）都必须在结果里如实标记，MCP 才知道不能无头重跑。
-        commandSent = true;
-        await new Promise((r) => setTimeout(r, 80));
-        await sshSend(sessionId, `echo ${sentinel}:$?\n`);
-
+        // 硬超时计时器必须先于「发命令」注册：sshSend 自身失败时旧代码会直接
+        // 抛出，两条 setInterval 与硬超时全都还没挂上——前端从此对这条请求永久
+        // 沉默，Rust 只能干等到 timeout+10s 回一个 `exec timeout`。现在无论
+        // sshSend 成功还是抛错，都有计时器兜住并回结果。
+        //
         // 三层完成策略：sentinel 结果行 → 空闲回退（5s 无新数据）→ 硬超时
         const IDLE_TIMEOUT_MS = 5000;
-        const idleCheck = setInterval(() => {
+        let idleCheck: number | undefined;
+        setTimeout(() => {
+          if (!done && !timedOut) {
+            timedOut = true;
+            clearInterval(idleCheck);
+            // 先补 Ctrl+C 清场再报错，让下一条命令拿到干净提示符
+            sshSend(sessionId, "\x03").catch(() => {});
+            finishExec({
+              ok: false,
+              error:
+                `命令超时（${event.payload.timeout || 30}秒未完成）。已自动发送 Ctrl+C 中断残留进程；` +
+                "如需长时间运行的命令，请用 nohup 后台执行并轮询日志。",
+              stdout: outputBuf,
+            });
+          }
+        }, timeoutMs);
+
+        try {
+          // 监听挂好后再发命令（先订阅后发送，避免快命令输出丢失）
+          await sshSend(sessionId, command + "\n");
+          // 从这一刻起命令已经在远端跑了——后续任何失败（硬超时、sentinel 丢失、
+          // IPC 断开）都必须在结果里如实标记，MCP 才知道不能无头重跑。
+          commandSent = true;
+          await new Promise((r) => setTimeout(r, 80));
+          await sshSend(sessionId, `echo ${sentinel}:$?\n`);
+        } catch (e) {
+          finishExec({ ok: false, error: `命令发送失败: ${e}` });
+          return;
+        }
+
+        idleCheck = setInterval(() => {
           if (done || timedOut) {
             clearInterval(idleCheck);
             return;
@@ -245,27 +315,6 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
           }
         }, 1000);
 
-        setTimeout(() => {
-          if (!done && !timedOut) {
-            timedOut = true;
-            clearInterval(idleCheck);
-            unlistenOutput();
-            // 先补 Ctrl+C 清场再报错，让下一条命令拿到干净提示符
-            sshSend(sessionId, "\x03").catch(() => {});
-            finishExec({
-              ok: false,
-              error: `命令超时（${event.payload.timeout || 30}秒未完成）。已自动发送 Ctrl+C 中断残留进程；如需长时间运行的命令，请用 nohup 后台执行并轮询日志。`,
-              stdout: outputBuf,
-            });
-          }
-        }, timeoutMs);
-
-        const cleanupCheck = setInterval(() => {
-          if (done || timedOut) {
-            clearInterval(cleanupCheck);
-            unlistenOutput();
-          }
-        }, 500);
       };
 
       if (existingTab && existingTab.status === "connected" && existingTab.sessionId) {
@@ -293,12 +342,16 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
           } else {
             finishExec({ ok: false, error: "重连后未找到会话" });
           }
+        }).catch((e) => {
+          finishExec({ ok: false, error: `重连失败: ${e}` });
         });
       } else {
-        // 新 tab 路径：开 tab + 连接，轮询等连上后执行
+        // 新 tab 路径：开 tab + 连接，轮询等连上后执行。
+        // 等连上的预算单独封顶 30s：旧实现用整个命令 timeout 去等连接，一条
+        // timeout=60s 的调用可能把 60s 全花在建连上，命令还没发就超时了。
         connect(config);
         let attempts = 0;
-        const maxAttempts = Math.floor(timeoutMs / 500);
+        const maxAttempts = Math.min(Math.floor(timeoutMs / 500), 60);
         const checkInterval = setInterval(() => {
           attempts++;
           const errTab = sessions.tabs.find(
@@ -327,6 +380,32 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
           }
         }, 500);
       }
+      return;
+    }
+
+    // ── mcp_confirm：不可逆文件操作的人工确认（GUI 内渲染）──
+    //
+    // 命令确认走 exec_in_tab 分支，文件类操作（上传覆盖 / 删除 / 重命名 /
+    // 项目传输 / zmodem 上传）此前由 MCP 进程弹原生 MessageBoxW —— 用户在
+    // MyShell 窗口里操作时那个框藏在后面，而这类操作不可逆，漏看一次框就等于
+    // 漏掉一次确认。改为复用同一个 McpConfirmDialog。
+    if (action === "mcp_confirm" && event.payload.request_id) {
+      const { request_id, operation, connection_name, detail } = event.payload as {
+        request_id: string;
+        operation: string;
+        connection_name: string;
+        detail: string;
+      };
+      // The listener callback is synchronous (Tauri events), so the dialog
+      // promise is chained rather than awaited: `showMcpConfirm` parks its
+      // resolver until the user clicks, and the decision goes back over IPC.
+      // dialog 的 command 字段渲染全文并做危险片段高亮；detail 一并传入，
+      // 用户能看到完整对象与目标路径。
+      void showMcpConfirm(
+        `${operation}\n\n${detail}`,
+        connection_name || "MyShell",
+        [],
+      ).then((decision) => mcpConfirmResult(request_id, decision));
       return;
     }
 

@@ -76,11 +76,15 @@ Vault unlock priority: `--passphrase` flag > `MYSHELL_PASSPHRASE` env var > inte
 ### MCP server (`myshell-mcp`)
 
 Exposes SSH/SFTP operations as MCP tools for AI agents (Claude Desktop, Cursor, ZCode, etc.):
-- Tools (18): `list_connections`, `ssh_exec`, `ssh_run`, `ssh_status`, `ssh_cancel`, `sftp_list`, `sftp_download`, `sftp_upload`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, `upload_project`, `download_project`, `test_connection`, `screenshot_terminal`, `open_in_gui`, `zmodem_download`, `zmodem_upload`
+- Tools (21): `vault_status`, `list_connections`, `ssh_exec`, `ssh_run`, `ssh_status`, `ssh_cancel`, `ssh_read_text`, `sftp_list`, `sftp_download`, `sftp_upload`, `sftp_mkdir`, `sftp_remove`, `sftp_rename`, `upload_project`, `download_project`, `test_connection`, `screenshot_terminal`, `open_in_gui`, `zmodem_download`, `zmodem_upload`, `zmodem_status`
 - Transport: stdio, newline-delimited JSON-RPC 2.0 (MCP 2025-06-18 spec). Read side also accepts legacy LSP-style `Content-Length` framing for old clients (Claude Desktop et al).
 - Auth: NONE — the MCP server stores no passphrase and holds no DEK. All credential access is delegated to the GUI over a localhost IPC bridge (port + per-session auth token discovered via `<config_dir>/myshell/gui-ipc-port`; every command must carry the token or the GUI rejects it before dispatch — see Known incomplete spots).
 
-**Vault gate (fail-fast).** Every tool except `ssh_status` / `ssh_cancel` / `zmodem_status` requires the GUI's vault to be unlocked — including `list_connections`. The gate (`ensure_vault_ready` in `myshell-mcp.rs`):
+**Argument-encoding norm (阶段 186).** The `initialize` `instructions` carry a NORMATIVE rule (not a hint): commands containing any of `"` `'` `\` `$` backtick `{` `}` `|` `;` or a newline MUST go through `command_b64`; plain `command` stays supported for trivial cases and is explicitly NOT deprecated. `ssh_exec` / `ssh_run` schemas express the choice as `required: ["connection"]` + `anyOf: [command, command_b64]` — a mismatch here (required `command` while the server also accepts the b64 form) silently rejects valid calls in clients that validate schemas strictly; `tests::command_tools_accept_either_command_form` locks the two together. Human-facing spec, with the client-integration checklist, lives in `docs/mcp-integration-spec.md`. Malformed-JSON errors are raised by the CLIENT before the request arrives — the server cannot diagnose them, and the instructions say so explicitly.
+
+**Caller-facing contract (阶段 185).** `tools/call` runs on its own tokio task — stdin is read inline, so a slow command no longer blocks `ssh_status` / `ssh_cancel` or a second connection's call (responses are serialized through one `Mutex<BufWriter<Stdout>>`; on stdin EOF the process waits ≤30s for in-flight calls to flush). Two arguments reduce caller-side failures: `command_b64` (base64 shell command, accepted by `ssh_exec` / `ssh_run`, removes every character that needs JSON escaping) and `ssh_read_text` (escape-free file read: SFTP path, shell `cat` fallback with `shell_quote`). `ssh_exec` results carry `exit_code`, `stdout` (ANSI/OSC stripped), `duration_ms`, `timed_out`, `truncated`, `command`, `exit_code_source`; every tool failure carries `error_kind` (`permission_denied` / `user_denied` / `timeout` / `busy` / `connection_lost` / `connect_failed` / `vault_locked` / `bad_request` / `not_found` / `internal`) plus a `hint` — classify at the boundary via `classify_error`, don't re-derive it. Deliberately NOT added: a `confirm:false`-style caller-declared bypass and a `readonly_hint` parameter (both would let the AI self-authorize past the confirmation gate; `free` / `ss` / `journalctl` are already in the default whitelist).
+
+**Vault gate (fail-fast).** Every tool except `ssh_status` / `ssh_cancel` / `zmodem_status` / `vault_status` requires the GUI's vault to be unlocked — including `list_connections`. The gate (`ensure_vault_ready` in `myshell-mcp.rs`):
 1. Auto-launches `myshell.exe` when the GUI isn't running. A stale `gui-ipc-port` file (left by a crashed GUI) is detected by probing the port: connection refused → delete the file and relaunch; connected-but-unresponsive → error only (never relaunch — would trigger the single-instance "覆盖启动" flow and could kill a hung-but-alive instance).
 2. Queries the vault state ONCE. Locked → sends a `focus_unlock` IPC action (brings the GUI's password gate to the front), then returns an immediate actionable error. No silent waiting — the old 30s poll was removed.
 
@@ -92,6 +96,17 @@ Auto-configuration: The GUI settings panel (MCP → "一键配置全部") auto-d
 - Cursor: `<USERPROFILE>\.cursor\mcp.json` → `mcpServers.myshell.command`
 
 **Safety: dangerous operation confirmation.** `ssh_exec` / `ssh_run` use a configurable whitelist/blacklist (regex rules in `<config_dir>/myshell/mcp-command-rules.json`, editable in the GUI: 设置 → MCP 支持 → 命令确认规则): read-only commands (ps, ls, cat, ...) run without a dialog; dangerous ones (rm, kill, sudo, shutdown, write-redirects, ...) must be confirmed by a human. When `show_in_gui` is enabled (default) the confirmation is a React/Vue dialog in the GUI tab; headless fallback pops a native Windows `MessageBoxW`. The file tools `sftp_upload`, `sftp_remove`, `sftp_rename`, `upload_project`, `download_project`, and `zmodem_upload` ALWAYS confirm regardless of rules. "Cancel" returns a HARD STOP error (`denied_by_user_text` in `myshell-mcp.rs`; the GUI-path copy lives in `App.vue` — keep the two in sync): the AI must immediately stop ALL further operations (no retry, no alternative tool/path/connection workaround, no next task step), output a summary of the current task for the user, and wait for the user to explicitly decide whether to continue. The AI agent cannot bypass the dialog; async denials (ssh_run / zmodem_upload) surface the same text via `ssh_status` / `zmodem_status`.
+
+**登录门禁契约（阶段 187）**：门禁失败**绝不隐式等待**——客户端普遍 30s 砍请求，MCP 端死等必然双重失败。改为：
+- 失败返回结构化结果：`error_kind: "vault_locked"` + `vault_state`（`locked` / `not_initialized` / `gui_unavailable` / `ipc_unresponsive`）+ hint（重试**同一个**工具，不要改用其他工具）。所有变体的 `error_kind` 恒为 `vault_locked`（调用方修法一致），`vault_state` 只做细分。
+- AI 用 `vault_status`（豁免门禁，只返三个布尔，不泄漏任何连接元数据）每 5 秒轮询一次，约 2 分钟上限。门禁拦住 `vault_status` 会自相矛盾（锁定时永远查不到状态），所以它必须在豁免名单里。
+- 门禁状态由 `enum VaultGateError::state()` 导出，**不能**从中文错误文本匹配。
+
+**确认门的安全约束（阶段 187，勿回退）**：
+- GUI 可达性由 `GuiLaunchError::gui_reachable()` 判定，**绝不**用 `e.message.contains("未找到 myshell.exe")` 之类的字符串匹配 —— 那会让错误措辞成为安全策略的一部分，改文案即可能让高危命令静默执行。回归测试 `gui_reachability_comes_from_type_not_wording` 锁住这点。
+- `IpcUnresponsive` → `gui_reachable = true`：对话框没显示，但 GUI 进程在且端口在绑，**不得**再启动第二个（会触发单实例「覆盖启动」并可能杀掉挂起但仍开着的实例）。
+- 不可逆文件操作的确认（六个文件工具）在 GUI 内渲染，走 `mcp_confirm` IPC action；**180s 超时按 deny 处理** —— 不可逆操作里「用户没说好」必须读作「不」，读作「是」则等待超时反而变成放行。GUI 完全不可达时才回退原生 `MessageBoxW`。
+- 不要加 `confirm:false` / `readonly_hint` 这类让 AI 自我授权的旁路（与确认门设计前提冲突）。
 
 ### Rust backend (`src-tauri/src/`)
 

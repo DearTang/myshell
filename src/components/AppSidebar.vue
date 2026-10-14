@@ -644,7 +644,7 @@ const dragHintTarget = computed<string | null>(() => {
           v-if="row.kind === 'folder'"
           class="folder-row"
           :class="{ 'drop-target': row.isDropTarget }"
-          :style="{ paddingLeft: `${16 + row.node.depth * 14}px` }"
+          :style="{ paddingLeft: `${8 + row.node.depth * 12}px` }"
           :data-folder-path="row.node.path"
           @click="toggle(row.node.path)"
           @contextmenu="onFolderContext(row.node, $event)"
@@ -673,7 +673,7 @@ const dragHintTarget = computed<string | null>(() => {
           v-else
           class="conn-row"
           :class="{ 'is-dragged': dragState?.connId === row.conn.id }"
-          :style="{ paddingLeft: `${24 + row.depth * 14}px` }"
+          :style="{ paddingLeft: `${12 + row.depth * 12}px` }"
           tabindex="0"
           @pointerdown="onConnPointerDown(row.conn, row.noDrag, $event)"
           @dblclick="handleConnect(row.conn)"
@@ -892,7 +892,9 @@ const dragHintTarget = computed<string | null>(() => {
 
 /* ── 搜索框 ── */
 .search-box {
-  padding: 8px 12px;
+  /* 12→8：与列表行的左侧缩进节奏对齐（行 padding-left 8px + 行右 margin 6px），
+     否则输入框左缘会比下面所有行的 chevron 更靠右，视觉上像多缩进一级。 */
+  padding: 8px 8px 8px 8px;
   border-bottom: 1px solid var(--border-subtle);
 }
 /* MyInput 接管搜索框观感；这里只约束外层宽度 */
@@ -921,7 +923,11 @@ const dragHintTarget = computed<string | null>(() => {
 
 /* 文件夹行 */
 .folder-row {
-  padding: 7px 16px;
+  /* 左侧缩进只保留一处。此前是 margin-left:6px + padding-left:16px 叠加出 22px，
+     行首 chevron 之前留出一条空列（见 feedback 截图），侧栏最窄 200px 时白扔
+     1/10 宽度。这里去掉行的左外边距，内边距压到 8px —— 与右侧 16px 相比
+     刻意更窄，因为左侧还要叠 depth*12px 的层级缩进，两者相加才接近视觉平衡。 */
+  padding: 7px 16px 7px 8px;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -932,7 +938,9 @@ const dragHintTarget = computed<string | null>(() => {
   user-select: none;
   transition: background var(--duration-fast) var(--ease-out-expo), color var(--duration-fast) var(--ease-in-out);
   border-radius: var(--radius-md);
-  margin: 1px 6px 1px 6px;
+  /* 只保留右外边距：hover/drop 高亮的圆角背景靠它与右缘保持 6px 呼吸位，
+     左侧则由 padding-left 统一承担缩进，不再叠加（见上方注释）。 */
+  margin: 1px 6px 1px 0;
 }
 /* drop target 高亮只在 isDropTarget 时生效；非 target 时保持 hover 背景 */
 .folder-row:not(.drop-target):hover {
@@ -999,7 +1007,10 @@ const dragHintTarget = computed<string | null>(() => {
    全部让给连接名（侧栏只有 264px，长名形如「火山_115.190.136…」本来就常被截断）。
    左侧的 padding-left 由模板按层级 depth 动态覆盖，不受此处影响。 */
 .conn-row {
-  padding: 8px 2px 8px 24px;
+  /* 同 .folder-row：左侧缩进去掉行的 6px 外边距，内边距 24→12。
+     连接名在此之后右移 18px，264px 侧栏下长名多露一截（阶段 181 的右缘
+     贴边结论保持不变 —— 这里只动左边）。 */
+  padding: 8px 2px 8px 12px;
   cursor: grab;
   display: flex;
   align-items: center;
@@ -1009,7 +1020,7 @@ const dragHintTarget = computed<string | null>(() => {
   outline: none;
   transition: background var(--duration-fast) var(--ease-in-out), box-shadow var(--duration-fast) var(--ease-in-out);
   border-radius: var(--radius-md);
-  margin: 1px 0 1px 6px;
+  margin: 1px 0;
   /* 会话=叶子节点，比文件夹(菜单)权重更高：文件名主色已是最亮，
      再用 600 字重把它从"目录标题"里拎出来 */
   font-weight: 600;
