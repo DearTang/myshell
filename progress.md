@@ -7728,3 +7728,34 @@ AI 客户端（使用方）提交了一份 13 条的意见书，附现场失败�
 | 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。 |
 | 什么可能导致偏离？ | ① 又凭推测断言根因而不 grep 证伪（「脚本只推 GitHub」就是错的）；② 把 `.zcode/` 删到磁盘（那是用户的调试脚手架，只该 untrack）；③ 加了校验但不真的执行 —— 校验不跑等于没有。 |
 | 下一步最小可验证动作？ | `git ls-remote` 三个 SHA 逐一比对，确认双远端一致。 |
+
+
+### 阶段 192 —— 发布脚本差点把别的项目的二进制发出去（mtime 选资产）
+
+**发生了什么**：v2.17.1 首次发布时，Gitee release挂上去的资产是 **`OMP Desktop_1.42.0_x64-setup.exe`** —— 另一个项目的安装包。
+
+**根因**：`publish-*.mjs` 定位安装包的逻辑是「`nsis` 目录下 **mtime 最新**的 `*-setup.exe`」。本机 `CARGO_TARGET_DIR`（`G:\Rust\cargo_target`）与另一个项目共用，`bundle/nsis/` 里躺着 **88 个** setup.exe，其中绝大多数是 `OMP Desktop_*`。上一轮 v2.17.0 发布的产物 mtime 恰好最新，脚本就挑中了它。**「最新 = 刚构建的」这个假设在共享 target 目录下不成立。**
+
+**修复**：
+- 改为**按版本号匹配文件名**（`MyShell_<version>[-_]x64-setup.exe`），不再看 mtime
+- 匹配不到时才回退 mtime，并在 stderr 打 `[warn]` 明说「请确认发布的是正确产物」—— 静默回退才是这类 bug 的真正帮凶
+- 实测：目录 88 个 exe，`2.17.1` 精确命中 `MyShell_2.17.1_x64-setup.exe`，`2.17.0` 命中对应文件，`9.9.9` 返回空（正确触发回退+告警），且**不会**误选 OMP Desktop
+
+**Gitee 上的补救**（API 不提供资产删除）：
+Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 404，**资产无法单独删除**。只能删掉整个 release（`DELETE /releases/{id}` → 204）再用显式 `asset-path` 重建。最终 release id `1205602`，资产 `MyShell_2.17.1_x64-setup.exe`（13426296 字节，与本地一致）。GitHub 侧因发布脚本支持 `asset-path` 参数，直接显式传路径即可。
+
+**其他**：
+- GitHub push 首次超时：清掉 remote URL 里的 PAT 后，GCM 需要走一次交互取凭据，非交互 shell 里卡住。`GIT_TERMINAL_PROMPT=0` 会直接失败（凭据未落盘到当前进程），去掉即可正常走GCM（Windows 凭据管理器里 `git:https://github.com` 条目本就存在）。
+- 三 SHA 校验（本轮新加的规则）实际执行：`origin` / `github` / 本地 HEAD 均为 `af6e509`，通过。
+
+**踩到的坑（跨层转义）**：用 Python heredoc 改 JS 正则时，`\\` / `\` 在 Python 字符串 → JS 源码 → 正则字面量三层传递中被吃掉，最终得到 `/2\.17\.1[^/\]*-setup\.exe$/i` 这种非法正则（`Unterminated character class`）。**改正则要减少转义层数**：用 `version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[-_]x64-setup\\.exe$"` 这种「字符串拼接 + 只转义一次」的形式，比在模板字符串里拼复杂字符类稳。
+
+**五问重启检查**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 修了两个 publish 脚本的资产定位（按版本而非 mtime），并清理了 Gitee 上发错的 release。 |
+| 什么是我没做的？ | 没删 `bundle/nsis/` 里的 OMP Desktop 产物（那是别的项目的，不归我管）；没给选择逻辑加自动化测试文件（用一次性脚本验过即删）。 |
+| 我想去哪里？ | 若共享 target 目录问题持续，考虑给构建产物按项目分目录。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。 |
+| 什么可能导致偏离？ | ① 靠「mtime 最新」判断「刚构建的产物」—— 共享目录下必错；② 正则跨 Python/JS 多层转义；③ 以为 Gitee 能删单个资产，实际只能删整个 release。 |
+| 下一步最小可验证动作？ | 下次发版不传 `asset-path`，确认脚本自动选中正确文件。 |

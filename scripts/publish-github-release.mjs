@@ -127,6 +127,17 @@ async function resolveAsset() {
   if (exes.length === 0) {
     throw new Error(`目录下没有 *-setup.exe: ${nsisDir}`);
   }
+  // 按版本号匹配，绝不用「mtime 最新」：本机 CARGO_TARGET_DIR 与另一个项目
+  // 共用，nsis 目录里混有别人的安装包（v2.17.1 发布时"最新"的是
+  // OMP Desktop_1.42.0_x64-setup.exe，差点把别人的二进制发出去）。
+  const wanted = new RegExp(version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[-_]x64-setup\\.exe$");
+  const matches = exes.filter((f) => wanted.test(f));
+  if (matches.length > 0) return join(nsisDir, matches[0]);
+
+  console.warn(
+    `[warn] 没有匹配版本 ${version} 的安装包（目录: ${nsisDir}），` +
+      `回退到 mtime 最新的文件。请确认发布的是正确产物。`
+  );
   let newest = null;
   let newestMtime = 0;
   for (const f of exes) {

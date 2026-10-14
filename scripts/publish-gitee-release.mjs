@@ -142,7 +142,20 @@ async function resolveAsset() {
   if (exes.length === 0) {
     throw new Error(`目录下没有 *-setup.exe: ${nsisDir}`);
   }
-  // Pick the most recently built installer (matches the version we just built).
+  // Pick the installer for THIS version, by name. Never by mtime: this
+  // machine's CARGO_TARGET_DIR is shared with another project, so the nsis
+  // dir also holds unrelated installers (e.g. "OMP Desktop_1.42.0_...exe").
+  // "newest wins" silently picked that one during the v2.17.1 release and
+  // shipped someone else's binary. Fall back to mtime ONLY when no file
+  // matches the version at all, and say so out loud.
+  const wanted = new RegExp(version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "[-_]x64-setup\\.exe$");
+  const matches = exes.filter((f) => wanted.test(f));
+  if (matches.length > 0) return join(nsisDir, matches[0]);
+
+  console.warn(
+    `[warn] 没有匹配版本 ${version} 的安装包（目录: ${nsisDir}），` +
+      `回退到 mtime 最新的文件。请确认发布的是正确产物。`
+  );
   let newest = null;
   let newestMtime = 0;
   for (const f of exes) {
