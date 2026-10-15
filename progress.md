@@ -7831,3 +7831,42 @@ Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 4
 | 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。 |
 | 什么可能导致偏离？ | ① 给 GitHub push 加 `GIT_TERMINAL_PROMPT=0`（会直接失败）；② 认为「mtime 最新 = 刚构建的」（共享目录下必错）；③ staging 条目归属按「哪一轮写的」而非「是否已随版本发布」来判。 |
 | 下一步最小可验证动作？ | 下载 v2.17.2 安装包，确认侧栏连接行密度符合预期。 |
+
+
+### 阶段 195 —— myui v0.30.1 → v1.1.1，连接图标切换为 myui 线性图标，默认窗宽 1300
+
+**做了什么**：
+- `myui` 从 `git+...#v0.30.1` 升到 `#v1.1.1`。v1.0.0 是约 70 处内部缺陷的修复大版本（changelog 明确「组件 API 全部向后兼容，可从任意 0.3x 直升」）；v1.1.0 新增四枚连接语义自绘图标；v1.1.1 把 `Sftp`/`Ftp` 从「屏幕内小字」改为协议名直接作字标 —— 恰好消掉 v1.1.0 changelog 自己警告的「16px 屏内小字发糊」问题
+- **`ConnIcon.vue`（规范源）**：渲染从 `<i class="iconfont">` 改为 `<MyIcon :name>`；映射更名 `CONN_ICON_CLASS` → `CONN_ICON_NAME`（值改为 `Server`/`Sftp`/`Ftp`/`LocalTerminal`）；`CONN_COLOR` 四色（蓝/紫/橙/灰）原样保留
+- **`AppSidebar.vue` / `RecycleDialog.vue`**：各自删除本地复制的映射（各约 12-20 行），改用 `<ConnIcon>` 组件 —— 图标与语义色从此只有 `ConnIcon` 一个来源。`class="conn-icon"` 透传保留 `flex-shrink:0`
+- **删除 `src/assets/iconfont/`**（css+ttf）：iconfont 字体只服务这四个图标，切换后全仓零引用（grep 确认），死重清除
+- **默认窗宽 1200 → 1300**（`tauri.conf.json`，高度本就是 800）
+
+**踩到的坑（包管理器）**：项目用 **pnpm**（`pnpm-lock.yaml` + `node_modules/.pnpm`），我按惯性跑了 `npm install` —— 报 `Cannot read properties of null (reading 'matches')` 且什么都没装上。正确姿势 `pnpm install --no-frozen-lockfile`（先更新 lockfile）30 秒装完。**下次改依赖一律 pnpm。**
+
+**冒烟验证的边界**（如实记录）：
+- `npm run test:ts` exit 0、`vite build` 14.8s 通过
+- dev server + 浏览器：页面正常启动，控制台仅有**一条环境预期报错** —— `WindowControls.vue:24` 的 `getCurrentWindow()` 在纯浏览器里读 `window.__TAURI_INTERNALS__.metadata` 必然 undefined（`@tauri-apps/api/window.js:85`），真实 Tauri 应用中不存在。**与 myui 升级无关**（升级前同样报）
+- **图标名的解析链是静态验证的**：保险库门禁挡住侧栏，`ConnIcon` 未真实挂载。已核对 myui v1.1.1 源码解析链：`line-icons.ts`（`Server`/`Sftp`/`Ftp`/`LocalTerminal` 四个键）→ `icons/index.ts:119` 展开进注册表 → `MyIcon.vue` 按 name 查表。若名字错会有 Vue Unknown icon 告警，控制台没有
+- **最终视觉（16px 下四枚图标的实际观感、四色区分度）需要你在真实应用里过目** —— 这是本轮唯一未闭环的验证
+
+**五问重启检查**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | myui 直升 v1.1.1；连接图标收口到 ConnIcon 单一来源并切 myui 线性图标；删 iconfont 死资产；默认窗宽 1300。 |
+| 什么是我没做的？ | 未在真实 Tauri 应用里目视图标观感（需要用户）；未删 `debug-shell.*`（用户文件）。 |
+| 我想去哪里？ | 用户确认观感后，若 `Sftp`/`Ftp` 字标在 16px 仍偏糊，考虑该场景升到 18px。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，已连续多轮顺延）。 |
+| 什么可能导致偏离？ | ① 改依赖用 npm（本项目是 pnpm）；② 把浏览器的 `__TAURI_INTERNALS__` 报错当成升级回归去追；③ 映射散落多处的老结构回潮（新增消费方时必须用 ConnIcon 组件而非复制映射）。 |
+| 下一步最小可验证动作？ | 用户打开真实应用看侧栏：四枚图标形状、四色区分、与 23px 行高的对齐。 |
+
+
+### 阶段 196 —— 发布 v2.18.0
+
+**做了什么**：按 `打包` 规则走完流水线。
+- 版本 2.17.2 → **2.18.0**（staging 含 ✨新增 → minor）
+- 预检查双通过：`cargo check` 0 error（顺带把 `Cargo.lock` 刷到 2.18.0 —— sync-version 不动 lock，靠 cargo 命令刷新，这在阶段 189 漏提交 lock 时埋过雷，现发布前必核对）
+- 构建 `MyShell_2.18.0_x64-setup.exe` → 提交 `release: v2.18.0` → 双远端推送（三 SHA 校验）→ 双平台 release（Gitee 脚本不传 `asset-path`，自动按版本号选中正确安装包 —— 阶段 192 的修复第二次在真实路径验证）→ 清空 staging
+- 本次发布内容：myui v1.1.1 直升、连接图标切换为自绘线性图标（来源收口到 ConnIcon）、默认窗宽 1300、移除 iconfont 死资产
+
+**待办顺延**：`command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。

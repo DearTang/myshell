@@ -1,20 +1,22 @@
-<!-- 连接类型图标：渲染自打包的 iconfont 字体（iconfont.cn）。
-     Glyph 映射（见 src/assets/iconfont/iconfont.css）：
-       ssh   → icon-fuwuqi  (服务器)
-       sftp  → icon-SFTP
-       ftp   → icon-ftp
-       local → icon-diannao (电脑)
+<!-- 连接类型图标：渲染 myui 的线性图标（v1.1.1 起提供四枚连接语义图标）。
+     名称映射（myui line-icons）：
+       ssh   → Server         两节机架服务器
+       sftp  → Sftp           协议名字标
+       ftp   → Ftp            协议名字标
+       local → LocalTerminal  笔记本 + `>` 提示符
      颜色默认取 CONN_COLOR 的类型语义色；size 控制字号（px）。
-     取代了旧的 emoji 方案（🖥️ / 📁 / 📤 / 💻，跨平台渲染不一致）。 -->
+     历史：emoji（🖥️/📁/📤/💻，跨平台渲染不一致）→ iconfont 字体
+     （icon-fuwuqi 等，需维护 ttf 资产）→ 现版本直接用 myui 图标，
+     ttf 资产已随之删除。 -->
 <script lang="ts">
 import type { ConnType } from "@/api";
 
-/** ConnType → iconfont 类名映射；未知/缺省回退 ssh。 */
-export const CONN_ICON_CLASS: Record<ConnType, string> = {
-  ssh: "icon-fuwuqi",
-  sftp: "icon-SFTP",
-  ftp: "icon-ftp",
-  local: "icon-diannao",
+/** ConnType → myui MyIcon 名称映射；未知/缺省回退 ssh。 */
+export const CONN_ICON_NAME: Record<ConnType, string> = {
+  ssh: "Server",
+  sftp: "Sftp",
+  ftp: "Ftp",
+  local: "LocalTerminal",
 };
 
 /**
@@ -32,6 +34,7 @@ export const CONN_COLOR: Record<ConnType, string> = {
 
 <script setup lang="ts">
 import { computed } from "vue";
+import { MyIcon } from "myui";
 
 defineOptions({ name: "ConnIcon" });
 
@@ -47,8 +50,8 @@ const props = withDefaults(
   { size: 16 },
 );
 
-const cls = computed(
-  () => (props.type ? CONN_ICON_CLASS[props.type] || CONN_ICON_CLASS.ssh : CONN_ICON_CLASS.ssh),
+const iconName = computed(
+  () => (props.type ? CONN_ICON_NAME[props.type] || CONN_ICON_NAME.ssh : CONN_ICON_NAME.ssh),
 );
 
 const color = computed(
@@ -57,11 +60,11 @@ const color = computed(
 </script>
 
 <template>
-  <i
-    class="iconfont"
-    :class="cls"
+  <MyIcon
+    :name="iconName"
+    :size="size"
     :title="name"
     :aria-hidden="name ? undefined : true"
-    :style="{ fontSize: `${size}px`, color }"
+    :style="{ color }"
   />
 </template>

@@ -14,6 +14,7 @@ import {
   purgeConnection,
   purgeAllDeletedConnections,
 } from "@/api";
+import ConnIcon from "./ConnIcon.vue";
 import { reloadConnections } from "@/store/connections";
 
 defineOptions({ name: "RecycleDialog" });
@@ -97,29 +98,6 @@ async function handlePurgeAll(): Promise<void> {
   }
 }
 
-// ── 连接类型图标（沿用旧 iconfont 类与 ConnIcon 的配色映射） ──
-const CONN_ICON_CLASS: Record<ConnType, string> = {
-  ssh: "icon-fuwuqi",
-  sftp: "icon-SFTP",
-  ftp: "icon-ftp",
-  local: "icon-diannao",
-};
-
-const CONN_COLOR: Record<ConnType, string> = {
-  ssh: "var(--accent-primary)",
-  sftp: "var(--accent-secondary)",
-  ftp: "var(--warning)",
-  local: "var(--text-secondary)",
-};
-
-function connIconClass(connType: ConnType): string {
-  return CONN_ICON_CLASS[connType] || CONN_ICON_CLASS.ssh;
-}
-
-function connColor(connType: ConnType): string {
-  return CONN_COLOR[connType] || CONN_COLOR.ssh;
-}
-
 /** Format an ISO timestamp as a Chinese relative-time string ("3 分钟前"). */
 function relativeTime(iso: string): string {
   const then = new Date(iso).getTime();
@@ -198,11 +176,7 @@ function relativeTime(iso: string): string {
       />
       <template v-else>
         <div v-for="item in items" :key="item.id" class="row">
-          <i
-            class="iconfont conn-icon"
-            :class="connIconClass((item.conn_type as ConnType) || 'ssh')"
-            :style="{ color: connColor((item.conn_type as ConnType) || 'ssh') }"
-          ></i>
+          <ConnIcon class="conn-icon" :type="(item.conn_type as ConnType) || 'ssh'" />
           <div class="row-info">
             <div class="row-name" :title="item.name">{{ item.name }}</div>
             <div class="row-meta">

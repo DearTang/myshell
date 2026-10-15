@@ -33,6 +33,7 @@ import {
   renameFolder,
   saveFolder,
 } from "@/api";
+import ConnIcon from "./ConnIcon.vue";
 import { connectionsStore, reloadConnections } from "@/store/connections";
 import { connect } from "@/store/sessions";
 import { openConnectionDialog, setThemeChoice, ui } from "@/store/ui";
@@ -105,21 +106,7 @@ function buildTree(conns: ConnectionConfig[], folders: string[]): FolderNode {
   return root;
 }
 
-// 连接类型图标来自 src/assets/iconfont (iconfont.cn)，全局已在 app.css 引入。
-// Sidebar / TabBar / ConnectionDialog 统一用同一映射渲染，保证跨平台一致。
-const CONN_ICON_CLASS: Record<ConnType, string> = {
-  ssh: "icon-fuwuqi",
-  sftp: "icon-SFTP",
-  ftp: "icon-ftp",
-  local: "icon-diannao",
-};
-/** 语义色按连接类型区分（与旧 ConnIcon 一致），供侧栏/标签栏/编辑框共用色觉。 */
-const CONN_COLOR: Record<ConnType, string> = {
-  ssh: "var(--accent-primary)",
-  sftp: "var(--accent-secondary)",
-  ftp: "var(--warning)",
-  local: "var(--text-secondary)",
-};
+// 连接类型图标与语义色统一来自 ConnIcon.vue（myui MyIcon：Server/Sftp/Ftp/LocalTerminal）。
 function connTypeOf(conn: ConnectionConfig): ConnType {
   return conn.conn_type || "ssh";
 }
@@ -680,12 +667,7 @@ const dragHintTarget = computed<string | null>(() => {
           @keydown.enter="handleConnect(row.conn)"
           @contextmenu.prevent
         >
-          <i
-            class="iconfont conn-icon"
-            :class="CONN_ICON_CLASS[connTypeOf(row.conn)]"
-            :style="{ fontSize: '16px', color: CONN_COLOR[connTypeOf(row.conn)] }"
-            aria-hidden="true"
-          ></i>
+          <ConnIcon class="conn-icon" :type="connTypeOf(row.conn)" :size="16" />
           <div
             class="conn-main"
             :title="`${row.conn.name}${row.conn.host ? `\n${row.conn.host}${row.conn.port ? `:${row.conn.port}` : ''}` : ''}`"

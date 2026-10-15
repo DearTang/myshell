@@ -4,8 +4,6 @@
    颜色一律引用令牌，禁止硬编码色值。
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* iconfont（iconfont.cn）— 连接类型图标（ssh/sftp/ftp/local），保留旧资源 */
-@import "../assets/iconfont/iconfont.css";
 
 /* ─── MyShell 令牌层：默认（暗色 Carbon） ─── */
 :root,

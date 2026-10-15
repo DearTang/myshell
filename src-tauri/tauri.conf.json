@@ -42,7 +42,7 @@
     "windows": [
       {
         "title": "MyShell - SSH/SFTP Client",
-        "width": 1200,
+        "width": 1300,
         "height": 800,
         "minWidth": 800,
         "minHeight": 600,
