@@ -97,9 +97,10 @@ Auto-configuration: The GUI settings panel (MCP → "一键配置全部") auto-d
 
 **Safety: dangerous operation confirmation.** `ssh_exec` / `ssh_run` use a configurable whitelist/blacklist (regex rules in `<config_dir>/myshell/mcp-command-rules.json`, editable in the GUI: 设置 → MCP 支持 → 命令确认规则): read-only commands (ps, ls, cat, ...) run without a dialog; dangerous ones (rm, kill, sudo, shutdown, write-redirects, ...) must be confirmed by a human. When `show_in_gui` is enabled (default) the confirmation is a React/Vue dialog in the GUI tab; headless fallback pops a native Windows `MessageBoxW`. The file tools `sftp_upload`, `sftp_remove`, `sftp_rename`, `upload_project`, `download_project`, and `zmodem_upload` ALWAYS confirm regardless of rules. "Cancel" returns a HARD STOP error (`denied_by_user_text` in `myshell-mcp.rs`; the GUI-path copy lives in `App.vue` — keep the two in sync): the AI must immediately stop ALL further operations (no retry, no alternative tool/path/connection workaround, no next task step), output a summary of the current task for the user, and wait for the user to explicitly decide whether to continue. The AI agent cannot bypass the dialog; async denials (ssh_run / zmodem_upload) surface the same text via `ssh_status` / `zmodem_status`.
 
-**登录门禁契约（阶段 187）**：门禁失败**绝不隐式等待**——客户端普遍 30s 砍请求，MCP 端死等必然双重失败。改为：
-- 失败返回结构化结果：`error_kind: "vault_locked"` + `vault_state`（`locked` / `not_initialized` / `gui_unavailable` / `ipc_unresponsive`）+ hint（重试**同一个**工具，不要改用其他工具）。所有变体的 `error_kind` 恒为 `vault_locked`（调用方修法一致），`vault_state` 只做细分。
-- AI 用 `vault_status`（豁免门禁，只返三个布尔，不泄漏任何连接元数据）每 5 秒轮询一次，约 2 分钟上限。门禁拦住 `vault_status` 会自相矛盾（锁定时永远查不到状态），所以它必须在豁免名单里。
+**登录门禁契约（阶段 187 → 阶段 198 修订）**：门禁先**调用内短等待**，超时才结构化报错。阶段 187 的「绝不等待」是因为客户端普遍 30s 砍请求，MCP 端死等 30s 必然双重失败；阶段 198 实测发现多数 AI 客户端收到 `vault_locked` 后不轮询而是直接转述，用户解锁后还得人工说「我解锁了」。修订为：
+- 锁定时：`focus_unlock` 置顶窗口 → **调用内等待最长 20 秒**（`VAULT_UNLOCK_WAIT_PROBES` × 2s，`wait_for_unlock`）。期间解锁 → 本次调用直接继续执行。20s 上限刻意低于客户端 ~30s 预算：等待失败仍能返回结构化错误而非传输超时（未回退到死等）。每个 tools/call 独立 tokio 任务（阶段 185），停靠不阻塞其他调用。`not_initialized` 不等待（长流程）。
+- 超时返回结构化结果：`error_kind: "vault_locked"` + `vault_state`（`locked` / `not_initialized` / `gui_unavailable` / `ipc_unresponsive`）+ hint（重试**同一个**工具，不要改用其他工具）。所有变体的 `error_kind` 恒为 `vault_locked`（调用方修法一致），`vault_state` 只做细分。
+- `vault_status`（豁免门禁，只返三个布尔，不泄漏任何连接元数据）退为**兜底**：仅当重试仍以 `vault_locked` 失败时才每 5 秒轮询，约 2 分钟上限。门禁拦住 `vault_status` 会自相矛盾（锁定时永远查不到状态），所以它必须在豁免名单里。
 - 门禁状态由 `enum VaultGateError::state()` 导出，**不能**从中文错误文本匹配。
 
 **确认门的安全约束（阶段 187，勿回退）**：

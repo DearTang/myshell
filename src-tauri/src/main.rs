@@ -4723,6 +4723,14 @@ fn set_windows_app_user_model_id() {}
 
 // ============ Single-instance guard ============
 //
+// Set once the app starts exiting, so the IPC port-file watchdog stops
+// re-publishing the file while ExitRequested deletes it. Otherwise the
+// watchdog can win the race and leave a stale port behind that outlives the
+// process.
+static GUI_SHUTTING_DOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+//
 // Detect a running MyShell GUI at startup, before any window/DB work. If one
 // is found, pop a native dialog: [是] restart (kill the old instance, keep
 // starting this one) / [否] quit (leave the old instance alone, exit now).
@@ -4870,6 +4878,9 @@ fn acquire_single_instance_lock() -> Result<bool, String> {
 fn ask_restart_or_quit() -> bool {
     use std::os::raw::{c_int, c_void};
     use std::os::windows::ffi::OsStrExt;
+    use winapi::um::winuser::{
+        MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_YESNO,
+    };
 
     const BTN_QUIT: c_int = 100;
     const BTN_OVERWRITE: c_int = 101;
@@ -5011,11 +5022,29 @@ fn ask_restart_or_quit() -> bool {
         )
     };
     if hr < 0 {
+        // TaskDialogIndirect is only reliable once comctl32 v6 is actually
+        // loaded. On machines where it isn't (observed: always E_INVALIDARG,
+        // and in a host without the v6 side-by-side even a missing entry
+        // point), silently defaulting to "quit" makes the second instance
+        // vanish without a word — the user double-clicks MyShell, sees
+        // nothing happen, and the MCP server's auto-launch burns its full
+        // 30s budget waiting for an instance that will never come.
+        //
+        // MessageBoxW needs no common-controls version, so fall back to it
+        // rather than dropping the dialog entirely. Both answers still mean
+        // what they meant before: 覆盖启动 (true) / 退出 (false).
         log::warn!(
-            "[single-instance] TaskDialogIndirect 失败 hr={}，默认按退出处理",
+            "[single-instance] TaskDialogIndirect 失败 hr={}，回退到 MessageBoxW 询问",
             hr
         );
-        return false;
+        return unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                content.as_ptr(),
+                title.as_ptr(),
+                MB_YESNO | MB_ICONQUESTION | MB_SYSTEMMODAL | MB_SETFOREGROUND,
+            ) == IDYES
+        };
     }
     // Cancel (X button) → clicked == 0 → falls through to "false" = quit,
     // which is the safe choice: never overwrite on an ambiguous result.
@@ -5464,15 +5493,64 @@ pub fn run() {
                     // Write the port file so the MCP server can discover us.
                     // Two lines: "<port>\n<token>". Single-line (port only)
                     // is the pre-token format — readers accept both.
-                    if let Some(dir) = dirs::config_dir() {
-                        let myshell_dir = dir.join("myshell");
-                        let _ = std::fs::create_dir_all(&myshell_dir);
-                        let port_file = myshell_dir.join("gui-ipc-port");
-                        if let Err(e) = std::fs::write(&port_file, format!("{}\n{}", port, ipc_token)) {
-                            log::error!("[ipc] failed to write port file: {}", e);
-                        } else {
-                            log::info!("[ipc] GUI IPC listener on 127.0.0.1:{}", port);
+                    //
+                    // This is written ONCE and then re-asserted by the
+                    // watchdog below: anything that deletes this file (the
+                    // MCP's stale-file cleanup racing a fresh boot, a file
+                    // cleaner, a sync client) otherwise makes a perfectly
+                    // healthy GUI permanently undiscoverable — every later
+                    // MCP call then spawns a doomed second instance and waits
+                    // out its 30s budget.
+                    let port_file = dirs::config_dir().map(|d| d.join("myshell").join("gui-ipc-port"));
+                    let published = match &port_file {
+                        Some(p) => {
+                            if let Some(dir) = p.parent() {
+                                let _ = std::fs::create_dir_all(dir);
+                            }
+                            match std::fs::write(p, format!("{}\n{}", port, ipc_token)) {
+                                Ok(()) => {
+                                    log::info!("[ipc] GUI IPC listener on 127.0.0.1:{}", port);
+                                    true
+                                }
+                                Err(e) => {
+                                    log::error!("[ipc] failed to write port file: {}", e);
+                                    false
+                                }
+                            }
                         }
+                        None => {
+                            log::error!("[ipc] 无法定位 config_dir，端口文件未发布");
+                            false
+                        }
+                    };
+
+                    if let (true, Some(path)) = (published, port_file.clone()) {
+                        let token = ipc_token.clone();
+                        std::thread::spawn(move || {
+                            loop {
+                                std::thread::sleep(std::time::Duration::from_secs(5));
+                                // ExitRequested deletes this file; stop
+                                // resurrecting it while the app is shutting
+                                // down (the process exits seconds later, but
+                                // a resurrected file would outlive us as a
+                                // stale port and make the MCP relaunch).
+                                if GUI_SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                                    return;
+                                }
+                                let still_ours = std::fs::read_to_string(&path)
+                                    .map(|c| c.split_whitespace().nth(1) == Some(token.as_str()))
+                                    .unwrap_or(false);
+                                if !still_ours {
+                                    match std::fs::write(&path, format!("{}\n{}", port, token)) {
+                                        Ok(()) => log::warn!(
+                                            "[ipc] gui-ipc-port 丢失或被覆盖，已重新发布（端口 {}）",
+                                            port
+                                        ),
+                                        Err(e) => log::error!("[ipc] 重新发布端口文件失败: {}", e),
+                                    }
+                                }
+                            }
+                        });
                     }
 
                     // Accept loop — one command per connection (the MCP server
@@ -6155,6 +6233,7 @@ fn read_ipc_line(reader: &mut std::io::BufReader<std::net::TcpStream>) -> IpcLin
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::ExitRequested { .. } = event {
+            GUI_SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
             drain_all_sessions(app_handle);
             // Clean up the IPC port file so a stale file doesn't mislead the
             // MCP server into thinking the GUI is still running.

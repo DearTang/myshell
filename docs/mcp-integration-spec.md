@@ -162,19 +162,21 @@ content = {"connection":"prod-db","command":"..."}     // ← 要这样
 - 用户可能需要先切换到 MyShell 窗口才能看到弹窗。若 MyShell 完全不可用（未安装 / 已挂起），回退到原生弹窗。
 - **180 秒无响应 = 拒绝**。这是刻意的：不可逆操作里「用户没说好」必须读作「不」。若读作「是」，则「一直等下去」反而变成无条件放行。
 
-## 登录门禁的等待契约（阶段 187）
+## 登录门禁的等待契约（阶段 187 → 阶段 198 修订）
 
-MyShell **不**在任何单个工具调用里等待主密码。原因是协议层的：多数 MCP 客户端在一个请求上 30 秒左右就会放弃，隐式等待会让客户端和用户同时失败。
+**阶段 187** 曾规定：门禁**绝不**在单个工具调用里等待主密码，锁定即返回错误，由 AI 用 `vault_status` 轮询。修订原因（阶段 198 的实测）：多数 AI 客户端收到 `vault_locked` 后并不轮询，而是直接把错误转述给用户——用户解锁后还得人工说一句「我解锁了」才能继续，等于把等待成本转嫁成一轮对话。
 
-契约如下：
+**当前契约（阶段 198）**——调用内短等待优先，轮询退为兜底：
 
-1. 门禁失败时返回 `isError: true`、`error_kind: "vault_locked"`、以及 `vault_state`（`locked` / `not_initialized` / `gui_unavailable` / `ipc_unresponsive`）与一段 `hint`。`error_kind` 对所有状态恒定（调用方的修法永远是「让用户解锁后重试」），`vault_state` 只用于细分展示。
-2. AI 调用 `vault_status`（**豁免门禁**，只返回 `gui_running` / `initialized` / `unlocked` 三个布尔，不泄漏任何连接元数据）轮询状态，约每 5 秒一次、最多约 2 分钟。
-3. `vault_state` 变为 `unlocked` 后，AI 重试**同一个**工具。不要改用其他工具 —— 用只读探针替代真正的操作会改变语义（例如拿 `list_connections` 顶替一次上传，什么也没发生）。
+1. 门禁发现保险库锁定时，先把 MyShell 窗口置顶（`focus_unlock`），然后**在本次调用内等待，最长 20 秒**（每 2 秒查一次）。用户在此窗口内解锁 → 本次调用**直接继续执行**，无需 AI 中转、无需用户报状态。
+2. 等待超时才返回 `isError: true`、`error_kind: "vault_locked"`、`vault_state`（`locked` / `not_initialized` / `gui_unavailable` / `ipc_unresponsive`）与 `hint`。`error_kind` 对所有状态恒定（调用方的修法永远是「让用户解锁后重试」），`vault_state` 只用于细分展示。
+3. 20 秒的上限是刻意选在客户端 ~30 秒请求预算**之下**：等待失败时错误仍能在预算内返回结构化结果，而不是死等成传输超时（这正是阶段 187 当初砍掉 30s 死等的根因，未回退）。每个 `tools/call` 跑在独立 tokio 任务上（阶段 185），停靠的调用不会阻塞 `ssh_status` 或其他连接的调用。
+4. `not_initialized` **不等待**（首次设置主密码是长流程，调用内等待无意义），立即返回。
+5. AI 侧对 `vault_locked` 的处理：先转述「窗口已置顶、本次已等 20 秒仍未解锁」，等用户确认后重试**同一**工具；只有重试仍以同样方式失败时，才改用 `vault_status`（**豁免门禁**，只返回三个布尔）每 ~5 秒轮询、上限约 2 分钟，查到 `unlocked` 后重试原工具。不要改用其他工具——用只读探针替代真正的操作会改变语义。
 
 | 你看到 | 你应该 |
 |---|---|
-| `error_kind: vault_locked`, `vault_state: "locked"` | 请用户在 MyShell 里输入主密码，`vault_status` 轮询到 `unlocked` 后重试原工具 |
-| `error_kind: vault_locked`, `vault_state: "not_initialized"` | 请用户在 MyShell 中完成主密码初始化 |
+| 工具停留 ~20 秒后返回 `vault_locked`, `vault_state: "locked"` | 用户没来得及解锁。转述后等用户确认，重试同一工具；再次失败才转 `vault_status` 轮询 |
+| `error_kind: vault_locked`, `vault_state: "not_initialized"` | 请用户在 MyShell 中完成主密码初始化（无调用内等待） |
 | `error_kind: vault_locked`, `vault_state: "gui_unavailable"` | 请用户先打开 MyShell 桌面应用 |
 | `error_kind: vault_locked`, `vault_state: "ipc_unresponsive"` | GUI 进程可能在挂起，请用户检查/重启 `myshell.exe` |

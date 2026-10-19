@@ -367,8 +367,7 @@ FILE TRANSFER (strict two-step policy):\n\
 1. ALWAYS try `zmodem_download`/`zmodem_upload` FIRST for any file upload/download request (ZMODEM over the remote `sz`/`rz` programs). It works in restricted environments where the SFTP channel is unavailable.\n\
 2. If the zmodem task FAILS for a TECHNICAL reason, fall back to `sftp_download`/`sftp_upload`. Common zmodem failure reasons: the remote lacks lrzsz (`sz`/`rz` not installed — the task fails after ~20s), transfer timeout, or the remote refuses the SSH channel. Tell the user: 'zmodem 失败，改用 SFTP 方式传输'.\n\
 3. To READ a file's content into the conversation, use `ssh_read_text` (it handles quoting and encoding internally) — never build a `cat`/`echo`/base64 workaround by hand. To TRANSFER a file (upload/download to local disk), use the two-step transfer policy above; NEVER — it is fragile, slow, and breaks on binary/large files. If both zmodem and sftp fail, tell the user and stop; do NOT invent a workaround.\n\
-\n\
-VAULT GATE (applies to EVERY tool except ssh_status/ssh_cancel/zmodem_status): MyShell stores all connection credentials in an encrypted vault. If the MyShell GUI isn't running, the tool AUTO-LAUNCHES it. If the vault is locked, the tool FAILS IMMEDIATELY (no waiting) with '保险库未解锁' and brings the MyShell window to the front. When you see this error: tell the user to enter their master password in the MyShell window, then RETRY the same tool — do NOT switch to a different approach. The zmodem → sftp fallback only applies when the failure is about ZMODEM availability (e.g. lrzsz missing on the remote), NOT about the vault and NOT about a user-denied confirmation dialog.\n\
+VAULT GATE (applies to EVERY tool except ssh_status/ssh_cancel/zmodem_status): MyShell stores all connection credentials in an encrypted vault. If the MyShell GUI isn't running, the tool AUTO-LAUNCHES it. If the vault is locked, the tool brings the MyShell window to the front and then WAITS UP TO 20 SECONDS in-call for the user to type the master password — if they unlock in time, this very call proceeds automatically. Only when the wait expires does it fail with '保险库未解锁'. When you see that error: the user was too slow, tell them the window is in the foreground, wait for their confirmation, then RETRY the same tool — do NOT switch to a different approach. The zmodem → sftp fallback only applies when the failure is about ZMODEM availability (e.g. lrzsz missing on the remote), NOT about the vault and NOT about a user-denied confirmation dialog.\n\
 \n\
 ZMODEM IS ASYNC: `zmodem_upload`/`zmodem_download` return IMMEDIATELY with a `task_id` (status=`running`); the transfer (including GUI launch, vault-unlock wait, and the confirmation dialog) runs in the background. You MUST then poll `zmodem_status` with the `task_id` every 5-10 seconds until `status` is `done` or `failed`. Do not report success until you see `done`.\n\
 \n\
@@ -376,14 +375,14 @@ EVERY tool failure carries a machine-readable `error_kind` (`permission_denied` 
 \n\
 SERIALIZATION: a connection's terminal runs one command at a time. A second `ssh_exec` on the same connection while the first is still running returns `error_kind: \"busy\"` with how long it has been running and the longest remaining wait — do NOT blind-retry; wait that long, or switch to `ssh_run` (asynchronous, exempt from this lock). Different connections run fully in parallel.\n\
 \n\
-ENCOUNTERING ERRORS: '保险库未解锁' means the user must enter their master password in the (now foregrounded) MyShell window — tell them, wait for them to confirm, then RETRY the same tool. '保险库尚未初始化' means first-time setup is needed in the GUI. Both are instant errors by design: the tools never hang waiting for the vault.";
+ENCOUNTERING ERRORS: '保险库未解锁' means the tool already parked for 20 seconds waiting for the user and they didn't unlock in time — tell them the MyShell window is in the foreground, wait for their confirmation, then RETRY the same tool. '保险库尚未初始化' means first-time setup is needed in the GUI. Do not poll vault_status as the FIRST response to a locked vault: the in-call wait already covered the short case; poll it only when a retry fails the same way.";
 
 fn tool_definitions() -> Value {
     json!({
         "tools": [
             {
                 "name": "vault_status",
-                "description": "Check whether the MyShell vault is unlocked, WITHOUT executing anything and WITHOUT exposing any connection data. Returns only booleans (`gui_running`, `initialized`, `unlocked`) and a `vault_state` string.\n\nWHEN TO USE: any tool just returned `error_kind: vault_locked`. Do not blind-retry it and do not switch to another tool (switching changes semantics — a read-only probe is not a substitute for the operation you actually need). Query this tool every ~5 seconds until `vault_state` is `unlocked` (or ~2 minutes have passed), then retry THE SAME tool.\n\nWHY THIS EXISTS: MyShell never blocks a single tool call waiting for a password. Most MCP clients abandon a call after ~30s, so an in-request wait would fail twice over — the client gives up before the user could plausibly type a master password. The wait therefore belongs to you, in explicit poll steps, where progress is visible.\n\nSECURITY: returns booleans only. While the vault is locked you still cannot see any connection names, hosts or credentials — that gate is unchanged.",
+                "description": "Check whether the MyShell vault is unlocked, WITHOUT executing anything and WITHOUT exposing any connection data. Returns only booleans (`gui_running`, `initialized`, `unlocked`) and a `vault_state` string.\n\nWHEN TO USE: a gated tool already parks up to 20s in-call waiting for the user to unlock — so in the common case you never need this tool. Reach for it only when a gated tool FAILED with `error_kind: vault_locked` despite that wait AND a retry fails the same way: then poll THIS tool every ~5 seconds until `vault_state` is `unlocked`, and retry THE SAME tool once it is. Do not blind-retry the gated tool in a tight loop (each retry can re-trigger a confirmation dialog), and do not switch to a different tool (switching changes semantics).\n\nSECURITY: returns booleans only. While the vault is locked you still cannot see any connection names, hosts or credentials — that gate is unchanged.",
                 "inputSchema": { "type": "object", "properties": {}, "required": [] }
             },
             {
@@ -892,11 +891,15 @@ async fn resolve_config_for_task(
     expected_conn_type: Option<&str>,
     fail: &impl Fn(String),
 ) -> Option<ConnectionConfig> {
-    // This is mostly a race guard: the synchronous vault gate at the top of
-    // call_tool has already run, so the common case is an instant Ok. If the
-    // vault got locked in between (auto-lock timer), we fail the task fast
-    // instead of silently waiting.
-    if let Err(e) = ensure_vault_ready() {
+    // This is mostly a race guard: the vault gate at the top of call_tool
+    // has already run, so the common case is an instant Ok. If the vault
+    // got locked in between (auto-lock timer), we fail the task fast
+    // instead of silently waiting. spawn_blocking keeps the gate's internal
+    // std::thread::sleep off the async worker (same rationale as call_tool).
+    let gate = tokio::task::spawn_blocking(ensure_vault_ready)
+        .await
+        .unwrap_or_else(|e| Err(VaultGateError::GuiUnavailable(format!("门禁探测任务失败: {e}"))));
+    if let Err(e) = gate {
         fail(e.to_string());
         return None;
     }
@@ -1178,27 +1181,39 @@ fn tool_error(kind_override: Option<&str>, msg: String) -> Value {
 }
 
 async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, String> {
-    // ── Vault-unlock gate (fail-fast, applies to EVERY tool except task
+    // ── Vault-unlock gate (applies to EVERY tool except task
     // status/cancel) ────────────────────────────────────────────────────
     // Every tool requires the GUI vault to be unlocked — INCLUDING
     // list_connections: without the master password the AI must not even
     // learn WHICH servers exist (connection names/groups are metadata worth
     // protecting too). The gate:
     //   - auto-launches the GUI when it isn't running;
-    //   - checks the vault state ONCE and fails immediately when locked,
-    //     focusing the GUI's password gate so the user sees it right away.
+    //   - when locked: focuses the GUI's password gate, then parks up to 20s
+    //     IN-CALL waiting for the user to unlock (阶段 198) — unlock makes
+    //     this very call proceed; only the expiry returns vault_locked.
     // The three exemptions (ssh_status / ssh_cancel / zmodem_status) never
     // touch credentials and must stay reachable so the AI can observe and
     // clean up tasks that failed ON this very gate.
     match name {
-        // `vault_status` joins the exemptions deliberately: the AI needs a way
-        // to POLL for the unlock (see the gate contract in SERVER_INSTRUCTIONS)
-        // without waiting inside a single request — most clients cut a call at
-        // ~30s, so an in-request wait is a guaranteed double failure. It
-        // returns booleans only, never credentials or connection metadata.
+        // `vault_status` joins the exemptions deliberately: the AI needs a
+        // way to check the vault state WITHOUT triggering the gate — gating
+        // it would make the state unqueryable exactly while locked. With the
+        // in-call wait it is a FALLBACK poll (not the first response): use it
+        // only when a gated tool failed with vault_locked AND the retry fails
+        // the same way. It returns booleans only, never credentials or
+        // connection metadata.
         "ssh_status" | "ssh_cancel" | "zmodem_status" | "vault_status" => {}
         _ => {
-            let gate = ensure_vault_ready();
+            // spawn_blocking: the gate parks on std::thread::sleep for up to
+            // 20s (vault-unlock wait) and up to ~27s more in launch paths —
+            // blocking a tokio worker for that long stalls other async tasks
+            // (ssh_run progress, zmodem transfers) whenever several gated
+            // calls park at once.
+            let gate = tokio::task::spawn_blocking(ensure_vault_ready)
+                .await
+                .unwrap_or_else(|e| {
+                    Err(VaultGateError::GuiUnavailable(format!("门禁探测任务失败: {e}")))
+                });
             if let Err(e) = gate {
                 // Structured so the caller can branch on `vault_state` and knows
                 // retrying the SAME tool after unlocking is the expected move,
@@ -1269,7 +1284,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 "gui_running": gui_up,
                 "initialized": initialized,
                 "unlocked": unlocked,
-                "hint": "每 5 秒查询一次，最多约 2 分钟；期间不要反复重试原工具（会重复弹确认窗）。",
+                "hint": "门禁工具会先就地等待解锁（最长 20 秒）；只有工具已返回 vault_locked 后才需要本工具兜底轮询 —— 每 5 秒一次、约 2 分钟上限，期间不要反复重试原工具（会重复弹确认窗）。",
             }))
         }
 
@@ -2522,6 +2537,11 @@ enum GuiLaunchError {
     /// A listener is bound on the recorded port but does not answer IPC.
     /// The GUI may be alive-but-wedged; we must NOT start a second one.
     IpcUnresponsive,
+    /// A myshell.exe process is alive, but there is no usable port file, so
+    /// we have no IPC endpoint to talk to. Spawning another GUI would only
+    /// trigger the single-instance guard and exit — so this is reported
+    /// rather than retried in a loop.
+    NoPortFile,
 }
 
 impl GuiLaunchError {
@@ -2533,7 +2553,12 @@ impl GuiLaunchError {
             // A bound-but-wedged GUI: nothing was shown, but we also must not
             // relaunch — treat as reachable so the headless fallback asks the
             // user rather than proceeding silently.
-            GuiLaunchError::IpcUnresponsive => true,
+            //
+            // NoPortFile is the same call: a GUI process exists (so we must
+            // not start a second one), and no IPC dialog was shown — so the
+            // headless fallback must not be taken either. Unreachable from
+            // the caller's perspective but never silently executable.
+            GuiLaunchError::IpcUnresponsive | GuiLaunchError::NoPortFile => true,
             // Everything else means we never got a working GUI.
             GuiLaunchError::NotInstalled(_)
             | GuiLaunchError::LocateFailed(_)
@@ -2560,6 +2585,10 @@ impl std::fmt::Display for GuiLaunchError {
                 f,
                 "MyShell GUI 正在运行但 IPC 无响应（进程可能已挂起）。请在任务管理器中检查 myshell.exe，必要时手动重启 MyShell 后重试。"
             ),
+            GuiLaunchError::NoPortFile => write!(
+                f,
+                "MyShell GUI 正在运行，但 IPC 端口文件（gui-ipc-port）缺失，无法建立连接。请完全退出 MyShell 后重新打开（任务管理器结束 myshell.exe 亦可），然后重试。"
+            ),
         }
     }
 }
@@ -2585,11 +2614,43 @@ fn ensure_gui_running_locked() -> Result<GuiIpcEndpoint, GuiLaunchError> {
             }
             return Err(GuiLaunchError::IpcUnresponsive);
         }
+        // No listener on the recorded port. Before deleting the file and
+        // spawning, check whether a GUI process is actually alive: a live GUI
+        // whose port file went missing (deleted externally, or lost to a
+        // crash-race) must NOT get a second instance launched at it — the new
+        // process would hit the single-instance guard and exit, so this call
+        // would burn its whole 30s budget and report a misleading timeout
+        // while the real cause is an unreachable port file.
+        if gui_process_running() {
+            log(&format!(
+                "[gui] myshell.exe 正在运行但端口 {} 无监听，端口文件不可用 — 不重复启动 GUI",
+                ep.port
+            ));
+            remove_gui_ipc_port_file();
+            if let Some(ep) = wait_for_port_file_republish() {
+                return Ok(ep);
+            }
+            return Err(GuiLaunchError::NoPortFile);
+        }
         log(&format!(
             "[gui] 陈旧的 gui-ipc-port 文件（端口 {} 无监听）— 删除并重新启动 GUI",
             ep.port
         ));
         remove_gui_ipc_port_file();
+    }
+
+    // No port file at all (or it was just deleted as stale). A GUI process
+    // may still be alive and healthy on a port nobody recorded — spawning a
+    // second one in that state can only produce a single-instance rejection
+    // that exits instantly, so this call would sit out the full 30s and then
+    // report StartupTimeout while the user actually has a running GUI.
+    // Report the real condition instead.
+    if gui_process_running() {
+        log("[gui] myshell.exe 正在运行但缺少 gui-ipc-port 文件 — 不重复启动 GUI");
+        if let Some(ep) = wait_for_port_file_republish() {
+            return Ok(ep);
+        }
+        return Err(GuiLaunchError::NoPortFile);
     }
 
     // Find myshell.exe — it lives in the same directory as myshell-mcp.exe.
@@ -2610,8 +2671,11 @@ fn ensure_gui_running_locked() -> Result<GuiIpcEndpoint, GuiLaunchError> {
         .map_err(|e| GuiLaunchError::SpawnFailed(e.to_string()))?;
 
     // Poll for the port file (GUI writes it on startup once the IPC listener
-    // binds). Give it up to 30 seconds — the GUI needs to boot WebView2.
-    for _ in 0..60 {
+    // binds). Cap at 20s — the slowest observed cold start (WebView2 init) is
+    // ~14s, and polling any longer would run into the ~30s budget most MCP
+    // clients give a request, turning a diagnosable StartupTimeout into an
+    // opaque client-side transport timeout.
+    for _ in 0..40 {
         std::thread::sleep(std::time::Duration::from_millis(500));
         if let Some(ep) = read_gui_ipc_endpoint() {
             log(&format!("GUI 就绪，IPC port = {}", ep.port));
@@ -2619,6 +2683,87 @@ fn ensure_gui_running_locked() -> Result<GuiIpcEndpoint, GuiLaunchError> {
         }
     }
     Err(GuiLaunchError::StartupTimeout)
+}
+
+/// Compare a NUL-terminated wide process name from `PROCESSENTRY32W` against
+/// a target name. Exact match only — `myshell.exe` must not match
+/// `myshell-mcp.exe` (which is this very binary).
+#[cfg(windows)]
+fn exe_name_eq(a: *const u16, b: &[u16]) -> bool {
+    if a.is_null() {
+        return false;
+    }
+    // SAFETY: two bounds on the scan. (1) szExeFile is NUL-terminated inside
+    // its [u16; 260] buffer per the API contract; test buffers passed here
+    // are NUL-terminated too. (2) Regardless, we stop as soon as the name is
+    // longer than `b` (such a name can never compare equal), so the deepest
+    // index ever read is b.len() — 11 for our target — far inside the buffer.
+    unsafe {
+        let mut n = 0usize;
+        while *a.add(n) != 0 {
+            n += 1;
+            if n > b.len() {
+                return false;
+            }
+        }
+        n == b.len() && (0..n).all(|i| *a.add(i) == b[i])
+    }
+}
+
+/// Is a MyShell GUI process running right now?
+///
+/// The port file is the only channel we have to reach the GUI, and it is
+/// written once at startup — so a live GUI whose file went missing is
+/// invisible to us while the process itself is still detectable. Checking the
+/// process table lets us tell "no GUI, safe to launch one" apart from "GUI is
+/// up, but unreachable", which the old code conflated and answered by
+/// launching a second instance that the single-instance guard instantly
+/// rejects. That made every tool call burn its full 30s budget and then
+/// report a misleading startup timeout.
+///
+/// Non-Windows: false (always launch) — same convention as the other
+/// Windows-only probes in this file.
+#[cfg(windows)]
+fn gui_process_running() -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let target: Vec<u16> = std::ffi::OsStr::new("myshell.exe").encode_wide().collect();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+            // Can't tell — assume a GUI may be running so we never launch a
+            // duplicate on an unknown state.
+            return true;
+        }
+        // SAFETY: PROCESSENTRY32W is an all-zero-valid POD struct (pointers
+        // are not dereferenced until Process32FirstW fills them); dwSize is
+        // set immediately after, as the API requires.
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                if exe_name_eq(entry.szExeFile.as_ptr(), &target) {
+                    found = true;
+                    break;
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        winapi::um::handleapi::CloseHandle(snap);
+        found
+    }
+}
+
+#[cfg(not(windows))]
+fn gui_process_running() -> bool {
+    false
 }
 
 /// Delete the GUI's IPC port-discovery file. Only called when we have proven
@@ -2632,6 +2777,34 @@ fn remove_gui_ipc_port_file() {
     path.push("myshell");
     path.push("gui-ipc-port");
     let _ = std::fs::remove_file(&path);
+}
+
+/// Wait briefly for a live GUI's port-file watchdog to re-publish
+/// `gui-ipc-port`, then hand back the endpoint once it actually answers IPC.
+///
+/// GUI builds with the watchdog re-assert their port file every ~5s whenever
+/// it is missing or no longer carries their token, so "GUI alive, file gone"
+/// is a TRANSIENT state for them — waiting one watchdog cycle here recovers
+/// it with no user action and no second instance. GUI builds without the
+/// watchdog (e.g. installed 2.18.0) never republish, the ~7s wait simply
+/// expires, and the caller reports NoPortFile exactly as before: degraded to
+/// the pre-existing error, never worse.
+fn wait_for_port_file_republish() -> Option<GuiIpcEndpoint> {
+    for _ in 0..7 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if let Some(ep) = read_gui_ipc_endpoint() {
+            if std::net::TcpStream::connect(("127.0.0.1", ep.port)).is_ok()
+                && query_gui_vault_status(&ep).is_some()
+            {
+                log(&format!(
+                    "[gui] 端口文件已由 GUI 看门狗重新发布（端口 {}）— 复用现有 GUI",
+                    ep.port
+                ));
+                return Some(ep);
+            }
+        }
+    }
+    None
 }
 
 /// Query the GUI's vault state via localhost IPC. Returns:
@@ -2678,9 +2851,57 @@ fn send_gui_focus_unlock(ep: &GuiIpcEndpoint) {
     }
 }
 
-/// Fail-fast vault gate. Called at the top of every tool handler that needs
-/// anything beyond task-status polling (ssh_exec, sftp_*, list_connections,
-/// open_in_gui, screenshot_terminal, and the async starters' pre-flight).
+/// How many times a parked tool call re-checks the vault while waiting for
+/// the user to type the master password. 10 × 2s = 20s total — deliberately
+/// UNDER the ~30s budget most MCP clients give one request, so the failure
+/// path still returns a structured `vault_locked` error in time instead of
+/// dying to a transport timeout (the failure mode that made the original
+/// 30s poll, removed in 阶段 187, unrecoverable).
+const VAULT_UNLOCK_WAIT_PROBES: usize = 10;
+const VAULT_UNLOCK_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Outcome of the in-call unlock wait. Three states, not a bool: if the GUI
+/// died mid-wait (every probe unreachable), reporting "still locked" would
+/// send the user to type a password in a window that no longer exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnlockWaitOutcome {
+    /// The vault got unlocked while we waited — this very call proceeds.
+    Unlocked,
+    /// Probes exhausted; the GUI stayed reachable and locked the whole time.
+    StillLocked,
+    /// Not one probe reached the GUI — it likely died mid-wait.
+    Unreachable,
+}
+
+/// Sleep, then ask `probe` for the vault state; repeat until it reports
+/// unlocked or `probes` runs out. `probe` is injected so the loop itself is
+/// unit-testable without a live GUI (the GUI-backed closure is a one-liner
+/// at the call site).
+fn wait_for_unlock(
+    probes: usize,
+    interval: std::time::Duration,
+    mut probe: impl FnMut() -> Option<(bool, bool)>,
+) -> UnlockWaitOutcome {
+    let mut ever_reachable = false;
+    for _ in 0..probes {
+        std::thread::sleep(interval);
+        match probe() {
+            Some((_, true)) => return UnlockWaitOutcome::Unlocked,
+            Some(_) => ever_reachable = true,
+            None => {}
+        }
+    }
+    if ever_reachable {
+        UnlockWaitOutcome::StillLocked
+    } else {
+        UnlockWaitOutcome::Unreachable
+    }
+}
+
+/// Fail-fast-with-a-grace-period vault gate. Called at the top of every tool
+/// handler that needs anything beyond task-status polling (ssh_exec, sftp_*,
+/// list_connections, open_in_gui, screenshot_terminal, and the async
+/// starters' pre-flight).
 ///
 /// Behavior:
 ///   1. Ensure the GUI is running — AUTO-LAUNCH myshell.exe if it isn't
@@ -2688,15 +2909,23 @@ fn send_gui_focus_unlock(ep: &GuiIpcEndpoint) {
 ///   2. Query the GUI's vault state ONCE (a few retries only to cover a
 ///      freshly launched GUI still binding its IPC listener).
 ///   3. Unlocked → Ok, proceed with the tool.
-///      Not initialized → immediate actionable error.
+///      Not initialized → immediate actionable error (first-run setup is a
+///      long flow; waiting for it inside the call is pointless).
 ///      Locked → focus the GUI so the password gate is in the user's face,
-///      then return an immediate error telling the AI (and the user) to
-///      unlock and RETRY the same tool.
+///      then WAIT IN-CALL for them to type the master password (up to
+///      [VAULT_UNLOCK_WAIT_PROBES] probes). If they unlock, this very call
+///      proceeds — the AI does not need to relay a "now retry" round-trip,
+///      and the user never has to announce "我已经解锁了" (阶段 198).
+///      If the wait expires, return the same structured error as before.
 ///
-/// DELIBERATELY no 30-second silent poll anymore: the old wait was the #1
-/// source of "the tool hung forever, then vaguely suggested the password
-/// might be missing" reports. Failing fast surfaces the prompt within
-/// milliseconds; the AI relays it, the user unlocks, the retry succeeds.
+/// Why an in-call wait is now safe when 阶段 187 removed the old 30s poll:
+/// the old poll was UNBOUNDED-in-spirit (30s) and burned the client's whole
+/// request budget, so the outcome was always a transport timeout. The wait
+/// below is capped at 20s — under the ~30s clients allow — so the failure
+/// path still returns a structured `vault_locked` error in time, while the
+/// success path (user unlocks while the AI's request is parked) now closes
+/// the whole flow in ONE call. Each tools/call runs on its own tokio task
+/// (阶段 185), so parked calls never block ssh_status or other connections.
 fn ensure_vault_ready() -> Result<(), VaultGateError> {
     let ep = ensure_gui_running().map_err(|e| VaultGateError::GuiUnavailable(e.to_string()))?;
 
@@ -2716,7 +2945,21 @@ fn ensure_vault_ready() -> Result<(), VaultGateError> {
         Some((false, _)) => Err(VaultGateError::NotInitialized),
         Some((true, false)) => {
             send_gui_focus_unlock(&ep);
-            Err(VaultGateError::Locked)
+            log("[vault] 保险库锁定 — 调用内等待用户解锁（最长 20 秒）");
+            match wait_for_unlock(
+                VAULT_UNLOCK_WAIT_PROBES,
+                VAULT_UNLOCK_WAIT_INTERVAL,
+                || query_gui_vault_status(&ep),
+            ) {
+                UnlockWaitOutcome::Unlocked => {
+                    log("[vault] 等待期间已解锁 — 继续执行本次调用");
+                    return Ok(());
+                }
+                UnlockWaitOutcome::StillLocked => Err(VaultGateError::Locked),
+                // GUI died mid-wait: "locked" would point the user at a
+                // password window that no longer exists.
+                UnlockWaitOutcome::Unreachable => Err(VaultGateError::IpcUnresponsive),
+            }
         }
         None => Err(VaultGateError::IpcUnresponsive),
     }
@@ -2763,7 +3006,7 @@ impl VaultGateError {
                 "保险库尚未初始化：请先在 MyShell GUI 中设置主密码（首次启动时会引导设置），然后重新调用此工具。"
                     .to_string(),
             VaultGateError::Locked =>
-                "保险库未解锁：MyShell 窗口已置顶，请在其中输入主密码解锁保险库，解锁后重新调用此工具即可。"
+                "保险库未解锁：MyShell 窗口已置顶，本次调用已就地等待 20 秒仍未解锁。请在 MyShell 中输入主密码，然后重新调用此工具。"
                     .to_string(),
             VaultGateError::IpcUnresponsive =>
                 "无法查询 MyShell GUI 的保险库状态（IPC 无响应）。请确认 MyShell 桌面应用正在运行后重试。"
@@ -3211,6 +3454,48 @@ mod tests {
         assert!(text.contains("before the request reaches this server") || text.contains("CLIENT"));
     }
 
+    /// 阶段 198：调用内等待解锁的循环语义 —— 迟到解锁要能等到，
+    /// 全程锁定返回 StillLocked；GUI 中途死亡（全程 None）必须与「锁定」
+    /// 区分开，否则会把用户指向一个已经不存在的密码窗口。
+    #[test]
+    fn unlock_wait_polls_until_unlocked() {
+        use super::{UnlockWaitOutcome, wait_for_unlock};
+        use std::time::Duration;
+        let tick = Duration::from_millis(1);
+
+        // 第 3 次探测时用户解锁
+        let mut calls = 0;
+        let unlocked_late = || {
+            calls += 1;
+            if calls >= 3 { Some((true, true)) } else { Some((true, false)) }
+        };
+        assert_eq!(wait_for_unlock(10, tick, unlocked_late), UnlockWaitOutcome::Unlocked);
+        assert_eq!(calls, 3, "解锁后应立即停止探测");
+
+        // 始终未解锁：耗尽次数后如实返回 StillLocked
+        let mut probes = 0;
+        let never = || {
+            probes += 1;
+            Some((true, false))
+        };
+        assert_eq!(wait_for_unlock(5, tick, never), UnlockWaitOutcome::StillLocked);
+        assert_eq!(probes, 5, "应恰好探测满次数");
+
+        // GUI 中途死亡（全程 None）：不得误报 StillLocked
+        assert_eq!(
+            wait_for_unlock(2, tick, || None),
+            UnlockWaitOutcome::Unreachable
+        );
+
+        // 先可达后失联（GUI 在等待中崩溃）：以最后已知状态 StillLocked 报告
+        let mut seq_calls = 0;
+        let flaky = || {
+            seq_calls += 1;
+            if seq_calls == 1 { Some((true, false)) } else { None }
+        };
+        assert_eq!(wait_for_unlock(3, tick, flaky), UnlockWaitOutcome::StillLocked);
+    }
+
     /// 审计不变量（阶段 187）：GUI 可达性必须来自错误**类型**，不能来自
     /// 错误**文案**。这条闸门锁住「改一个字就可能让高危命令静默执行」的结构。
     #[test]
@@ -3229,8 +3514,44 @@ mod tests {
         }
         // 监听存在但无响应 ⇒ 也算「可达」：绝不能因为无响应就静默改走无头
         assert!(GuiLaunchError::IpcUnresponsive.gui_reachable());
+        // 进程在但端口文件丢失同理：不能启动第二个实例，更不能静默执行
+        assert!(GuiLaunchError::NoPortFile.gui_reachable());
         // 普通字符串错误全部发生在 GUI 就绪之后
         assert!(GuiExecError::from("whatever".to_string()).gui_reachable);
+    }
+
+    /// 端口文件丢失时必须能通过进程表发现「GUI 还活着」——否则
+    /// ensure_gui_running_locked 会启动第二个 myshell.exe，被单实例守卫
+    /// 立刻拒绝退出，于是每次调用都耗尽 30s 并报 StartupTimeout
+    /// （阶段 192 观测到的 MCP 工具全部 30s 超时的直接原因）。
+    ///
+    /// 这里锁住名称匹配规则而非结果：进程表里有无 myshell.exe 取决于
+    /// 跑测试的机器，断言它等于 true/false 都会让测试不稳定。
+    #[test]
+    #[cfg(windows)]
+    fn gui_process_probe_matches_only_the_gui() {
+        use super::exe_name_eq;
+        use std::os::windows::ffi::OsStrExt;
+
+        // 模拟 PROCESSENTRY32W.szExeFile 的 NUL 终止形态
+        fn cstr(s: &str) -> Vec<u16> {
+            let mut v: Vec<u16> = std::ffi::OsStr::new(s).encode_wide().collect();
+            v.push(0);
+            v
+        }
+        fn chars(s: &str) -> Vec<u16> {
+            std::ffi::OsStr::new(s).encode_wide().collect()
+        }
+
+        let gui = cstr("myshell.exe");
+        let mcp = cstr("myshell-mcp.exe");
+        let cli = cstr("myshell-cli.exe");
+        let target = chars("myshell.exe");
+        assert!(exe_name_eq(gui.as_ptr(), &target));
+        // 关键：不能把 MCP/CLI 自身误判成 GUI，否则永远不会去启动 GUI
+        assert!(!exe_name_eq(mcp.as_ptr(), &target));
+        assert!(!exe_name_eq(cli.as_ptr(), &target));
+        assert!(!exe_name_eq(std::ptr::null(), &target));
     }
 
     /// 门禁状态必须能脱离文案被机器读取（vault_status 轮询契约的基础）。

@@ -7870,3 +7870,67 @@ Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 4
 - 本次发布内容：myui v1.1.1 直升、连接图标切换为自绘线性图标（来源收口到 ConnIcon）、默认窗宽 1300、移除 iconfont 死资产
 
 **待办顺延**：`command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。
+
+
+### 阶段 197 —— 修复 MCP 全工具 30s 超时：活 GUI 端口文件被误删后永久失联
+
+**现象**：MCP 所有工具调用（连豁免门禁的 `vault_status`）一律 30s 客户端超时，日志里 `ensure_gui_running` 反复「启动 GUI」却永远等不到端口文件。
+
+**根因（三层叠加，日志 + C# 探针实锤）**：
+1. **TOCTOU 误删**：MCP 在 09:37:25 读到陈旧端口 40234 → 探测失败耗时 2s → 09:37:27 删文件时，用户刚在 09:37:25.3 启动的 GUI 已把端口文件重写为 50815 —— 活 GUI 的发现文件被删。
+2. **GUI 无自愈**：端口文件只在启动写一次，被删后活 GUI 永久失联；MCP 每次调用都 spawn 第二实例 → 单实例弹窗恒失败 → 静默退出 → 30s 等待烧穿客户端预算。
+3. **`TaskDialogIndirect` 本机恒 E_INVALIDARG**（0x80070057；C# 探针 + v6 manifest 复现，结构体布局与 cbSize=176 均正确）→「覆盖启动/退出」弹窗从未真正出现，旧代码失败即默认退出。
+
+**修复**：
+- **GUI**（`main.rs`）：① 端口文件看门狗 —— 每 5s 校验文件 token 是否仍是自己的，丢失/被覆盖即重写（`GUI_SHUTTING_DOWN` 原子位防止退出时和 ExitRequested 清理打架）；② 单实例弹窗 TaskDialog 失败回退 `MessageBoxW(是=覆盖启动/否=退出)`，不再静默退出。
+- **MCP**（`myshell-mcp.rs`）：`ensure_gui_running_locked` 在删除端口文件 / spawn 前先用 Toolhelp32 探测 `myshell.exe` 是否存活；存活则返回新增的 `GuiLaunchError::NoPortFile`（`gui_reachable()=true`，与 IpcUnresponsive 同守安全语义：不启第二实例、不走无头放行），文案直接告诉用户重启 GUI。进程名比较抽 `exe_name_eq`（精确匹配，`myshell-mcp.exe` 不会误判成 `myshell.exe`）。
+
+**验证**：
+- `cargo check --bins` 0 error；`cargo test --bin myshell-mcp` 22/22、`--bin myshell` 8/8（新增 `gui_process_probe_matches_only_the_gui` 锁死名称匹配规则；`gui_reachability_comes_from_type_not_wording` 补 NoPortFile 断言）
+- 端到端（重启已安装 GUI 恢复端口文件后）：`vault_status`→unlocked、`list_connections`→22 条、`test_connection /生产/3.0池/135.32.56.59`→330ms 密码认证成功、`ssh_exec hostname && uptime`→exit 0 真实输出。**SSH 链路本身无恙**；`/自用/192.168.3.30` 连接超时是服务器/网络不可达，与本故障无关。
+
+**注意**：已安装的 2.18.0 二进制不含本修复 —— 恢复靠的是重启 GUI（旧版也会在启动时重写端口文件）；根治需走 `打包` 流程出新版。
+
+**五问重启检查**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 定位并修复 MCP 全工具 30s 超时：GUI 端口文件看门狗 + 单实例弹窗 MessageBoxW 回退；MCP 端 spawn 前进程探测 + NoPortFile 错误类型。端到端验证 SSH 链路正常。 |
+| 什么是我没做的？ | 未构建/部署新二进制（需走 `打包` 流程）；未把 `exe_name_eq` 提到 lib 共享（仅 MCP 用）；`/自用/192.168.3.30` 不可达未查（服务器侧问题）。 |
+| 我想去哪里？ | 下次 `打包` 后，本修复随新版落地；届时可删掉「注意」段。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
+| 什么可能导致偏离？ | ① TaskDialogIndirect 的 E_INVALIDARG 根因未定（已绕开而非根治，换机器可能自愈）；② 看门狗 5s 间隔内的删除仍有一个窗口，MCP 侧 NoPortFile 错误会兜住；③ 进程探测在非 Windows 恒 false（沿既有平台约定）。 |
+| 下一步最小可验证动作？ | `打包` 出新版后：启动新版 GUI → 手动删 `gui-ipc-port` → 5s 内文件自动回来（日志有「已重新发布」）。 |
+
+
+### 阶段 198 —— 门禁改「调用内等待解锁 20s」+ MCP 侧自愈收尾（用户提议）
+
+**背景**：用户确认执行步骤时点出真痛点——阶段 187 的 fail-fast 契约依赖 AI 客户端收到 `vault_locked` 后主动轮询 `vault_status`，但多数客户端不轮询而是直接转述，用户解锁后还得人工说一句「我解锁了」才能继续。等于把等待成本转嫁成一轮对话。
+
+**改动**（`myshell-mcp.rs`）：
+1. **调用内等待解锁**：`ensure_vault_ready` 锁定分支先 `focus_unlock` 置顶，再 `wait_for_unlock`（10 × 2s = 20s，`VAULT_UNLOCK_WAIT_PROBES`/`INTERVAL` 常量，探测闭包注入可单测）。期间解锁 → 本次调用直接继续；超时 → 沿用原 `vault_locked` 结构化错误。20s 上限刻意低于客户端 ~30s 预算（等待失败仍能返回结构化错误而非传输超时——阶段 187 砍死等的根因未回退）；每个 tools/call 独立 tokio 任务（阶段 185），停靠不阻塞其他调用。`not_initialized` 不等待（首次设置是长流程）。
+2. **NoPortFile 分支等看门狗一拍**：两个「GUI 进程活着但端口文件不可用」分支先 `wait_for_port_file_republish`（7 × 1s，读到且 IPC 应答即复用现有 GUI），新版 GUI（带阶段 197 看门狗）全程自动恢复；旧版 GUI 等待无效照旧报错——只劣化 7s，不劣化行为。
+3. **spawn 轮询 30s → 20s**（60→40 次）：最慢冷启动实测 ~14s，20s 覆盖且留出预算返回结构化 `StartupTimeout`，而不是被客户端砍成不透明传输超时。
+4. **文案三处同步**：SERVER_INSTRUCTIONS 的 VAULT GATE / ENCOUNTERING ERRORS 段、`vault_status` 工具描述（WHEN TO USE 改为「等待超时且重试同败后才轮询」）、`vault_status` 响应 hint、`VaultGateError::Locked` 消息（注明已等 20s）。`docs/mcp-integration-spec.md` 与 `AGENTS.md` 的门禁契约段同步修订（187 → 198）。
+
+**验证**：`cargo test --bin myshell-mcp` **23/23**（新增 `unlock_wait_polls_until_unlocked`：迟到解锁立即停、全程锁定恰好探测满、None 不算解锁）；新 debug 二进制 stdio 冒烟——initialize 带新文案（`WAITS UP TO 20 SECONDS` 命中）、`list_connections` 过门禁正常返回 22 条（当前 vault 解锁，无回归）。**锁定态的 20s 等待路径未做真机全流程验证**（需要真实锁定+人工解锁，用户主密码不可知），循环语义由单测覆盖，接线为一行闭包。
+
+**注意**：与阶段 197 相同，已安装 2.18.0 不含本改动，需 `打包` 落地。落地后的解锁体验变化：**工具会先停 ~20s 等你解锁，解锁即自动继续，不再需要说「我解锁了」**。
+
+**五问重启检查**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 门禁加 20s 调用内等待解锁（用户提议）；NoPortFile 分支等看门狗自愈；spawn 轮询缩到 20s；三处契约文档同步修订。 |
+| 什么是我没做的？ | 锁定态真机全流程验证（缺主密码）；未做等待时长可配置（无人要求）；`阶段 187` 段落保留在文档里作历史依据。 |
+| 我想去哪里？ | `打包` 后实测：锁定时调工具 → GUI 置顶 → 20s 内输入主密码 → 工具自动返回结果。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
+| 什么可能导致偏离？ | ① 客户端预算 <20s 的极端环境会把等待砍成传输超时（此时退回旧契约行为——轮询兜底仍在）；② 等待期间 GUI 崩溃，`query` 恒 None，20s 后按 Locked 报错（文案略偏但无害）；③ 多工具并发停靠时各自独立探测，IPC 连接数线性增长（上限 = 并发调用数，实际很小）。 |
+| 下一步最小可验证动作？ | `打包` 后锁定保险库，调用 `list_connections`：预期停 ~20s 返回 vault_locked；期间解锁则直接返回连接列表。 |
+
+**审查修正（同阶段，open-code-review delegate 模式自查 5 项真问题全修）**：
+1. 门禁调用改 `tokio::task::spawn_blocking`（两处调用点）——`thread::sleep` 停靠不再占用 tokio worker，多个锁定调用并行停靠不会拖慢 ssh_run/zmodem 等异步任务；JoinError 映射 `GuiUnavailable` 不 unwrap。
+2. `wait_for_unlock` 二态 bool → 三态 `UnlockWaitOutcome`（Unlocked / StillLocked / Unreachable）——GUI 等待中途死亡（全程 None）现在报 `IpcUnresponsive` 而非误导性的 `Locked`；先可达后失联按最后已知状态 StillLocked。测试补对应断言。
+3. `exe_name_eq` 指针扫描加上界（名字长于目标即 false），最坏读深 b.len()=11，双重防御去除越界读可能。
+4. `PROCESSENTRY32W::zeroed()` 补 SAFETY 不变量注释。
+5. call_tool 门禁处的阶段 187 过期注释（「绝不等待」）改写为 198 契约。
+驳回 5 项：GUI_LAUNCH_LOCK 跨 7s sleep（串行化启动决策的有意设计）、看门狗 5s 轮询（50 字节读，开销可忽略）、覆盖启动交接窗口的回写竞态（≤5s 自愈）、SeqCst 过强（单 bool 无敏感点）、debug-shell.* 调试文件（用户遗留、不进构建产物）。
+验证：`cargo test --bin myshell-mcp` 23/23、`cargo test --lib` 108/108。
