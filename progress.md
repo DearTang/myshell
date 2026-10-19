@@ -7934,3 +7934,28 @@ Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 4
 5. call_tool 门禁处的阶段 187 过期注释（「绝不等待」）改写为 198 契约。
 驳回 5 项：GUI_LAUNCH_LOCK 跨 7s sleep（串行化启动决策的有意设计）、看门狗 5s 轮询（50 字节读，开销可忽略）、覆盖启动交接窗口的回写竞态（≤5s 自愈）、SeqCst 过强（单 bool 无敏感点）、debug-shell.* 调试文件（用户遗留、不进构建产物）。
 验证：`cargo test --bin myshell-mcp` 23/23、`cargo test --lib` 108/108。
+
+
+### 阶段 199 —— 发布 v2.18.1
+
+**做了什么**：按 `打包` 规则走完流水线。
+- 版本 2.18.0 → **2.18.1**（staging 仅 🐛+🛠️ → patch）
+- 预检查双通过：`npm run test:ts` exit 0、`cargo check` 0 error（`Cargo.lock` 随之刷到 2.18.1，已核对入提交——阶段 189 的坑未重蹈）
+- 构建 `MyShell_2.18.1_x64-setup.exe`（release 编译 29m30s）→ 逐文件提交 `release: v2.18.1` → 双远端推送。GitHub 首推被 180s 超时打断，按阶段 189 教训先 `ls-remote` 核对真实 ref（确认未达）后用显式 refspec 补推成功；三 SHA 核对一致（1ea42b0）
+- 发布内容：MCP 全工具 30s 超时根因修复（端口文件看门狗自愈 + 进程探测 + 弹窗回退，阶段 197）、门禁调用内等待解锁 20s（阶段 198）
+
+**网络插曲（双平台 API 直连超时）**：发布脚本用 node fetch，而本机 shell 挂着一个**已死**的内网代理（`HTTP_PROXY=172.19.109.247:3128`）。git（libcurl）与 node（undici，Node 24 默认不读 env 代理）各自路径下首几次请求都超时；清掉死代理变量（`env -u HTTP_PROXY -u HTTPS_PROXY ...`）后 Gitee 靠脚本自带 4 次退避重试第 4 次成功、GitHub 一次成功。**下次发布再遇 `UND_ERR_CONNECT_TIMEOUT`：先清代理环境变量再跑，别自己造重试。**
+
+**发布地址**：
+- Gitee: https://gitee.com/argustang/myshell/releases/tag/v2.18.1
+- GitHub: https://github.com/DearTang/myshell/releases/tag/v2.18.1
+
+**五问重启检查**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 发布 v2.18.1：版本号、CHANGELOG/README 双写、构建、提交推送（三 SHA 核对）、双平台 release、清空 staging。 |
+| 什么是我没做的？ | 未真机安装新包回归（阶段 197/198 的运行时行为靠单测 + 早前真机验证过的链路）；未删 `.release-notes-tmp.md` 之外的任何临时物。 |
+| 我想去哪里？ | 用户装新版后实测：锁定保险库调工具 → 20s 内解锁应直接放行。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
+| 什么可能导致偏离？ | ① 本机死代理环境变量会让 node fetch 类脚本静默变慢/失败——发布前先清；② GitHub 推送超时不等于失败，先 `ls-remote` 再补推。 |
+| 下一步最小可验证动作？ | 安装 `MyShell_2.18.1_x64-setup.exe`，锁保险库后经 AI 客户端调 `list_connections`，20s 内输入主密码验证自动放行。 |
