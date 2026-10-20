@@ -3933,6 +3933,45 @@ mod secret_path_tests {
     }
 }
 
+#[cfg(test)]
+mod port_file_tests {
+    use super::*;
+
+    /// 端口文件必须整体可见：读者要么看到旧内容、要么看到新内容，绝不能看到
+    /// 写了一半的片段（非原子写的经典后果 —— 读方看到截断内容就可能把
+    /// 「token 行缺失」误判成「文件损坏」进而删掉活实例的发现文件）。
+    /// 本测试锁住「发布后读到的永远是完整的两行」这一不变量。
+    #[test]
+    fn port_file_is_published_atomically() {
+        let dir = std::env::temp_dir().join("myshell_port_file_publish_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("gui-ipc-port");
+
+        publish_port_file(&f, 50815, "token-a").expect("publish");
+        let content = std::fs::read_to_string(&f).expect("read back");
+        assert_eq!(content, "50815\ntoken-a");
+
+        // 再次发布必须整体替换，且不留任何临时文件。
+        publish_port_file(&f, 40234, "token-b").expect("republish");
+        let content = std::fs::read_to_string(&f).expect("read back");
+        assert_eq!(content, "40234\ntoken-b");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("gui-ipc-port.tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "原子发布不得留下临时文件，实际残留: {:?}",
+            leftovers
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 // ============ SFTP Commands ============
 
 #[tauri::command]
@@ -5175,6 +5214,44 @@ fn acquire_single_instance_lock() -> Result<bool, String> {
     Ok(true)
 }
 
+/// Publish the GUI's IPC port-discovery file ATOMICALLY: write a temp file
+/// next to the target, then rename over it.
+///
+/// WHY atomic: `fs::write` truncates the destination first and streams the
+/// bytes in, so a reader (the MCP server) that opens the file during that
+/// window sees a HALF-WRITTEN file. The port alone still parses, but the
+/// token line is missing — the MCP then treats the endpoint as tokenless and
+/// its IPC commands get rejected as unauthorized, or it sees an unparsable
+/// fragment, concludes the file is missing, and deletes a perfectly healthy
+/// GUI's discovery file. Rename is atomic on NTFS within a volume, so a
+/// reader sees either the old file or the complete new one — never a torn
+/// one.
+///
+/// The temp name carries the PID so two GUI processes (upgrade overlap) can't
+/// clobber each other's staging file.
+fn publish_port_file(path: &std::path::Path, port: u16, token: &str) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!("gui-ipc-port.tmp-{}", std::process::id()));
+    let content = format!("{}\n{}", port, token);
+    std::fs::write(&tmp, &content)?;
+    // Rename is atomic on NTFS within a volume, but it FAILS with
+    // ACCESS_DENIED when the target is held open by a process that did not
+    // share delete (an editor, a backup tool, an AV scanner). Publishing
+    // nothing at all would be worse than publishing non-atomically, so fall
+    // back to the direct write — the reader then sees the same torn-window
+    // risk as before, but never a missing port file.
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(path, &content).map_err(|e| {
+                log::warn!("[ipc] 原子发布失败（{}），已回退直接写入", rename_err);
+                e
+            })
+        }
+    }
+}
+
 pub fn run() {
     // GPU acceleration escape hatch — MUST run before any window is created.
     // WebView2 reads WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS once during its
@@ -5507,7 +5584,7 @@ pub fn run() {
                             if let Some(dir) = p.parent() {
                                 let _ = std::fs::create_dir_all(dir);
                             }
-                            match std::fs::write(p, format!("{}\n{}", port, ipc_token)) {
+                            match publish_port_file(p, port, &ipc_token) {
                                 Ok(()) => {
                                     log::info!("[ipc] GUI IPC listener on 127.0.0.1:{}", port);
                                     true
@@ -5523,6 +5600,7 @@ pub fn run() {
                             false
                         }
                     };
+
 
                     if let (true, Some(path)) = (published, port_file.clone()) {
                         let token = ipc_token.clone();
@@ -5541,7 +5619,7 @@ pub fn run() {
                                     .map(|c| c.split_whitespace().nth(1) == Some(token.as_str()))
                                     .unwrap_or(false);
                                 if !still_ours {
-                                    match std::fs::write(&path, format!("{}\n{}", port, token)) {
+                                    match publish_port_file(&path, port, &token) {
                                         Ok(()) => log::warn!(
                                             "[ipc] gui-ipc-port 丢失或被覆盖，已重新发布（端口 {}）",
                                             port

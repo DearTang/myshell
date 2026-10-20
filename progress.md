@@ -8031,3 +8031,54 @@ Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 4
 | 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
 | 什么可能导致偏离？ | ① GitHub push 再遇无输出——先 `GIT_TERMINAL_PROMPT=0` 取真实错误再动手；② 阶段 200 风险①（极老的待删记录未消费时）依然成立。 |
 | 下一步最小可验证动作？ | 装 v2.18.2，`dir "E:\Program Files\MyShell"` 三件套齐全且 mcp 版本 = 2.18.2，重启一次后复查文件仍在。 |
+
+### 阶段 202 —— MCP「端口文件」死锁报告核实：4/5 条已修，2 处残留缺口补齐
+
+**起因**：用户转来一份 MCP 死锁问题报告，判定为「GUI+MCP 配合的死锁缺陷」，并给出 5 条修改建议（端口文件丢失自愈、不得在有活实例时删文件重启、spawn 快速失败、TaskDialogIndirect 回退、vault_status 不应依赖 GUI）。
+
+#### 一、核实结论：报告诊断方向对，但引用的是 2.18.0 期现场，5 条里 4 条早已修复
+
+报告引用的 `mcp-20745.log` / `myshell-20745.log` 是 **2026-10-19 的 2.18.0 期**产物（报告引用的 `[gui] 陈旧的 gui-ipc-port 文件（端口 40234 无监听）` 这行文案，在现行代码里已改写为「端口无监听…不重复启动 GUI」）。那次死锁本身属实：GUI 就绪行出现 **0 次**，每次 tools/call 都重新启动 GUI。但阶段 197/198 已在 **2.18.1** 修掉，实机装 2.18.2 后活体探针 `vault_status` **1.27s 返回 unlocked**，无 30s 挂起。
+
+逐条比对现网代码：
+
+| 报告建议 | 2.18.2 实际状态 | 位置 |
+|---|---|---|
+| ① 端口文件丢失自愈（守护重写） | **已实现**：每 5s 检查，丢失/被覆盖即重写 | `main.rs:5527` 看门狗 |
+| ② 不得在有活实例时删文件重启 | **已实现**：探测到 `myshell.exe` 存活即不 spawn，改等看门狗重发布（≤7s），超时返回结构化 `NoPortFile` | `myshell-mcp.rs:2624/2648` |
+| ③ spawn 失败要快速失败 | **已实现**：冷启动轮询上限 20s，GUI 存活分支不 spawn | `myshell-mcp.rs:2678` |
+| ④ TaskDialogIndirect E_INVALIDARG 回退 | **已实现**：回退 `MessageBoxW` 询问（报告日志里「默认按退出处理」是 2.18.0 旧文案） | `main.rs:5024` |
+| ⑤ vault_status 不应依赖 GUI | **安全设计下的合理限制**：已豁免门禁不触发 GUI 启动，但「是否已初始化/已解锁」必须由 GUI 回答，无 GUI 只能报 `gui_unavailable`——不能凭空断言保险库状态 | `myshell-mcp.rs:1242` |
+
+#### 二、核实中挖出的两处真实残留缺口（报告未提，同源）
+
+**缺口 A：端口文件非原子写**（`main.rs` 写点）。`fs::write` 先截断目标再逐字节写入，MCP 恰在写入窗口打开文件会读到**半截内容**：端口行还在、token 行缺失 → MCP 判成「无 token 的端点」，IPC 命令被拒（unauthorized）；或读到不可解析的碎片 → 判定「文件缺失」→ 删掉健康 GUI 的发现文件。报告建议里的「原子写（temp+rename）」是唯一现网未实现的条目。
+
+**缺口 B：MCP 删除端口文件前不再核验**（`myshell-mcp.rs`）。`remove_gui_ipc_port_file()` 是无条件删除：从文件读出端口 P 判定无监听之后、真正删除之前，GUI 看门狗（或另一个 MCP 实例）可能已重写了一份**新鲜的活端口** P2——无条件删除会毁掉健康 GUI 的发现文件，之后每次调用都去拉起注定被单实例拦下的第二实例，把预算耗光。多 MCP 实例并存（本机 3 个）是这个竞态的温床。
+
+#### 三、修复
+
+1. **GUI 侧原子发布**（`main.rs`）：新增模块级 `publish_port_file(path, port, token)` —— 写同目录临时文件（带 PID，避免升级重叠期两个 GUI 互相覆盖暂存文件）后 `rename` 覆盖目标。NTFS 同卷 rename 原子，读者只会看到旧内容或完整新内容，不会看到撕裂态。初次发布与看门狗重发布**都**改走它。
+2. **MCP 侧比对后删**（`myshell-mcp.rs`）：`remove_gui_ipc_port_file(stale_port: Option<u16>)` 改为「比对后删」——重新读文件，若当前端口已不是我们判定陈旧的那个（说明被更新过），**跳过删除**并记日志。逻辑内核抽成 `remove_port_file_if_stale(path, stale_port)`，路径可注入以便测试。
+
+#### 四、验证
+
+- 新增两个回归测试：
+  - `port_file_is_published_atomically`（main.rs）：发布后读回必须是完整两行；重复发布整体替换；**不得残留任何 `gui-ipc-port.tmp-*` 临时文件**。
+  - `stale_port_file_removal_preserves_a_newer_publication`（myshell-mcp.rs）：文件已是新端口时判定陈旧删除**必须放行**；仍是原端口时才删。
+- **「修前必挂、修后必过」等价性证明**（`.zcode/verify-port-file-equiv.mjs`，不改动仓库源码）：对两份实现跑同一组用例——
+  - 缺口 B：旧逻辑（无条件删）必然破坏「已被更新」的端口文件；新逻辑保住它，且仍删真正陈旧的那份。
+  - 缺口 A：旧逻辑（truncate-then-write）并发读者 **33/34 次**读到不完整内容；新逻辑（temp+rename）**0 次**。
+- `cargo test --bin myshell --bin myshell-mcp` 全量通过。
+- **实现中发现的额外风险**：`rename` 覆盖目标在 Windows 上会因目标被不共享删除的句柄占用而失败（ACCESS_DENIED，实测 EPERM）。此时若不处理，端口文件就发布不出去——比原来更糟。故 `publish_port_file` 加了回退链：rename 失败 → 删临时文件 → 直接写目标并记警告。**保证端口文件一定发布得出去**，只是退回非原子窗口。
+
+#### 五问重启检查（阶段 202）
+
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 核实报告（4/5 条已修、1 条为安全限制）→ 补齐两处真实残留缺口：端口文件原子发布、MCP 比对后删；各配一个回归测试。 |
+| 什么是我没做的？ | 未做 GetExtendedTcpTable 那样的「枚举 myshell.exe 监听端口」二次发现——现行 `gui_process_running()` 进程探测 + 端口连通性判定已覆盖同一场景，引入 netstat 类 API 收益不足。 |
+| 我想去哪里？ | 下次 `打包` 后真机验证：多 MCP 实例并发调用下端口文件不再被误删。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
+| 什么可能导致偏离？ | ① 原子发布用 `rename` 覆盖，Windows 上跨卷会失败——temp 与目标同目录同卷，不会触发；② `remove_port_file_if_stale` 的比对窗口极小，但「读→判→删」之间仍有理论竞态（要彻底消除需文件锁，代价远大于收益）。 |
+| 下一步最小可验证动作？ | 装新版后开 3 个 MCP 实例并发调工具，观察 mcp.log 不再出现「端口文件不可用」且 GUI 不被重复拉起。 |

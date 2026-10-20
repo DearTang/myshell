@@ -2626,7 +2626,7 @@ fn ensure_gui_running_locked() -> Result<GuiIpcEndpoint, GuiLaunchError> {
                 "[gui] myshell.exe 正在运行但端口 {} 无监听，端口文件不可用 — 不重复启动 GUI",
                 ep.port
             ));
-            remove_gui_ipc_port_file();
+            remove_gui_ipc_port_file(Some(ep.port));
             if let Some(ep) = wait_for_port_file_republish() {
                 return Ok(ep);
             }
@@ -2636,7 +2636,7 @@ fn ensure_gui_running_locked() -> Result<GuiIpcEndpoint, GuiLaunchError> {
             "[gui] 陈旧的 gui-ipc-port 文件（端口 {} 无监听）— 删除并重新启动 GUI",
             ep.port
         ));
-        remove_gui_ipc_port_file();
+        remove_gui_ipc_port_file(Some(ep.port));
     }
 
     // No port file at all (or it was just deleted as stale). A GUI process
@@ -2766,17 +2766,53 @@ fn gui_process_running() -> bool {
     false
 }
 
-/// Delete the GUI's IPC port-discovery file. Only called when we have proven
-/// nothing is listening on that port (stale file from a crashed GUI), so a
-/// freshly launched GUI can publish its real port without confusion.
-fn remove_gui_ipc_port_file() {
+/// Delete the GUI's IPC port-discovery file — but ONLY if it still holds the
+/// exact endpoint we judged stale.
+///
+/// The check is a compare-and-delete, not an unconditional remove. Between
+/// "I read the file and found port P dead" and "I delete the file", the
+/// GUI's watchdog may have re-published a FRESH, LIVE port (P2) — e.g. the
+/// GUI was merely slow to bind, or another MCP instance raced us. An
+/// unconditional delete would then destroy a healthy GUI's discovery file:
+/// every later MCP call finds no port file, spawns a doomed second instance
+/// and burns its whole budget. Deleting only the file that still names the
+/// port we proved dead cannot touch a newer publication.
+///
+/// `stale_port` = the port we found with no listener. `None` means "no
+/// endpoint to compare against" — then the file is left alone and the caller
+/// reports the real condition (NoPortFile).
+fn remove_gui_ipc_port_file(stale_port: Option<u16>) {
     let mut path = match dirs::config_dir() {
         Some(d) => d,
         None => return,
     };
     path.push("myshell");
     path.push("gui-ipc-port");
-    let _ = std::fs::remove_file(&path);
+    remove_port_file_if_stale(&path, stale_port);
+}
+
+/// Compare-and-delete core of [`remove_gui_ipc_port_file`], with the target
+/// path injected so the behavior can be tested against a temp dir instead of
+/// the real `<config>/myshell/gui-ipc-port`.
+fn remove_port_file_if_stale(path: &std::path::Path, stale_port: Option<u16>) {
+    if let Some(port) = stale_port {
+        // Re-read: if the file now names a DIFFERENT port, a newer
+        // publication replaced ours — leave it untouched.
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            let current = raw
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u16>().ok());
+            if current != Some(port) {
+                log(&format!(
+                    "[gui] 端口文件已被更新（现为 {:?}，判定陈旧的为 {}）— 不删除",
+                    current, port
+                ));
+                return;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 /// Wait briefly for a live GUI's port-file watchdog to re-publish
@@ -3772,6 +3808,37 @@ mod tests {
         assert!(sanitize_relative_path("/").is_none());
         assert!(sanitize_relative_path("..").is_none());
         assert!(sanitize_relative_path("./..\\").is_none());
+    }
+
+    /// 端口文件的删除必须是「比对后删」：只有仍写着我们判定为陈旧的那个端口
+    /// 时才删。GUI 看门狗（或另一个 MCP 实例）刚重写的新端口文件必须毫发无损
+    /// —— 否则一次误删就让活着的 GUI 彻底不可发现，之后每次调用都去拉起
+    /// 一个注定被单实例拦下的第二实例，把 30 秒预算耗光。
+    #[test]
+    fn stale_port_file_removal_preserves_a_newer_publication() {
+        use super::remove_port_file_if_stale;
+
+        let dir = std::env::temp_dir().join("myshell_port_file_stale_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("gui-ipc-port");
+
+        // 文件现在写着 5555，而我们判定陈旧的是 1234 → 不得删除。
+        std::fs::write(&f, "5555\ntok-new").unwrap();
+        remove_port_file_if_stale(&f, Some(1234));
+        assert!(
+            f.exists(),
+            "端口文件已被更新为新端口时，删除陈旧判定必须放行（不得删除活实例的发现文件）"
+        );
+
+        // 文件仍是我们判定陈旧的那个端口 → 应当删除。
+        std::fs::write(&f, "1234\ntok-old").unwrap();
+        remove_port_file_if_stale(&f, Some(1234));
+        assert!(
+            !f.exists(),
+            "文件仍是判定为陈旧的那份时必须删除，否则 MCP 永远读不到新端口"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
