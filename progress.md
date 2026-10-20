@@ -8082,3 +8082,27 @@ Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 4
 | 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
 | 什么可能导致偏离？ | ① 原子发布用 `rename` 覆盖，Windows 上跨卷会失败——temp 与目标同目录同卷，不会触发；② `remove_port_file_if_stale` 的比对窗口极小，但「读→判→删」之间仍有理论竞态（要彻底消除需文件锁，代价远大于收益）。 |
 | 下一步最小可验证动作？ | 装新版后开 3 个 MCP 实例并发调工具，观察 mcp.log 不再出现「端口文件不可用」且 GUI 不被重复拉起。 |
+
+### 阶段 203 —— 发布 v2.18.3
+
+**做了什么**：按 `打包` 规则发布阶段 202 的端口文件修复。
+- 版本 2.18.2 → **2.18.3**（staging 仅 🐛 一条 → patch）
+- 预检查双通过：`npm run test:ts` rc=0、`cargo check` 0 error（2m47s）
+- 构建 `MyShell_2.18.3_x64-setup.exe`（13,366,049 B，BUILD_RC=0）→ 逐文件提交 `release: v2.18.3`（3a0131a）→ 双远端推送 → 三 SHA 一致 → 双平台 release → 清空 staging（baseline → v2.18.3）
+- 发布内容：端口文件原子发布（temp+rename，含 rename 失败回退）+ MCP 侧「比对后删」
+
+**再次踩到死代理（阶段 199/201 同款）**：本次两个远端**都**报 `Failed to connect ... after 21s`，但 `Test-NetConnection gitee.com:443` 为 True、`curl https://www.baidu.com` 返回 200，`HTTP_PROXY=172.19.109.247:3128` 仍挂在环境里。清掉 `HTTP_PROXY/HTTPS_PROXY/http_proxy/https_proxy/ALL_PROXY` **并显式 `-c http.proxy= -c https.proxy=`** 后，Gitee 4.7s、GitHub 69s 各一次成功。**教训升级：git push 连接超时时，先看环境代理变量并显式用 `-c` 清空再推，不要先怀疑网络。**
+
+**发布地址**：
+- Gitee: https://gitee.com/argustang/myshell/releases/tag/v2.18.3 （release id 1223268）
+- GitHub: https://github.com/DearTang/myshell/releases/tag/v2.18.3 （release id 418412584）
+
+**五问重启检查（阶段 203）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 发布 v2.18.3：版本号、CHANGELOG/README 双写、预检查、构建、提交推送（三 SHA 核对）、双平台 release、清空 staging。 |
+| 什么是我没做的？ | 未真机安装 v2.18.3 做多 MCP 实例并发冒烟。 |
+| 我想去哪里？ | 装新版后开 3 个 MCP 客户端并发调用，确认端口文件不再被误删、GUI 不被重复拉起。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
+| 什么可能导致偏离？ | ① 环境代理变量会让所有 git 远端连接超时——已固化为「先清代理再推」；② rename 回退链生效时会退回非原子写窗口（有告警日志，可观测）。 |
+| 下一步最小可验证动作？ | 装 v2.18.3 后 `grep -c "端口文件已被更新" mcp.log`：出现即说明「比对后删」在真实并发下生效；且不应再出现「端口文件不可用」。 |
