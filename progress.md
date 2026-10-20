@@ -7959,3 +7959,52 @@ Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 4
 | 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
 | 什么可能导致偏离？ | ① 本机死代理环境变量会让 node fetch 类脚本静默变慢/失败——发布前先清；② GitHub 推送超时不等于失败，先 `ls-remote` 再补推。 |
 | 下一步最小可验证动作？ | 安装 `MyShell_2.18.1_x64-setup.exe`，锁保险库后经 AI 客户端调 `list_connections`，20s 内输入主密码验证自动放行。 |
+
+### 阶段 200 —— 安装器 REBOOTOK 延迟删除误杀新装 MCP（用户问题报告核实与修复）
+
+**起因**：用户提交问题审查报告——`E:\Program Files\MyShell\myshell-mcp.exe` 不存在，三处 MCP 客户端配置指向该路径，spawn 即 WinError 2「服务器在响应前退出」。报告推断根因是「安装器改名让位成功、File 复制未落盘」，并怀疑 binaries 列表因 target-dir 重定向取到空源。
+
+#### 一、核实结论：报告的根因推断不成立
+
+三条现场证据全部指向相反结论——**安装器落盘正常，文件是装好之后、在 10/19 15:33 重启时被系统删掉的**：
+
+1. **File 是编译期指令**：`{{#each binaries}}` 展开的 `File "/oname=..." "绝对路径"` 在 makensis 打包时就把文件内容嵌入安装包，源不存在则打包直接失败，不存在「运行时静默跳过」。且同一次安装 `myshell-cli.exe`（2.18.1，13:18，与 G 盘构建产物逐字节同尺寸）落盘成功——同一循环、同一次执行，不可能 cli 成、mcp 败。
+2. **`uninstall.exe` 时间戳 13:42**：WriteUninstaller 位于 binaries 复制**之后**（installer.nsi 安装段第 782 行），它存在即证明安装段完整执行到底，File 段必然跑过。
+3. **安装目录 LastWriteTime = 15:33，恰是 15:32 计划外重启完成时刻**（事件日志 6005 @ 15:33:25）。安装器 13:42 就结束了，15:33 动这个目录的不是安装器，是开机时处理 `PendingFileRenameOperations` 的 Session Manager。
+
+报告的另一条论据「结尾 Delete 没收走 .myshell-old，反证复制段没走到」也不成立：`.myshell-old`（2.18.0，10/15 09:30）正是**改名保留原 mtime** 的旧文件，删不掉是因为它还锁在运行中的旧 MCP 进程手里——这正是文件头第 6 项设计文档里明说的预期状态。
+
+#### 二、真根因：旧卸载器的 `Delete /REBOOTOK` 与升级流程的时序竞态
+
+完整故障链（每一环都有现场证据）：
+
+1. 用户升级 2.18.0 → 2.18.1，重装页默认选「先卸载再安装」→ 新安装器静默执行**旧版**（2.18.0）卸载器。
+2. 旧卸载器卸载段执行 `Delete /REBOOTOK "$INSTDIR\myshell-mcp.exe"`。此刻 MCP 进程被 AI 客户端常驻占用（mcp-20745.log 显示该进程一直活到 15:12），删除失败 → NSIS 走 MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT) 把**该路径**登记进重启后删除队列。
+3. 新安装段接着把 2.18.1 的 myshell-mcp.exe 写回**同一路径**（13:19 构建、13:42 前落盘，15:12 还成功完成过一次握手）。
+4. 15:32 计划外重启 → Session Manager 执行队列，按**路径**删除 → 刚装好的 2.18.1 二进制被误删，目录只剩改名副本。
+5. 旁证：`myshell.exe`/`myshell-cli.exe` 当时未被占用、卸载时一次删净，无待删记录，故完好幸存——「只有常驻的 MCP 被杀」与占用状态完全吻合；当前队列里只剩 aTrust/EdgeUpdate 条目（MyShell 的已被那次重启消费）。
+
+#### 三、修复（installer.nsi 三处配套 + 守卫脚本纠偏）
+
+1. **reinst_uninstall 分支**：调旧卸载器**之前**先把旧目录 mcp/cli 改名让位。旧卸载器 Delete 找不到文件即静默跳过，根本不登记待删记录——治本，且覆盖任何旧版卸载器（含已装在用户机器上的 2.18.1）。
+2. **卸载段**：binaries 改为「先改名到 `.uninstall-pending` 唯一名，再对该名 REBOOTOK」。本版以后自己登记的待删路径永不复用，不可能误伤后续安装写入的新文件。
+3. **安装段写后自检**：三件套（myshell.exe / myshell-mcp.exe / myshell-cli.exe）缺一即 MessageBox 报错并 Abort，杜绝「安装报告成功、目录却缺文件」的静默半套安装（报告建议项）。
+4. 第 6 项的改名让位加 `${FileExists}` 守卫：升级走「先卸载」路径时源已被 1) 挪走，Rename 失败属预期，不加守卫会误触 CheckIfAppIsRunning（按进程名仍匹配得到运行中的旧 MCP，弹无意义强杀框）。
+5. `.zcode/check-nsis-handlebars.mjs` 第二项检查从「断言 $INSTDIR 前缀」改回「断言裸文件名」——阶段 150 真机实测已推翻阶段 147 的前缀方向，脚本没跟上，一直误报。
+
+#### 四、现场恢复与验证
+
+- **用户机器已恢复**：`G:\Rust\cargo_target\release\myshell-mcp.exe`（2.18.1，与已装 GUI 同版本，无 IPC token 错配）复制回 `E:\Program Files\MyShell\myshell-mcp.exe`；实测 spawn + initialize 握手通过（`.zcode/smoke-mcp.mjs`）。两代残留 `.myshell-old`(2.18.0)/`.old`(2.13.0) 已清，安装目录现为完整三件套 + uninstall.exe。
+- **模板编译验证**：`npm run tauri:build` 全程通过，产出 `MyShell_2.18.1_x64-setup.exe`——修改后的模板经 Handlebars 渲染 + makensis 编译无误；守卫脚本双检查通过。
+- **原语沙盒实测**（`.zcode/nsis/test-rename.nsi`，真实 NSIS 工具链编译）：运行中的 exe 可 Rename、不可 Delete、Rename 后原路径已空——修复依赖的全部前提成立。
+
+## 五问重启检查（阶段 200）
+
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 核实用户问题报告（根因推断改判：非落盘失败，是 REBOOTOK 待删记录重启误杀）；修复 installer.nsi 三处 + 守卫脚本纠偏；恢复用户安装目录并握手验证；重建安装包验证模板可编译。 |
+| 什么是我没做的？ | 未真机走一遍「升级 → 重启 → 文件仍在」完整链路（需重启机器，留给用户装新版后验证）；未删除 `.zcode/` 下的沙盒脚本（可重跑的验证矩阵，沿 test-findproc.nsi 惯例保留）。 |
+| 我想去哪里？ | 下次 `打包` 后：用户开着 AI 客户端升级 → 重启 → `myshell-mcp.exe` 应仍在且为新版。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
+| 什么可能导致偏离？ | ① 极端残留：修复前旧卸载器登记的待删记录若还没被重启消费、期间又装新版，仍会误删一次（当前用户机器队列已清，不适用）；② 升级 Tauri re-sync 模板时漏掉第 7 项三处改动，会静默退回本故障——文件头清单已列。 |
+| 下一步最小可验证动作？ | 装新版后 `ls "E:\Program Files\MyShell"`：三件套齐全且 myshell-mcp.exe 版本 = 新版；重启一次再确认文件仍在。 |

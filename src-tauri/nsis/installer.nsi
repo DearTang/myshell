@@ -60,6 +60,21 @@
 ;      才会用上新版本，这一点在下方 DetailPrint 里明说。
 ;      改名失败（极少数：杀软独占等）才回退到第 2 项的提示式强杀。
 ;
+;
+;   7. 修复「升级后重启，myshell-mcp.exe 被误删」（2026-10-20，阶段 200）。
+;      根因不是安装器没落盘 —— File 指令编译期已把二进制嵌进安装包，同一次
+;      安装 myshell-cli.exe 落盘成功即可证明循环执行了。真凶是旧卸载器的
+;      Delete /REBOOTOK：卸载时 mcp 正被 AI 客户端占用，删除被登记成
+;      「下次重启时删除该路径」；新安装随后把新二进制写回同一路径，下次重启
+;      Session Manager 执行待删队列，把刚装好的文件删掉（现场：唯独 mcp 缺失、
+;      cli/GUI 完好、安装目录 mtime 停在重启时刻、队列里只剩别家条目）。
+;      三处配套修复：
+;      a) reinst_uninstall 分支调旧卸载器前，先把旧目录 mcp/cli 改名让位 ——
+;         旧卸载器 Delete 找不到文件即不登记待删记录（治本，覆盖旧版卸载器）；
+;      b) 卸载段改为「先改名到 .uninstall-pending 唯一名，再对该名 REBOOTOK」
+;         —— 本版卸载器自己登记的待删路径永不复用；
+;      c) 安装段写后自检三件套齐全，缺一即报错中止，不再静默半套安装。
+;      另: 第 6 项的改名让位加了存在性守卫，源不存在时不再误触强杀确认框。
 ;      注: 本文件由 Tauri 用 Handlebars 渲染，注释里不能出现双花括号。
 ;
 ; 维护须知（接管模板的代价）:
@@ -420,6 +435,21 @@ Function PageLeaveReinstall
       ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|} ; append /P
       ; MyShell 改动: 加 /S 让旧版卸载静默执行（官方原版只有 _?=$4，会弹卸载向导）
       StrCpy $R1 "$R1 /S _?=$4" ; append silent + uninstall directory
+      ; MyShell 改动（文件头第 7 项）: 调旧卸载器前先把 mcp/cli 改名让位。
+      ; 旧卸载器对这两个文件执行 Delete /REBOOTOK；文件正被 AI 客户端占用时，
+      ; 删除会被登记成「下次重启时删除该路径」，而本次安装随后把新二进制写回
+      ; 同一路径 —— 下次重启时新文件被这份待删记录连带删掉，安装目录只剩改名
+      ; 副本、客户端报「服务器在响应前退出」（阶段 200 故障：唯独 mcp 缺失、
+      ; 目录时间戳停在重启时刻）。先改名让位后旧卸载器 Delete 找不到文件，
+      ; 静默跳过，不再登记任何重启后删除。
+      ${If} $4 != ""
+        Delete "$4\myshell-mcp.exe.myshell-old"
+        Delete "$4\myshell-cli.exe.myshell-old"
+        ClearErrors
+        Rename "$4\myshell-mcp.exe" "$4\myshell-mcp.exe.myshell-old"
+        Rename "$4\myshell-cli.exe" "$4\myshell-cli.exe.myshell-old"
+        ClearErrors
+      ${EndIf}
       ExecWait '$R1' $0
     ${EndIf}
 
@@ -733,17 +763,25 @@ Section Install
   Delete "$INSTDIR\myshell-cli.exe.myshell-old"
   ClearErrors
 
-  Rename "$INSTDIR\myshell-mcp.exe" "$INSTDIR\myshell-mcp.exe.myshell-old"
-  ${If} ${Errors}
-    ; 改名被拦（极少数：安全软件独占句柄等）→ 回退到原先的提示式强杀。
-    ClearErrors
-    !insertmacro CheckIfAppIsRunning "myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
+  ; MyShell 改动（文件头第 7 项）: 改名让位加存在性守卫。升级走「先卸载」路径
+  ; 时文件已在 reinst_uninstall 前被改名挪走，这里源不存在、Rename 失败属预期；
+  ; 不加守卫会误触 CheckIfAppIsRunning —— 它按进程名仍匹配得到运行中的旧 MCP
+  ;（改名不改 PEB 映像名），弹出无意义的强杀确认框。
+  ${If} ${FileExists} "$INSTDIR\myshell-mcp.exe"
+    Rename "$INSTDIR\myshell-mcp.exe" "$INSTDIR\myshell-mcp.exe.myshell-old"
+    ${If} ${Errors}
+      ; 改名被拦（极少数：安全软件独占句柄等）→ 回退到原先的提示式强杀。
+      ClearErrors
+      !insertmacro CheckIfAppIsRunning "myshell-mcp.exe" "${PRODUCTNAME} (MCP Server)"
+    ${EndIf}
   ${EndIf}
 
-  Rename "$INSTDIR\myshell-cli.exe" "$INSTDIR\myshell-cli.exe.myshell-old"
-  ${If} ${Errors}
-    ClearErrors
-    !insertmacro CheckIfAppIsRunning "myshell-cli.exe" "${PRODUCTNAME} (CLI)"
+  ${If} ${FileExists} "$INSTDIR\myshell-cli.exe"
+    Rename "$INSTDIR\myshell-cli.exe" "$INSTDIR\myshell-cli.exe.myshell-old"
+    ${If} ${Errors}
+      ClearErrors
+      !insertmacro CheckIfAppIsRunning "myshell-cli.exe" "${PRODUCTNAME} (CLI)"
+    ${EndIf}
   ${EndIf}
   ClearErrors
 
@@ -758,6 +796,17 @@ Section Install
   Delete "$INSTDIR\myshell-mcp.exe.myshell-old"
   Delete "$INSTDIR\myshell-cli.exe.myshell-old"
   ClearErrors
+
+  ; MyShell 改动（文件头第 7 项）: 写后自检 —— 三个二进制缺一即明示失败并中止，
+  ; 杜绝「安装报告成功、目录里却缺 mcp/cli」的静默半套安装。
+  ${IfNot} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
+  ${OrIfNot} ${FileExists} "$INSTDIR\myshell-mcp.exe"
+  ${OrIfNot} ${FileExists} "$INSTDIR\myshell-cli.exe"
+    ${If} $PassiveMode != 1
+      MessageBox MB_OK|MB_ICONSTOP "安装不完整：$INSTDIR 下缺少 myshell.exe / myshell-mcp.exe / myshell-cli.exe 之一。请重新运行安装包；若反复出现，请把安装目录文件列表截图反馈。"
+    ${EndIf}
+    Abort
+  ${EndIf}
 
   ; 让用户知道 MCP 何时才会用上新版本：正在跑的那份是改名后的旧副本，
   ; 要等 AI 客户端下次拉起进程才会换成新的。
@@ -898,9 +947,18 @@ Section Uninstall
   {{/each}}
 
   ; Delete external binaries (myshell-mcp.exe / myshell-cli.exe)
-  ; /REBOOTOK: 若文件被占用无法立即删除，登记为重启后删除，卸载不会因此卡住
+  ; MyShell 改动（文件头第 7 项）: 不再对规范路径直接 Delete /REBOOTOK。文件被
+  ; 占用时它登记的是「重启后删除该路径」，而升级流程是旧卸载器先删、新安装后
+  ; 写同一路径 —— 重启时新装二进制被这份记录误删（阶段 200 故障）。改为先改名
+  ; 到唯一名再删：待删路径永不复用，不可能误伤后续安装写入的新文件。
   {{#each binaries}}
-    Delete /REBOOTOK "$INSTDIR\\{{this}}"
+    Rename "$INSTDIR\\{{this}}" "$INSTDIR\\{{this}}.uninstall-pending"
+    ${If} ${Errors}
+      ClearErrors
+      Delete /REBOOTOK "$INSTDIR\\{{this}}"
+    ${Else}
+      Delete /REBOOTOK "$INSTDIR\\{{this}}.uninstall-pending"
+    ${EndIf}
   {{/each}}
 
   ; MyShell 改动（文件头第 6 项）: 删掉安装时改名让位留下的旧副本。
