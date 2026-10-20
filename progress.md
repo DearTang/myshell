@@ -8008,3 +8008,26 @@ Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 4
 | 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
 | 什么可能导致偏离？ | ① 极端残留：修复前旧卸载器登记的待删记录若还没被重启消费、期间又装新版，仍会误删一次（当前用户机器队列已清，不适用）；② 升级 Tauri re-sync 模板时漏掉第 7 项三处改动，会静默退回本故障——文件头清单已列。 |
 | 下一步最小可验证动作？ | 装新版后 `ls "E:\Program Files\MyShell"`：三件套齐全且 myshell-mcp.exe 版本 = 新版；重启一次再确认文件仍在。 |
+
+### 阶段 201 —— 发布 v2.18.2
+
+**做了什么**：按 `打包` 规则走完流水线，发布阶段 200 的安装器修复。
+- 版本 2.18.1 → **2.18.2**（staging 仅 🐛 一条 → patch）；CHANGELOG/README 双写，完整性校验覆盖 baseline..HEAD + 工作区全部变更（`debug-shell.*` 用户遗留不进提交）
+- 预检查双通过：`npm run test:ts` rc=0、`cargo check` RC=0（11m56s，版本 bump 触发全量重检）
+- 构建 `MyShell_2.18.2_x64-setup.exe`（BUILD_RC=0）→ 逐文件提交 `release: v2.18.2`（721c2ed）→ 双远端推送（三 SHA 一致）→ 双平台 release → 清空 staging（baseline → v2.18.2，a74478e，再推双远端，三 SHA 复核一致）
+
+**GitHub 推送卡了两轮（阶段 189/199 同款区域）**：症状是 push 挂住无输出、300s 超时被杀。诊断排除了「死代理」误判（`HTTP_PROXY=172.19.109.247:3128` 确实还挂着，但 `ls-remote github` 3 秒内返回），真因是 **GCM 凭据失效 → 卡在交互式认证**：禁交互重推立刻报 `could not read Username for 'https://github.com': terminal prompts disabled`。恢复正常交互认证后一次推送成功。**教训：下次 GitHub push 无输出时，先用 `GIT_TERMINAL_PROMPT=0` 跑一次拿真实错误，别猜代理。**
+
+**发布地址**：
+- Gitee: https://gitee.com/argustang/myshell/releases/tag/v2.18.2 （release id 1221356）
+- GitHub: https://github.com/DearTang/myshell/releases/tag/v2.18.2 （release id 418011322）
+
+**五问重启检查（阶段 201）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 发布 v2.18.2：版本号、CHANGELOG/README 双写、预检查、构建安装包、提交推送（三 SHA 核对两次）、双平台 release、清空 staging 并二次推送。 |
+| 什么是我没做的？ | 未真机安装 v2.18.2 回归（本轮未替用户点安装包）；`.zcode/` 下沙盒脚本按惯例保留可重跑。 |
+| 我想去哪里？ | 用户装 v2.18.2 实测「升级 → 重启 → myshell-mcp.exe 仍在」，闭环阶段 200 五问的待验证项。 |
+| 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
+| 什么可能导致偏离？ | ① GitHub push 再遇无输出——先 `GIT_TERMINAL_PROMPT=0` 取真实错误再动手；② 阶段 200 风险①（极老的待删记录未消费时）依然成立。 |
+| 下一步最小可验证动作？ | 装 v2.18.2，`dir "E:\Program Files\MyShell"` 三件套齐全且 mcp 版本 = 2.18.2，重启一次后复查文件仍在。 |
