@@ -7645,7 +7645,7 @@ AI 客户端（使用方）提交了一份 13 条的意见书，附现场失败�
 
 **遗留的安全隐患（未处理，需用户决定）**：
 `.git/config` 里 `github` remote 的 URL **嵌了明文 PAT**：
-`https://DearTang:github_pat_11AGIIL...@github.com/DearTang/myshell.git`
+`https://DearTang:<PAT 已脱敏>@github.com/DearTang/myshell.git`
 任何能读该目录的进程都能取到该 token。建议改用 credential helper（`git config --global credential.helper store`）或 SSH remote。本轮未擅自改动 —— 改 remote 属于凭据管理变更，应由用户决定。
 
 **五问重启检查**：
@@ -7701,7 +7701,7 @@ AI 客户端（使用方）提交了一份 13 条的意见书，附现场失败�
 **背景**：用户要求处理阶段 189 遗留的两项待办。查证后发现**第三项**（Gitee 积压 3 个版本）的根因与我原先的猜测不同。
 
 **待办一：`.git/config` 内嵌明文 PAT —— 已处理**
-`.git/config` 里 GitHub remote 是 `https://DearTang:github_pat_11AGIIL...@github.com/...`，任何能读该目录的进程都能取到该 token。
+`.git/config` 里 GitHub remote 是 `https://DearTang:<PAT 已脱敏>@github.com/...`，任何能读该目录的进程都能取到该 token。
 查证后确认**它本来就是多余的**：全局 `credential.helper=manager`（`E:\Program Files\Git\mingw64\bin\git-credential-manager.exe`）已在提供凭据，URL 里再带一份只是多一处泄漏面。
 改法：`git remote set-url github https://github.com/DearTang/myshell.git`，随后 `git ls-remote github HEAD` 验证认证仍正常（返回 `ff5a2a3...`）。写入 `AGENTS.md` Notes 段作为长期约束。
 
@@ -8106,3 +8106,30 @@ Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 4
 | 我要去哪里？ | `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留，继续顺延）。 |
 | 什么可能导致偏离？ | ① 环境代理变量会让所有 git 远端连接超时——已固化为「先清代理再推」；② rename 回退链生效时会退回非原子写窗口（有告警日志，可观测）。 |
 | 下一步最小可验证动作？ | 装 v2.18.3 后 `grep -c "端口文件已被更新" mcp.log`：出现即说明「比对后删」在真实并发下生效；且不应再出现「端口文件不可用」。 |
+
+### 阶段 204 —— GitGuardian 告警核实：命中的是**截断前缀占位符**，真实 PAT 从未进库
+
+**触发**：GitGuardian 报告 `DearTang/myshell` 于 2026-10-20 17:07:26 UTC 存在 Basic Auth String。
+
+**核实过程与证据**：
+1. 全库扫描（2395 个 git 对象，`cat-file --batch-all-objects`）：唯一样本为 `https://DearTang:<21 字节>@github.com`。该 21 字节恰为 `github_pat_`(11) + token 前 7 个字符 + `...`(3) —— 阶段 189 写文档时**手工截断的前缀示意**，不是可用凭据（本文件中不再复述这 7 个字符）。
+2. 用真实 `.github-token`（93 字节）整串 + 三个 30 字节片段对全部对象做逐串匹配：**命中 0 次**。`ghp_*` / `gitee_*` / `Authorization: Basic` / `Bearer` 亦全部 0。
+3. 真实 PAT 的唯一驻留点是本地 `.git/config` 的 remote URL（从未被提交），已在阶段 191（`af6e509`）用 `git remote set-url` 清除；当前 `remote.github.url` 无凭据。
+4. 该字符串自 `v2.17.1`（`af6e509`）起存在于所有 tag 的 `progress.md` 中，且随 `main` 公开（GitHub blob sha `e88e3f2` 与本地一致）。GitHub 自身 secret scanning 告警列表为空，命中的是 GitGuardian 的 `scheme://user:pass@host` 形态规则。
+5. 时间戳对不上：`17:07:26Z` 无任何 commit；最近一次推送为 `13:10:17Z`（v2.18.3）。说明这是 GitGuardian 的**延迟扫描**，不是新泄漏。
+
+**结论**：告警为**规则形态误报（Info 级）**，不存在可用的泄露凭据，无需轮换 token。真实残留风险仅为「GitHub 用户名 + PAT 前缀格式」公开。
+
+**处置**：
+- `progress.md:7648` / `:7704` 两处前缀替换为 `<PAT 已脱敏>`（`grep -c github_pat` → 0）。
+- 未改写历史：完整凭据未泄露，重写 `main` 全部 tag 的收益为零而破坏面极大（全部 release 指向的 commit 会变）。
+
+**五问重启检查（阶段 204）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 核实告警并脱敏文档中的 PAT 前缀占位符。 |
+| 什么是我没做的？ | 未改写 git 历史；未轮换 token（无必要）。 |
+| 我想去哪里？ | 让文档里再出现凭据示例时一律用 `<PAT 已脱敏>`，不写任何真实前缀。 |
+| 我要去哪里？ | 提交并推送本次脱敏（双远端），随后 `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。 |
+| 什么可能导致偏离？ | 历史 blob 里仍有该 21 字节字符串，GitGuardian 可能在下次全量扫描时重复告警——届时按本条结论回复为误报。 |
+| 下一步最小可验证动作？ | 推送后 `git ls-remote` 三 SHA 一致 + `git grep -c github_pat HEAD` 为 0。 |
