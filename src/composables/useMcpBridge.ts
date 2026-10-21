@@ -45,6 +45,33 @@ const MCP_LOCK_STALE_MS = 60_000;
 export async function startMcpBridge(): Promise<UnlistenFn> {
   return listen<McpGuiCommand>("mcp-gui-command", (event) => {
     const { action, connection_id } = event.payload;
+
+    // ── mcp_confirm：不可逆文件操作的人工确认（GUI 内渲染）──
+    //
+    // 必须在 connection_id 守卫之前：文件类操作的 payload 不带 connection_id
+    // （main.rs 的 mcp_confirm 分支只发 action/request_id/operation/
+    // connection_name/detail），守卫先返回会让弹窗永不渲染，MCP 侧空等 180s
+    // 后按 deny 收场 —— 用户看到的就是「任务卡在等待确认，但没弹框」。
+    if (action === "mcp_confirm" && event.payload.request_id) {
+      const { request_id, operation, connection_name, detail } = event.payload as {
+        request_id: string;
+        operation: string;
+        connection_name: string;
+        detail: string;
+      };
+      // The listener callback is synchronous (Tauri events), so the dialog
+      // promise is chained rather than awaited: `showMcpConfirm` parks its
+      // resolver until the user clicks, and the decision goes back over IPC.
+      // dialog 的 command 字段渲染全文并做危险片段高亮；detail 一并传入，
+      // 用户能看到完整对象与目标路径。
+      void showMcpConfirm(
+        `${operation}\n\n${detail}`,
+        connection_name || "MyShell",
+        [],
+      ).then((decision) => mcpConfirmResult(request_id, decision));
+      return;
+    }
+
     if (!connection_id) return;
 
     const config = connectionsStore.connections.find((c) => c.id === connection_id);
@@ -380,32 +407,6 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
           }
         }, 500);
       }
-      return;
-    }
-
-    // ── mcp_confirm：不可逆文件操作的人工确认（GUI 内渲染）──
-    //
-    // 命令确认走 exec_in_tab 分支，文件类操作（上传覆盖 / 删除 / 重命名 /
-    // 项目传输 / zmodem 上传）此前由 MCP 进程弹原生 MessageBoxW —— 用户在
-    // MyShell 窗口里操作时那个框藏在后面，而这类操作不可逆，漏看一次框就等于
-    // 漏掉一次确认。改为复用同一个 McpConfirmDialog。
-    if (action === "mcp_confirm" && event.payload.request_id) {
-      const { request_id, operation, connection_name, detail } = event.payload as {
-        request_id: string;
-        operation: string;
-        connection_name: string;
-        detail: string;
-      };
-      // The listener callback is synchronous (Tauri events), so the dialog
-      // promise is chained rather than awaited: `showMcpConfirm` parks its
-      // resolver until the user clicks, and the decision goes back over IPC.
-      // dialog 的 command 字段渲染全文并做危险片段高亮；detail 一并传入，
-      // 用户能看到完整对象与目标路径。
-      void showMcpConfirm(
-        `${operation}\n\n${detail}`,
-        connection_name || "MyShell",
-        [],
-      ).then((decision) => mcpConfirmResult(request_id, decision));
       return;
     }
 

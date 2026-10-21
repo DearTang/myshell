@@ -192,6 +192,18 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 
 ## 更新日志
 
+### v2.18.4（2026-10-21）
+
+MCP 文件操作确认框修复：确认事件被前端守卫丢弃。
+
+**🐛 修复**
+
+- **MCP 文件类操作的确认框永不弹出**：`sftp_upload`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`zmodem_upload` 的确认事件（`mcp_confirm`）不携带 `connection_id`，而前端监听器首行就是 `if (!connection_id) return`，事件在到达 `mcp_confirm` 分支前即被丢弃，对话框从未渲染。后端确认 channel 空等到 180 秒超时后按拒绝回包，用户侧表现是「任务卡在等待确认，但没有任何弹窗」，最终报「用户已拒绝高危操作」。修复为把 `mcp_confirm` 分支前移到 `connection_id` 守卫之前，并在注释中固定该顺序，避免后续重构改回。命令确认（`exec_in_tab`）payload 带 `connection_id`，不受影响
+
+**🔒 安全**
+
+- **文档脱敏**：`progress.md` 中被 GitGuardian 按 `scheme://user:pass@host` 形态标记的 PAT 前缀占位符改为 `<PAT 已脱敏>`（为手工截断的示意串，非可用凭据，无需轮换 token）
+
 ### v2.18.3（2026-10-20）
 
 MCP 稳定性修复：端口文件的两处竞态。

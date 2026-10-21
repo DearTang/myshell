@@ -8133,3 +8133,31 @@ Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 4
 | 我要去哪里？ | 提交并推送本次脱敏（双远端），随后 `command_rules` 的 `systemctl` 子命令解析消噪（阶段 187 遗留）。 |
 | 什么可能导致偏离？ | 历史 blob 里仍有该 21 字节字符串，GitGuardian 可能在下次全量扫描时重复告警——届时按本条结论回复为误报。 |
 | 下一步最小可验证动作？ | 推送后 `git ls-remote` 三 SHA 一致 + `git grep -c github_pat HEAD` 为 0。 |
+
+### 阶段 205 —— ZMODEM 上传不弹确认框：`mcp_confirm` 事件被 `connection_id` 守卫丢弃
+
+**现象**：用户报告 `zmodem_upload`（`F:/personalProject/omnido-src.tar.gz` → `nas.ggbond.fun:/home/argus`）一直停在「等待用户确认」，MyShell 里没有任何弹窗。
+
+**根因**（`src/composables/useMcpBridge.ts`）：
+- `main.rs` 的 `mcp_confirm` 分支发的 payload 只有 `action / request_id / operation / connection_name / detail`，**没有 `connection_id`**（这类操作不绑定某个 tab）。
+- `startMcpBridge` 的监听器第一行是 `if (!connection_id) return;`，事件在进入 `mcp_confirm` 分支之前就被丢弃，`showMcpConfirm` 从未被调用，弹窗自然不出现。
+- 后端 oneshot 空等 `MCP_CONFIRM_TIMEOUT_SECS = 180` 秒后按 deny 回包，所以任务最终报「用户已拒绝高危操作」。
+- 时间戳佐证：`mcp-20747.log` 09:13:52 发起确认，`mcp-error-20747.log` 09:16:56 记录拒绝，间隔 184s ≈ 180s 超时 + 启动开销。日志里没有 `[confirm] GUI 不可用，回退原生弹窗`，说明 IPC 通、GUI 可达，纯粹是前端监听器丢事件。
+
+**影响面**：不只是 zmodem。走 `confirm_or_session_allowed` → `confirm_via_gui` 的六个文件工具（`sftp_upload` / `sftp_remove` / `sftp_rename` / `upload_project` / `download_project` / `zmodem_upload`）**只要 GUI 在跑就必然卡 180 秒后拒绝**。命令确认（`exec_in_tab`）不受影响，因为那条 payload 带 `connection_id` —— 日志 09:21:14 用户成功点了「本轮会话均允许」正是反证。
+
+**修复**：把 `mcp_confirm` 分支整体前移到 `connection_id` 守卫之前，并在注释里写明「该 payload 不带 connection_id，必须放在守卫前面」，避免下次重构又把顺序改回去。
+
+**验证**：`npm run test:ts` 通过；`npm run build` 通过；产物 `dist/assets/index-CiPbPXZf.js` 中 `if(t==="mcp_confirm"&&e.payload.request_id)` 紧跟解构、位于 `if(!n)return` 之前（旧产物 `index-C9_sv3qi.js` 是守卫在前），说明修复确实进了打包产物。仓库无 JS 单测框架，未为此引入 vitest —— 该回归由上述注释 + 产物顺序约束兜底。
+
+**升级提示**：已安装的 v2.18.3（`E:\Program Files\MyShell\myshell.exe`）内置的是旧前端，必须重新打包/覆盖安装才生效。
+
+**五问重启检查（阶段 205）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 定位并修复 `mcp_confirm` 事件被 `connection_id` 守卫丢弃导致文件类确认框永不弹出的 bug。 |
+| 什么是我没做的？ | 未重新打包安装器；未给前端引入测试框架。 |
+| 我想去哪里？ | 文件类工具（上传/删除/重命名/项目传输/zmodem）的确认框在实际 GUI 里能正常弹出并回传 allow/deny。 |
+| 我要去哪里？ | 重新构建并覆盖安装，然后重跑一次 `zmodem_upload` 做实机确认。 |
+| 什么可能导致偏离？ | 打包后的 GUI 仍跑旧前端（未覆盖安装）时会看起来「没修好」。 |
+| 下一步最小可验证动作？ | 装上新构建后，对一个无害的 `sftp_upload` 目标触发一次，确认对话框出现且 5 秒内有反应。 |
