@@ -647,9 +647,12 @@ Enter 发送 ● Shift+Enter 换行"
   height: 100%;
   display: flex;
   flex-direction: column;
-  /* 旧版即引用未定义令牌（--bg-sidebar 在两版主题里均未定义 → 解析为透明）。
-     逐字保留以维持行为一致；若壳层日后补充该令牌则自动生效。 */
-  background: var(--bg-sidebar);
+  /* 旧版这里写的是 `var(--bg-sidebar)` —— 该令牌在两版主题里**从未定义**，
+     实际解析成 transparent，AI 栏底色一直靠壳层 `.shell-ai` 的玻璃兜底。
+     那层玻璃属于壳层而非面板，一旦壳层样式被调整（比如实心度插值），
+     AI 栏会跟着一起变、行为不可控。改为显式的 --surface-translucent，
+     与顶栏/侧栏同一套实心度插值，AI 栏也就能被外观设置统一控制。 */
+  background: var(--surface-translucent);
   position: relative;
 }
 
@@ -690,7 +693,7 @@ Enter 发送 ● Shift+Enter 换行"
 .panel-title {
   font-weight: 600;
   color: var(--text-primary);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -701,7 +704,7 @@ Enter 发送 ● Shift+Enter 换行"
 }
 
 .ctx-label {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -717,7 +720,7 @@ Enter 发送 ● Shift+Enter 换行"
 .close-btn {
   background: transparent;
   color: var(--text-secondary);
-  font-size: 18px;
+  font-size: var(--fs-lg);
   line-height: 1;
   padding: 4px 8px;
   border-radius: 6px;
@@ -735,7 +738,7 @@ Enter 发送 ● Shift+Enter 换行"
 
 .empty-hint {
   color: var(--text-tertiary);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.7;
 }
 
@@ -755,7 +758,7 @@ Enter 发送 ● Shift+Enter 换行"
   background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
   color: var(--text-primary);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
   display: flex;
   flex-direction: column;
@@ -774,7 +777,7 @@ Enter 发送 ● Shift+Enter 换行"
 }
 
 .sel-snap {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   line-height: 1.5;
   color: var(--text-tertiary);
   background: var(--bg-base);
@@ -817,7 +820,7 @@ Enter 发送 ● Shift+Enter 换行"
   padding: 1px 5px;
   border-radius: 4px;
   font-family: "Cascadia Code", Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 
 .ai-markdown :deep(.ai-code-block) {
@@ -843,7 +846,7 @@ Enter 发送 ● Shift+Enter 换行"
   border: none;
   border-radius: 5px;
   padding: 3px 8px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   cursor: pointer;
   font-family: inherit;
 }
@@ -857,7 +860,7 @@ Enter 发送 ● Shift+Enter 换行"
 
 .ai-markdown :deep(.ai-code-pre code) {
   font-family: "Cascadia Code", Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 
 /* ── Input ── */
@@ -868,7 +871,7 @@ Enter 发送 ● Shift+Enter 换行"
 }
 
 .attach-chip {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-secondary);
   background: var(--accent-primary-muted);
   border: 1px solid var(--border-accent);
@@ -899,7 +902,7 @@ Enter 发送 ● Shift+Enter 换行"
   border: none;
   color: var(--text-secondary);
   cursor: pointer;
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 
 .input-wrap {
@@ -950,7 +953,7 @@ Enter 发送 ● Shift+Enter 换行"
 .toolbar-hint {
   flex: 1;
   min-width: 0;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -983,7 +986,7 @@ Enter 发送 ● Shift+Enter 换行"
 .picker-label {
   flex: 1;
   min-width: 0;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 500;
   color: var(--text-primary);
   overflow: hidden;
@@ -1051,7 +1054,7 @@ Enter 发送 ● Shift+Enter 换行"
 
 .supplier-name {
   flex: 1;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1064,7 +1067,7 @@ Enter 发送 ● Shift+Enter 换行"
 }
 
 .need-key {
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   color: var(--warning, #fab005);
 }
 
@@ -1076,7 +1079,7 @@ Enter 发送 ● Shift+Enter 换行"
 
 .model-empty {
   padding: 12px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
 }
 
@@ -1096,7 +1099,7 @@ Enter 发送 ● Shift+Enter 换行"
 
 .model-name {
   flex: 1;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1109,7 +1112,7 @@ Enter 发送 ● Shift+Enter 换行"
 }
 
 .model-id {
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   max-width: 80px;
   overflow: hidden;

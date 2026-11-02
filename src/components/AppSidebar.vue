@@ -545,8 +545,10 @@ const dragHintTarget = computed<string | null>(() => {
     @click="closeMenu"
     @contextmenu="onBlankContext"
   >
-      <!-- 头部：动作图标行（myui/EP 单色图标体系） -->
-    <div class="side-header">
+      <!-- 顶排：动作图标行。高度固定 --chrome-top-height（44px），与右侧顶栏
+           拼成窗口最上面同一整排（对齐 ompDesktop 的 .wb-logo 口径）。
+           兼作窗口拖拽区：deep 表示整行空白处可拖，按钮自动豁免。 -->
+    <div class="side-header" data-tauri-drag-region="deep">
       <div class="header-actions">
         <MyIconButton
           :title="isDark ? '切换到亮色模式' : '切换到暗色模式'"
@@ -826,11 +828,14 @@ const dragHintTarget = computed<string | null>(() => {
   display: flex;
   flex-direction: column;
 }
-/* ── 头部 ── */
+/* ── 顶排（与顶栏拼成连续 44px 一整排） ── */
 .side-header {
   /* 横向 padding 收窄（16→8）：侧栏最窄 200px 时 6 个 28px 图标 + gap2
      恰好单行（194px），不再溢出/换行 */
-  padding: 12px 8px;
+  flex-shrink: 0;
+  height: var(--chrome-top-height);
+  box-sizing: border-box;
+  padding: 0 8px;
   border-bottom: 1px solid var(--border-subtle);
   display: flex;
   align-items: center;
@@ -838,7 +843,7 @@ const dragHintTarget = computed<string | null>(() => {
   gap: 8px;
 }
 .header-title {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   color: var(--text-secondary);
   text-transform: uppercase;
@@ -885,7 +890,7 @@ const dragHintTarget = computed<string | null>(() => {
 }
 .search-count {
   margin-top: 6px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
   text-align: center;
 }
@@ -900,7 +905,7 @@ const dragHintTarget = computed<string | null>(() => {
   padding: 32px;
   text-align: center;
   color: var(--text-tertiary);
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 
 /* 文件夹行 */
@@ -909,22 +914,21 @@ const dragHintTarget = computed<string | null>(() => {
      行首 chevron 之前留出一条空列（见 feedback 截图），侧栏最窄 200px 时白扔
      1/10 宽度。这里去掉行的左外边距，内边距压到 8px —— 与右侧 16px 相比
      刻意更窄，因为左侧还要叠 depth*12px 的层级缩进，两者相加才接近视觉平衡。
-     纵向 7→5，与连接行同步收紧（阶段 190）：文件夹行是单行文字，原 7px 会
-     让它比连接行矮一截，列表密度不统一。 */
-  padding: 5px 16px 5px 8px;
+     纵向 5→4：文件夹是分组标题，比连接行矮一档，但仍保留可点的呼吸位
+     （对齐 ompDesktop 项目组头 min-height 26px 的观感）。 */
+  padding: 4px 16px 4px 8px;
   cursor: pointer;
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   /* secondary → 暗色下 #8b949e 对 --bg-elevated 约 6:1，标题层级清晰不糊 */
   color: var(--text-secondary);
   user-select: none;
   transition: background var(--duration-fast) var(--ease-out-expo), color var(--duration-fast) var(--ease-in-out);
   border-radius: var(--radius-md);
   /* 只保留右外边距：hover/drop 高亮的圆角背景靠它与右缘保持 6px 呼吸位，
-     左侧则由 padding-left 统一承担缩进，不再叠加（见上方注释）。
-     行间距同样收到 0（阶段 190）。 */
+     左侧则由 padding-left 统一承担缩进，不再叠加（见上方注释）。 */
   margin: 0 6px;
 }
 /* drop target 高亮只在 isDropTarget 时生效；非 target 时保持 hover 背景 */
@@ -949,7 +953,7 @@ const dragHintTarget = computed<string | null>(() => {
   transition: color var(--duration-fast) var(--ease-in-out);
 }
 .folder-emoji {
-  font-size: 14px;
+  font-size: var(--fs-md);
   display: inline-flex;
   align-items: center;
   transition: color var(--duration-fast) var(--ease-in-out);
@@ -995,23 +999,23 @@ const dragHintTarget = computed<string | null>(() => {
   /* 同 .folder-row：左侧缩进去掉行的 6px 外边距，内边距 24→12。
      连接名在此之后右移 18px，264px 侧栏下长名多露一截（阶段 181 的右缘
      贴边结论保持不变 —— 这里只动左边）。 */
-  /* 纵向内边距收到 2px —— 行高完全由文字撑出，上下只留 2px 呼吸位。
+  /* 纵向内边距 2→5（2026-10-ui-refactor）：13px 文字块 19px + 上下各 5px
+     ≈ 29px 行高，对齐 ompDesktop 会话行 30px 的呼吸感。旧版压到 2px 是为
+     了一屏塞更多连接（阶段 190/193），但配合 14px 正文字号后过挤，
+     这次反向调回 —— 「好看和好用」优先于极限密度。
      树形视图下连接行是**单行**（`.conn-host` 受 `v-if="showGroupPath"` 控制，
-     只有搜索结果才显示 IP 副标题），文字块 13px × 1.25 ≈ 19px，
-     实测行高从 29px 降到 23px，一屏可多放约 2 条连接。
-     注意：必须同时放开 `.conn-more` 的高度（见下），否则 36px 的按钮盒
-     反而成为新瓶颈，行高卡在 29px 下不去 —— padding 改成 2px 却看不出变化。 */
-  padding: 2px 2px 2px 12px;
+     只有搜索结果才显示 IP 副标题）。 */
+  padding: 5px 2px 5px 12px;
   cursor: grab;
   display: flex;
   align-items: center;
   gap: 10px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
   outline: none;
   transition: background var(--duration-fast) var(--ease-in-out), box-shadow var(--duration-fast) var(--ease-in-out);
   border-radius: var(--radius-md);
-  /* 行间距 1→0：行高已收窄，再留 1px 只会让密度看起来仍偏松。 */
+  /* 行间距 0（行高已由 padding 承担，再加 margin 只会让树看不清层级）。 */
   margin: 0;
   /* 会话=叶子节点，比文件夹(菜单)权重更高：文件名主色已是最亮，
      再用 600 字重把它从"目录标题"里拎出来 */
@@ -1057,7 +1061,7 @@ const dragHintTarget = computed<string | null>(() => {
   /* 字重由 .conn-row 统一给（600），此处不重复声明以免规则打架 */
 }
 .conn-group {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   line-height: 1.3;
   color: var(--text-tertiary);
   overflow: hidden;
@@ -1065,7 +1069,7 @@ const dragHintTarget = computed<string | null>(() => {
   white-space: nowrap;
 }
 .conn-host {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   /* 副标题同样收行高（默认 1.5 ⇒ 15px → 1.3 ⇒ 13px）。 */
   line-height: 1.3;
   color: var(--text-tertiary);
@@ -1102,7 +1106,7 @@ const dragHintTarget = computed<string | null>(() => {
   background: var(--accent-primary-muted);
   border: 1px solid var(--border-accent);
   border-radius: var(--radius-md);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   line-height: 1.5;
   color: var(--text-primary);
   display: flex;
@@ -1155,11 +1159,11 @@ const dragHintTarget = computed<string | null>(() => {
   background: var(--bg-surface-hover);
 }
 .footer-brand {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-secondary);
 }
 .footer-version {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
 }
 /* 更新提示圆点：光晕与尺寸由 MyStatusDot 的 glow 承担，这里只靠右推。 */
@@ -1167,7 +1171,7 @@ const dragHintTarget = computed<string | null>(() => {
   margin-left: auto;
 }
 .feedback-icon {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1;
   cursor: pointer;
   padding: 0 2px;
@@ -1196,7 +1200,7 @@ const dragHintTarget = computed<string | null>(() => {
 }
 .menu-item {
   padding: 8px 14px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   cursor: pointer;
   border-radius: var(--radius-md);
   display: flex;
@@ -1215,7 +1219,7 @@ const dragHintTarget = computed<string | null>(() => {
   background: var(--error-muted);
 }
 .menu-ico {
-  font-size: 14px;
+  font-size: var(--fs-md);
   opacity: 0.8;
 }
 .row-overlay {
@@ -1231,17 +1235,17 @@ const dragHintTarget = computed<string | null>(() => {
   gap: 12px;
 }
 .confirm-ico {
-  font-size: 18px;
+  font-size: var(--fs-lg);
   line-height: 1.2;
   display: inline-flex;
 }
 .confirm-title {
-  font-size: 15px;
+  font-size: var(--fs-md);
   font-weight: 600;
   color: var(--text-primary);
 }
 .confirm-msg {
-  font-size: 12.5px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   line-height: 1.7;
   white-space: pre-wrap;

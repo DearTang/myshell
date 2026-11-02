@@ -259,12 +259,12 @@ function toolIcon(id: string): string {
 }
 
 .mcp-title {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 500;
 }
 
 .mcp-subtitle {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-top: 2px;
 }
@@ -281,7 +281,7 @@ function toolIcon(id: string): string {
 }
 
 .block-title {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 500;
 }
 
@@ -295,7 +295,7 @@ function toolIcon(id: string): string {
   border-radius: var(--radius-sm);
   background: var(--warning-muted);
   border: 1px solid var(--warning);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-secondary);
   margin-bottom: 8px;
 }
@@ -305,19 +305,19 @@ function toolIcon(id: string): string {
   border-radius: var(--radius-sm);
   background: var(--bg-input);
   border: 1px solid var(--border-default);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-secondary);
   font-family: monospace;
   word-break: break-all;
 }
 
 .dir-missing {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
 }
 
 .dir-hint {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-top: 6px;
 }
@@ -345,7 +345,7 @@ function toolIcon(id: string): string {
 }
 
 .tool-icon {
-  font-size: 14px;
+  font-size: var(--fs-md);
   display: inline-flex;
   align-items: center;
 }
@@ -356,12 +356,12 @@ function toolIcon(id: string): string {
 }
 
 .tool-name {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 500;
 }
 
 .tool-status {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
 }
 
@@ -380,13 +380,13 @@ function toolIcon(id: string): string {
   border-radius: var(--radius-sm);
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   line-height: 1.5;
 }
 
 .other-tools code {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   background: var(--bg-base);
   padding: 2px 4px;
   border-radius: 3px;

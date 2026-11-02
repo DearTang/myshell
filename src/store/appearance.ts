@@ -10,36 +10,14 @@ import {
   STORAGE_KEY_COLOR,
   STORAGE_KEY_CUSTOM,
   STORAGE_KEY_BG,
+  STORAGE_KEY_SOLIDITY,
+  STORAGE_KEY_POPUP_SOLIDITY,
 } from "../themes";
 import { ui } from "./ui";
 
-// 与预设系统对齐的 UI 变量清单（预设可覆盖的令牌范围）
-const UI_VAR_KEYS = [
-  "--bg-base",
-  "--bg-elevated",
-  "--bg-surface",
-  "--bg-surface-hover",
-  "--bg-surface-active",
-  "--bg-input",
-  "--bg-input-hover",
-  "--accent-primary",
-  "--accent-primary-hover",
-  "--accent-primary-muted",
-  "--accent-secondary",
-  "--accent-secondary-muted",
-  "--success",
-  "--success-muted",
-  "--warning",
-  "--warning-muted",
-  "--error",
-  "--error-muted",
-  "--info",
-  "--info-muted",
-  "--border-accent",
-  "--shadow-glow",
-  "--glass-bg",
-  "--glass-border",
-];
+// 预设可覆盖的 UI 变量范围由 themes.ts 的 UIVariables 类型约束；
+// 应用侧不维护第二份清单 —— 旧版这里有一份 UI_VAR_KEYS 常量，从未被读取，
+// 且会随令牌增删漂移（例如 --glass-bg 已改为实心度插值后它仍列着该项）。
 
 function readStored<T>(key: string, fallback: T): T {
   try {
@@ -63,6 +41,10 @@ interface AppearanceState {
   paletteId: string;
   customPalette: ColorPalette | null;
   bgImage: BackgroundImageConfig;
+  /** 界面实心度 0-1（0 = 基线玻璃，1 = 完全不透明）。 */
+  uiSolidity: number;
+  /** 弹窗/浮层实心度 0-1，默认比界面更实（弹层压在文字上）。 */
+  popupSolidity: number;
 }
 
 function migrateStoredPalette(stored: string): string {
@@ -70,10 +52,20 @@ function migrateStoredPalette(stored: string): string {
   return stored === "catppuccin-mocha" ? DEFAULT_PALETTE_ID : stored;
 }
 
+/** 实心度收敛：localStorage 里的旧值/外部改动都可能带出界，读写两侧都过一遍。
+ *  fallback 必填 —— 界面与弹窗的默认值不同（0.25 / 0.55），不能共用一个兜底。 */
+function clampSolidity(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(1, Math.max(0, value))
+    : fallback;
+}
+
 export const appearance = reactive<AppearanceState>({
   paletteId: migrateStoredPalette(readStored<string>(STORAGE_KEY_COLOR, DEFAULT_PALETTE_ID)),
   customPalette: readStored<ColorPalette | null>(STORAGE_KEY_CUSTOM, null),
   bgImage: readStored<BackgroundImageConfig>(STORAGE_KEY_BG, DEFAULT_BG_IMAGE),
+  uiSolidity: clampSolidity(readStored<number>(STORAGE_KEY_SOLIDITY, 0.25), 0.25),
+  popupSolidity: clampSolidity(readStored<number>(STORAGE_KEY_POPUP_SOLIDITY, 0.55), 0.55),
 });
 
 let appliedKeys: string[] = [];
@@ -96,16 +88,49 @@ export function applyColorPreset(): void {
   }
 }
 
-/** 把背景图配置写入根节点（终端工作区背景使用）。 */
+/** 把背景图配置写入根节点（body 级壁纸层使用，全窗透出）。 */
 export function applyBgImage(): void {
   const root = document.documentElement.style;
+  const html = document.documentElement;
   if (appearance.bgImage.dataUrl) {
-    root.setProperty("--app-bg-image", `url(${appearance.bgImage.dataUrl})`);
+    // 用 JSON.stringify 把 URL 包成带引号的 CSS 字符串：data URL 里可能出现
+    // `#` / `)` / 空白（SVG 的 `data:image/svg+xml,...` 就有），裸写进
+    // `url(...)` 会被 CSS 解析器判为非法 —— setProperty 静默失败，
+    // 属性根本没写进去（实测 --app-bg-opacity 成功、--app-bg-image 丢失）。
+    // 引号形式对 base64 与原样 URL 都安全。
+    root.setProperty("--app-bg-image", `url(${JSON.stringify(appearance.bgImage.dataUrl)})`);
     root.setProperty("--app-bg-opacity", String(appearance.bgImage.opacity));
+    // 只有真设了壁纸才上可读性遮罩（app.css 的 html[data-wallpaper="1"]）
+    html.dataset.wallpaper = "1";
   } else {
     root.removeProperty("--app-bg-image");
     root.removeProperty("--app-bg-opacity");
+    delete html.dataset.wallpaper;
   }
+}
+
+/** 把界面/弹窗实心度写入 html 内联样式。
+ *  内联优先于任何选择器 —— 写进 :root 会被 myui 的 `:root, html.dark`
+ *  在深色模式下压过（ompDesktop 升级 myui 时踩过这个坑）。 */
+export function applySolidity(): void {
+  const html = document.documentElement;
+  html.style.setProperty("--ui-solidity", String(clampSolidity(appearance.uiSolidity, 0.25)));
+  html.style.setProperty(
+    "--ui-popup-solidity",
+    String(clampSolidity(appearance.popupSolidity, 0.55)),
+  );
+}
+
+export function setSolidity(next: { ui?: number; popup?: number }): void {
+  if (next.ui !== undefined) {
+    appearance.uiSolidity = clampSolidity(next.ui, 0.25);
+    writeStored(STORAGE_KEY_SOLIDITY, appearance.uiSolidity);
+  }
+  if (next.popup !== undefined) {
+    appearance.popupSolidity = clampSolidity(next.popup, 0.55);
+    writeStored(STORAGE_KEY_POPUP_SOLIDITY, appearance.popupSolidity);
+  }
+  applySolidity();
 }
 
 export function setPaletteId(id: string): void {
@@ -147,3 +172,4 @@ watch(
 // 初始化（main.ts import 本模块即生效；applyTheme 后 watcher 会再跑一次）
 applyColorPreset();
 applyBgImage();
+applySolidity();

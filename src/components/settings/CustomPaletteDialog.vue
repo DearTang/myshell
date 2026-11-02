@@ -97,7 +97,7 @@ const canSave = computed(() => props.accentValid && props.bgValid);
 
 <style scoped>
 .dialog-intro {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   margin-bottom: 14px;
 }
@@ -108,7 +108,7 @@ const canSave = computed(() => props.accentValid && props.bgValid);
 
 .field-label {
   display: block;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-bottom: 6px;
   font-weight: 500;
@@ -154,7 +154,7 @@ const canSave = computed(() => props.accentValid && props.bgValid);
 }
 
 .preview-label {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: #888;
   text-align: center;
 }
@@ -162,7 +162,7 @@ const canSave = computed(() => props.accentValid && props.bgValid);
 .preview-button {
   padding: 6px 12px;
   border-radius: var(--radius-md);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   color: #fff;
   text-align: center;

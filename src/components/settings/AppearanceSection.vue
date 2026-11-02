@@ -11,8 +11,17 @@ import {
   setCustomPalette,
   clearCustomPalette,
   setBgImage,
+  setSolidity,
 } from "@/store/appearance";
-import { ui } from "@/store/ui";
+import {
+  ui,
+  setThemeChoice,
+  setUiFontPx,
+  setMotionEnabled,
+  UI_FONT_PX_MIN,
+  UI_FONT_PX_MAX,
+  UI_FONT_PX_DEFAULT,
+} from "@/store/ui";
 import { primaryFont, setPrimaryFont } from "@/composables/useTerminalFont";
 import {
   rendererBackend,
@@ -31,6 +40,56 @@ defineOptions({ name: "AppearanceSection" });
 // 背景透明度滑杆范围。与下方 MySlider 的 min/max 保持同步。
 const BG_OPACITY_MIN = 10;
 const BG_OPACITY_MAX = 100;
+
+// ── 界面通用设置（字号 / 实心度 / 动效 / 深浅）──
+
+/** 实心度滑杆的百分比区间：下限 = 设计基线的玻璃质感，上限 = 完全不透明。
+ *  与 ompDesktop 同一套口径。**不能**直接把 solidity×100 当显示值：
+ *  solidity 0 会显示成 0%（被 el-slider 的 min=40 夹住），而真正的基线
+ *  玻璃 alpha 是 0.55 —— 滑杆位置与实际透明度脱节（实测默认值 0.25 显示成
+ *  40%，但玻璃 alpha 是 0.6625）。 */
+const OPACITY_MIN_PERCENT = 40;
+const OPACITY_MAX_PERCENT = 100;
+
+function solidityToPercent(solidity: number): number {
+  const ratio = Math.min(1, Math.max(0, solidity));
+  return Math.round(OPACITY_MIN_PERCENT + ratio * (OPACITY_MAX_PERCENT - OPACITY_MIN_PERCENT));
+}
+
+function percentToSolidity(percent: number): number {
+  const bounded = Math.min(OPACITY_MAX_PERCENT, Math.max(OPACITY_MIN_PERCENT, percent));
+  return (bounded - OPACITY_MIN_PERCENT) / (OPACITY_MAX_PERCENT - OPACITY_MIN_PERCENT);
+}
+
+const uiOpacityPercent = computed({
+  get: () => solidityToPercent(appearance.uiSolidity),
+  set: (v: number) => setSolidity({ ui: percentToSolidity(v) }),
+});
+
+const popupOpacityPercent = computed({
+  get: () => solidityToPercent(appearance.popupSolidity),
+  set: (v: number) => setSolidity({ popup: percentToSolidity(v) }),
+});
+
+function onDarkToggle(v: string | number | boolean): void {
+  setThemeChoice(v ? "dark" : "light");
+}
+
+function onUiFontChange(v: number | number[]): void {
+  setUiFontPx(Array.isArray(v) ? v[0] : v);
+}
+
+function onUiSolidityChange(v: number | number[]): void {
+  uiOpacityPercent.value = Array.isArray(v) ? v[0] : v;
+}
+
+function onPopupSolidityChange(v: number | number[]): void {
+  popupOpacityPercent.value = Array.isArray(v) ? v[0] : v;
+}
+
+function onMotionToggle(v: string | number | boolean): void {
+  setMotionEnabled(Boolean(v));
+}
 
 // ── 配色方案 ──
 const showCustomDialog = ref(false);
@@ -200,6 +259,99 @@ function onRendererChange(v: string | number | boolean): void {
 </script>
 
 <template>
+  <!-- 界面（通用外观，对齐 ompDesktop 的「外观」通用设置）——
+       深浅模式 / 界面字号 / 界面实心度 / 弹窗实心度 / 动效。 -->
+  <MySection
+    title="界面"
+    description="调整整体观感：字号、玻璃实心度与动效。改动即时生效并自动保存。"
+  >
+    <div class="setting-row">
+      <div class="setting-text">
+        <div class="setting-title">暗色模式</div>
+        <div class="setting-desc">切换深浅主题，33 套配色各自带深浅两套变体。</div>
+      </div>
+      <MyToggle :model-value="ui.isDark" @update:model-value="onDarkToggle" />
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-text">
+        <div class="setting-title">界面字号</div>
+        <div class="setting-desc">
+          整体缩放正文 / 按钮 / 下拉 / 弹窗文字。快捷键 Ctrl+= 放大、Ctrl+- 缩小、Ctrl+0
+          复位（焦点在终端时调的是终端字号）。
+        </div>
+      </div>
+      <div class="setting-control">
+        <div class="slider-slot">
+          <MySlider
+            :model-value="ui.uiFontPx"
+            :min="UI_FONT_PX_MIN"
+            :max="UI_FONT_PX_MAX"
+            :step="1"
+            unit="px"
+            aria-label="界面字号"
+            @update:model-value="onUiFontChange"
+          />
+        </div>
+        <button type="button" class="reset-link" @click="setUiFontPx(UI_FONT_PX_DEFAULT)">
+          复位
+        </button>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-text">
+        <div class="setting-title">界面实心度</div>
+        <div class="setting-desc">
+          越低越透（壁纸/底色透出顶栏、侧栏与 AI 栏），拉满为完全不透明。
+        </div>
+      </div>
+      <div class="setting-control">
+        <div class="slider-slot">
+          <MySlider
+            :model-value="uiOpacityPercent"
+            :min="40"
+            :max="100"
+            :step="5"
+            unit="%"
+            aria-label="界面实心度"
+            @update:model-value="onUiSolidityChange"
+          />
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-text">
+        <div class="setting-title">弹窗实心度</div>
+        <div class="setting-desc">
+          下拉 / 对话框 / 通知等浮层的实心度，默认比常驻界面更实，避免与背后文字糊在一起。
+        </div>
+      </div>
+      <div class="setting-control">
+        <div class="slider-slot">
+          <MySlider
+            :model-value="popupOpacityPercent"
+            :min="40"
+            :max="100"
+            :step="5"
+            unit="%"
+            aria-label="弹窗实心度"
+            @update:model-value="onPopupSolidityChange"
+          />
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-text">
+        <div class="setting-title">界面动效</div>
+        <div class="setting-desc">关闭后一次性停掉全部过渡与动画（低配设备更跟手）。</div>
+      </div>
+      <MyToggle :model-value="ui.motionEnabled" @update:model-value="onMotionToggle" />
+    </div>
+  </MySection>
+
   <!-- 配色方案 -->
   <MySection title="配色方案" description="选择预设配色方案，同步更新终端和界面颜色">
     <div class="preset-grid">
@@ -258,7 +410,10 @@ function onRendererChange(v: string | number | boolean): void {
   </MySection>
 
   <!-- 背景图片 -->
-  <MySection title="背景图片" description="为终端区域设置背景图片">
+  <MySection
+    title="背景图片"
+    description="作为整窗壁纸铺在最底层，顶栏 / 侧栏 / AI 栏按「界面实心度」透出它。图片会压缩后存进本地存储。"
+  >
     <MyButton
       variant="secondary"
       class="block-btn"
@@ -373,6 +528,73 @@ function onRendererChange(v: string | number | boolean): void {
 </template>
 
 <style scoped>
+/* 通用设置行：左侧标题+说明，右侧控件（对齐 ompDesktop 的 field-row 口径：
+   标签区可换行、控件区固定宽度不挤压说明文字）。 */
+.setting-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.setting-row:last-child {
+  border-bottom: none;
+}
+
+.setting-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.setting-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setting-desc {
+  margin-top: 4px;
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  line-height: 1.6;
+}
+
+.setting-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+
+/* 滑杆宽度：**必须挂在包裹层**上。MySlider 是 inheritAttrs:false +
+   内层 ElSlider 透传 attrs，写在 MySlider 上的 class 会落到内层
+   .el-slider 而拿不到外层的 .my-slider flex 容器宽度 —— 实测直接把滑杆
+   压成 6px（.el-slider 只有 runway 宽度）。与项目里 .cmd-slot 包裹
+   MyInput 的写法同一个原因。 */
+.slider-slot {
+  width: 200px;
+  flex-shrink: 0;
+}
+
+.reset-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent-primary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+
+.reset-link:hover {
+  text-decoration: underline;
+}
+
 .preset-grid {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
@@ -447,7 +669,7 @@ function onRendererChange(v: string | number | boolean): void {
 }
 
 .preset-name {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: 400;
   color: var(--text-tertiary);
   text-align: center;
@@ -467,7 +689,7 @@ function onRendererChange(v: string | number | boolean): void {
   width: 100%;
   padding: 10px 14px;
   border: 1px dashed var(--border-default);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 500;
   gap: 6px;
 }
@@ -479,7 +701,7 @@ function onRendererChange(v: string | number | boolean): void {
 }
 
 .custom-entry-icon {
-  font-size: 14px;
+  font-size: var(--fs-md);
 }
 
 .block-btn {
@@ -502,7 +724,7 @@ function onRendererChange(v: string | number | boolean): void {
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   display: flex;
   align-items: center;
@@ -525,13 +747,13 @@ function onRendererChange(v: string | number | boolean): void {
 }
 
 .opacity-label {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   font-weight: 500;
 }
 
 .opacity-value {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
@@ -551,14 +773,14 @@ function onRendererChange(v: string | number | boolean): void {
 
 .field-label {
   display: block;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-bottom: 6px;
   font-weight: 500;
 }
 
 .font-hint {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-top: 8px;
   line-height: 1.6;
@@ -568,7 +790,7 @@ function onRendererChange(v: string | number | boolean): void {
    .backend-chip.active 选中态全部删除。说明文字从原来的逐项 title
    改为下方常驻一行。 */
 .backend-hint {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-top: 8px;
   line-height: 1.6;
@@ -592,12 +814,12 @@ function onRendererChange(v: string | number | boolean): void {
 }
 
 .gpu-title {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
 }
 
 .gpu-desc {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-top: 3px;
   line-height: 1.5;

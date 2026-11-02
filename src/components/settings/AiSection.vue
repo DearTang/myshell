@@ -447,7 +447,7 @@ const apiKeyPlaceholder = computed(() =>
   justify-content: center;
   height: 100%;
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 
 .editor-form {
@@ -468,7 +468,7 @@ const apiKeyPlaceholder = computed(() =>
 
 .field-label {
   display: block;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-bottom: 6px;
   font-weight: 500;

@@ -8161,3 +8161,127 @@ Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 4
 | 我要去哪里？ | 重新构建并覆盖安装，然后重跑一次 `zmodem_upload` 做实机确认。 |
 | 什么可能导致偏离？ | 打包后的 GUI 仍跑旧前端（未覆盖安装）时会看起来「没修好」。 |
 | 下一步最小可验证动作？ | 装上新构建后，对一个无害的 `sftp_upload` 目标触发一次，确认对话框出现且 5 秒内有反应。 |
+
+### 阶段 206 —— 前端界面重构（参考 ompDesktop）：字号阶梯 / 玻璃实心度 / 壁纸全窗 / 壳层结构
+
+用户诉求：参考 `F:/personalProject/ompDesktop` 的「设置 → 外观」通用设置与主页结构，把 MyShell 前端界面重构一遍，总体功能不变，重点是「总体样式、字体大小、背景管控范围」不如 ompDesktop 好看好用。分支 `ui-refactor-omp-style`。
+
+**关键前置事实（决定了实现路径）**：
+- MyShell 装的 myui 是 **v1.1.1**，包内**没有** `--fs-*` / `--fs-scale` 字号令牌（那是 myui v1.2.0 起才有，ompDesktop 用的是 v1.6.0）。所以字号阶梯必须在应用侧 `app.css` 自己声明，不能依赖库。
+- 全仓原有 **279 处硬编码 `font-size: Npx`**，跨 36 个文件，14 个不同档位（9/10/11/12/12.5/13/14/15/16/17/18/20/22/24/36/48），换字号时只能逐个改 —— 这就是「字体大小不可控」的根因。
+
+**改动**：
+
+1. **字号阶梯**（`src/styles/app.css`）
+   - 新增 `--fs-scale: 1` 与七级阶梯 `--fs-2xs..--fs-3xl`（11/12/13/14/16/20/24/30，均 `calc(Npx * var(--fs-scale, 1))`）。
+   - `body { font-size: var(--fs-md) }`，基线从写死的 13px 提到 **14px**（ompDesktop 口径）。副标题类小字（9/10px）统一收到 11px，可读性最差的一批先受益。
+   - 279 处 `font-size: Npx` 全部替换为 `var(--fs-*)`（脚本一次性映射，见 §校验）。行高/盒尺寸**不动**：缩放字号不应把布局一起推歪。
+
+2. **字号旋钮与快捷键**
+   - `store/ui.ts` 新增 `uiFontPx`（12-18，默认 14）与 `motionEnabled`；`applyUiAppearance()` 写 `html` 内联样式 `--fs-scale = uiFontPx / 14` 并切 `motion-off` class。**必须内联**：写进 `:root` 会被 myui 的 `:root, html.dark`（特异性 0,1,1）在深色模式压过，滑杆静默失效（ompDesktop 升级 myui 时踩过同一个坑）。
+   - 新增 `composables/useFontSizeShortcuts.ts`：Ctrl+= / Ctrl+- / Ctrl+0。焦点在 xterm 子树（`.xterm`）时调**终端字号**（10-22），否则调**界面字号**。捕获阶段监听 —— xterm 自己吞 keydown，冒泡阶段拦不住。
+   - 终端字号从写死的 `fontSize: 14` 改为响应式 `terminalFontSize`（`useTerminalFont.ts`，独立 localStorage key），变化时走已有的 `refitAfterFontSettle` 重排。
+
+3. **玻璃实心度**（对齐 ompDesktop 的 `--ui-solidity` / `--ui-popup-solidity`）
+   - `--glass-alpha`（暗 0.55→1 / 亮 0.6→1）与 `--glass-alpha-popup` 声明在主题块，真正的 `--glass-bg` / `--glass-bg-popup` 定义在 **myui 令牌桥**里（选择器带 `html.dark/html.light`，靠源码顺序压过 myui）。原因同上：myui 自己在 `html.dark` 声明了 `--glass-bg`，特异性更高。
+   - 玻璃底色取 `color-mix(in srgb, var(--bg-elevated) …, transparent)`，**跟随预设的 --bg-elevated**。为此删掉 `themes.ts` 里 10 处预设的 `--glass-bg` 写死值（`rgba(...,0.85)`）—— 写死 alpha 会绕过实心度公式，滑杆对那几套预设静默失效。
+   - `--el-bg-color-overlay` 指到 `--glass-bg-popup`，弹窗实心度才对 EP 浮层真正生效。**没有**改 `--bg-overlay`：MyShell 自己那套令牌里它是**遮罩色**（SettingsDrawer / SftpPanel / 多窗口选择器拿它铺全屏背景），换成表面色会把遮罩变成实心板。
+
+4. **壁纸全窗透出**（原为「仅终端工作区」）
+   - 壁纸从 `.app-shell.has-bg-image::before`（只铺壳层内、被 0.88 不透明玻璃整片盖住）提升为 `body::before` 固定层 + `body::after` 可读性遮罩（仅 `html[data-wallpaper="1"]` 时上雾）。
+   - **根因修复**：底色从 `body` 移到 `html`，`body` 保持 `transparent`。负 z-index 的伪元素按层叠顺序画在其父元素背景**之上**，底色留在 body 上会把壁纸整片盖住（实测浅色 #fff 时壁纸完全不出现）。同时给 `#app` 加 `position: relative; z-index: 0` 自建层叠上下文。
+   - `applyBgImage()` 写 `url()` 时改用 `JSON.stringify` 包引号：data URL 里可能出现 `#`/`)`/空白（SVG 形态就有），裸写会被 CSS 解析器判非法，`setProperty` 静默失败 —— 实测 `--app-bg-opacity` 写入成功而 `--app-bg-image` 直接丢失。
+   - 设置页 `.settings-panel` 底色从 `--bg-base` 改为 `--glass-bg`：实底会把设置页里的壁纸整片盖掉。
+
+5. **壳层结构**（对齐 ompDesktop 的 `--chrome-top-height` 口径）
+   - 壳层 grid 第一行由 `"topbar topbar topbar"` 改为 `"side topbar topbar"`：侧栏贯通三行，其自带的 44px 顶排与右侧顶栏拼成窗口最上面**连续一整排**。此前侧栏头部是 12px padding 包 28px 按钮的 53px 高块、且独占第二行顶部，与顶栏上下错开。
+   - 侧栏顶排加 `data-tauri-drag-region="deep"`（整行空白可拖窗口，按钮自动豁免）。
+   - 连接树密度放宽：连接行 padding 2px→5px（行高约 29px，对齐 ompDesktop 会话行 30px），副标题 10px→11px，侧栏宽度默认 264→260。
+   - 欢迎页改为玻璃卡（品牌矢量标 + 标题 + 提示 + 快捷键提示），替代原来两行裸文字。
+
+6. **设置页结构**（对齐 ompDesktop 的 settings 三件套）
+   - 顶排 44px（`--chrome-top-height`）+ 左 nav 200px + 右**圆角玻璃内容卡**（`--glass-border` 描边 + 内高光 + 阴影），正文限宽 940px 居中，内容卡头显示当前类目标题。
+
+7. **动效总开关**：`html.motion-off` 把 `--duration-*` 三个变量乘 0 并 `!important` 压 animation/transition。不逐条删 transition —— 组件里引用 `var(--duration-*)` 的地方上百处，改根变量即可全量掐断。
+
+**踩到的坑（务必记住）**：
+- **Vite 依赖预构建缓存会带旧 scope id**：`node_modules/.vite/deps/myui.js` 是 10 月 10 日生成的（对应 myui 0.30.1 的 `data-v-d1472fe0`），而当前 myui 1.1.1 的 CSS 用的是 `data-v-11fb7a99`。两者不匹配时**所有 myui 组件的基础样式全部失效**（MyIconButton 退回浏览器默认的灰底 `2px outset` 按钮），视觉上像"按钮全是灰块"。清 `node_modules/.vite` 重启即恢复。这不是代码问题，但会误判成样式回归。
+- **MySlider 的 class 不能直接写**：组件是 `inheritAttrs: false` + 内层 ElSlider 透传 attrs，写在 `<MySlider class="…">` 上的 class 会落到内层 `.el-slider`，拿不到外层 `.my-slider` 的宽度 —— 实测把滑杆压成 6px。宽度必须挂在包裹层上（与项目里 `.cmd-slot` 包裹 MyInput 同一个原因）。
+- **调试入口 `src/debug-shell.ts` 缺 i18n**：myui 的 MyWindowControls 内部调 `useI18n()`，只 `setupMyUII18n` 不 `app.use(i18n)` 会在 setup 阶段抛 `Need to install with 'app.use' function`，整个顶栏渲染失败。已补 `.use(i18n)`。
+
+**校验（实跑，不是推断）**：
+- `npm run test:ts`（vue-tsc）通过；`npm run build` 通过。
+- 残留检查：`grep -rn 'font-size: [0-9]' src --include=*.vue --include=*.css` → 0 条（仅剩 1 处 `font-size: inherit`，语义就是继承）。
+- 浏览器实测（真实 App.vue + stub IPC 跑在浏览器，探针页验证后已删除）：
+  - 壳层几何：顶栏 44px、侧栏顶排 44px、侧栏贯通 900px 全高；折叠后顶栏横贯全宽 1440px、工作区上移。
+  - 字号：`Ctrl+=` ×3 → body 14px→17px、`--fs-scale` 1→1.214；`Ctrl+0` → 回 14px/1。
+  - 滑杆：界面字号滑杆拖到 90% → 17px/1.214/写入 localStorage；复位按钮 → 14px。
+  - 实心度：滑杆拖到 95% → `--ui-solidity: 0.95`、侧栏合成色 alpha 0.9775、写入 localStorage；0.25 ↔ 1.0 往返，alpha 0.6625 ↔ 1.0。
+  - 壁纸：写入 data URL 后 `html[data-wallpaper="1"]`、`body::before` 背景长度 566、遮罩 `rgba(13,17,23,0.28)`、侧栏与顶栏均透出壁纸（截图确认）。
+  - 设置页：顶排 44px、nav 200px、内容卡 1216px 含 940px 限宽正文、类目切换标题跟随、关闭正常。
+
+**取舍（自主决定，供日后回顾）**：
+- **不做「主题色色相旋钮」**：MyShell 已有 33 套配色预设且每套自带 `--accent-primary`，再加一个全局 hue 旋钮会与预设互相覆盖、用户拖了看不出反应。ompDesktop 没有预设体系才需要那个旋钮。
+- **不做背景模式三选（光晕/网格/无）**：MyShell 原本没有环境光晕层，凭空加一层属于新增视觉而非"参考结构"，且会与 33 套预设的底色打架。本次只做"壁纸铺满全窗 + 实心度可控"。
+- **终端字号独立于界面字号**：两者合理区间不同（终端 10-22、界面 12-18），且终端字号是 xterm 自己的度量。
+
+**五问重启检查（阶段 206）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 把 ompDesktop 的字号阶梯、玻璃实心度、壁纸全窗透出、44px 连续顶排、设置页三件套搬进 MyShell，279 处硬编码字号令牌化。 |
+| 什么是我没做的？ | 未做主题色 hue 旋钮（与 33 套预设冲突）；未做背景模式三选；未升级 myui（1.1.1 无字号令牌，应用侧自建阶梯绕开）。 |
+| 我想去哪里？ | 字号、实心度、壁纸三个外观维度都能从设置页一处调节并实时生效，壳层视觉与 ompDesktop 同一口径。 |
+| 我要去哪里？ | 实机 `cargo tauri dev` 跑一遍深/浅色 + 有/无壁纸四组合，确认 xterm WebGL 透明合成在真实窗口里正常（浏览器探针覆盖不到 Tauri 的 GPU 合成路径）。 |
+| 什么可能导致偏离？ | Vite 旧依赖缓存会让 myui 样式全失效、看起来像大面积回归；先清 `node_modules/.vite` 再判断。 |
+| 下一步最小可验证动作？ | `cargo tauri dev` 起真实窗口，开一个 SSH 终端，切深浅色各按一次 Ctrl+=，确认外壳与终端字号一起变且终端未错位。 |
+
+### 阶段 207 —— 实心度覆盖不到的面板（用户实测反馈）
+
+用户测试「界面实心度」滑杆后反馈：**拉到 100% 仍然透，切不成不透明**。
+
+逐层排查后确认漏了四处表面（此前只把 `--glass-bg` 接到顶栏/侧栏/AI 栏/设置页）：
+
+1. **对话框一族完全没接**：Element Plus 的 `.el-dialog` 用的是 `--el-dialog-bg-color`，
+   而 EP 把它默认成 `var(--el-bg-color)` —— 不是我以为的 `--el-bg-color-overlay`。
+   只桥 overlay 一条线，`MyDialog` / 确认框 / 密码框的底色对弹窗实心度滑杆毫无反应。
+   现把 `--el-dialog-bg-color`、`--el-bg-color`、`--el-bg-color-overlay` 三条都指到
+   `--glass-bg-popup`。桥必须写在 app.css 的 myui 令牌桥里（选择器带
+   `html.dark/html.light`），否则压不过 EP 自己那份声明。
+2. **工作区没有底色**：`.shell-work` 本来就是透明的（终端/SFTP/欢迎页都靠它透出壁纸）。
+   实心度拉满时顶栏/侧栏都变实底，唯独这一大块仍透出壁纸 —— 用户看到的「拉满还透」
+   主要就是这个。改为按实心度插值，底色取 `--bg-elevated`（与侧栏/顶栏的
+   `--glass-bg` 同源，拉满后三块交界处不会出现 1~2px 色差带）。
+3. **底栏两块写死实色**：`CommandBar` 与 `ServerInfoPanel` 都是 `--bg-elevated`
+   —— 有壁纸时这两块「本来就实、滑杆管不着」，与相邻区域不一致。改为 `--glass-bg`
+   + 同套 backdrop-filter。
+4. **AI 右栏引用了不存在的令牌**：`AiPanel` 的 `--bg-sidebar` 在两版主题里从未定义，
+   一直解析成 transparent，全靠壳层 `.shell-ai` 的玻璃兜底。改为显式
+   `--surface-translucent`，与顶栏/侧栏同一套插值。
+
+另外修了一个真 bug：实心度滑杆的**显示值与真实值脱节**。滑杆区间是 40–100%，
+代码却直接把 `solidity × 100` 当显示值 —— 默认 0.25 显示成 25%，被 el-slider 的
+`min=40` 夹住显示 40%，但玻璃 alpha 其实是 0.6625。改为 ompDesktop 那套映射
+（`percent = 40 + solidity × 60`，默认 0.25 显示 55%），滑杆位置与真实透明度才对得上。
+
+**验证**：浏览器探针逐档实测（`--ui-solidity` 取 0 / 0.25 / 0.5 / 1）：
+- 工作区、侧栏、顶栏、欢迎卡、设置面板、设置导航、设置内容卡的背景 alpha
+  依次为 0 → 0.6625 → 0.775 → 1.0（到 1 时全部无 alpha 后缀，即完全不透明）；
+- 装一张亮色渐变壁纸后拉到 100%，四层背景全部为 `#161b22` 实色，壁纸被完全盖住；
+- EP 三个浮层变量均解析到 `--glass-bg-popup`，弹窗实心度滑杆对对话框生效。
+
+**取舍**：
+- 没有把「实心度 100%」做成隐藏壁纸层（`display:none` 那条路走过又回滚了）。
+  理由是那会让「背景图」设置看起来失效 —— 用户设了图、拉个滑杆图就没了。
+  正确语义是「所有面板都变实底，把壁纸挡住」，所以补齐的是面板底色，不是删壁纸。
+- AI 面板从「透明靠壳层兜底」改成自己的玻璃底，是有意为之的行为变化：
+  此后壳层 `.shell-ai` 那层玻璃变成双保险，不再单独承担底色职责。
+
+**五问重启检查（阶段 207）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 把界面/弹窗实心度接到此前漏掉的四类表面（EP 对话框、工作区、底栏、AI 栏），并修掉滑杆显示值与真实值脱节。 |
+| 什么是我没做的？ | 没有新增「一键不透明」按钮；没有动 33 套预设的 `--bg-elevated`。 |
+| 我想去哪里？ | 实心度滑杆拉到 100% 时整个界面（含对话框、工作区、底栏）真的完全不透。 |
+| 我要去哪里？ | 真机 `cargo tauri dev` 复验一次亮壁纸 + 100% 实心度，并确认对话框/快捷命令浮层的观感。 |
+| 什么可能导致偏离？ | 这台机器上脚本模拟点击打不开设置页（已用浏览器探针替代验证），真机需人工点一次确认。 |
+| 下一步最小可验证动作？ | 人工打开设置 → 外观，把两个实心度滑杆拖到 100%，看是否整窗纯色。 |

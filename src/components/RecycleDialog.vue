@@ -244,7 +244,7 @@ function relativeTime(iso: string): string {
 }
 
 .header-icon {
-  font-size: 18px;
+  font-size: var(--fs-lg);
   display: inline-flex;
 }
 
@@ -254,13 +254,13 @@ function relativeTime(iso: string): string {
 }
 
 .header-title {
-  font-size: 15px;
+  font-size: var(--fs-md);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .header-sub {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-top: 2px;
 }
@@ -300,7 +300,7 @@ function relativeTime(iso: string): string {
 }
 
 .row-name {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -308,7 +308,7 @@ function relativeTime(iso: string): string {
 }
 
 .row-meta {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
 }
 
@@ -332,7 +332,7 @@ function relativeTime(iso: string): string {
   margin: 0 calc(var(--el-dialog-padding-primary) * -1)
     calc(var(--el-dialog-padding-primary) * -1);
   padding: 10px 20px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   text-align: center;
 }

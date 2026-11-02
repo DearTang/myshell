@@ -812,7 +812,7 @@ const remaining = computed(() => {
 
 .nav-count {
   margin-left: 2px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 
 .toolbar-sep {
@@ -866,7 +866,7 @@ const remaining = computed(() => {
   align-items: center;
   padding: 6px 10px 6px 12px;
   border-bottom: 1px solid var(--border-subtle);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -930,7 +930,7 @@ const remaining = computed(() => {
   padding: 24px;
   text-align: center;
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -946,7 +946,7 @@ const remaining = computed(() => {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   cursor: pointer;
   color: var(--text-primary);
   transition: background var(--duration-fast) var(--ease-in-out);
@@ -994,7 +994,7 @@ const remaining = computed(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   letter-spacing: 0.01em;
 }
 
@@ -1008,7 +1008,7 @@ const remaining = computed(() => {
   text-align: right;
   flex-shrink: 0;
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-variant-numeric: tabular-nums;
 }
 
@@ -1020,7 +1020,7 @@ const remaining = computed(() => {
   width: 50px;
   text-align: center;
   flex-shrink: 0;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   letter-spacing: 0.02em;
   color: var(--text-tertiary);
 }
@@ -1034,7 +1034,7 @@ const remaining = computed(() => {
   text-align: right;
   flex-shrink: 0;
   color: var(--text-secondary);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-family: "JetBrains Mono", "Cascadia Code", "Fira Code", ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.01em;
@@ -1045,7 +1045,7 @@ const remaining = computed(() => {
   text-align: right;
   flex-shrink: 0;
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-family: "JetBrains Mono", "Cascadia Code", "Fira Code", ui-monospace, monospace;
   letter-spacing: -0.02em;
 }
@@ -1085,7 +1085,7 @@ const remaining = computed(() => {
   background: var(--glass-bg);
   border-top: 1px solid var(--border-emphasis);
   padding: 8px 16px 10px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-family: "Cascadia Code", Consolas, monospace;
   z-index: 10;
   display: flex;
@@ -1109,7 +1109,7 @@ const remaining = computed(() => {
 
 .tx-arrow {
   color: var(--accent-primary);
-  font-size: 16px;
+  font-size: var(--fs-lg);
   line-height: 1;
 }
 
@@ -1146,7 +1146,7 @@ const remaining = computed(() => {
   display: flex;
   justify-content: space-between;
   color: var(--text-tertiary);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 
 .tx-errors {
@@ -1171,6 +1171,6 @@ const remaining = computed(() => {
 
 .dead-text {
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 </style>

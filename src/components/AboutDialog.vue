@@ -332,18 +332,18 @@ function onDownloadClick(): void {
 }
 
 .whatsnew-icon {
-  font-size: 28px;
+  font-size: var(--fs-2xl);
   display: inline-flex;
 }
 
 .whatsnew-title {
-  font-size: 16px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .whatsnew-sub {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-tertiary);
   margin-top: 2px;
 }
@@ -365,13 +365,13 @@ function onDownloadClick(): void {
 }
 
 .about-title {
-  font-size: 18px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .about-sub {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-tertiary);
   margin-top: 2px;
 }
@@ -397,7 +397,7 @@ function onDownloadClick(): void {
 }
 
 .banner-icon {
-  font-size: 16px;
+  font-size: var(--fs-lg);
 }
 
 .banner-info {
@@ -406,13 +406,13 @@ function onDownloadClick(): void {
 }
 
 .banner-title {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .banner-sub {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
   margin-top: 2px;
 }
@@ -443,7 +443,7 @@ function onDownloadClick(): void {
 .banner-waiting {
   flex: 1;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   padding: 6px 0;
 }
@@ -455,7 +455,7 @@ function onDownloadClick(): void {
 }
 
 .check-hint {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
 }
 
@@ -467,7 +467,7 @@ function onDownloadClick(): void {
   /* body 为 overflow:hidden 的 flex 列（负边距会被剪裁），故不做全宽拉伸：
      分隔线随 body 内容盒（缩进 16px），内容保持旧版 24px 缩进 */
   padding: 4px 24px 16px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   line-height: 1.6;
 }
@@ -475,19 +475,19 @@ function onDownloadClick(): void {
 /* 旧版 ReactMarkdown 内联组件映射 → 深度选择器复现同款观感 */
 .markdown-body :deep(h1) {
   margin: 14px 0 8px;
-  font-size: 16px;
+  font-size: var(--fs-lg);
   color: var(--text-primary);
 }
 
 .markdown-body :deep(h2) {
   margin: 14px 0 8px;
-  font-size: 15px;
+  font-size: var(--fs-md);
   color: var(--text-primary);
 }
 
 .markdown-body :deep(h3) {
   margin: 10px 0 6px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
 }
 
@@ -495,7 +495,7 @@ function onDownloadClick(): void {
 .markdown-body :deep(h5),
 .markdown-body :deep(h6) {
   margin: 10px 0 6px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
 }
 
@@ -526,7 +526,7 @@ function onDownloadClick(): void {
 
 .markdown-body :deep(code) {
   font-family: monospace;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   background: var(--bg-surface);
   padding: 1px 5px;
   border-radius: 4px;
@@ -539,13 +539,13 @@ function onDownloadClick(): void {
   background: var(--bg-surface);
   border-radius: var(--radius-sm);
   color: var(--text-tertiary);
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 
 .markdown-body :deep(table) {
   border-collapse: collapse;
   margin: 8px 0;
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 
 .markdown-body :deep(th),

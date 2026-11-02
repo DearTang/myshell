@@ -15,7 +15,7 @@ import {
   reportVersion,
   setStatsConsent,
 } from "./lib/usageStats";
-import { ui, closeConnectionDialog, connectionDialog } from "@/store/ui";
+import { ui, closeConnectionDialog, connectionDialog, applyUiAppearance } from "@/store/ui";
 import { reloadConnections, connectionsStore } from "@/store/connections";
 import {
   sessions,
@@ -60,17 +60,17 @@ import BroadcastDupDialog from "@/components/BroadcastDupDialog.vue";
 import McpConfirmDialog from "@/components/McpConfirmDialog.vue";
 import MultiWindowPicker from "@/components/MultiWindowPicker.vue";
 import UpdateNotification from "@/components/UpdateNotification.vue";
-import { appearance } from "@/store/appearance";
+import { appearance, applySolidity } from "@/store/appearance";
+import { installFontSizeShortcuts } from "@/composables/useFontSizeShortcuts";
 import type { Tab } from "./api";
 
 defineOptions({ name: "AppShell" });
 
 let stopMcpBridge: (() => void) | null = null;
+let uninstallFontShortcuts: (() => void) | null = null;
 
 const activeTab = computed<Tab | undefined>(() => sessions.tabs.find((t) => t.id === sessions.activeTabId));
 const hasTabs = computed(() => sessions.tabs.length > 0);
-// 响应式：外观设置里更换背景图后壳层立即生效
-const hasBgImage = computed(() => !!appearance.bgImage.dataUrl);
 
 // ── 保险库就绪后的启动序列（版本/更新/统计/MCP 桥/连接列表） ──
 async function onVaultReady(): Promise<void> {
@@ -79,13 +79,30 @@ async function onVaultReady(): Promise<void> {
 }
 
 onMounted(async () => {
+  uninstallFontShortcuts = installFontSizeShortcuts();
   await refreshVaultStatus();
 });
 
 onUnmounted(() => {
+  uninstallFontShortcuts?.();
+  uninstallFontShortcuts = null;
   stopMcpBridge?.();
   stopMcpBridge = null;
 });
+
+// ── 外观偏好的增量应用 ──
+// 初始值由各 store 模块在 import 时写入（store/ui.ts 的 applyUiAppearance、
+// store/appearance.ts 的 applySolidity），这里只处理运行期改动。
+// 必须写 html 内联样式而非 :root 规则：内联优先级高于任何选择器，
+// 才能压过 myui 在 `:root, html.dark` 的声明（ompDesktop 升级 myui 时踩过）。
+watch(
+  () => [ui.uiFontPx, ui.motionEnabled],
+  () => applyUiAppearance(),
+);
+watch(
+  () => [appearance.uiSolidity, appearance.popupSolidity],
+  () => applySolidity(),
+);
 
 // vault 翻到 ready 时执行一次性启动任务
 watch(
@@ -233,7 +250,6 @@ function onOpenQuickCommandsManage(cid?: string): void {
     :class="{
       'sidebar-collapsed': ui.sidebarCollapsed,
       'no-ai': !ui.showAiPanel,
-      'has-bg-image': hasBgImage,
     }"
   >
     <AppTopBar class="shell-topbar" />
@@ -245,8 +261,31 @@ function onOpenQuickCommandsManage(cid?: string): void {
 
       <!-- 欢迎页 -->
       <div v-else-if="!hasTabs" class="welcome-screen">
-        <div class="welcome-logo">MyShell</div>
-        <div class="welcome-hint">点击左侧连接列表开始新会话</div>
+        <div class="welcome-card">
+          <svg class="welcome-mark" viewBox="0 0 64 64" fill="none" role="img" aria-label="MyShell">
+            <defs>
+              <linearGradient id="welcome-mark-grad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" style="stop-color: var(--accent-primary-hover)" />
+                <stop offset="0.5" style="stop-color: var(--accent-primary)" />
+                <stop offset="1" style="stop-color: var(--accent-secondary)" />
+              </linearGradient>
+            </defs>
+            <path
+              d="M35 19 L16 32 L35 45"
+              stroke="url(#welcome-mark-grad)"
+              stroke-width="6.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+            <rect x="37" y="42" width="13" height="5" rx="2.5" style="fill: var(--accent-secondary)" />
+          </svg>
+          <div class="welcome-title">MyShell</div>
+          <div class="welcome-hint">点击左侧连接列表开始新会话</div>
+          <div class="welcome-keys">
+            <span class="welcome-key"><kbd>Ctrl</kbd><kbd>=</kbd> 放大字号</span>
+            <span class="welcome-key"><kbd>Ctrl</kbd><kbd>0</kbd> 复位</span>
+          </div>
+        </div>
       </div>
 
       <!-- 标签页堆叠：保持所有 tab 面板挂载（xterm 尺寸不变量）。
@@ -421,28 +460,83 @@ function onOpenQuickCommandsManage(cid?: string): void {
   justify-content: center;
   background: var(--bg-base);
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 
 .welcome-screen {
   position: absolute;
   inset: 0;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 16px;
+  padding: 24px;
   color: var(--text-muted);
 }
 
-.welcome-logo {
-  font-size: 20px;
-  font-weight: 600;
-  color: var(--text-secondary);
+/* 欢迎卡：轻玻璃 + 圆角 + 极淡描边，与工作区其他面板同一套玻璃语言。
+   旧版是两行裸文字浮在空工作区里，层级完全立不住。 */
+.welcome-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 36px 48px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-xl);
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), var(--shadow-md);
+}
+
+.welcome-mark {
+  width: 44px;
+  height: 44px;
+  display: block;
+  margin-bottom: 2px;
+}
+
+.welcome-title {
+  font-size: var(--fs-xl);
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: 0.01em;
 }
 
 .welcome-hint {
-  font-size: 13px;
+  font-size: var(--fs-sm);
+  color: var(--text-tertiary);
+}
+
+.welcome-keys {
+  display: flex;
+  gap: 14px;
+  margin-top: 6px;
+  font-size: var(--fs-xs);
+  /* --text-muted 在玻璃面上只有 ~2:1，快捷键提示几乎读不出来；
+     提到 tertiary（~3.8:1），次要信息仍需可读。 */
+  color: var(--text-tertiary);
+}
+
+.welcome-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.welcome-key kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text-tertiary);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--fs-2xs);
+  line-height: 1.4;
+}
+
+.welcome-hint {
+  font-size: var(--fs-sm);
 }
 
 .connecting-state {
@@ -454,11 +548,11 @@ function onOpenQuickCommandsManage(cid?: string): void {
   justify-content: center;
   gap: 12px;
   color: var(--text-muted);
-  font-size: 14px;
+  font-size: var(--fs-md);
 }
 
 .connecting-icon {
-  font-size: 24px;
+  font-size: var(--fs-2xl);
   animation: spin 1s linear infinite;
 }
 
@@ -480,19 +574,19 @@ function onOpenQuickCommandsManage(cid?: string): void {
   justify-content: center;
   background: var(--error-muted);
   border-radius: var(--radius-xl);
-  font-size: 36px;
+  font-size: var(--fs-3xl);
   margin-bottom: 20px;
 }
 
 .error-title {
-  font-size: 18px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   color: var(--text-primary);
   margin-bottom: 8px;
 }
 
 .error-message {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
   text-align: center;
   max-width: 400px;
@@ -511,7 +605,7 @@ function onOpenQuickCommandsManage(cid?: string): void {
   color: var(--text-secondary);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   cursor: pointer;
 }
 
@@ -526,7 +620,7 @@ function onOpenQuickCommandsManage(cid?: string): void {
   color: var(--text-inverse);
   border: none;
   border-radius: var(--radius-md);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   cursor: pointer;
   box-shadow: var(--shadow-glow);

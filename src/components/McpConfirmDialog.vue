@@ -160,7 +160,7 @@ function onCancel(): void {
 
 <style scoped>
 .mcp-body {
-  font-size: 12.5px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   line-height: 1.7;
 }
@@ -179,7 +179,7 @@ function onCancel(): void {
   border-radius: var(--radius-sm);
   padding: 8px 10px;
   font-family: monospace;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-primary);
   white-space: pre-wrap;
   word-break: break-all;
@@ -204,7 +204,7 @@ function onCancel(): void {
 }
 
 .reasons-title {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 700;
   color: var(--error);
   margin-bottom: 4px;
@@ -216,7 +216,7 @@ function onCancel(): void {
 .reasons-list {
   margin: 0;
   padding-left: 18px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   line-height: 1.7;
 }

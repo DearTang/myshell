@@ -314,14 +314,14 @@ function formatTime(timestamp: number | null): string {
 }
 
 .title {
-  font-size: 20px;
+  font-size: var(--fs-xl);
   font-weight: 600;
   color: var(--text-primary);
   letter-spacing: -0.02em;
 }
 
 .subtitle {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   /* tertiary 在卡片面上仅 3.77:1，副标题读不清；secondary 提到 5.62:1 */
   color: var(--text-secondary);
   margin-top: 8px;
@@ -335,7 +335,7 @@ function formatTime(timestamp: number | null): string {
   border: 1px solid var(--warning);
   border-radius: var(--radius-md);
   color: var(--warning);
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 
 .lockout-hint {
@@ -343,7 +343,7 @@ function formatTime(timestamp: number | null): string {
   padding: 8px 12px;
   background: var(--warning-muted);
   border-radius: var(--radius-md);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--warning);
 }
 
@@ -357,7 +357,7 @@ function formatTime(timestamp: number | null): string {
 
 .field-label {
   display: block;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-bottom: 6px;
   /* 500 → 600：小字号在暗底上需要更实的字重才立得住 */
@@ -393,7 +393,7 @@ function formatTime(timestamp: number | null): string {
 .pass-input :deep(.el-input__inner) {
   height: 40px;
   font-family: ui-monospace, monospace;
-  font-size: 14px;
+  font-size: var(--fs-md);
   color: var(--text-primary);
 }
 
@@ -423,7 +423,7 @@ function formatTime(timestamp: number | null): string {
   justify-content: space-between;
   align-items: center;
   margin-top: 6px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 
 .char-count {
@@ -432,7 +432,7 @@ function formatTime(timestamp: number | null): string {
 
 .mismatch {
   margin-top: 6px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--error);
 }
 
@@ -442,7 +442,7 @@ function formatTime(timestamp: number | null): string {
   background: var(--error-muted);
   border: 1px solid var(--error);
   border-radius: var(--radius-md);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--error);
   display: flex;
   align-items: center;
@@ -450,7 +450,7 @@ function formatTime(timestamp: number | null): string {
 }
 
 .err-icon {
-  font-size: 14px;
+  font-size: var(--fs-md);
 }
 
 /* 主按钮配色：全部通过 EP 自己的变量覆盖，避免与其选择器打架。
@@ -467,7 +467,7 @@ function formatTime(timestamp: number | null): string {
 .submit-btn {
   width: 100%;
   height: 44px;
-  font-size: 14px;
+  font-size: var(--fs-md);
   font-weight: 600;
   --el-button-text-color: var(--text-inverse);
   --el-button-hover-text-color: var(--text-inverse);
@@ -484,7 +484,7 @@ function formatTime(timestamp: number | null): string {
 .footer-hint {
   margin-top: 20px;
   text-align: center;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   /* muted 在卡片面上只有 2.09:1，等于看不见；tertiary 提到 3.77:1 */
   color: var(--text-tertiary);
 }

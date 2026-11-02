@@ -114,7 +114,7 @@ async function submit(): Promise<void> {
 }
 
 .title {
-  font-size: 14px;
+  font-size: var(--fs-md);
   font-weight: 600;
   margin-bottom: 6px;
   color: var(--text-primary);
@@ -128,14 +128,14 @@ async function submit(): Promise<void> {
 }
 
 .subtitle {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   margin-bottom: 14px;
 }
 
 .field-label {
   display: block;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-bottom: 4px;
 }
@@ -146,7 +146,7 @@ async function submit(): Promise<void> {
   background: var(--error-muted);
   border: 1px solid var(--error);
   border-radius: var(--radius-sm);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--error);
 }
 

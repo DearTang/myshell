@@ -4,7 +4,7 @@
      例外：McpSection 每次切入都重新拉取（旧版 useEffect 依赖 activeCategory 语义）。
      左侧类目导航用 myui MyNav（el-menu 封装），图标用注册表内置名。 -->
 <script setup lang="ts">
-import { reactive, ref } from "vue";
+import { computed, reactive, ref } from "vue";
 import { MyIconButton, MyNav, type NavGroup } from "myui";
 import AppearanceSection from "@/components/settings/AppearanceSection.vue";
 import AiSection from "@/components/settings/AiSection.vue";
@@ -66,6 +66,11 @@ const navGroups: NavGroup[] = [
 const isCategoryId = (value: string): value is CategoryId =>
   categories.some((category) => category.id === value);
 
+/** 内容卡标题取当前类目的 label（ompDesktop 的内容卡头就是这个语义）。 */
+const activeLabel = computed(
+  () => categories.find((category) => category.id === activeCategory.value)?.label ?? "设置",
+);
+
 // 类目点击切换逻辑不变（MyNav select 的 key 即类目 id）。
 function onNavSelect(key: string): void {
   if (isCategoryId(key)) setActive(key);
@@ -75,20 +80,20 @@ function onNavSelect(key: string): void {
 <template>
   <div class="settings-overlay">
     <div class="settings-panel">
-      <!-- 头部 -->
-      <div class="panel-header">
-        <div>
-          <div class="panel-title">设置</div>
-          <div class="panel-subtitle">管理应用配置与安全设置</div>
+      <!-- 顶排：与外壳顶栏同高（--chrome-top-height），右侧留给窗口键 -->
+      <div class="settings-topbar">
+        <div class="topbar-left">
+          <span class="topbar-title">设置</span>
+          <span class="topbar-sub">管理应用配置与安全设置</span>
         </div>
         <MyIconButton
           title="关闭设置" class="close-btn" label="关闭设置" size="16" name="Close" @click="emit('close')" />
       </div>
 
-      <!-- 主内容区 -->
-      <div class="panel-body">
+      <!-- 主内容区：左分组菜单 + 右玻璃内容卡（对齐 ompDesktop settings-panel） -->
+      <div class="settings-body">
         <!-- 左侧导航（MyNav：activeKey 绑当前类目，select 派发类目 id） -->
-        <nav class="panel-nav">
+        <nav class="panel-nav" aria-label="设置分类">
           <MyNav
             :groups="navGroups"
             :active-key="activeCategory"
@@ -97,38 +102,43 @@ function onNavSelect(key: string): void {
           />
         </nav>
 
-        <!-- 右侧内容 -->
-        <div class="panel-content">
-          <div v-show="activeCategory === 'appearance'" class="category-pane">
-            <AppearanceSection v-if="visited.has('appearance')" />
-          </div>
-          <div v-show="activeCategory === 'ai'" class="category-pane">
-            <AiSection v-if="visited.has('ai')" />
-          </div>
-          <div v-show="activeCategory === 'mcp'" class="category-pane">
-            <McpSection v-if="visited.has('mcp')" :active="activeCategory === 'mcp'" />
-          </div>
-          <div v-show="activeCategory === 'multiWindow'" class="category-pane">
-            <MultiWindowSection v-if="visited.has('multiWindow')" />
-          </div>
-          <div v-show="activeCategory === 'transfer'" class="category-pane">
-            <TransferSection v-if="visited.has('transfer')" />
-          </div>
-          <div v-show="activeCategory === 'security'" class="category-pane">
-            <SecuritySection v-if="visited.has('security')" />
-          </div>
-          <div v-show="activeCategory === 'data'" class="category-pane">
-            <DataSection
-              v-if="visited.has('data')"
-              :connection-count="connectionCount"
-              @refresh="emit('refresh')"
-            />
-          </div>
-          <div v-show="activeCategory === 'quickCommands'" class="category-pane">
-            <QuickCommandsSection
-              v-if="visited.has('quickCommands')"
-              @open-manage="emit('open-quick-commands')"
-            />
+        <!-- 右侧内容卡：标题在卡片头，正文限宽居中 -->
+        <div class="settings-content">
+          <header class="settings-content-head">
+            <h2 class="settings-content-title">{{ activeLabel }}</h2>
+          </header>
+          <div class="settings-content-body">
+            <div v-show="activeCategory === 'appearance'" class="category-pane">
+              <AppearanceSection v-if="visited.has('appearance')" />
+            </div>
+            <div v-show="activeCategory === 'ai'" class="category-pane">
+              <AiSection v-if="visited.has('ai')" />
+            </div>
+            <div v-show="activeCategory === 'mcp'" class="category-pane">
+              <McpSection v-if="visited.has('mcp')" :active="activeCategory === 'mcp'" />
+            </div>
+            <div v-show="activeCategory === 'multiWindow'" class="category-pane">
+              <MultiWindowSection v-if="visited.has('multiWindow')" />
+            </div>
+            <div v-show="activeCategory === 'transfer'" class="category-pane">
+              <TransferSection v-if="visited.has('transfer')" />
+            </div>
+            <div v-show="activeCategory === 'security'" class="category-pane">
+              <SecuritySection v-if="visited.has('security')" />
+            </div>
+            <div v-show="activeCategory === 'data'" class="category-pane">
+              <DataSection
+                v-if="visited.has('data')"
+                :connection-count="connectionCount"
+                @refresh="emit('refresh')"
+              />
+            </div>
+            <div v-show="activeCategory === 'quickCommands'" class="category-pane">
+              <QuickCommandsSection
+                v-if="visited.has('quickCommands')"
+                @open-manage="emit('open-quick-commands')"
+              />
+            </div>
           </div>
         </div>
       </div>
@@ -140,7 +150,7 @@ function onNavSelect(key: string): void {
 .settings-overlay {
   position: fixed;
   inset: 0;
-  background: var(--bg-overlay);
+  background: rgba(0, 0, 0, 0.55);
   backdrop-filter: blur(8px);
   z-index: 1000;
   animation: settings-fade-in var(--duration-normal) var(--ease-out-expo);
@@ -158,7 +168,11 @@ function onNavSelect(key: string): void {
 .settings-panel {
   position: absolute;
   inset: 0;
-  background: var(--bg-elevated);
+  /* 面板底色不用 --bg-base（不透明实底会把壁纸整片盖掉，等于设置页里
+     壁纸消失）。改走同族的玻璃底，实心度滑杆对它同样生效。 */
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -176,42 +190,54 @@ function onNavSelect(key: string): void {
   }
 }
 
-.panel-header {
-  padding: 20px 24px;
-  border-bottom: 1px solid var(--border-subtle);
+/* 顶排：高度与外壳顶栏一致，右侧留出窗口控制键的宽度（无边框窗口自绘键
+   在 App 层固定定位，设置页全屏覆盖时也在最上层）。 */
+.settings-topbar {
+  flex-shrink: 0;
+  height: var(--chrome-top-height);
+  box-sizing: border-box;
+  padding: 0 12px 0 20px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  flex-shrink: 0;
+  gap: 12px;
+  background: var(--surface-translucent);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  border-bottom: 1px solid var(--border-subtle);
 }
 
-.panel-title {
-  font-size: 16px;
+.topbar-left {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.topbar-title {
+  font-size: var(--fs-md);
   font-weight: 600;
   color: var(--text-primary);
 }
 
-.panel-subtitle {
-  font-size: 12px;
+.topbar-sub {
+  font-size: var(--fs-xs);
   color: var(--text-tertiary);
-  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .close-btn {
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--bg-surface);
+  background: transparent;
   border: 1px solid var(--border-subtle);
-  /* 关闭钮原来用 --text-tertiary（#6e7681），在 --bg-elevated（≈#21262d）上
-     对比度只有 ~3.1:1 —— 14px 的细笔画 ✕ 在这个对比度下几乎等于不可见，
-     用户反馈"右上角的关闭设置 x 看不到"。改用 --text-secondary（~5.5:1），
-     并给一层极淡的常驻底，让它在整屏浮层的右上角自带可点性（此前只有 hover
-     才显形，等于要先找到位置才知道这里能点）。 */
   color: var(--text-secondary);
-  font-size: 18px;
+  font-size: var(--fs-lg);
   cursor: pointer;
   border-radius: var(--radius-md);
   transition: all var(--duration-fast) var(--ease-in-out);
@@ -223,7 +249,8 @@ function onNavSelect(key: string): void {
   color: var(--text-primary);
 }
 
-.panel-body {
+/* 主体：左菜单 + 右内容卡 */
+.settings-body {
   flex: 1;
   display: flex;
   overflow: hidden;
@@ -232,29 +259,64 @@ function onNavSelect(key: string): void {
 
 .panel-nav {
   width: 200px;
-  border-right: 1px solid var(--border-subtle);
-  background: var(--bg-surface);
-  padding: 16px 0;
-  overflow-y: auto;
   flex-shrink: 0;
+  border-right: 1px solid var(--border-subtle);
+  background: var(--surface-translucent);
+  padding: 12px 8px;
+  overflow-y: auto;
 }
 
-/* MyNav（el-menu 封装）：透明底融入面板；条目高度对齐旧版按钮观感。 */
+/* MyNav（el-menu 封装）：透明底融入面板；条目高度对齐 ompDesktop 的 32px。 */
 .panel-nav :deep(.my-nav__menu) {
-  --el-menu-item-height: 38px;
+  --el-menu-item-height: 32px;
   width: 100%;
   background: transparent;
   padding: 0;
 }
 
-.panel-content {
+/* 内容卡：圆角玻璃卡 + 极淡描边 + 高光内阴影（ompDesktop 的
+   .settings-content 三件套）。卡片内正文限宽 940px 居中，长行不至于拉满
+   整个窗口宽度。 */
+.settings-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  margin: 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-translucent);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), var(--shadow-sm);
+  overflow: hidden;
+}
+
+.settings-content-head {
+  flex-shrink: 0;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--glass-bg);
+}
+
+.settings-content-title {
+  margin: 0;
+  font-size: var(--fs-xl);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.settings-content-body {
   flex: 1;
   overflow-y: auto;
-  padding: 20px 24px;
-  min-width: 0;
+  padding: 16px 20px 24px;
+  max-width: 940px;
+  width: 100%;
+  margin: 0 auto;
+  min-height: 0;
 }
 
 .category-pane {
-  min-height: 480px;
+  min-height: 100%;
 }
 </style>

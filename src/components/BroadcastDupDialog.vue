@@ -115,18 +115,18 @@ function onCancel(): void {
 }
 
 .warn-icon {
-  font-size: 24px;
+  font-size: var(--fs-2xl);
   line-height: 1;
 }
 
 .title {
-  font-size: 15px;
+  font-size: var(--fs-md);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .desc {
-  font-size: 12.5px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   line-height: 1.7;
 }
@@ -146,7 +146,7 @@ function onCancel(): void {
   border-radius: var(--radius-md);
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   line-height: 1.7;
   color: var(--text-secondary);
 }
@@ -177,7 +177,7 @@ function onCancel(): void {
 }
 
 .dont-remind :deep(.el-checkbox__label) {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   line-height: 1.5;
   color: var(--text-secondary);
   white-space: normal;

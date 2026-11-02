@@ -110,12 +110,12 @@ function onMsChange(v: unknown): void {
 }
 
 .manage-title {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
 }
 
 .manage-desc {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   margin-top: 2px;
 }
@@ -136,7 +136,7 @@ function onMsChange(v: unknown): void {
 
 .field-label {
   display: block;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-bottom: 6px;
   font-weight: 500;
@@ -147,14 +147,14 @@ function onMsChange(v: unknown): void {
 }
 
 .idle-hint {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-top: 4px;
   line-height: 1.5;
 }
 
 .delay-intro {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   margin-bottom: 14px;
   line-height: 1.6;
@@ -165,6 +165,6 @@ function onMsChange(v: unknown): void {
   padding: 1px 5px;
   border-radius: 3px;
   font-family: "Cascadia Code", "Fira Code", monospace;
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 </style>

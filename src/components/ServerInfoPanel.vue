@@ -169,9 +169,11 @@ function clampPct(pct: number): number {
 .server-info {
   height: 36px;
   min-height: 36px;
-  /* 实底 + 上边框：旧版引用的 --bg-sidebar/--border 在两版主题里均未定义
-     （背景透明导致终端文字透过监控条），改用真实令牌。 */
-  background: var(--bg-elevated);
+  /* 底栏与命令栏并排同属一行，实心度插值必须一致（--glass-bg），
+     否则有壁纸时两段交界处会露出色差带。 */
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
   border-top: 1px solid var(--border-subtle);
   display: flex;
   align-items: stretch;
@@ -181,14 +183,14 @@ function clampPct(pct: number): number {
 
 .hint-loading {
   padding: 0 16px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   align-self: center;
 }
 
 .hint-error {
   padding: 0 14px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--error);
   align-self: center;
 }
@@ -212,12 +214,12 @@ function clampPct(pct: number): number {
 }
 
 .chip-icon {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   flex-shrink: 0;
 }
 
 .chip-label {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   font-weight: 600;
   letter-spacing: 0.3px;
@@ -227,7 +229,7 @@ function clampPct(pct: number): number {
 }
 
 .chip-content {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
@@ -269,7 +271,7 @@ function clampPct(pct: number): number {
   margin-left: auto;
   align-self: center;
   padding: 0 12px;
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   color: var(--warning);
 }
 </style>

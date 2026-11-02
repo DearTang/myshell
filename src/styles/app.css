@@ -5,6 +5,42 @@
    ═══════════════════════════════════════════════════════════════════════════ */
 
 
+/* ─── 界面字号阶梯（对齐 ompDesktop 的 myui --fs-* 体系）──
+   本机 myui 是 v1.1.1，包内没有 --fs-* 令牌，故由应用侧声明。
+   唯一旋钮是 --fs-scale：App.vue 把它写进 html 内联样式（内联优先级高于
+   任何选择器），七级阶梯整体缩放。此处只声明「默认值 + fallback」，
+   真正的运行时倍率一律走内联样式，不在这里重复定义。
+
+   基线 14px（ompDesktop 口径）：旧版 body 是 13px，配合下面
+   --fs-2xs/--fs-xs 两档小字号，正文与说明文的层级差比旧版更清楚。 */
+:root {
+  --fs-scale: 1;
+  /* 值写成 var() 而非字面量：让 --fs-scale 在运行期能改（SCSS 算术在此无意义，
+     浏览器侧 calc 才生效）。 */
+  --fs-2xs: calc(11px * var(--fs-scale, 1));
+  --fs-xs: calc(12px * var(--fs-scale, 1));
+  --fs-sm: calc(13px * var(--fs-scale, 1));
+  --fs-md: calc(14px * var(--fs-scale, 1));
+  --fs-lg: calc(16px * var(--fs-scale, 1));
+  --fs-xl: calc(20px * var(--fs-scale, 1));
+  --fs-2xl: calc(24px * var(--fs-scale, 1));
+  --fs-3xl: calc(30px * var(--fs-scale, 1));
+
+  /* 玻璃实心度（对齐 ompDesktop --ui-solidity）：
+     0 = 设计基线的玻璃质感，1 = 完全不透明。
+     界面族（顶栏/侧栏/AI 栏/底栏）与弹窗族（下拉/对话框）分开两档，
+     弹层直接压在其他文字上，默认比常驻界面更实才读得清。
+     由外观设置的两个滑杆写入 html 内联样式。 */
+  --ui-solidity: 0.25;
+  --ui-popup-solidity: 0.55;
+
+  /* 壳层顶排高度：侧栏顶排 / 顶栏拼成窗口最上面同一整排。 */
+  --chrome-top-height: 44px;
+
+  /* 界面动效总开关（html.motion-off 时全部过渡/动画归零）。 */
+  --motion-scale: 1;
+}
+
 /* ─── MyShell 令牌层：默认（暗色 Carbon） ─── */
 :root,
 [data-theme="dark"] {
@@ -50,7 +86,16 @@
   --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.6);
   --shadow-glow: 0 0 20px rgba(88, 166, 255, 0.2);
 
-  --glass-bg: rgba(22, 27, 34, 0.88);
+  /* 玻璃族实心度插值（真正的 --glass-bg 定义在下方 myui 令牌桥里，见那里的
+     特异性说明）：alpha 在基线（0.55）与 1（全实底）之间，一个滑杆同时控制
+     顶栏/侧栏/AI 栏/底栏的「透出程度」。
+     这里只放**不与环境撞名**的中间变量（--glass-alpha*），因为 myui 自己
+     也声明了 --glass-bg 且写在 `html.dark`（特异性 0,1,1），比本块的
+     `:root`（0,1,0）高 —— 直接在这里写 --glass-bg 在深色模式下会被盖掉。 */
+  --glass-alpha: calc(0.55 + 0.45 * var(--ui-solidity, 0.25));
+  /* 弹窗/浮层族：独立滑杆，默认比常驻界面更实 —— 弹层直接压在其他文字上，
+     太透会和背后内容糊在一起。 */
+  --glass-alpha-popup: calc(0.72 + 0.28 * var(--ui-popup-solidity, 0.55));
   --glass-border: rgba(255, 255, 255, 0.08);
   --glass-blur: 12px;
 
@@ -73,8 +118,23 @@
   --conn-ftp: #d29922;
   --conn-local: #8b949e;
 
-  /* 终端工作区背景图（设置 → 外观 可选） */
+  /* 壁纸透明度兜底（运行时由 store/appearance.ts 写入 html 内联样式覆盖） */
   --app-bg-opacity: 0.85;
+}
+
+/* ─── EP 对话框 / 抽屉底色：压过库自己的 `.el-dialog{--el-dialog-bg-color:…}` ───
+   上面桥里那三条（--el-bg-color-overlay / --el-dialog-bg-color / --el-bg-color）
+   是 `:root, html.dark, html.light` 级，特异性 (0,1,1)；Element Plus 自己在
+   `.el-dialog{…}` 里也声明了 `--el-dialog-bg-color`，特异性同为 (0,1,0)
+   但**源码顺序在后**（打包后 app.css 在 EP css 之前）—— 同名自定义属性
+   后者胜出，桥里那行会被 EP 盖掉，弹窗实心度对对话框依然无效。
+   这里用 `html .el-dialog`（(0,1,1)）再声明一次，特异性与顺序双保险。
+   抽屉（.el-drawer）复用 --el-dialog-bg-color，一并覆盖。 */
+html .el-dialog,
+html .el-drawer {
+  --el-dialog-bg-color: var(--glass-bg-popup);
+  --el-drawer-bg-color: var(--glass-bg-popup);
+  --el-bg-color: var(--glass-bg-popup);
 }
 
 /* ─── MyShell 令牌层：浅色 Carbon ─── */
@@ -115,7 +175,10 @@
   --border-accent: rgba(9, 105, 218, 0.4);
 
   --shadow-glow: 0 0 20px rgba(9, 105, 218, 0.15);
-  --glass-bg: rgba(255, 255, 255, 0.88);
+  /* 浅色玻璃的基线 alpha 比暗色更高（0.6 起）：浅色文字对比度依赖浅底，
+     透太多壁纸的亮部会直接吃掉深色文字。 */
+  --glass-alpha: calc(0.6 + 0.4 * var(--ui-solidity, 0.25));
+  --glass-alpha-popup: calc(0.8 + 0.2 * var(--ui-popup-solidity, 0.55));
   --glass-border: rgba(0, 0, 0, 0.06);
 
   --conn-ftp: #9a6700;
@@ -141,6 +204,32 @@ html.light {
   --text-disabled: var(--text-muted);
   --surface-translucent: var(--glass-bg);
   --surface-translucent-hover: var(--bg-surface-hover);
+  /* 玻璃底色：**必须在桥上定义**（而不是各主题块），因为 myui 自己也声明了
+     --glass-bg 且写在 `html.dark`（特异性 0,1,1），比 `:root`（0,1,0）高。
+     本桥选择器同样带 html.dark / html.light（特异性持平），靠源码顺序
+     （app.css 最后加载）取胜 —— 与下面 --accent 那批同一个道理。
+     底色取 --bg-elevated：33 套预设各自定义它，玻璃自动跟着预设走，
+     预设不必再单独写一遍 --glass-bg（themes.ts 里那 10 处覆盖已删除，
+     写死 rgba 会绕过实心度公式，滑杆对那几套预设静默失效）。 */
+  --glass-bg: color-mix(in srgb, var(--bg-elevated) calc(var(--glass-alpha, 0.55) * 100%), transparent);
+  --glass-bg-popup: color-mix(
+    in srgb,
+    var(--bg-elevated) calc(var(--glass-alpha-popup, 0.72) * 100%),
+    transparent
+  );
+  /* 浮层表面：把 EP 的三条浮层底色都指到弹窗实心度算出的那档玻璃。
+     - --el-bg-color-overlay：下拉 / popper / notification
+     - --el-dialog-bg-color：**对话框自己的变量**，EP 把它默认成
+       `var(--el-bg-color)`（＝ --bg-surface，完全没接实心度），
+       不显式覆盖的话「弹窗实心度」滑杆对 MyDialog 一族完全不生效
+       （实测：滑杆 40%→100% 对话框底色一动不动）。
+     - --el-bg-color：EP 的基础表面色，一并接上，避免自定义浮层漏网。
+     注意**不能**顺手改 --bg-overlay：MyShell 自己那套令牌里它是**遮罩色**
+     （rgba(0,0,0,0.75)，SettingsDrawer / SftpPanel / 多窗口选择器都拿它铺
+     全屏背景），换成表面色会把遮罩变成实心板。 */
+  --el-bg-color-overlay: var(--glass-bg-popup);
+  --el-dialog-bg-color: var(--glass-bg-popup);
+  --el-bg-color: var(--glass-bg-popup);
   --danger: var(--error);
   /* 状态色淡底：myui 叫 -subtle，MyShell 叫 -muted，语义一一对应。
      myui 的 my-tone.types.ts 把 "--xxx-subtle" 当字符串交给 MyIconTile 写成
@@ -158,7 +247,7 @@ html.light {
   --ui-topbar-h: 44px;
   /* 状态栏已移除；此变量仅为 UpdateNotification 等浮层的底部偏移保留 */
   --ui-statusbar-h: 0px;
-  --ui-sidebar-w: 264px;
+  --ui-sidebar-w: 260px;
   --ui-ai-w: 380px;
   --ui-gap: 0px;
 }
@@ -175,14 +264,64 @@ body,
   height: 100%;
 }
 
+/* #app 自建层叠上下文（z-index:0）：壳层各面的 z-index（1/2）因此只在
+   #app 内部比较，不会与 body 的负 z-index 壁纸层交叉。 */
+#app {
+  position: relative;
+  z-index: 0;
+}
+
+html {
+  /* 底色放在 html 上、body 保持透明：body::before 壁纸层是 z-index:-1，
+     按 CSS 层叠顺序，负 z-index 的伪元素画在**其父元素背景之上**、
+     但仍在 html 背景之上。若底色留在 body 上，它会把壁纸整片盖住
+     （实测：浅色 #fff 时壁纸完全不出现，深色同理）。 */
+  background: var(--bg-base);
+}
+
 body {
   margin: 0;
   overflow: hidden;
-  background: var(--bg-base);
+  background: transparent;
   color: var(--text-primary);
-  font-size: 13px;
+  /* 正文基线走阶梯（14px × --fs-scale），不再是写死的 13px */
+  font-size: var(--fs-md);
   font-family: var(--font-sans, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif);
   -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── 壁纸图层（全窗透出，对齐 ompDesktop）──
+   独立 fixed 层铺窗口底层：内容靠壳层半透明玻璃透出它。
+   z-index 必须为负，否则绘制顺序上会盖住全部 static 内容
+   （ompDesktop 实测整窗只剩壁纸）。 */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: var(--app-bg-image, none);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  /* 透明度沿用外观设置的滑杆（10-100%）；没设壁纸时 --app-bg-image 为 none，
+     整层不绘制任何像素。 */
+  opacity: var(--app-bg-opacity, 0.85);
+  transition: opacity var(--duration-normal) var(--ease-in-out);
+}
+
+/* 可读性遮罩：垫在壁纸与界面之间，只把最亮/最暗的极端部分拉回可读范围。
+   主力是壳层玻璃，这里太厚壁纸就没了（ompDesktop 0.55 实测翻车）。
+   只在真设了壁纸时才上雾（html[data-wallpaper="1"]），见下方取色规则。 */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: transparent;
+  transition: background var(--duration-normal) var(--ease-in-out);
 }
 
 ::-webkit-scrollbar {
@@ -200,6 +339,39 @@ body {
   background: transparent;
 }
 
+/* 壁纸可读性遮罩的取色：亮色垫薄白雾、暗色垫薄黑雾。
+   只在真设了壁纸时（html[data-wallpaper="1"]）才上雾 —— 无壁纸时遮罩必须
+   完全透明，否则会给基础底色平白加一层雾、整窗变暗。 */
+[data-theme="dark"] {
+  --wallpaper-scrim-color: rgba(13, 17, 23, 0.28);
+}
+[data-theme="light"] {
+  --wallpaper-scrim-color: rgba(255, 255, 255, 0.22);
+}
+html[data-wallpaper="1"] body::after {
+  background: var(--wallpaper-scrim-color, transparent);
+}
+
+/* ─── 界面动效总开关 ───
+   html.motion-off 时把全部过渡与动画的时长乘 0（而非逐条删 transition：
+   组件里 var(--duration-*) 与 var(--ease-*) 的引用有上百处，改一处根变量
+   即可全量掐断，也不需要动任何组件源码）。 */
+html.motion-off {
+  --duration-fast: 0ms;
+  --duration-normal: 0ms;
+  --duration-slow: 0ms;
+}
+
+/* 关键帧动画不吃 CSS 变量，用 animation-duration 覆盖。
+   WebView2 上无限动画是「有或没有」的阶跃，逐个组件优化没有意义。 */
+html.motion-off *,
+html.motion-off *::before,
+html.motion-off *::after {
+  animation-duration: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0ms !important;
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -207,7 +379,12 @@ body {
 }
 
 /* ═══════════════ App Shell 布局 ═══════════════
-   顶栏横贯顶部；左侧连接树；中央工作区；右侧 AI 面板（可选）；
+   第一行是**连续顶排**：左侧连接树自带的 44px 顶排（.side-header）与右侧顶栏
+   拼成窗口最上面同一整排（对齐 ompDesktop 的 --chrome-top-height 口径）——
+   此前侧栏头部是 12px padding 包 28px 按钮的 53px 高块，且独占第二行顶部，
+   与顶栏上下错开、拼不成一整排。
+
+   第二行：左侧连接树、中央工作区、右侧 AI 面板（可选）。
    最底一行是**命令栏 + 服务器状态栏**，只占侧栏右侧的两列。
 
    2026-10-10 新增 bottom 行。此前命令栏嵌在 TerminalPanel 内部、状态栏是
@@ -223,7 +400,7 @@ body {
 .app-shell {
   display: grid;
   grid-template:
-    "topbar topbar topbar" var(--ui-topbar-h)
+    "side   topbar topbar" var(--chrome-top-height)
     "side   work   ai" 1fr
     "side   bottom bottom" auto
     / var(--ui-sidebar-w) minmax(0, 1fr) auto;
@@ -245,7 +422,7 @@ body {
 
 .app-shell.no-ai {
   grid-template:
-    "topbar topbar" var(--ui-topbar-h)
+    "side   topbar" var(--chrome-top-height)
     "side   work" 1fr
     "side   bottom" auto
     / var(--ui-sidebar-w) minmax(0, 1fr);
@@ -281,7 +458,7 @@ body {
   min-height: 0;
   overflow: hidden;
   position: relative;
-  z-index: 2; /* 侧栏不透明，压在壳层背景图之上 */
+  z-index: 2; /* 侧栏在壁纸层之上（壁纸是 body::before，z-index:-1） */
 }
 
 .app-shell > .shell-work {
@@ -289,11 +466,25 @@ body {
   min-width: 0;
   min-height: 0;
   position: relative;
-  /* 高于壳层背景图层（.app-shell::before），透明区域透出背景图 */
+  /* 高于壁纸层（body::before 为 z-index:-1），本区透明处直接透出壁纸 */
   z-index: 1;
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  /* 工作区是「壁纸透出」的唯一主场（终端/SFTP/欢迎页都在这），
+     所以它的底色也按实心度插值：0 → 全透明（壁纸完整透出），
+     1 → 完全不透明（与顶栏/侧栏一起变成实底）。
+     少这一层的话，实心度拉满时终端区仍会露出一整张壁纸 ——
+     实测滑杆 100% 时终端背景还是一片照片，因为终端容器是透明的。
+     底色取 --bg-elevated 而非 --bg-base：侧栏/顶栏用的是 --glass-bg
+     （由 --bg-elevated 算出），工作区若用更深的 --bg-base，
+     实心度拉满后三块交界处会出现一道台阶（实测 1302x802 窗口下
+     侧栏右缘可见 1~2px 色差带）。 */
+  background: color-mix(
+    in srgb,
+    var(--bg-elevated) calc(var(--ui-solidity, 0.25) * 100%),
+    transparent
+  );
 }
 
 .app-shell > .shell-ai {
@@ -308,18 +499,10 @@ body {
   z-index: 2;
 }
 
-/* 工作区背景图（外观设置可选） */
-.app-shell.has-bg-image::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background-image: var(--app-bg-image);
-  background-size: cover;
-  background-position: center;
-  opacity: var(--app-bg-opacity, 0.85);
-  pointer-events: none;
-  z-index: 0;
-}
+/* 工作区背景图已提升为 body 级壁纸层（见上方「壁纸图层」）：
+   旧版 .app-shell.has-bg-image::before 只铺在壳层内、被侧栏/顶栏的 0.88
+   不透明玻璃整片盖住，等于「背景图只在终端区可见」。现在壁纸铺满整窗，
+   由玻璃实心度决定各区域透出多少。 */
 
 /* 标签页堆叠层：占据工作区的全部空间，作为 .tab-stack 的定位上下文
    （inset:0 以此为基准）。2026-10-10 起监控条移到了壳层底栏（.shell-bottom），

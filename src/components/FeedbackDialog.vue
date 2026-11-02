@@ -524,18 +524,18 @@ const logSizeText = (): string => {
 }
 
 .header-icon {
-  font-size: 20px;
+  font-size: var(--fs-xl);
   display: inline-flex;
 }
 
 .header-title {
-  font-size: 15px;
+  font-size: var(--fs-md);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .header-sub {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-tertiary);
 }
 
@@ -552,12 +552,12 @@ const logSizeText = (): string => {
 }
 
 .result-icon {
-  font-size: 48px;
+  font-size: var(--fs-3xl);
   margin-bottom: 12px;
 }
 
 .result-title {
-  font-size: 16px;
+  font-size: var(--fs-lg);
   font-weight: 700;
   margin-bottom: 8px;
 }
@@ -576,7 +576,7 @@ const logSizeText = (): string => {
   border: 1px solid var(--error);
   border-radius: var(--radius-md);
   padding: 10px 16px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
   line-height: 1.6;
   max-width: 440px;
@@ -585,7 +585,7 @@ const logSizeText = (): string => {
 }
 
 .result-success-text {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   line-height: 1.6;
   max-width: 420px;
@@ -607,7 +607,7 @@ const logSizeText = (): string => {
 }
 
 .field-label {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   color: var(--text-secondary);
   margin-bottom: 6px;
@@ -626,7 +626,7 @@ const logSizeText = (): string => {
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   padding: 10px 12px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
   font-family: inherit;
   outline: none;
@@ -677,7 +677,7 @@ const logSizeText = (): string => {
   /* 图片缩略图上的悬浮删除钮：黑色半透明底 + 白字与主题无关（无对应令牌） */
   background: rgba(0, 0, 0, 0.6);
   color: #fff;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   cursor: pointer;
   line-height: 1;
   padding: 0;
@@ -690,13 +690,13 @@ const logSizeText = (): string => {
   right: 0;
   background: rgba(0, 0, 0, 0.5);
   color: #fff;
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   text-align: center;
   padding: 1px 0;
 }
 
 .hint-text {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
   margin-top: 6px;
 }
@@ -718,7 +718,7 @@ const logSizeText = (): string => {
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   padding: 10px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   line-height: 1.5;
   color: var(--text-muted);
   white-space: pre-wrap;
@@ -738,7 +738,7 @@ const logSizeText = (): string => {
 }
 
 .gitee-link {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-tertiary);
   text-decoration: none;
   cursor: pointer;

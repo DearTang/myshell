@@ -279,7 +279,7 @@ async function handleChangePassword(): Promise<void> {
 }
 
 .elevated-chip {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   padding: 5px 12px;
   border-radius: var(--radius-full);
@@ -297,7 +297,7 @@ async function handleChangePassword(): Promise<void> {
 .elevated-warn {
   margin-top: 10px;
   padding: 8px 12px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--warning);
   background: var(--warning-muted);
   border: 1px solid var(--warning);
@@ -317,7 +317,7 @@ async function handleChangePassword(): Promise<void> {
 
 .field-label {
   display: block;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-bottom: 6px;
   font-weight: 500;
@@ -335,12 +335,12 @@ async function handleChangePassword(): Promise<void> {
 }
 
 .privacy-title {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
 }
 
 .privacy-desc {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   margin-top: 2px;
 }
@@ -364,14 +364,14 @@ async function handleChangePassword(): Promise<void> {
 
 .strength-label {
   margin-top: 4px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 
 .msg-box {
   margin-bottom: 12px;
   padding: 10px 14px;
   border-radius: var(--radius-md);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   display: flex;
   align-items: center;
   gap: 8px;

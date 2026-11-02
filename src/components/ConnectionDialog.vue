@@ -1114,13 +1114,13 @@ function onKeepaliveInput(v: string): void {
 }
 
 .title {
-  font-size: 16px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .subtitle {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-tertiary);
   margin-top: 2px;
 }
@@ -1129,7 +1129,7 @@ function onKeepaliveInput(v: string): void {
   padding: 4px 10px;
   background: var(--accent-primary-muted);
   border-radius: var(--radius-full);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   color: var(--accent-primary);
   letter-spacing: 0.04em;
@@ -1156,7 +1156,7 @@ function onKeepaliveInput(v: string): void {
 .type-btn {
   flex: 1;
   padding: 14px 12px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   flex-direction: column;
   gap: 8px;
   transition: all var(--duration-normal) var(--ease-out-expo);
@@ -1194,7 +1194,7 @@ function onKeepaliveInput(v: string): void {
 }
 
 .field-group-label {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   color: var(--text-tertiary);
   text-transform: uppercase;
@@ -1209,7 +1209,7 @@ function onKeepaliveInput(v: string): void {
 }
 
 .form-field-label {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   font-weight: 500;
 }
@@ -1316,7 +1316,7 @@ function onKeepaliveInput(v: string): void {
 }
 
 .key-status {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   flex: 1;
   overflow: hidden;
@@ -1330,13 +1330,13 @@ function onKeepaliveInput(v: string): void {
 
 .key-err {
   margin-top: 8px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--error);
 }
 
 .key-hint {
   margin-top: 8px;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   line-height: 1.5;
   padding: 8px 10px;
@@ -1346,7 +1346,7 @@ function onKeepaliveInput(v: string): void {
 
 /* ── 提示块 ── */
 .hint-box {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   line-height: 1.5;
   padding: 8px 10px;
@@ -1359,13 +1359,13 @@ function onKeepaliveInput(v: string): void {
   background: var(--warning-muted);
   border: 1px solid var(--warning);
   border-radius: var(--radius-md);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--warning);
   line-height: 1.5;
 }
 
 .field-note {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   line-height: 1.5;
 }
@@ -1378,7 +1378,7 @@ function onKeepaliveInput(v: string): void {
 }
 
 .tmout-hint {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
   margin-top: 4px;
   line-height: 1.5;
@@ -1398,7 +1398,7 @@ function onKeepaliveInput(v: string): void {
 }
 
 .test-result {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   line-height: 1.5;
   border-radius: var(--radius-md);
   padding: 8px 12px;

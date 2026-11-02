@@ -192,7 +192,7 @@ function onOpenQuickCommandsManage(connectionId: string): void {
 }
 
 .toolbar-title {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   color: var(--text-secondary);
   display: inline-flex;
@@ -245,7 +245,7 @@ function onOpenQuickCommandsManage(connectionId: string): void {
 }
 
 .cell-title {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -257,7 +257,7 @@ function onOpenQuickCommandsManage(connectionId: string): void {
   border: none;
   color: var(--text-muted);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-md);
   padding: 0 4px;
   line-height: 1;
 }

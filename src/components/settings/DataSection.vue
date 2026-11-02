@@ -347,7 +347,7 @@ async function handleRollback(version: string): Promise<void> {
   margin-bottom: 12px;
   padding: 10px 14px;
   border-radius: var(--radius-md);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -369,7 +369,7 @@ async function handleRollback(version: string): Promise<void> {
 }
 
 .count-hint {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-top: 10px;
   text-align: center;
@@ -398,17 +398,17 @@ async function handleRollback(version: string): Promise<void> {
 }
 
 .version-icon {
-  font-size: 16px;
+  font-size: var(--fs-lg);
   color: var(--accent-primary);
 }
 
 .version-label {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
 }
 
 .version-value {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--text-primary);
 }
@@ -417,7 +417,7 @@ async function handleRollback(version: string): Promise<void> {
   margin-bottom: 12px;
   padding: 10px 14px;
   border-radius: var(--radius-md);
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 
 .rollback-result.error {
@@ -447,7 +447,7 @@ async function handleRollback(version: string): Promise<void> {
 .backup-head {
   padding: 10px 14px;
   background: var(--bg-surface);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
   border-bottom: 1px solid var(--border-subtle);
 }
@@ -468,7 +468,7 @@ async function handleRollback(version: string): Promise<void> {
 }
 
 .backup-version {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 500;
   color: var(--text-primary);
 }
@@ -479,25 +479,25 @@ async function handleRollback(version: string): Promise<void> {
   background: var(--success-muted);
   color: var(--success);
   border-radius: var(--radius-full);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
 }
 
 .backup-meta {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-top: 2px;
 }
 
 .backup-empty {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   text-align: center;
   padding: 24px;
 }
 
 .dialog-intro {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   margin-bottom: 14px;
 }
@@ -508,7 +508,7 @@ async function handleRollback(version: string): Promise<void> {
 
 .field-label {
   display: block;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-bottom: 6px;
   font-weight: 500;

@@ -378,8 +378,9 @@ function revokeSessionAllowed(): void {
 
 <style scoped>
 .app-topbar {
-  /* App.vue 壳层未给 .shell-topbar 设 grid-area，由本组件自己声明，
-     横贯第一行三列并填满 var(--ui-topbar-h) */
+  /* App.vue 壳层未给 .shell-topbar 设 grid-area，由本组件自己声明。
+     壳层第一行是 "side topbar topbar"：左列归侧栏顶排，本栏占第 2~3 列，
+     两者等高（--chrome-top-height）拼成窗口最上面连续的一整排。 */
   grid-area: topbar;
   display: flex;
   align-items: stretch;
@@ -392,12 +393,15 @@ function revokeSessionAllowed(): void {
   border-bottom: 1px solid var(--border-subtle);
 }
 
-/* ─── 左：折叠钮 + 品牌 ─── */
+/* ─── 左：折叠钮 + 品牌 ───
+   侧栏顶排现在是壳层第一行左列（.side-header），本栏从第 2 列起 ——
+   左侧不再需要 8px 内边距去跟窗口边缘拉开，改成 4px 与侧栏顶排的
+   右内边距（8px）合起来约 12px 的视觉缝隙。 */
 .topbar-left {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 0 4px 0 8px;
+  padding: 0 4px;
   flex-shrink: 0;
 }
 
@@ -437,7 +441,7 @@ function revokeSessionAllowed(): void {
 
 .brand-name {
   color: var(--text-primary);
-  font-size: 14px;
+  font-size: var(--fs-md);
   font-weight: 600;
   letter-spacing: 0.02em;
   white-space: nowrap;
@@ -467,7 +471,7 @@ function revokeSessionAllowed(): void {
   align-items: center;
   gap: 8px;
   padding: 0 14px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   cursor: pointer;
   border-right: 1px solid var(--border-subtle);
   background: transparent;
@@ -577,7 +581,7 @@ function revokeSessionAllowed(): void {
   border-radius: 0;
   background: transparent;
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   white-space: nowrap;
   flex-shrink: 0;
@@ -616,7 +620,7 @@ function revokeSessionAllowed(): void {
 }
 
 .dropdown-trigger :deep(.trigger-icon) {
-  font-size: 14px;
+  font-size: var(--fs-md);
 }
 
 /* 两枚计数徽标形态必须一致：都是「图标 + 数字」的实心/淡底胶囊、同样的
@@ -627,7 +631,7 @@ function revokeSessionAllowed(): void {
   align-items: center;
   justify-content: center;
   gap: 3px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   background: var(--bg-surface-active);
   color: var(--text-secondary);
   padding: 0 7px;
@@ -650,7 +654,7 @@ function revokeSessionAllowed(): void {
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   color: var(--text-inverse);
   background: var(--success);
@@ -682,7 +686,7 @@ function revokeSessionAllowed(): void {
   border: 1px solid var(--warning);
   border-radius: var(--radius-full, 999px);
   color: var(--warning);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   white-space: nowrap;
   cursor: pointer;

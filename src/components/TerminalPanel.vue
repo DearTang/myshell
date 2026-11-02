@@ -50,7 +50,7 @@ import {
   unregisterSessionAction,
 } from "@/store/sessions";
 import { ui } from "@/store/ui";
-import { primaryFont, resolveFontStack } from "@/composables/useTerminalFont";
+import { primaryFont, resolveFontStack, terminalFontSize } from "@/composables/useTerminalFont";
 import { resolveRenderer } from "@/composables/useRendererPref";
 import type { RendererBackend } from "@/composables/useRendererPref";
 import { ZmodemBridge } from "@/zmodem-bridge";
@@ -233,7 +233,16 @@ const hasBgImage = computed(() => bgImage.value.dataUrl !== null);
 const fontFamily = computed(() =>
   props.fontOverride ? resolveFontStack(props.fontOverride) : resolveFontStack(primaryFont.value),
 );
-const wrapBg = computed(() => (hasBgImage.value ? "transparent" : terminalTheme.value.background));
+// 终端背景是否让壁纸透出：既要设了壁纸，也要界面实心度还没拉到全实底。
+// 实心度 = 1 表示「完全不透明」—— 此时顶栏/侧栏/AI 栏都变实色，终端若继续
+// 透出壁纸就是唯一的例外（实测：滑杆拉满后终端区仍是一张图）。
+// 阈值取 0.999 而非 1：滑杆落在 100% 时算出的是浮点数，等值比较不可靠。
+const terminalSeeThrough = computed(
+  () => hasBgImage.value && appearance.uiSolidity < 0.999,
+);
+const wrapBg = computed(() =>
+  terminalSeeThrough.value ? "transparent" : terminalTheme.value.background,
+);
 
 // Route send/resize to the ssh_* or local_* backend depending on the tab's
 // connection type. Read live from props so the closures bound in
@@ -430,16 +439,16 @@ function setupTerminal(): void {
     // 2 reads clearly without eating the next glyph).
     cursorStyle: "bar",
     cursorWidth: 2,
-    fontSize: 14,
+    fontSize: terminalFontSize.value,
     fontFamily: fontFamily.value,
     theme: {
       ...terminalTheme.value,
       ...forceVisibleCursor(terminalTheme.value),
       selectionBackground: visibleSelection(terminalTheme.value.selectionBackground),
-      ...(hasBgImage.value ? { background: "rgba(0, 0, 0, 0)" } : {}),
+      ...(terminalSeeThrough.value ? { background: "rgba(0, 0, 0, 0)" } : {}),
     },
     allowProposedApi: true,
-    allowTransparency: hasBgImage.value,
+    allowTransparency: terminalSeeThrough.value,
   });
 
   const fit = new FitAddon();
@@ -1062,11 +1071,20 @@ watch(fontFamily, () => {
   refitAfterFontSettle();
 });
 
+// 字号变化同样要重排（字符格尺寸变了，列数必须重算），走同一条
+// refitAfterFontSettle 延迟路径。
+watch(terminalFontSize, (px) => {
+  const t = term;
+  if (!t) return;
+  t.options.fontSize = px;
+  refitAfterFontSettle();
+});
+
 // Live theme update: when the user switches palette or toggles dark/light
 // (applyTheme 会改 html[data-theme] 并重跑 applyColorPreset），update the
 // existing terminal theme without losing scrollback.
 // xterm.js 5.x supports live `term.options.theme` mutation.
-watch([() => activePalette.value.id, () => ui.isDark, hasBgImage], () => {
+watch([() => activePalette.value.id, () => ui.isDark, terminalSeeThrough], () => {
   const t = term;
   if (!t) return;
 
@@ -1074,14 +1092,14 @@ watch([() => activePalette.value.id, () => ui.isDark, hasBgImage], () => {
   // WebGL renderer can't parse "transparent" (canvas could), and falls back
   // to an opaque black clearColor, hiding the background image.
   const theme = terminalTheme.value;
-  const currentBg = hasBgImage.value ? "rgba(0, 0, 0, 0)" : theme.background;
+  const currentBg = terminalSeeThrough.value ? "rgba(0, 0, 0, 0)" : theme.background;
   t.options.theme = {
     ...theme,
     ...forceVisibleCursor(theme),
     background: currentBg,
     selectionBackground: visibleSelection(theme.selectionBackground),
   };
-  t.options.allowTransparency = hasBgImage.value;
+  t.options.allowTransparency = terminalSeeThrough.value;
   // 容器背景由模板的 :style 绑定（wrapBg computed）自动跟随，无需手动同步。
 });
 
@@ -1217,10 +1235,10 @@ onUnmounted(() => {
          chrome behind it) in the non-background-image case. -->
     <div
       class="terminal-wrap"
-      :class="{ 'terminal-bg-transparent': hasBgImage }"
+      :class="{ 'terminal-bg-transparent': terminalSeeThrough }"
       :style="{ background: wrapBg }"
     >
-      <!-- 背景图由壳层统一渲染（App.vue 的 .app-shell::before，响应式），
+      <!-- 背景图由 body 级壁纸层统一渲染（app.css 的 body::before，全窗透出），
            此处只保持容器透明让图片透出 —— 避免双层叠加重影 -->
       <!-- xterm 挂载容器。NO padding here — the 4px visual inset lives on the
            wrapper above. xterm's .xterm element fills this container's content
@@ -1353,7 +1371,7 @@ onUnmounted(() => {
   gap: 10px;
   flex-wrap: wrap;
   font-family: "Cascadia Code", Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-primary);
   z-index: 10;
 }
@@ -1374,7 +1392,7 @@ onUnmounted(() => {
   padding: 3px 12px;
   border-radius: var(--radius-sm);
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-family: inherit;
   white-space: nowrap;
   display: inline-flex;
@@ -1398,7 +1416,7 @@ onUnmounted(() => {
   background: var(--bg-elevated);
   border: 1px solid var(--border-default);
   box-shadow: var(--shadow-md);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-primary);
   z-index: 1000;
   display: flex;

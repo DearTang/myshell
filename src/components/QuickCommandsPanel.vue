@@ -390,13 +390,13 @@ function lineCount(command: string): number {
 }
 
 .header-title {
-  font-size: 16px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .header-sub {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   margin-top: 2px;
 }
@@ -410,7 +410,7 @@ function lineCount(command: string): number {
 }
 
 .scope-label {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
 }
 
@@ -428,7 +428,7 @@ function lineCount(command: string): number {
   padding: 24px;
   text-align: center;
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 
 .body-hint.empty {
@@ -442,7 +442,7 @@ function lineCount(command: string): number {
   color: var(--accent-primary);
   border: 1px dashed var(--border-accent);
   border-radius: var(--radius-md);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   cursor: pointer;
   margin-bottom: 12px;
@@ -470,7 +470,7 @@ function lineCount(command: string): number {
 
 .command-label {
   flex: 1;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--text-primary);
   overflow: hidden;
@@ -479,7 +479,7 @@ function lineCount(command: string): number {
 }
 
 .command-lines {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
 }
 
@@ -487,7 +487,7 @@ function lineCount(command: string): number {
   background: transparent;
   border: none;
   color: var(--text-muted);
-  font-size: 14px;
+  font-size: var(--fs-md);
   cursor: pointer;
   opacity: 0.8;
   padding: 2px 4px;
@@ -508,7 +508,7 @@ function lineCount(command: string): number {
 
 .command-text {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
   white-space: pre-wrap;
@@ -525,7 +525,7 @@ function lineCount(command: string): number {
 }
 
 .editor-title {
-  font-size: 14px;
+  font-size: var(--fs-md);
   font-weight: 600;
   color: var(--text-primary);
   display: flex;
@@ -540,7 +540,7 @@ function lineCount(command: string): number {
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 700;
   line-height: 1;
   padding: 0;
@@ -552,7 +552,7 @@ function lineCount(command: string): number {
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   padding: 10px 12px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   line-height: 1.7;
   display: flex;
@@ -565,7 +565,7 @@ function lineCount(command: string): number {
   padding: 1px 5px;
   border-radius: var(--radius-sm);
   font-family: "Cascadia Code", "Fira Code", monospace;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-primary);
 }
 
@@ -575,7 +575,7 @@ function lineCount(command: string): number {
 }
 
 .editor-label {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-bottom: 4px;
 }
@@ -590,7 +590,7 @@ function lineCount(command: string): number {
   color: var(--text-muted);
   font-weight: 400;
   margin-left: 6px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 
 .editor-input,
@@ -601,7 +601,7 @@ function lineCount(command: string): number {
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   padding: 8px 10px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   outline: none;
 }
 

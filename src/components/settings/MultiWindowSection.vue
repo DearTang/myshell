@@ -81,7 +81,7 @@ function onColsChange(v: unknown): void {
 
 .field-label {
   display: block;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-bottom: 6px;
   font-weight: 500;
@@ -92,7 +92,7 @@ function onColsChange(v: unknown): void {
 }
 
 .grid-hint {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
   margin-top: 10px;
   line-height: 1.5;

@@ -67,19 +67,19 @@ const emit = defineEmits<{ agree: []; decline: [] }>();
 }
 
 .icon {
-  font-size: 28px;
+  font-size: var(--fs-2xl);
   line-height: 1;
   display: inline-flex;
 }
 
 .title {
-  font-size: 16px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .desc {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   line-height: 1.7;
   margin-bottom: 16px;
@@ -95,7 +95,7 @@ const emit = defineEmits<{ agree: []; decline: [] }>();
   border-radius: var(--radius-md);
   padding: 12px 14px;
   margin-bottom: 20px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   line-height: 1.6;
 }
@@ -114,7 +114,7 @@ const emit = defineEmits<{ agree: []; decline: [] }>();
 }
 
 .repeat-hint {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
   margin-bottom: 4px;
   line-height: 1.5;

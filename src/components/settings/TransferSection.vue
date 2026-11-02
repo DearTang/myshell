@@ -60,7 +60,7 @@ function setConcurrency(v: string | number | boolean): void {
 
 .field-label {
   display: block;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-bottom: 6px;
   font-weight: 500;
@@ -70,7 +70,7 @@ function setConcurrency(v: string | number | boolean): void {
    选中态全部删除——单选按钮组的选中表达由 myui 承接。 */
 
 .chip-hint {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-tertiary);
   margin-top: 10px;
   line-height: 1.5;

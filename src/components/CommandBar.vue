@@ -625,7 +625,12 @@ function firstLine(cmd: string): string {
 .command-bar {
   height: 36px;
   min-height: 36px;
-  background: var(--bg-elevated);
+  /* 底栏原来写死 --bg-elevated（实色）：界面实心度滑杆对整条底栏毫无作用
+     —— 拉满时其它三块都变实，唯独这块本来就不透（在有壁纸时会「实得
+     突然」，其它区域仍透出壁纸）。改成与侧栏/顶栏同一套插值。 */
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
   border-top: 1px solid var(--border-default);
   display: flex;
   align-items: center;
@@ -720,7 +725,7 @@ function firstLine(cmd: string): string {
 }
 
 .float-title {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   color: var(--text-secondary);
 }
@@ -742,7 +747,7 @@ function firstLine(cmd: string): string {
   padding: 16px;
   text-align: center;
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 
 .history-item {
@@ -767,7 +772,7 @@ function firstLine(cmd: string): string {
 .cmd-text {
   flex: 1;
   min-width: 0;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -782,7 +787,7 @@ function firstLine(cmd: string): string {
 
 .qc-group-title {
   padding: 8px 12px 4px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   color: var(--text-muted);
 }
@@ -811,7 +816,7 @@ function firstLine(cmd: string): string {
 }
 
 .qc-label {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -819,7 +824,7 @@ function firstLine(cmd: string): string {
 }
 
 .qc-cmd {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;

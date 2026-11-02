@@ -158,7 +158,7 @@ async function onConfirmClick(): Promise<void> {
 }
 
 .header-title {
-  font-size: 14px;
+  font-size: var(--fs-md);
   font-weight: 600;
   color: var(--text-primary);
   display: flex;
@@ -177,7 +177,7 @@ async function onConfirmClick(): Promise<void> {
 }
 
 .count-text {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-tertiary);
 }
 
@@ -187,7 +187,7 @@ async function onConfirmClick(): Promise<void> {
   color: var(--text-secondary);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   cursor: pointer;
 }
 
@@ -206,7 +206,7 @@ async function onConfirmClick(): Promise<void> {
   padding: 32px 20px;
   text-align: center;
   color: var(--text-tertiary);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
 }
 
@@ -228,7 +228,7 @@ async function onConfirmClick(): Promise<void> {
 }
 
 .row-name {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
 }
 

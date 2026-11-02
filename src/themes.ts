@@ -63,6 +63,16 @@ export const STORAGE_KEY_COLOR = "myshell-color-scheme";
 export const STORAGE_KEY_CUSTOM = "myshell-custom-color-scheme";
 export const STORAGE_KEY_BG = "myshell-bg-image";
 export const STORAGE_KEY_TERMINAL_FONT = "myshell-terminal-font";
+/** 终端字号（px）。与终端字体同域，但独立存储 —— 字号要能被 Ctrl+= 快捷键
+ *  实时改写，混进字体字符串会让两条写入路径互相覆盖。 */
+export const STORAGE_KEY_TERMINAL_FONT_SIZE = "myshell-terminal-font-size";
+/** 界面/弹窗实心度（0-1）。外观设置的两个滑杆写入。 */
+export const STORAGE_KEY_SOLIDITY = "myshell-ui-solidity";
+export const STORAGE_KEY_POPUP_SOLIDITY = "myshell-ui-popup-solidity";
+
+export const TERMINAL_FONT_SIZE_DEFAULT = 14;
+export const TERMINAL_FONT_SIZE_MIN = 10;
+export const TERMINAL_FONT_SIZE_MAX = 22;
 
 export const DEFAULT_PALETTE_ID = "carbon";
 export const DEFAULT_BG_IMAGE: BackgroundImageConfig = { dataUrl: null, opacity: 0.85 };
@@ -157,7 +167,6 @@ const c1Dark: ColorPaletteVariant = {
     "--shadow-lg": "0 8px 24px rgba(0,0,0,0.5)",
     "--shadow-xl": "0 16px 48px rgba(0,0,0,0.6)",
     "--shadow-glow": "0 0 20px rgba(88,166,255,0.2)",
-    "--glass-bg": "rgba(22,27,34,0.88)",
     "--glass-border": "rgba(255,255,255,0.08)",
     "--glass-blur": "12px",
   },
@@ -213,7 +222,6 @@ const c1Light: ColorPaletteVariant = {
     "--border-emphasis": "rgba(0,0,0,0.15)",
     "--border-accent": "rgba(9,105,218,0.4)",
     "--shadow-glow": "0 0 20px rgba(9,105,218,0.15)",
-    "--glass-bg": "rgba(255,255,255,0.88)",
     "--glass-border": "rgba(0,0,0,0.06)",
     "--glass-blur": "12px",
   },
@@ -253,7 +261,7 @@ const c2Dark: ColorPaletteVariant = {
     "--accent-secondary-muted": "rgba(139,233,253,0.15)",
     "--success": "#69f0a8", "--warning": "#f4d370", "--error": "#ff6e6e", "--info": "#8be9fd",
     "--border-accent": "rgba(196,160,255,0.4)", "--shadow-glow": "0 0 20px rgba(196,160,255,0.25)",
-    "--glass-bg": "rgba(40,42,54,0.85)", "--glass-border": "rgba(255,255,255,0.08)",
+    "--glass-border": "rgba(255,255,255,0.08)",
   },
 };
 
@@ -314,7 +322,7 @@ const c3Dark: ColorPaletteVariant = {
     "--accent-secondary-muted": "rgba(137,180,212,0.15)",
     "--success": "#a3be8c", "--warning": "#ebcb8b", "--error": "#c26970", "--info": "#8cc4c0",
     "--border-accent": "rgba(140,196,192,0.4)", "--shadow-glow": "0 0 20px rgba(140,196,192,0.2)",
-    "--glass-bg": "rgba(46,52,64,0.85)", "--glass-border": "rgba(255,255,255,0.06)",
+    "--glass-border": "rgba(255,255,255,0.06)",
   },
 };
 
@@ -375,7 +383,7 @@ const c4Dark: ColorPaletteVariant = {
     "--accent-secondary-muted": "rgba(42,161,152,0.15)",
     "--success": "#859900", "--warning": "#c48d00", "--error": "#dc322f", "--info": "#4da0e0",
     "--border-accent": "rgba(77,160,224,0.4)", "--shadow-glow": "0 0 20px rgba(77,160,224,0.2)",
-    "--glass-bg": "rgba(0,43,54,0.85)", "--glass-border": "rgba(255,255,255,0.06)",
+    "--glass-border": "rgba(255,255,255,0.06)",
   },
 };
 
@@ -436,7 +444,7 @@ const c5Dark: ColorPaletteVariant = {
     "--accent-secondary-muted": "rgba(107,168,168,0.15)",
     "--success": "#98971a", "--warning": "#d79921", "--error": "#e04040", "--info": "#6ba8a8",
     "--border-accent": "rgba(215,153,33,0.4)", "--shadow-glow": "0 0 20px rgba(215,153,33,0.25)",
-    "--glass-bg": "rgba(40,40,40,0.85)", "--glass-border": "rgba(255,255,255,0.06)",
+    "--glass-border": "rgba(255,255,255,0.06)",
   },
 };
 
@@ -495,7 +503,7 @@ const c6Dark: ColorPaletteVariant = {
     "--accent-secondary-muted": "rgba(86,182,194,0.15)",
     "--success": "#98c379", "--warning": "#e5c07b", "--error": "#e06c75", "--info": "#72b1f0",
     "--border-accent": "rgba(114,177,240,0.4)", "--shadow-glow": "0 0 20px rgba(114,177,240,0.25)",
-    "--glass-bg": "rgba(40,44,52,0.85)", "--glass-border": "rgba(255,255,255,0.08)",
+    "--glass-border": "rgba(255,255,255,0.08)",
   },
 };
 
@@ -554,7 +562,7 @@ const c7Dark: ColorPaletteVariant = {
     "--accent-secondary-muted": "rgba(102,217,239,0.15)",
     "--success": "#a6e22e", "--warning": "#e6db74", "--error": "#f92672", "--info": "#66d9ef",
     "--border-accent": "rgba(166,226,46,0.4)", "--shadow-glow": "0 0 20px rgba(166,226,46,0.2)",
-    "--glass-bg": "rgba(39,40,34,0.85)", "--glass-border": "rgba(255,255,255,0.08)",
+    "--glass-border": "rgba(255,255,255,0.08)",
   },
 };
 
@@ -614,7 +622,7 @@ const c8Dark: ColorPaletteVariant = {
     "--accent-secondary-muted": "rgba(125,207,255,0.15)",
     "--success": "#9ece6a", "--warning": "#e0af68", "--error": "#f7768e", "--info": "#7aa2f7",
     "--border-accent": "rgba(122,162,247,0.4)", "--shadow-glow": "0 0 20px rgba(122,162,247,0.3)",
-    "--glass-bg": "rgba(26,27,38,0.85)", "--glass-border": "rgba(255,255,255,0.06)",
+    "--glass-border": "rgba(255,255,255,0.06)",
   },
 };
 
@@ -673,7 +681,7 @@ const c9Dark: ColorPaletteVariant = {
     "--accent-secondary-muted": "rgba(127,187,179,0.15)",
     "--success": "#a7c080", "--warning": "#dbbc7f", "--error": "#e67e80", "--info": "#7fbbb3",
     "--border-accent": "rgba(167,192,128,0.4)", "--shadow-glow": "0 0 20px rgba(167,192,128,0.2)",
-    "--glass-bg": "rgba(45,53,59,0.85)", "--glass-border": "rgba(255,255,255,0.06)",
+    "--glass-border": "rgba(255,255,255,0.06)",
   },
 };
 

@@ -164,7 +164,7 @@ const etaSeconds = computed(() => {
   flex-direction: column;
   gap: 6px;
   font-family: "Cascadia Code", Consolas, monospace;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-primary);
   z-index: 10;
 }
@@ -229,6 +229,6 @@ const etaSeconds = computed(() => {
   display: flex;
   justify-content: space-between;
   color: var(--text-tertiary);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 </style>

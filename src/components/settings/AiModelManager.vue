@@ -212,7 +212,7 @@ defineExpose({ resetTransient });
 }
 
 .models-title {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--text-primary);
   margin-bottom: 8px;
@@ -226,7 +226,7 @@ defineExpose({ resetTransient });
 }
 
 .models-empty {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   padding: 4px 0;
 }
@@ -243,7 +243,7 @@ defineExpose({ resetTransient });
 
 .model-name {
   flex: 1;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -251,7 +251,7 @@ defineExpose({ resetTransient });
 }
 
 .model-primary {
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
 }
 
@@ -272,7 +272,7 @@ defineExpose({ resetTransient });
 }
 
 .fetched-hint {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-bottom: 4px;
 }
@@ -291,7 +291,7 @@ defineExpose({ resetTransient });
    ButtonVariant 里没有的形状。 */
 .fetched-chip {
   border-radius: var(--radius-full);
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   padding: 3px 10px;
 }
 
@@ -308,7 +308,7 @@ defineExpose({ resetTransient });
 
 .manual-label {
   display: block;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   margin-bottom: 6px;
   font-weight: 500;

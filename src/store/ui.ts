@@ -41,9 +41,20 @@ interface UiState {
   } | null;
   /** 本轮会话已授权自动放行高危命令（MCP 确认框「本轮会话均允许」的结果反馈） */
   mcpSessionAllowed: boolean;
+  /** 界面字号基准（px，12-18）。写进 html 内联样式 --fs-scale = uiFontPx / 14。
+   *  之所以存 px 而非倍率：滑杆刻度是 px，存倍率每次进出要来回换算，
+   *  而 px 是用户真正想控制的东西。 */
+  uiFontPx: number;
+  /** 界面动效总开关。关掉时挂 html.motion-off，由 app.css 一次性掐断。 */
+  motionEnabled: boolean;
 }
 
 const PERSIST_KEY = "myshell.ui.prefs";
+
+/** 界面字号滑杆边界（px）。基线 14px 与 app.css 的 --fs-* 阶梯一致。 */
+export const UI_FONT_PX_MIN = 12;
+export const UI_FONT_PX_MAX = 18;
+export const UI_FONT_PX_DEFAULT = 14;
 
 function readPersisted(): Partial<UiState> {
   try {
@@ -107,6 +118,8 @@ export const ui = reactive<UiState>({
   mwOverflowPrompt: null,
   mcpConfirm: null,
   mcpSessionAllowed: false,
+  uiFontPx: 14,
+  motionEnabled: true,
   ...pickPersisted(),
 });
 
@@ -123,6 +136,16 @@ export const ui = reactive<UiState>({
   if (Number.isFinite(storedAi)) ui.aiPanelWidth = Math.min(720, Math.max(300, storedAi));
   const storedTheme = localStorage.getItem("myshell-theme-choice");
   if (storedTheme === "light" || storedTheme === "dark") ui.themeChoice = storedTheme;
+  // 界面字号：null 视作未存储（Number(null)=0 会把空存储钳到下限）
+  const rawFont = localStorage.getItem("myshell-ui-font-px");
+  const storedFont = rawFont === null ? NaN : Number(rawFont);
+  if (Number.isFinite(storedFont)) {
+    ui.uiFontPx = Math.min(UI_FONT_PX_MAX, Math.max(UI_FONT_PX_MIN, Math.round(storedFont)));
+  }
+  ui.motionEnabled = localStorage.getItem("myshell-motion-enabled") !== "0";
+  // 字号与动效偏好必须在这一刻就落到 html 上：main.ts 里 applyTheme() 紧随
+  // 本模块之后调用，首帧渲染前必须已有正确倍率，否则会先按 14px 画一帧再跳。
+  applyUiAppearance();
 }
 
 export function persistUi(): void {
@@ -186,6 +209,39 @@ export function setThemeChoice(choice: ThemeChoice): void {
   }
   applyTheme();
   persistUi();
+}
+
+// ── 界面字号 / 动效 ──────────────────────────────────────────────────────────
+
+/** 把界面字号与动效偏好写到 html（内联样式 / class）。
+ *  字号必须走内联：--fs-scale 写进 :root 会被 myui 的 `:root, html.dark`
+ *  在深色模式下压过（ompDesktop 升级 myui 时踩过这个坑）。 */
+export function applyUiAppearance(): void {
+  const root = document.documentElement;
+  const px = Math.min(UI_FONT_PX_MAX, Math.max(UI_FONT_PX_MIN, ui.uiFontPx || UI_FONT_PX_DEFAULT));
+  // 倍率 = 当前 px / 基线 14px —— 阶梯定义在 app.css 里都是「Npx × 倍率」
+  root.style.setProperty("--fs-scale", String(px / UI_FONT_PX_DEFAULT));
+  root.classList.toggle("motion-off", !ui.motionEnabled);
+}
+
+export function setUiFontPx(px: number): void {
+  ui.uiFontPx = Math.min(UI_FONT_PX_MAX, Math.max(UI_FONT_PX_MIN, Math.round(px)));
+  try {
+    localStorage.setItem("myshell-ui-font-px", String(ui.uiFontPx));
+  } catch {
+    /* best-effort */
+  }
+  applyUiAppearance();
+}
+
+export function setMotionEnabled(enabled: boolean): void {
+  ui.motionEnabled = enabled;
+  try {
+    localStorage.setItem("myshell-motion-enabled", enabled ? "1" : "0");
+  } catch {
+    /* best-effort */
+  }
+  applyUiAppearance();
 }
 
 // ── 连接编辑对话框状态 ──

@@ -387,13 +387,13 @@ function handleRowClick(row: DropdownRow): void {
   align-items: center;
   flex-wrap: wrap;
   gap: 6px 8px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   color: var(--text-secondary);
 }
 
 .ddp-header-icon {
-  font-size: 14px;
+  font-size: var(--fs-md);
 }
 
 /* 批量操作钮改用 MyButton + outline：描边、配色、hover 反色全部交给
@@ -405,7 +405,7 @@ function handleRowClick(row: DropdownRow): void {
 }
 
 .ddp-count {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   background: var(--bg-surface);
   padding: 1px 8px;
@@ -418,7 +418,7 @@ function handleRowClick(row: DropdownRow): void {
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   font-weight: 600;
   color: var(--success);
   background: var(--success-muted);
@@ -435,7 +435,7 @@ function handleRowClick(row: DropdownRow): void {
 .ddp-empty {
   padding: 24px 12px;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   line-height: 1.6;
 }
@@ -478,7 +478,7 @@ function handleRowClick(row: DropdownRow): void {
 .ddp-row-name {
   flex: 1;
   min-width: 0;
-  font-size: 12.5px;
+  font-size: var(--fs-xs);
   color: var(--text-primary);
   font-weight: 400;
   overflow: hidden;
@@ -500,7 +500,7 @@ function handleRowClick(row: DropdownRow): void {
 
 .ddp-row-secondary {
   flex-shrink: 0;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   cursor: pointer;
   padding: 1px 4px;
   color: var(--text-muted);
@@ -515,7 +515,7 @@ function handleRowClick(row: DropdownRow): void {
 
 .ddp-row-action {
   flex-shrink: 0;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   cursor: pointer;
   padding: 2px 5px;

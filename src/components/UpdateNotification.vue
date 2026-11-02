@@ -251,18 +251,18 @@ function openBrowser(): void {
 }
 
 .icon {
-  font-size: 22px;
+  font-size: var(--fs-xl);
 }
 
 .title {
-  font-size: 17px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   color: var(--text-primary);
   letter-spacing: -0.01em;
 }
 
 .version {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 500;
   color: var(--accent-primary);
   background: var(--accent-primary-muted);
@@ -273,7 +273,7 @@ function openBrowser(): void {
 
 .subtitle {
   text-align: center;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
   line-height: 1.5;
   padding: 14px 24px 0;
@@ -311,7 +311,7 @@ function openBrowser(): void {
 .downloading-text {
   flex: 1;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   padding: 8px 0;
 }

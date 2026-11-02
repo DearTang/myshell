@@ -106,7 +106,7 @@ function onRenameKeydown(e: KeyboardEvent): void {
 }
 
 .plus {
-  font-size: 14px;
+  font-size: var(--fs-md);
 }
 
 .supplier-list {
@@ -138,7 +138,7 @@ function onRenameKeydown(e: KeyboardEvent): void {
 
 .supplier-name {
   flex: 1;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 400;
   color: var(--text-primary);
   overflow: hidden;
@@ -152,7 +152,7 @@ function onRenameKeydown(e: KeyboardEvent): void {
 }
 
 .disabled-badge {
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   margin-left: 4px;
   color: var(--text-muted);
 }
@@ -166,7 +166,7 @@ function onRenameKeydown(e: KeyboardEvent): void {
 .rename-input {
   width: 100%;
   padding: 2px 4px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   background: var(--bg-input);
   color: var(--text-primary);
   border: 1px solid var(--accent-primary);
@@ -175,7 +175,7 @@ function onRenameKeydown(e: KeyboardEvent): void {
 }
 
 .supplier-empty {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   text-align: center;
   padding: 20px;

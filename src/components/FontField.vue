@@ -215,7 +215,7 @@ function onClear(): void {
 
 .dropdown-cap {
   padding: 6px 10px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   border-top: 1px solid var(--border-subtle);
   margin-top: 2px;

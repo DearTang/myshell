@@ -246,7 +246,7 @@ function filteredRules(key: RuleListVM["key"]): string[] {
 }
 
 .block-title {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 500;
 }
 
@@ -256,7 +256,7 @@ function filteredRules(key: RuleListVM["key"]): string[] {
 }
 
 .rules-intro {
-  font-size: 11px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-bottom: 8px;
 }
@@ -268,7 +268,7 @@ function filteredRules(key: RuleListVM["key"]): string[] {
 .rules-check {
   display: flex;
   margin-bottom: 10px;
-  font-size: 11px;
+  font-size: var(--fs-2xs);
 }
 
 .rule-block {
@@ -276,7 +276,7 @@ function filteredRules(key: RuleListVM["key"]): string[] {
 }
 
 .rule-title {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 500;
   margin-bottom: 4px;
 }
@@ -297,7 +297,7 @@ function filteredRules(key: RuleListVM["key"]): string[] {
 
 .rule-input {
   flex: 1;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-family: monospace;
   background: var(--bg-input);
   border: 1px solid var(--border-default);
@@ -332,7 +332,7 @@ function filteredRules(key: RuleListVM["key"]): string[] {
 }
 
 .rule-text {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-family: monospace;
   flex: 1;
   word-break: break-all;
@@ -351,26 +351,26 @@ function filteredRules(key: RuleListVM["key"]): string[] {
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-md);
   padding: 0 4px;
   flex-shrink: 0;
 }
 
 .rule-empty {
   padding: 8px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   text-align: center;
 }
 
 .rule-count {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-top: 2px;
 }
 
 .verdict-hint {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   color: var(--text-muted);
   margin-top: 4px;
   line-height: 1.6;
