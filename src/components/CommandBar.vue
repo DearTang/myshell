@@ -28,6 +28,7 @@ import {
 } from "@/api";
 import type { CommandHistoryItem, ConnType, QuickCommandExecItem, Tab } from "@/api";
 import { registerHistoryRefresher, unregisterHistoryRefresher } from "@/store/sessions";
+import { setMcpSessionAllowed, ui } from "@/store/ui";
 
 defineOptions({ name: "CommandBar" });
 
@@ -441,6 +442,22 @@ function firstLine(cmd: string): string {
          没有它的话按钮会紧贴输入框右侧，栏的右半看起来是空的。 -->
     <div class="bar-spacer" />
 
+    <!-- 会话放行指示器（2026-11-13 用户指定位置：输入框右侧、快捷按钮左侧）：
+         MCP 高危命令「本轮会话均允许」授权期间常驻显示，点击撤销。文案带
+         MCP 前缀 —— 放行作用于 MCP 工具发起的命令（进程级），与终端标签
+         无关，靠近终端动作区时必须自我说明，消除「属于当前标签」的歧义。 -->
+    <MyButton
+      v-if="ui.mcpSessionAllowed"
+      variant="ghost-success"
+      size="small"
+      class="session-allowed-chip"
+      title="MCP 工具发起的高危命令已放行（点击撤销，撤销后恢复逐条确认）。作用于 MCP 客户端会话，与终端标签无关。"
+      @click="setMcpSessionAllowed(false)"
+    >
+      <MyIcon :size="13" name="Unlock" />
+      <span>MCP 高危已放行</span>
+    </MyButton>
+
     <!-- Quick commands button -->
     <!-- popper-style 承担面板宽度：宽度必须给到 popper **外壳**上，不能只给
          面板自己。EP 的 .el-popover 有 `min-width: 150px` 且 position:absolute，
@@ -684,6 +701,30 @@ function firstLine(cmd: string): string {
 .bar-spacer {
   flex: 1;
   min-width: 0;
+}
+
+/* 会话放行指示器：警示色胶囊，点击撤销（从 AppTopBar 迁入，用户指定
+   落位在命令输入框右侧、快捷按钮左侧）。 */
+.session-allowed-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  margin-right: 4px;
+  padding: 0 8px;
+  background: var(--warning-muted);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-full, 999px);
+  color: var(--warning);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.session-allowed-chip:hover {
+  background: var(--warning);
+  color: var(--text-inverse);
 }
 
 /* 工具栏按钮改用 MyButton 后，这里只剩排版：不换行、不被 flex 压扁、

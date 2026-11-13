@@ -9954,3 +9954,24 @@ html[data-translucent="1"] {
   且头部第 7 行 baseline 不更新。v2.20.1 发布时就因残留 v2.21.0 被误判 resuming
   (目标版本不升号)。本次已手动修正两处为 v2.20.1。脚本在
   ~/.omp/agent/skills/myTools-packageTauri/,待修:clear 应写刚发布的版本并同步头部。
+
+### 阶段 244 -- MCP 命令可见性恢复 + 放行 chip 迁位
+
+- **动机**:用户实报两点——(1) MCP 执行命令在会话窗口不显示输入与输出;
+  (2) 放行指示器要放命令输入框右侧、快捷按钮左侧。
+- **根因(1)**:GUI 侧 exec_in_tab 三条路径(复用/重连/新建)都正确激活标签;
+  问题在 MCP instructions(阶段 220)积极引导 AI 客户端「命令长/含 | ; 2>&1
+  heredoc → 用 pipe 通道」,pipe 无 GUI 展示,实际命令大多命中这些条件,
+  用户从「全都看得见」变成「几乎全看不见」。
+- **修复(1)**:myshell-mcp.rs 两处文案(SERVER_INSTRUCTIONS 的 EXECUTION
+  CHANNEL 段 + exec_channel schema 描述)收窄 pipe 条件为「写凭据且
+  ssh_write_text 不可用」或「上次 gui 结果字符损坏」,明确长命令/管道/
+  分号/heredoc 在 gui 通道都正常。
+- **修复(2)**:chip 从 AppTopBar 迁到 CommandBar(bar-spacer 之后、快捷
+  按钮 MyPopover 之前),点击撤销逻辑不变(setMcpSessionAllowed(false))。
+- **验证**:debug-shell 临时挂 CommandBar + 注入放行标志,CDP 几何探针
+  实测 chip(l=800,r=912)在输入框右缘(620)之后、快捷按钮左缘(936)
+  之前,chipRightOfInput/chipLeftOfQuick 均 true;cargo check +
+  npm run test:ts 通过;debug-shell 临时改动已还原(git diff 干净)。
+- **注意**:instructions 修复要 AI 客户端重连 MCP(重启会话)后生效——
+  新 instructions 随 initialize 下发。

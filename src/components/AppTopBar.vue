@@ -5,9 +5,9 @@
      v2.15.4 起窗口无边框（decorations:false），最小化/最大化/关闭按钮
      内嵌本栏最右（omp desktop 式一行顶栏），空白区域可拖动窗口。 -->
 <script setup lang="ts">
-import { MyButton, MyIcon, MyIconButton, MyStatusDot, type MyTone } from "myui";
+import { MyIcon, MyIconButton, MyStatusDot, type MyTone } from "myui";
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
-import { setMcpSessionAllowed, ui } from "@/store/ui";
+import { ui } from "@/store/ui";
 import {
   broadcastAll,
   closeDisconnected,
@@ -226,13 +226,6 @@ function openQuickCommands(): void {
   ui.showQuickCommands = true;
 }
 
-/** 撤销会话放行：仅清除 GUI 侧标志。MCP 服务器仍持有自己的授权标志，
- *  但它每次 exec 请求都带 session_allowed，GUI 是权威判定方——被撤销后
- *  GUI 忽略该字段、照常弹窗，并在响应里回带 session_revoked 让 MCP
- *  同步清除标志。因此无需反向连接 MCP（它由 AI 客户端以 stdio 启动）。 */
-function revokeSessionAllowed(): void {
-  setMcpSessionAllowed(false);
-}
 </script>
 
 <template>
@@ -357,21 +350,6 @@ function revokeSessionAllowed(): void {
         name="Robot"
         @click="ui.showAiPanel = !ui.showAiPanel"
       />
-      <!-- 会话放行指示器：MCP 高危命令「本轮会话均允许」授权期间常驻显示，
-           点击撤销。挪到快捷命令左侧（用户指定）；文案带 MCP 前缀 ——
-           放行作用于 MCP 工具发起的命令（进程级），与终端标签无关，
-           靠近终端动作区时必须自我说明，消除「属于当前标签」的歧义。 -->
-      <MyButton
-        v-if="ui.mcpSessionAllowed"
-        variant="ghost-success"
-        size="small"
-        class="session-allowed-chip"
-        title="MCP 工具发起的高危命令已放行（点击撤销，撤销后恢复逐条确认）。作用于 MCP 客户端会话，与终端标签无关。"
-        @click="revokeSessionAllowed"
-      >
-        <MyIcon :size="13" name="Unlock" />
-        <span>MCP 高危已放行</span>
-      </MyButton>
       <MyIconButton
         title="快捷命令"
         class="icon-btn"
@@ -743,29 +721,6 @@ function revokeSessionAllowed(): void {
   padding: 0 8px;
   flex-shrink: 0;
   border-left: 1px solid var(--border-subtle);
-}
-
-/* 会话放行指示器：警示色胶囊，点击撤销 */
-.session-allowed-chip {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  height: 22px;
-  margin-right: 4px;
-  padding: 0 8px;
-  background: var(--warning-muted);
-  border: 1px solid var(--warning);
-  border-radius: var(--radius-full, 999px);
-  color: var(--warning);
-  font-size: var(--fs-2xs);
-  font-weight: 600;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.session-allowed-chip:hover {
-  background: var(--warning);
-  color: var(--text-inverse);
 }
 
 /* 窗口控制样式在 WindowControls.vue（顶栏与门禁页共用）。 */
