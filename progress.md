@@ -9942,3 +9942,15 @@ html[data-translucent="1"] {
   vite headers 已移除,探针已清。
 - **注意**:修复只进新构建的包——**已安装的 2.20.0 仍带旧 CSP**,用户要
   看到壁纸需等下一版(建议 2.20.1)。无运行时 workaround(CSP 嵌死在二进制)。
+
+### 阶段 243 -- 发布 v2.20.1（壁纸 CSP 修复）
+
+- 流水线全绿:2.20.1(patch,1 条 BUG)→ 构建 → 提交 → 推送 → Gitee Release
+  1304148 → 暂存区清空。https://gitee.com/argustang/myshell/releases/tag/v2.20.1
+- 流水线 git push 在 pty 服务里挂起(等凭据 tty 输入,上次是快速失败,环境差异),
+  杀掉后按惯例用 .gitee-token 一次性 URL 补推;main/tag/Release 三处 SHA 一致。
+- **skill 脚本 bug 复现记录**:package-tauri.mjs 的 clear 步把「待发布条目」节内
+  baseline 写成下一候选版本(v2.20.0 发完写 v2.21.0、v2.20.1 发完写 v2.20.2),
+  且头部第 7 行 baseline 不更新。v2.20.1 发布时就因残留 v2.21.0 被误判 resuming
+  (目标版本不升号)。本次已手动修正两处为 v2.20.1。脚本在
+  ~/.omp/agent/skills/myTools-packageTauri/,待修:clear 应写刚发布的版本并同步头部。
