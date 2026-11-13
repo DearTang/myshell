@@ -9918,3 +9918,27 @@ html[data-translucent="1"] {
 - **验证**：`npm run test:ts` 通过；探针实测——6 标签（无裁切）× 全部
   在标签界内且命中自身；10 标签场景全部在界内（第 10 个位于裁切区，
   真实场景不可见/不可悬停，无实际影响）。
+
+### 阶段 242 -- 修复安装版壁纸不渲染：CSP connect-src 漏放行 asset 域
+
+- **动机**:用户实报(2026-11-13)——安装版 2.20.0 里设置壁纸,导入成功但整窗
+  看不到壁纸。dev 模式完全正常,发布前未暴露。
+- **根因**:`tauri.conf.json` 的 CSP 里 `img-src` 放行了 `asset:
+  http://asset.localhost`,但 **`connect-src` 漏了**。壁纸应用链
+  (`appearance.ts applyBgImage`)在写 `--app-bg-image` 前先用
+  `verifyWallpaperReachable` 对 asset URL 发 HEAD fetch 预检——该 fetch
+  属于 connect-src 管辖,被 CSP 无条件拦截(TypeError: Failed to fetch),
+  与文件存在与否无关 → 预检恒 false → 永不写壁纸变量,静默退回 glow 底。
+  dev 页面(Vite 直出)无该 CSP 响应头,所以 dev 里壁纸一直正常。
+- **佐证链**:安装版 localStorage 里最新记录正是磁盘现存文件
+  (wallpaper-1794543100750.jpg, opacity 0.8)——设置/导入/持久化全成功;
+  Tauri asset 协议响应带 ACAO 回显(tauri-2.11.5 protocol/asset.rs:21),
+  CORS 不拦;Chrome 三组对照页实证:无 CSP 畅通 / 旧 CSP 拦截(复现) /
+  新 CSP 放行(修复)。
+- **修复**:`connect-src` 补 `http://asset.localhost https://asset.localhost`
+  (tauri.conf.json 一行)。
+- **验证**:Chrome file:// 页 + 本地 ACAO:* 服务三组对照(FETCH_OK /
+  FETCH_BLOCKED / FETCH_OK);`npm run test:ts` 通过;临时注入 CSP 的
+  vite headers 已移除,探针已清。
+- **注意**:修复只进新构建的包——**已安装的 2.20.0 仍带旧 CSP**,用户要
+  看到壁纸需等下一版(建议 2.20.1)。无运行时 workaround(CSP 嵌死在二进制)。
