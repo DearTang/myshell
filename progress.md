@@ -9975,3 +9975,10 @@ html[data-translucent="1"] {
   npm run test:ts 通过;debug-shell 临时改动已还原(git diff 干净)。
 - **注意**:instructions 修复要 AI 客户端重连 MCP(重启会话)后生效——
   新 instructions 随 initialize 下发。
+
+### 阶段 245 -- 发布 v2.20.2（MCP 可见性 + chip 迁位）
+
+- 2.20.2(patch,2 条 🛠️):pipe 引导收窄 + 放行指示器迁命令栏。
+  https://gitee.com/argustang/myshell/releases/tag/v2.20.2
+- 流水线 push 步依旧挂起(无凭据 tty),照例杀掉后 token 一次性 URL 手动推
+  main+tag;clear 的 baseline 误写 bug 第三次出现(v2.20.3→已修正 v2.20.2)。
