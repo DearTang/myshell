@@ -446,6 +446,8 @@ async fn upload_impl(
         &TransferDonePayload {
             request_id: request_id.to_string(),
             errors,
+            // FTP 上传是 files-only（没有目录展开）。
+            created_dirs: 0,
         },
     );
     Ok(())
@@ -561,6 +563,7 @@ async fn download_impl(
         &TransferDonePayload {
             request_id: request_id.to_string(),
             errors,
+            created_dirs: 0,
         },
     );
     Ok(())

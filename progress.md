@@ -8285,3 +8285,1636 @@ Gitee 的 `DELETE /releases/{id}/assets/...` 与 `/attach_files/...` 均返回 4
 | 我要去哪里？ | 真机 `cargo tauri dev` 复验一次亮壁纸 + 100% 实心度，并确认对话框/快捷命令浮层的观感。 |
 | 什么可能导致偏离？ | 这台机器上脚本模拟点击打不开设置页（已用浏览器探针替代验证），真机需人工点一次确认。 |
 | 下一步最小可验证动作？ | 人工打开设置 → 外观，把两个实心度滑杆拖到 100%，看是否整窗纯色。 |
+
+### 阶段 208 —— 竞品能力补齐：端口转发 / 终端分屏 / 侧栏多视图 + 外部导入 / 监控面板
+
+**需求**：调研 GitHub `binaricat/Netcatty`（Electron SSH 客户端，7.1k stars），
+找出「MyShell 没有且确有集成价值」的能力并实现。逐项对照后选定四项：
+端口转发、终端分屏、侧栏多视图 + 外部工具连接导入、监控面板升级。
+明确不做：Catty Agent 式应用内 AI 直操会话（会破坏 MyShell 的 MCP 确认门
+安全模型）、插件平台、Vault Notes、动态 SOCKS 转发（local/remote 已覆盖
+跳板场景）。
+
+**改动（后端）**：
+- `db.rs` —— 新表 `port_forwards`（明文：主机名与端口的敏感级同连接的 host，
+  且设置面板要在保险库未解锁时列出规则）。CRUD 六件套 + `orphaned_port_forwards`。
+- `forward.rs`（新模块）—— `ForwardManager` 持全部活动隧道。local 方向
+  `TcpListener::bind` + 每 accept 一条 `channel_open_direct_tcpip`；remote 方向
+  `tcpip_forward` 申请服务端监听，入站 channel 由 `SshClient` 的
+  `server_channel_open_forwarded_tcpip` 按 `(bind_host, bind_port)` 路由。
+  每条规则一个 tokio accept/pump 任务，字节计数经 `Arc<Mutex<TunnelStatus>>`
+  共享给 UI。
+- `ssh.rs` —— `SshClient` 加 `port_forwards` 字段并实现
+  `server_channel_open_forwarded_tcpip`（russh 默认实现是空函数，不覆盖则
+  远程转发的入站 channel 会被静默丢弃）；`disconnect` 联动 `stop_for_session`
+  先停隧道再释放 handle；新增 `session_handle` 查询。
+- `main.rs` —— 六个 Tauri 命令 + `generate_handler!` 注册；`ServerInfo` 与
+  `SERVER_INFO_SCRIPT` 扩展磁盘 I/O / 网络速率 / loopback 延迟三项。
+- `myshell-cli.rs` —— `forward list/start/stop` 子命令（`start` 阻塞到 Ctrl+C，
+  CLI 隧道没有别的生命周期）。
+
+**改动（前端）**：
+- `store/panes.ts`（新）—— 每 tab 一棵 pane 树，纯操作函数 split/close/
+  focus/resize/exit。
+- `SplitContainer.vue`（新）—— 递归渲染树，叶子挂 TerminalPanel；拖拽分隔条
+  实时改 flex-basis 不重建 DOM。
+- `TerminalPanel.vue` —— 新增 `inputEnabled` / `resizeEnabled` 两个 prop
+  （默认 true，单 pane 与多窗口网格调用点零改动）：非焦点叶子不发 keystroke、
+  不推 window size。
+- `AppSidebar.vue` —— 树/列表/网格三视图（`ui.sidebarView` 持久化，加入
+  `PERSISTED_KEYS` 白名单并做值校验）。
+- `utils/importers.ts`（新）—— 五种格式解析器，纯函数，返回草稿 + 逐条错误；
+  凭据一律不导入。
+- `DataSection.vue` —— 「从外部工具导入」入口 + 预览勾选对话框。
+- `MonitorPanel.vue`（新）—— 多主机一览，列可选、刷新率 1–30s、行内打开终端。
+- `AppTopBar.vue` —— 分屏两枚 + 监控一枚按钮。
+
+**设计取舍**：
+1. 隧道不复用终端标签的 SSH 会话，而是每条规则单独拨一条 —— 否则关掉配置它
+   的那个标签会静默杀死隧道。代价是每条活动隧道一条连接。
+2. 分屏是「同会话双视图」而非「同标签多会话」：SSH PTY 只有一个 window size，
+   两个 xterm 各自 resize 会互相打架，所以非焦点叶子只本地 fit。
+3. 端口转发不挂 MCP：隧道等于把本机端口开放给第三方进程，不应由 AI 决定。
+4. 规则持久化但 `enabled` 不随启动自动开启 —— 避免每次开机都静默开放端口。
+5. 监控面板只探测「已打开终端」的连接（复用其会话），不额外建连：每秒一次
+   刷新若每连接新建 SSH，会把服务器和 CPU 都打满。
+6. 导入不接收外部密码/私钥：各家存储方式私有且多为混淆而非加密，硬解只会
+   制造错误的安全感，预览列表明确标注「导入后需自行填写凭据」。
+
+**踩过的坑（都已修）**：
+- `splitPane` 的 walk 在**根本身是目标叶子**时返回 true 却没有调用方替换它 ——
+  首拆静默失败（点了没反应）。补了根替换分支。
+- `closePane` 的 prune 写成「na 里没有就返回 na」，把已递归剪好的 nb 丢了 ——
+  关一个深层叶子会让整个兄弟分支从树上消失。
+- `stop` 原先只在 `tunnels` 里有该规则时才清 `remote_index`，而 accept loop
+  自己退出时 tunnels 已空、index 仍在 —— 同一 bind pair 从此永久被占。
+- `resizePane` 拖拽边界：探针最初把钳制方向写反（5 期望 0.2，实际 Math.min
+  先夹到 0.8），是探针错不是代码错。
+- `SplitContainer` 比例直接拼 `(1-ratio)*100`，二进制浮点产出
+  `30.000000000000004%` —— 取整到三位小数。
+- PuTTY `.reg` 的段头在 `Sessions` 键**之后用正斜杠**、之前用反斜杠，只匹配
+  一种分隔符会静默解析出零个会话。
+- ssh_config 缺 HostName 时别退回别名当地址（会造出连错地方的连接）。
+- 监控面板 `viewRows` 视图模型替代模板里满屏的 `rows.get(c.id)?.info` 三连取。
+
+**验证**：
+- `cargo test`：156 通过 / 0 失败（新增 forward 6 + port_forward 5 +
+  server_info 速率/延迟 4）。
+- `npm run test:ts`（vue-tsc）：通过。
+- 分屏 store 19 项树操作断言 + SplitContainer SSR 渲染 20 项断言（叶子数、
+  分隔条数、轴方向、焦点描边、flex-basis、input/resize 门禁透传）全过。
+- 五种导入格式 50 项字段映射断言全过（含通配 Host、ProxyJump、%20 解码、
+  dword 端口、引号内含逗号、计数器归零饱和等边界）。
+- 监控面板 SSR 渲染 10 项断言全过（关闭态零 DOM、默认四列、提示文案）。
+- 探针脚本均为一次性，已从 `scripts/` 与 `F:/tmp` 删除。
+
+**五问重启检查（阶段 208）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 补齐端口转发、终端分屏、侧栏三视图 + 五格式导入、监控面板四项能力。 |
+| 什么是我没做的？ | 动态 SOCKS 转发、应用内 AI Agent、插件平台、Vault Notes；导入不收外部凭据。 |
+| 我想去哪里？ | 四项功能在真实连接上逐一跑通（建隧道、拆屏、导入连接、看监控数字）。 |
+| 我要去哪里？ | 真机 `cargo tauri dev`：建一条 local 隧道验证连通与断开；横拆一个 SSH 终端验证输入互斥；用 ssh_config 样本导入；开监控面板看数字刷新。 |
+| 什么可能导致偏离？ | 浏览器环境无 Tauri 运行时，UI 层只做了 SSR 渲染与 store 逻辑验证，交互（拖拽分隔条、勾选导入、隧道启停）未经真机确认。 |
+| 下一步最小可验证动作？ | 真机打开设置 → 端口转发，新建一条指向某服务器内网服务的 local 规则，启动后本机端口连通即通过。 |
+
+### 阶段 209 —— "session not found" 刷屏与会话不稳定根治（日志实证驱动）
+
+- **需求**：用户报「频繁报 session not found」+「会话连接经常不稳定」。本机日志定位：
+  - `myshell-20767.log`（当天）176 次、`myshell-20760.log`（11-03）**7104 次**
+    `exec channel open failed (Session not found), attempting one-time reconnect`，
+    集中在 4 个死 sessionId（2728/2561/2544/1862 次 ≈ 各挂机 3.8h，5s 一条）——
+    会话被 `ssh_disconnect` 删除后，底栏监控条 / 监控面板仍每 5s 用死 id 轮询。
+  - `02:56:22.602` 同一毫秒 3 条 `attempting one-time reconnect` + 3 条 `dial+auth`、
+    2 条 `reconnect succeeded`——连接闲置死亡时多个并发 `exec_once` 各自 dial+auth，
+    多开 2 条 TCP+SSH 握手（frp/NAS 脆弱链路的放大器）。
+  - `reconnect_session` 只换 exec 用 handle，交互 PTY 留在死 handle 上 → 终端断线遮罩
+    弹着、底栏数据还在跳——「不稳定」的体感来源（连接真死是环境侧，代码只能收敛行为）。
+
+- **改动**：
+  - `src-tauri/src/ssh.rs`：
+    - `is_connection_dead` 移除 `"Session not found"` 匹配：map miss = 会话已显式断开，
+      dial 无法复活，exec_once 直接报错返回（新增 `connection_dead_tests` 回归测试锁定）。
+    - `reconnect_session` 加 per-session 单飞锁（进程级 `static RECONNECT_LOCKS`，
+      `LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>`）：并发调用先快照
+      handle 指针（存 `usize` 保持 future Send），排队拿锁后发现 handle 已被并发者换新
+      即复用、跳过自己的 dial。消灭同毫秒三重拨号。
+  - `src/components/ServerInfoPanel.vue`：轮询加连续失败熔断——连续 2 次失败即
+    `clearInterval` 停表（错误文案保留展示），sessionId/active 变化时 watch 重建自动恢复。
+  - `src/components/MonitorPanel.vue`：`Row` 加 `fails` 计数，probe 连续 2 次失败后跳过
+    该行；`startPolling`（面板重开/搜索/刷新率变化）重置全部计数。
+- **明确不做**：
+  - 断线后自动重连终端：`ssh_closed` 无法区分「用户 exit」与「网络断开」，自动重连会在
+    正常退出登录后立即弹回，语义错误；断线遮罩的「重新连接」按钮保持唯一恢复入口。
+  - `reconnect_session` 顺带救活交互 PTY：涉及 reader/command_tx 重建，复杂度高且
+    连接死时终端显示断开是诚实行为。
+- **验证**：`cargo check` 通过（警告均为存量）；`cargo test connection_dead` 1 passed；
+  `npm run test:ts`（vue-tsc）通过。真机验证路径：断开会话后底栏红字不再每 5s 刷新、
+  日志不再出现 `Session not found … attempting one-time reconnect`。
+
+**五问重启检查（阶段 209）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 删掉对已删会话的无意义重连匹配、给自愈重连加单飞锁、两个轮询面板加连续失败熔断。 |
+| 什么是我没做的？ | 断线自动重连（exit 会误弹回）、PTY 随 exec 自愈一起复活、环境侧链路稳定性（穿透/NAS 本身）。 |
+| 我想去哪里？ | "session not found" 不再出现在 UI 与日志刷屏；掉线自愈只拨一次号。 |
+| 我要去哪里？ | 真机重连/断开会话，观察底栏与监控面板在会话死后 10 秒内安静下来，日志最多 2 条错误。 |
+| 什么可能导致偏离？ | 「前端 connected + 后端已删」并存的具体触发路径未从日志完全还原（两个面板的熔断是无条件兜底，不依赖该路径）。 |
+| 下一步最小可验证动作？ | 连接一台服务器 → 断开会话（保留 tab）→ 10 秒内底栏错误停更、`logs/myshell-*.log` 无 5s 周期的 not found 刷屏。 |
+
+### 阶段 209 —— 外观系统对齐 ompDesktop：色相派生 / 玻璃四档透出 / 背景四模式 / 外观主题快照
+
+**需求（用户原话）**：参考 `gitee.com/argustang/omp-desktop` 的桌面布局和样式重构——
+「界面背景设置范围，透明度设置范围，字体，颜色，外观设置，我更喜欢这个项目的」。
+先出差异与变更方案（已确认），再按五步执行。
+
+**差异调研结论**（对照 omp-desktop 的 tokens.scss / _variables.scss /
+AppearanceThemePanel / appearanceThemes.ts / wallpaper.rs / App.vue）：
+- 颜色：omp 是「dark/light 两版 oklch 中性底 + --accent-hue 单旋钮派生全部强调色」；
+  MyShell 原来是 33 套预设把终端 16 色与 UI 变量（十六进制）绑死。
+- 透明度：omp 玻璃四档（base/strong/popup/float）+ 透出模式第三态
+  （`html[data-translucent="1"]`，设壁纸自动进入，alpha 基线整体再降）；
+  MyShell 只有两档且由 `color-mix(--bg-elevated)` 算出。
+- 背景：omp 四模式 glow/grid/image/none + 壁纸走 Rust 自管目录导入
+  （白名单/16MB/毫秒文件名防 URL 缓存）；MyShell 只有 image 且 base64 塞 localStorage。
+- 字体：MyShell 已有 --fs-scale 与 tabular-nums，缺字体栈 token。
+- 外观设置：omp 有命名主题快照（12 套/256KB/归一化）；MyShell 无。
+
+**改动（五步）**：
+1. **颜色**：`themes.ts` 删全部预设 `ui` 字段（保留终端 16 色，781→580 行）；
+   `app.css` 暗/亮主题块整体改写为 oklch——中性底照抄 omp 数值，强调色族
+   （accent 五档 + subtle + fg + border-accent + shadow-glow + glow-accent）由
+   `--accent-hue` 派生；`appearance.ts` 增 `accentHue`（0-360 持久化 + 内联写入）；
+   外观分区新增「主题色」滑杆（oklch 色相渐变参考带）。`--accent-secondary`
+   （sftp 连接类型色）**固定色相 165 不随 hue 漂移**——连接类型语义色要稳定可辨识。
+   自定义预设对话框裁剪为只编辑终端背景色。
+2. **玻璃**：三档 token（base 0.48 / strong 0.70 / popup 0.70，暗色基线；浅色
+   0.72/0.62/0.62）由 `--glass-tint`（oklch 明度彩度+主题色相）+ `--glass-alpha*`
+   实心度插值合成；新增 `html[data-translucent="1"]` 透出态（暗 0.30/0.42/0.52、
+   亮 0.50/0.66/0.68）；blur 12→24（omp 视觉签名）；顶部内高光 `--glass-highlight`；
+   边框暗白亮深（跟卡面明暗走）。omp 的 float 档（sticky 悬浮卡）**未落**——
+   MyShell 没有该场景，不造无人消费的档位。工作区底色从旧 color-mix 公式
+   统一到 base 玻璃（消除交界透明度台阶）。MonitorPanel 换 strong 玻璃。
+3. **背景**：`BackgroundImageConfig` 改 `{ mode: glow|grid|image|none, image, opacity }`
+   （0.05-0.8），读入时旧结构自动归一迁移；`applyBgImage` 写
+   `data-background-mode` + URL 消毒（data:image/asset/http(s) 白名单）+
+   `--wallpaper-blur`（清晰度反向映射 (0.8-c)×4px）；glow（双团径向光晕随主题色）
+   与 grid（32px 网格线随明暗取色）由纯 CSS 绘制；设壁纸自动挂透出属性
+   （omp 语义：透出是「背后真有东西」的派生态，非独立开关）。
+   新增 `src-tauri/src/wallpaper.rs`（照抄 omp 逻辑：扩展名白名单、16MB 上限、
+   `wallpaper-<毫秒>.<ext>` 文件名防 asset URL 缓存不刷新、自动清理旧图、
+   data URL 迁入命令）+ `tauri.conf.json` assetProtocol scope
+   `$APPLOCALDATA/wallpapers/*` + Cargo feature `protocol-asset`。
+   启动时 `migrateLegacyWallpaper()` 把旧 base64 dataUrl 一次性迁入自管目录
+   （失败不清设置，下次重试）。
+4. **字体**：`--font-sans`（Inter 栈+中文回退）/`--font-mono`（JetBrains Mono 栈）
+   token 落入暗色块 `:root`；body 字体直引 token（tabular-nums/antialiased 原已有）。
+5. **快照**：`src/utils/appearanceThemes.ts`（纯函数：归一化夹取/读写分离/
+   浮点容差相等/256KB 预算/命名校验/12 套上限，模式照抄 omp）；
+   外观分区新增「外观主题」面板（保存当前/切换/更新/删除，相等判定现算高亮
+   「当前」）；快照字段 = isDark/paletteId/accentHue/两实心度/uiFontPx/motion/
+   background；customPalette 是用户资产不入快照。
+
+**踩过的坑**：
+- `main.rs` 注册 `import_wallpaper` 裸名——`use myshell_core::*` 只导出模块不导出
+  模块内函数，须 `wallpaper::import_wallpaper`。
+- Cargo 未开 `protocol-asset` feature 时 tauri 构建脚本直接拒绝 assetProtocol 配置。
+- AppearanceSection 新增 MyIconButton 漏 import——`audit-myui-imports` 抓到
+  （正是该审计存在的意义：未知标签退化成空盒子按钮）。
+- 探针正则两次翻车：`data-translucent="1"]` 的选择器闭合 `]` 漏写；
+  色相钳制方向把 5 期望成 0.2（Math.min 先夹 0.8）。
+- `cargo test` 出现一次 E0277（generate_handler × ai_inspect_health_ssh 的
+  never-type fallback），干净重编后消失、复跑未再现——增量编译缓存问题，
+  非代码缺陷（全量 165 测试通过）。
+
+**验证**：
+- `cargo test` 全量：**165 通过 / 0 失败**（wallpaper 8 项新增：白名单大小写、
+  文件名唯一/无用户输入、连续导入路径不同、幂等、旧命名清理、data URL 迁移往返）。
+- `npm run test:ts` 通过；`audit-myui-imports` 通过。
+- 一次性探针（已删）41 项断言全过：快照纯函数 21 项（归一化夹取/读写 roundtrip/
+  相等容差/预算/命名/id 唯一）+ CSS 令牌 17 项（hue 派生落值、玻璃三档与 tint、
+  透出态数值、四模式选择器、glow 随主题色、grid 随强度、暗白边亮深边、旧
+  color-mix 清零）+ 预设 3 项（10 套齐全、terminal 完整、ui 字段清零）。
+
+**取舍（设计疑点自裁）**：
+1. 33 套预设的 UI 变量全废（预设=纯终端配色；UI 颜色由深浅+hue 决定）——
+   对齐 omp 模型的必然结果，方案确认时已明示。
+2. `--accent-secondary` 固定色相不随主题色——连接类型语义色优先稳定。
+3. float 档不落（无消费场景）；strong 档给 MonitorPanel。
+4. 透出模式非独立开关，由「设了壁纸」自动驱动。
+5. glow/grid 视觉为等价语义自设计（omp 具体层样式未逐行取到），真机目验后微调。
+
+**未做视觉确认**：浏览器无 Tauri 运行时，UI 层验证止于探针断言；
+真机需人工过一遍：主题色滑杆全区间拖动、四背景模式切换、壁纸导入与重启存留、
+透出模式观感、外观主题保存/切换、浅色主题玻璃可读性。
+
+**五问重启检查（阶段 209）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 外观系统五步对齐 ompDesktop：色相派生替换预设 UI 覆盖、玻璃三档+透出、背景四模式+壁纸自管导入、字体 token、外观主题快照。 |
+| 什么是我没做的？ | float 玻璃档（无场景）、桌宠/悬浮窗（omp 特有）、主题色对终端 16 色的联动（终端配色独立）。 |
+| 我想去哪里？ | 真机拖主题色滑杆、切四背景模式、导壁纸、存两套外观主题来回切。 |
+| 我要去哪里？ | `cargo tauri dev` 逐项目验；重点浅色+低实心度+亮壁纸下文字可读性。 |
+| 什么可能导致偏离？ | oklch 在 WebView2 的渲染差异、glow/grid 视觉需微调、旧壁纸迁移在无写权限目录失败。 |
+| 下一步最小可验证动作？ | 真机打开设置→外观，把主题色滑杆从 0 拖到 360，看按钮/选中态/光晕连续变色。 |
+
+### 阶段 210 —— 复查应用日志：找回 Vue 迁移丢失的全局前端错误捕获
+
+**触发**：用户要求检查应用日志并同步修复。日志位于 `%LOCALAPPDATA%/myshell/logs/`
+（`tauri-dev.log` + `zmodem-monitor.log`，后者 335KB）。
+
+**日志发现（4 类）**：
+1. `[frontend] uncaught: Cannot read properties of undefined (reading 'dimensions')`
+   ×9 —— 全部同一栈：`RenderService.dimensions → Viewport.syncScrollArea`。
+   xterm.js 的 `syncScrollArea()` 无 try/catch，直接读
+   `_renderService.dimensions`（= `_renderer.value.dimensions`）；而
+   `MutableDisposable.value` 在 `_isDisposed` 时恒返回 undefined。
+   触发窗口：新连接建立后 0.3–2.1 秒（与 `term.open()` 后 100ms fit 窗口吻合）。
+2. `[TX] pump produced 0 bytes, sender state was=SendingData` ×526（单会话
+   51 秒内每 ~110ms 一条）—— zmodem-monitor.log 涨到 335KB 的主因。
+3. `russh_cryptovec ... VirtualUnlock` ×9 —— russh 在 Windows 的非分页缓冲
+   锁定失败，每次启动各一条，已知上游行为，非安全问题。
+4. `dom-ready not received within 4s` —— dev 模式首屏慢走后端兜底。
+
+**根因（关键）**：日志时间戳为 2026-08-07，彼时跑的仍是 **React 版**
+（HEAD 0ecf1fd，8-03 提交；Vue 迁移 2c2ce3d 是 9-14）。React 版
+`src/main.tsx` 有整块 Global frontend error capture：
+- `window.addEventListener("error")` → `writeFrontendLog` 上报
+- 并对 `msg.includes("reading 'dimensions'") && filename.includes("xterm")`
+  调 `event.preventDefault()` —— 注释明写「不抑制的话 WebView2 会把它当致命
+  错误，直接崩掉渲染进程」。
+- `window.addEventListener("unhandledrejection")` 同理上报。
+
+**Vue 迁移（2c2ce3d）把整块丢了**：`git show 2c2ce3d:src/main.ts | grep uncaught`
+= 0；当前 `dist/assets/index-*.js` 同样 0 命中。后果两条：
+1. 前端未捕获错误/rejection 从此不再落盘（排障时只剩 Rust 侧日志）；
+2. xterm 的 syncScrollArea race 失去 `preventDefault`，WebView2 可能把该错误
+   升级为渲染进程致命错误——整个 UI 冻结只能杀进程。这是**回归**，不是新 bug。
+
+**修复**：`src/main.ts` 等价移植 React 原版（不新增依赖，判定条件逐字符一致）。
+同时保留「React 迁移丢失」的来龙去脉注释，防后人再当无用代码删掉。
+
+**其余三类不处理**：
+- pump 0 字节 WARN：当前代码已无此日志点（8-07 React 版遗留），无需改。
+  附带发现：该次传输里 rz 反复发 `ZRPOS offset=0`（hex 帧解码确认
+  `2a 2a 18 42 | 30 39 | 00000000 | a87c | 0d 8a 11`），而本地已
+  `stream: 170992 bytes` —— 属接收端 CRC/窗口问题，非本地缺陷，列为观察项。
+- `VirtualUnlock`：russh 上游行为。
+- `dom-ready`：dev 首屏慢，后端 4s 兜底按设计工作。
+
+**验证**：
+- `npm run test:ts` 通过。
+- 静态校验 6 项关键逻辑（error/unhandledrejection 两个 listener、xterm race
+  判定、preventDefault、writeFrontendLog 导入、safeStringify 兜底）ALL PASS。
+- 抑制条件与 React 原版逐字符一致（`msg.includes("reading 'dimensions'")`
+  + `event.filename.includes("xterm")`）。
+- **未做浏览器实机复现**：本机无 Tauri 运行时，vite 静态服务探测无输出。
+  抑制效果需真机 `cargo tauri dev` 后新建连接目验（不再冻结、日志有
+  `uncaught:` 行）。
+
+**取舍**：
+1. 只补回丢失的捕获块，不顺手改 xterm 集成方式（fit 提前/延后是另一个
+   议题，且 React 版同一时序下靠 preventDefault 已稳跑）。
+2. ZRPOS(0) 循环只记录不改 —— 无本地侧证据，改动风险大于收益。
+3. 不清理历史日志文件（用户可能要回溯）。
+
+**五问重启检查（阶段 210）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 从日志定位到 Vue 迁移丢失全局前端错误捕获（含 xterm race 抑制），已在 main.ts 等价补回。 |
+| 什么是我没做的？ | xterm fit 时序优化、ZRPOS(0) 死锁修复、历史日志清理。 |
+| 我想去哪里？ | 真机新建连接确认不再冻结 + 日志有 `uncaught:` 行。 |
+| 我要去哪里？ | `cargo tauri dev` → 连一台 SSH → 看终端是否正常出提示符。 |
+| 什么可能导致偏离？ | 若 race 实际由别的原因触发（非 renderer 未就绪），抑制条件不命中。 |
+| 下一步最小可验证动作？ | 真机连 SSH，首秒内观察窗口是否冻结；随后 grep 日志 `uncaught:`。 |
+
+### 阶段 211 —— 用户实报三连修：外观设置竖排坍塌 / 壁纸可见度联动 / zmodem 错误吞键
+
+**需求（用户原话）**：「当前在连接会话窗口中无法输入」「外观界面字体错位」「背景清晰度拉满了，反而看不到背景了」「他们的背景透明度差异也很大，左侧菜单栏也看不到背景」。
+
+**定位（浏览器 stub 探针实证，非猜测）**：
+- **竖排坍塌**：`AppearanceSection` 主题色行的 `.setting-row` 是单行 flex，`.hue-track`（色相渐变参考带，`width:100%`）无法换行、参与主轴分配，把 `.setting-text`（`min-width:0`）挤到 **0 宽** —— 标题与说明逐字竖排（探针实测 w:0，用户截图同现象）。
+- **壁纸可见度**：`--app-bg-opacity` 在 image 模式下**只写不读**（仅 glow/grid 消费），清晰度滑杆实际只把 blur 从 3px 收到 0px；壁纸可见度被雾层（0.28 固定）+ 透出玻璃基线（暗 0.30 起）压制，拉满体感无变化。侧栏与工作区玻璃同层（探针实测三区同 alpha），「侧栏看不到背景」是玻璃基线偏高 + 内容卡遮挡的叠加。
+- **吞键**：`onZmodemError` 只写状态不复位 `isZmodem`，`onData` 首行 `if (isZmodem) return` 吞掉全部按键；zmodem_end 丢失/迟到时终端「能看不能打」。Rust 侧 error 后通常补发 end，但前端复位幂等、无成本。
+
+**改动**：
+1. `AppearanceSection.vue`：`.setting-row` 加 `flex-wrap: wrap`（普通行宽度足够不换行，零回归）；`.hue-track` 改 `flex-basis: 100%` 换行独占第二行。清晰度滑杆下新增联动语义提示（`.opacity-note`）。
+2. `appearance.ts`：`applyBgImage` 增写 `--bg-visibility`（清晰度 0.05-0.8 归一化 0-1）。
+3. `app.css`：透出模式 base 玻璃基线随可见度再降 0.14（`alpha=(0.30-0.14v)+(0.7+0.14v)×solidity`，solidity=1 仍回全实底，亮色同步）；雾层 alpha 随可见度稀释一半（暗 0.28→0.14 / 亮 0.22→0.11）。strong/popup 档不联动（弹层可读性优先）。
+4. `TerminalPanel.vue`：`onZmodemError` 复位 `isZmodem / nativeDownload / nativeDir / nativeCancelled`。
+
+**验证（浏览器 stub 实测 + 视觉模型核验）**：
+- 竖排：`.setting-text` 宽 0→644px，渐变带独占第二行（控件 bottom 之下）；视觉模型确认标题/说明横排、四行常规行无重叠回归。
+- 联动：清晰度 80% → 雾 0.14、侧栏玻璃 0.37、blur 0；清晰度 5% → 雾 0.28（原值）、侧栏玻璃 0.475（原基线）、blur 3px —— 单调、两端语义正确。
+- `npm run test:ts` 通过。zmodem 复位为防御性修复，无浏览器可测路径（需真机 rz/sz）。
+
+**明确不做 / 未决**：
+- 「无法输入」若修复后仍复现：需要「是否分屏态、光标是否空心、会话是否刚传过文件」三个观察点 —— 静态排查未发现焦点链/输入路径其他断点。
+- 区域透明度「差异」的另一半来源是内容卡遮挡（侧栏搜索框/树行实底），不做内容卡透明化（伤可读性，omp 同款权衡）。
+
+**五问重启检查（阶段 211）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 修 flex 换行坍塌、给清晰度滑杆接上真实可见度联动、zmodem 错误复位吞键标志。 |
+| 什么是我没做的？ | 侧栏内容卡透明化、输入问题焦点链深挖（无复现路径）、真机 rz/sz 验证。 |
+| 我想去哪里？ | 外观页无竖排；拉清晰度背景肉眼可见变清楚；zmodem 出错后终端立即可打字。 |
+| 我要去哪里？ | 真机打开设置看主题色行；拉清晰度滑杆看侧栏背景变化；rz 一次失败传输后打字。 |
+| 什么可能导致偏离？ | 输入问题另有根因（WebView2 渲染半死 / 会话死静默）；联动后浅色模式可读性需目验。 |
+| 下一步最小可验证动作？ | `cargo tauri dev` → 设置-外观看主题色行横排 → 清晰度滑杆 5%→80% 看侧栏壁纸渐显。 |
+
+### 阶段 212 —— 壁纸可见度对齐 ompDesktop：工作区透出 + 雾层减薄 + 实心度默认归零
+
+**需求（用户原话）**：给同一张壁纸截图对比 ompDesktop（清晰可见整幅图）与 MyShell（几乎全黑只剩光影），问「是加了什么遮罩吗？为什么看不清背景图」。
+
+**差异定位（对照 F:/personalProject/ompDesktop 源码）**：
+| 层 | ompDesktop | MyShell（改前） |
+|---|---|---|
+| 主内容区 | `.app-content` **完全透明**（AppShell.vue 注释明写「透明！让动态光晕从内容区透出」） | `.shell-work` 整块玻璃：暗底 oklch(0.17)@0.475 + blur24 + saturate1.8 |
+| 整窗雾层 | 无（`--scrim` 只用于弹窗遮罩） | `body::after` 暗雾 rgba(13,17,23,0.28) |
+| 实心度默认 | 0（透出玻璃 0.3 基线） | 0.25（侧栏玻璃 0.475，比 omp 厚 0.175） |
+
+blur 24px 两边一致，非差异源。工作区玻璃是最大贡献者：壁纸先被 0.475 暗底压掉一半亮度，再被 24px 模糊糊掉细节。
+
+**改动**：
+1. `app.css`：`html[data-translucent="1"] .app-shell > .shell-work` 改透明（`background: transparent` + `backdrop-filter: none`），无壁纸模式保持原玻璃（那层是工作区底色）。侧栏/顶栏/底栏/AI 栏仍是玻璃 —— 与 omp 的「只有侧栏顶栏玻璃」一致。
+2. `app.css`：整窗雾层基数 0.28→0.12（亮 0.22→0.10）。保留而非删除：MyShell 有 omp 没有的全屏终端场景，裸文字压壁纸需要兜底；仍随清晰度稀释（拉满时约 0.06）。
+3. `appearance.ts`：界面实心度默认 0.25→0（对齐 omp；只影响未存过值的环境，存量 localStorage 保持原值需用户手动调低）。
+4. `app.css`：8 处 `var(--ui-solidity, 0.25)` fallback 同步改 0（applySolidity 总会写内联值，fallback 是死值，改动只为语义一致）。
+
+**验证（浏览器 stub 实测 + 视觉模型核验截图）**：
+- 设壁纸（清晰度 80%）：`.shell-work` = rgba(0,0,0,0) + backdrop none；侧栏玻璃 0.268；雾层 0.106；清晰度默认 22% 时雾 0.106 / 侧栏 0.268，清晰度 80% 时雾 0.06 / 侧栏 0.16（随可见度联动）。
+- 无壁纸（glow）：工作区保持玻璃 oklch(...)/0.48 + blur24，雾层全透明 —— 零回归。
+- 图案壁纸截图：工作区壁纸整幅清晰可见（同心圆、橙块均可辨），与 ompDesktop 观感一致。
+- `npm run test:ts` 通过。
+
+**取舍与风险**：
+- 雾层保留 0.12 而非像 omp 彻底删除：终端文字直接压壁纸需要兜底，亮壁纸 + 暗色终端配色是最差组合。
+- 实心度默认归零只对新环境生效；存量用户（含本机）localStorage 里是 0.25，需手动把「界面实心度」拉到最低才是 omp 同款侧栏。
+- 未做：侧栏内容卡（搜索框/树行实底）透明化 —— 改透明会伤可读性，omp 同款权衡。
+
+**五问重启检查（阶段 212）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 拆掉工作区整块玻璃、雾层基数减到 0.12、实心度默认归零，壁纸可见度对齐 ompDesktop。 |
+| 什么是我没做的？ | 侧栏内容卡透明化、存量实心度迁移（不擅自改用户已存值）、浅色主题下的终端可读性实测。 |
+| 我想去哪里？ | 设壁纸时整幅壁纸清晰可见，侧栏/顶栏保留磨砂，与 ompDesktop 观感一致。 |
+| 我要去哪里？ | 真机设同一张壁纸对比 ompDesktop；开终端看亮壁纸下文字对比度；实心度拉到最低看侧栏。 |
+| 什么可能导致偏离？ | 亮色壁纸下终端文字对比度不足（雾层 0.12 是兜底，可能仍需加厚）。 |
+| 下一步最小可验证动作？ | 装 2.19.0-test → 设壁纸 → 拖清晰度滑杆看工作区壁纸显隐 → 开终端打字看可读性。 |
+
+### 阶段 213 —— 连接失败页按钮点不动：遮罩被 xterm canvas 吃掉 + v-if 断链
+
+**需求（用户截图）**：连接失败页（红叉「连接失败 / 关闭 / 重新连接」）的按钮无法点击，要求修复并检查其他界面是否有同类问题。
+
+**根因（浏览器探针实证，两处叠加）**：
+1. **层级**：`App.vue` 的 `.error-state` 与 `.terminal-panel` 是 `.tab-stack` 下的同层兄弟，两者都渲染。`.error-state` 的 `z-index: auto`，而终端面板里的 `.xterm-container` 是 `z-index: 1` —— xterm 生成的 `canvas.xterm-link-layer`（链接层，整屏尺寸）压在按钮上。探针 `elementFromPoint` 实测命中的是 CANVAS 而非按钮。
+2. **条件链断裂**：`SplitContainer` 用的是独立 `v-if`（不是 `v-else-if`），打断了前面 `v-if="tab.status === 'error'"` → `v-else-if="!tab.sessionId"` → `v-else-if` 的链条。于是错误态出现时，`error-state` 与 `TerminalPanel` **同时渲染**，终端把遮罩压住。
+
+**改动**：
+1. `App.vue`：`.error-state` / `.connecting-state` 加 `z-index: 20`（高于终端面板的 1）；`.error-state` 底色用 `var(--glass-bg)` + blur —— 不用 `--bg-overlay`（0.7 的纯遮罩色会把刚做好的「工作区透出壁纸」压暗）。
+2. `App.vue`：`SplitContainer` 的 `v-if` 改 `v-else-if`，条件链恢复单选互斥。
+
+**验证（浏览器 stub 实测）**：
+- 复现：stub 让 `ssh_connect` 抛错 → 错误态出现 → 按钮命中元素是 `CANVAS.xterm-link-layer`（blocked=true）。
+- 修复后：栈内只剩 `error-state`（不再有 terminal-panel），命中元素是按钮自身内部 SPAN（blocked=false），z-index 20。
+- 行为：「重新连接」触发第 2 次 `ssh_connect` 调用（计数 1→2），「关闭」清空 tab 与遮罩（tabs 0）。
+- **其他界面排查（elementFromPoint 全量扫描 button/role=button/checkbox/switch/input/slider/select，命中非祖先即记为遮挡）**：
+  - 壳层、设置抽屉（九个分区逐一进入）、AI 栏、监控面板、多窗口选择器、连接对话框内部 —— 全部 0 遮挡。
+  - 连接对话框内 13 项「被挡」经核实全部是视口外字段（对话框可滚动，`inViewport: false`）+ Element Plus 组件自身嵌套（`el-select__input` 被 `el-select__selected-item` 覆盖），非缺陷。
+  - 设置抽屉/模态框遮住背后顶栏按钮属模态语义（正常）。
+  - SFTP 断线遮罩 `.dead-overlay` 已有 `z-index: 15`，本就有层级保护。
+  - 分屏场景（2 叶子）与「分屏 + 错误态」组合均验证：分屏时栈内只有 `split-root`，错误态下分屏按钮不可用（canSplit 要求 status==="connected"），均 0 遮挡。
+
+**明确不做**：未改 xterm 链接层的 pointer-events（它是 xterm 内部机制，跨终端与分屏都有用）；未给 SftpPanel 的 `.dead-overlay` 加固（已有 z-index 15 且实测无遮挡）。
+
+**五问重启检查（阶段 213）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 给错误/连接中遮罩提层到 z-index 20 并改用玻璃底；把 SplitContainer 的 v-if 改 v-else-if 修好条件链。 |
+| 什么是我没做的？ | 未改 xterm 链接层本身、未给 SFTP 遮罩加固、未做真机验证。 |
+| 我想去哪里？ | 任何覆盖在终端之上的状态页，按钮都能点。 |
+| 我要去哪里？ | 真机连一台不可达的服务器，确认「重新连接」「关闭」可点。 |
+| 什么可能导致偏离？ | 若还有别的状态页与终端同层（本次全量扫描未发现），需再提层。 |
+| 下一步最小可验证动作？ | 装 2.19.0-test → 连不可达主机 → 点「重新连接」看是否发起第二次连接。 |
+
+### 阶段 214 —— 敏感文件读取确认门：AI 不再把服务器凭证读进对话
+
+**背景**：对比 CC Safety Net（本地编码智能体的执行前 hook）时发现的能力差距。`ssh_exec` 把 stdout 原样返回给 AI，`ssh_read_text` 把文件内容原样返回给 AI —— 因此 `cat ~/.ssh/id_rsa`、`cat .env`、`cat /etc/shadow` 此前**不需要任何确认**即可执行，内容直接进入模型上下文。CC Safety Net 的 secret-protection 正是覆盖这一点（它拦 `.env`、`~/.ssh`、云凭证文件）。
+
+**改动**：
+
+1. `command_rules.rs` —— 新增 `SECRET_PATH_PATTERNS`（远程服务器的凭证路径清单：`.ssh/`、`.env`、`/etc/shadow|gshadow|sudoers`、`.aws/credentials`、`.config/gcloud/`、`.azure/`、`.kube/config`、`.docker/config.json`、`*_history`、`.pem`、`.key`、`id_rsa|ed25519|…`、`.git-credentials`、`.netrc`）与 `SECRET_READER_COMMANDS`（`cat`/`head`/`tail`/`less`/`strings`/`xxd`/`od`/`base64`/`grep` 族/`awk`/`sed`/`openssl`/`ssh-keygen` 等会**打印内容**的命令）。
+2. **判定位置：不可配置的安全底线**，与「命令替换」「写重定向」同级（`command_needs_confirmation` 第 1b 步）。**理由**：`blacklist` 在用户规则文件里是**快照**，`serde(default)` 只补缺失字段 —— 放进 `default_blacklist()` 的新规则永远到不了已有规则文件的用户（本机实测该文件已存在旧快照）。放在这里，对所有用户立即生效，且用户无法关掉。
+3. `has_secret_read_across_segments()` —— 跨段检查。逐段判定看不见 `for f in .env; do cat $f; done`（路径在循环头、读取在循环体），因此对整条命令检查「有凭证路径」+「有读取动作」两半。读取动作按**段内任一 token**匹配（覆盖 `sudo cat`、`xargs cat`）。
+4. `myshell-mcp.rs` —— `ssh_read_text` 分支接入同一确认门（路径不经 shell，直接用 `is_secret_remote_path()`）。命中则走既有的 `confirm_or_session_allowed()` + `denied_by_user_text()` 硬停止语义，与六个 ALWAYS confirm 文件工具一致。
+5. MCP `instructions` 的 SAFETY 段补充说明：读取凭证文件一律确认（ssh_exec 与 ssh_read_text 两个入口）。
+
+**顺带修掉的既有缺陷**：`is_wrapper_zone_token` 把「含数字且全小写」的 token 当作时长/CPU 列表吞掉，于是 `base64`、`sha256sum`、`md5sum` 这类命令名被当成 wrapper 参数，**命令位落到了参数上**，命令本体对黑名单不可见。改为要求 token **以数字开头**（时长形态 `10s`/`0-3` 才是）。
+
+**验证**：
+- `cargo test --lib`：135 passed / 0 failed（含新增 5 条：凭证读取确认、普通读取免确认、跨段形态、含数字命令名回归、硬底线不受用户黑名单为空影响）。
+- `cargo check --all-targets`：通过（仅既有警告）。
+- 真实用户规则文件探针（`tests/secret_read_probe.rs`，临时）：用本机 `mcp-command-rules.json` 旧快照验证新底线仍生效。
+
+**明确不做**：
+- 未改 `sftp_download`（文件落到本地磁盘，不进 AI 上下文，不构成模型侧泄漏）。
+- 未引入 CC Safety Net 的结构化 shell 解析器（Node.js 依赖 + 本地文件系统语义，与远程 SSH 场景错配）。
+- 未改 GUI 设置面板（该规则不可配置，不应出现在可编辑黑名单列表里）。
+
+**五问重启检查（阶段 214）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 给「读取服务器凭证文件」加了一道不可配置的人工确认门，覆盖 `ssh_exec`（cat/head/grep 等）与 `ssh_read_text` 两个入口；顺手修掉 wrapper 词法把含数字命令名吞掉的既有缺陷。 |
+| 什么是我没做的？ | 未动 `sftp_download`、未做真机 SSH 端到端验证（需真实服务器）、未给 CLI 单独加开关（CLI 复用同一判定，自动生效）。 |
+| 我想去哪里？ | AI 能读服务器文件，但读不到密钥。 |
+| 我要去哪里？ | 真机连一台测试机，`cat ~/.ssh/id_rsa` 与 `ssh_read_text` 都应弹出确认框。 |
+| 什么可能导致偏离？ | 若把这条规则改回可配置黑名单，已有规则文件的用户会静默失去保护（serde 快照语义）。 |
+| 下一步最小可验证动作？ | 装 2.19.0-test → 连测试机 → AI 调 `ssh_exec "cat ~/.ssh/id_rsa"` → 应弹确认框。 |
+
+### 阶段 215 —— 终端输入整条被吞：Vue boolean casting 把「默认开启」的门禁翻成「默认关闭」
+
+**需求（用户原话）**：「shell 操作界面，输入命令没有正常展示，enter 无反应」。
+
+**根因（浏览器探针实证，非猜测）**：阶段 208 引入终端分屏时，给 `TerminalPanel`
+加了两个「默认开启、显式关闭」的门禁 prop：
+
+```ts
+inputEnabled?: boolean;   // 组件内：if (props.inputEnabled === false) return;
+resizeEnabled?: boolean;  // 组件内：if (props.resizeEnabled === false) return;
+```
+
+Vue 3 对 **Boolean 类型的 prop 有 boolean casting**：调用点**不传**该 prop 时，
+它被解析成 **`false`**（不是 `undefined`）。于是「不传即默认开启」的门禁反过来
+把调用点全部拦死 —— 而单 pane（App.vue 的 `TerminalPanel` 分支）与多窗口网格
+（`MultiWindowGrid.vue`）**恰恰都不传这两个 prop**。
+
+实测（探针页，真实 `TerminalPanel` 组件 + 真实 xterm 实例）：
+
+| 路径 | 修复前 | 修复后 |
+|---|---|---|
+| 单 pane 键入 | 载荷 `""` ❌ | `"echo-hi"` ✅ |
+| 单 pane Enter | 载荷 `""` ❌ | `"\r"` ✅ |
+| 单 pane resize 推尺寸 | 0 次 ❌ | 1 次（cols=62）✅ |
+| 分屏非焦点叶子 | 被拦 ✅ | 被拦 ✅（门禁仍正确） |
+| 分屏焦点切换 | ✅ | ✅ |
+| 多窗口格子命令栏 | 不渲染 ❌ | 渲染 ✅ |
+
+Vue casting 本身用独立探针页实测确认：`{ type: Boolean }` 的 prop，
+不传 → `false`；传 `true` → `true`；传 `false` → `false`。
+
+**为什么表现为「输入没有正常展示、enter 无反应」**：输入字节根本没离开浏览器
+（`ssh_send` 从未被调用），PTY 自然没有回显；Enter 同理。xterm 侧完全正常
+（自挂 `onData` 监听每次都触发），所以问题不在 xterm、不在焦点、不在 IPC。
+
+**改动**：
+1. `src/components/TerminalPanel.vue` —— 三个可选 boolean prop 改用
+   `withDefaults` 显式声明默认值：`{ commandBar: true, inputEnabled: true,
+   resizeEnabled: true }`。给了 `default` 后 Vue 的 boolean casting 不再介入。
+   `showCommandBar` 从 `props.commandBar !== false` 简化为 `props.commandBar`
+   （默认值已由 props 声明兜住）。
+2. `src/components/SplitContainer.vue` —— `allowClose?: boolean` 同样用
+   `withDefaults` 显式给 `false`（原先靠 `undefined` 的 falsy 侥幸正确）。
+
+**同批被 casting 破坏的行为**：`commandBar` 默认 true 是「多窗口网格每格自带
+一条命令栏」的约定 —— 修复前多窗口模式的命令栏**一条都不渲染**（网格里只剩
+终端，没有输入框与工具钮）。
+
+**扫描结论**：全仓 `?: boolean` 的可选 boolean prop 共 5 处 —— `TerminalPanel`
+的 3 个（本次修）、`SplitContainer` 的 1 个（本次修）、`SftpPanel` 的
+`fullHeight`（**已有** `withDefaults({ fullHeight: false })`，写法正确，无需改）。
+其余 `?: boolean` 都在 `api.ts` 的**接口类型**里（非组件 prop），不经过 casting。
+
+**验证**：
+- 探针（一次性，已删）：真实 `TerminalPanel` + 真实 `SplitContainer` + 真实
+  xterm 实例，六条断言全过（见上表）。
+- `npm run test:ts`（vue-tsc --noEmit）：通过。
+- `cargo check`：通过（警告均为存量）。
+
+**明确不做 / 未决**：
+- 未改后端 `exec_once` 的透明重连（阶段 209 已知：它换 handle 会让交互 PTY
+  留在死连接上）—— 那是连接真死时的行为，与本次「连接活着但输入被前端吞」无关。
+- 未改 `filterSentinel` 的 UTF-8 分片乱码（探针另测确实存在：TCP 把一个中文
+  字符拆成两片时，`TextDecoder` 往返会产生替换字符）。**这是独立缺陷**，
+  影响的是中文显示而非输入丢失，留作下一阶段处理。
+- 未做真机 SSH 端到端验证（本机 CLI 需要 vault 主密码，无法自动连接）。
+
+**五问重启检查（阶段 215）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 定位并修掉「Vue boolean casting 把可选 boolean prop 的默认值翻成 false」这一类缺陷：终端输入、Enter、resize、命令栏四条链路全部恢复。 |
+| 什么是我没做的？ | `filterSentinel` 的 UTF-8 分片乱码（独立缺陷）、后端 exec 重连与 PTY 的耦合、真机 SSH 端到端验证。 |
+| 我想去哪里？ | 单 pane / 多窗口网格敲命令立刻有回显、回车能执行；多窗口格子有命令栏。 |
+| 我要去哪里？ | 真机 `cargo tauri dev` → 连一台 SSH → 敲 `ls` 看回显、回车看执行；进多窗口模式看每格命令栏在位。 |
+| 什么可能导致偏离？ | 若还有别的可选 boolean prop 依赖「不传即 undefined」的旧假设；本轮已全仓扫描过，但新增组件时仍可能重犯 —— 故在 props 声明处留了注释说明。 |
+| 下一步最小可验证动作？ | 真机连 SSH 后敲一段命令，确认字符逐个回显且回车生效。 |
+
+### 阶段 216 —— 壳层透明度拉不到底：滑杆下限误导 + 注释提前闭合吞掉整条声明
+
+**需求（用户原话）**：「顶部，左侧菜单，底部菜单，透明度还不可以设置，现在还是不够透明，
+参考omp继续优化下」。
+
+**量化诊断（浏览器探针实测，非估算）**：
+
+| 项 | 修复前 | ompDesktop | 判定 |
+|---|---|---|---|
+| 界面实心度滑杆区间 | 40%–100% | 40%–100% | 下限即最透档，用户拉不到「更低」 |
+| 滑杆读数 vs 真实 alpha | 脱节（solidity 0 显示成 40%） | 同 | 读数不具参考价值 |
+| 透出档 base alpha（暗） | `0.30 - 0.14×可见度` | `0.30` | MyShell 理论更低，但被上一行的显示误导掩盖 |
+| 无壁纸档 base（暗） | 0.38（**声明被注释吞掉，实际恒为 fallback 0.48**） | 0.48 | **滑杆在无壁纸模式下完全无效** |
+| 存量实心度（本机） | 0.25 | 0 | 0.25 时实际 alpha ≈ 0.45，与壁纸几乎隔绝 |
+
+**根因（两个，叠加）**：
+
+1. **滑杆下限误导**：`OPACITY_MIN_PERCENT = 40` 把 solidity 0 显示成「40%」，且滑杆
+   物理下限就是 40 —— 用户既拉不到更低，也从读数里看不出「40% 其实已经是最透档」。
+2. **注释提前闭合吞掉声明（既有缺陷，本轮新发现）**：`app.css` 的 :root 注释里写了
+   `（--glass-alpha*/--glass-tint）`，其中的 `*/` **提前闭合了注释块**，导致紧随其后的
+   `--glass-alpha: calc(0.38 + 0.62 * var(--ui-solidity, 0));` 被当成注释内容整条吞掉。
+   表现：**无壁纸（glow/grid/none）模式下 `--glass-alpha` 恒为空**，`--glass-bg` 退回
+   fallback 值，滑杆拉到底也纹丝不动。CSSOM 实证：全文档没有任何规则定义 `--glass-alpha`，
+   而同块的 `--glass-alpha-strong` 正常 —— 正是「注释在两者之间闭合」的特征。
+
+   这条缺陷此前没暴露，是因为透出模式（设壁纸）另有一份定义在
+   `html[data-translucent="1"]` 块里，那份没被吞，所以壁纸场景看着正常。
+
+**改动**：
+1. `src/styles/app.css`：
+   - 修掉注释里的 `*/`（改成反引号包住变量名，不再出现星号斜杠组合）。
+   - 透出档 base（暗）：`0.30 - 0.14v` → `0.10 - 0.04v`；strong `0.42` → `0.26`。
+   - 透出档 base（亮）：`0.50 - 0.14v` → `0.28 - 0.06v`；strong `0.66` → `0.46`。
+   - 无壁纸档 base（暗）：`0.48 + 0.52s` → `0.38 + 0.62s`；（亮）`0.72 + 0.28s` → `0.60 + 0.40s`。
+   - `--glass-bg` 的 fallback 同步 0.48→0.38。
+   - 弹窗档（`--glass-alpha-popup`）**不动**：浮层压在文字上，可读性优先。
+2. `src/components/settings/AppearanceSection.vue`：
+   - 界面实心度滑杆区间 `40–100` → `0–100`，映射改为一比一（`solidity × 100`），
+     滑块读数即真实实心度；0% = 最透档。
+   - 弹窗实心度保留 `40–100` 压缩映射（`POPUP_MIN_PERCENT`），独立于界面档。
+   - 界面档说明文案改为「顶栏 / 侧栏 / 底栏 / AI 栏的实心度。0% 为最透…」。
+3. `src/utils/appearanceThemes.ts`：外观快照的 `uiSolidity` 归一化 fallback
+   0.25 → 0，与 store 默认值对齐（否则缺该字段的旧快照会被恢复成「比默认更实」）。
+
+**验证（浏览器探针实测 + 视觉截图确认，探针已删）**：
+
+暗色透出档（清晰度 22% → 可见度 0.227，base = 0.091）：
+
+| 滑杆 | 实测 alpha | 期望 | 结果 |
+|---|---|---|---|
+| 0% | 0.091 | 0.091 | ✅ |
+| 25% | 0.318 | 0.318 | ✅ |
+| 50% | 0.545 | 0.545 | ✅ |
+| 75% | 0.773 | 0.773 | ✅ |
+| 100% | 1.000 | 1.000 | ✅ |
+
+亮色透出 0% → 0.266 ✅ / 100% → 1.000 ✅；无壁纸暗 0% → 0.380、50% → 0.690、100% → 1.000
+✅；无壁纸亮 0% → 0.600、50% → 0.800、100% → 1.000 ✅；strong 0.260、popup 0.784 ✅。
+
+**回归断言（专门锁第 2 个根因）**：无壁纸模式下三档 alpha 必须单调递增
+（0.38 → 0.69 → 1.00）。修复前该序列恒为 0.48（滑杆失效）。
+
+**视觉确认**：截图对比 0% / 40% / 100% 三档 —— 0% 档壁纸颜色完整透出、壳层只剩极薄暗纱，
+40% 明显压暗，100% 全实底。与 ompDesktop 的观感方向一致且更透。
+
+**取舍**：
+- 界面档下限取 0（可拉到近乎全透），而不是像 omp 那样夹在 40：omp 的夹位本身就是
+  用户报「不可以设置」的来源。可读性交给用户自己的滑杆，不由代码替用户拍板。
+- 弹窗档仍夹 40：浮层直接压在文字上，留一道可读性下限是刻意的。
+- 未给侧栏内部内容卡（搜索框、树行）做透明化：那会伤可读性，与 omp 同款权衡。
+
+**明确不做 / 未决**：
+- 未把「界面实心度」拆成顶栏/侧栏/底栏各自独立的滑杆（一杆管全部，与 omp 一致）。
+- 未迁移存量用户已存的 solidity 值（0.25 会显示成 25%，用户需自行拉到 0% 才是最透）。
+
+**五问重启检查（阶段 216）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 把壳层最透档从 alpha 0.27 压到 0.091（暗色透出），滑杆改为 0–100 一比一；顺带修掉一个把整条 `--glass-alpha` 声明吞掉的注释语法缺陷。 |
+| 什么是我没做的？ | 未拆三档独立滑杆、未迁移存量 solidity 值、未做真机壁纸目验（浏览器截图已确认）。 |
+| 我想去哪里？ | 滑杆拉到 0% 时顶栏/侧栏/底栏几乎全透，壁纸完整可见；拉满回实底。 |
+| 我要去哪里？ | 真机 `cargo tauri dev` → 设壁纸 → 把「界面实心度」拉到 0% 看壳层是否接近全透。 |
+| 什么可能导致偏离？ | 若用户想要的「透明」还包含侧栏内部内容卡（搜索框/树行实底），那些没动，观感仍会偏实。 |
+| 下一步最小可验证动作？ | 真机拉实心度滑杆到 0%，对比 40% 与 100% 三档观感。 |
+
+### 阶段 217 —— 终端与命令输入框接入同一套玻璃：底色由 div 承载，xterm 只画字
+
+**需求（用户原话）**：「考虑 ompdesktop 的方式在会话窗口通过一个 div 底部颜色管控的方式
+展示，跟菜单使用同一个菜单控制透明度和颜色变化方式同 ompdesktop；命令输入窗口也是」。
+
+**现状诊断（源码 + 浏览器探针实测）**：
+
+| 区域 | 修复前底色来源 | 跟随主题色 | 跟随实心度 |
+|---|---|---|---|
+| 顶栏 / 侧栏 / AI 栏 | `--surface-translucent`（＝`--glass-bg`） | ✅ | ✅ |
+| 命令栏容器 / 状态栏 | `--glass-bg` | ✅ | ✅ |
+| **会话窗口（终端）** | 配色预设写死的 `theme.background`（如 `#0d1117`）；设壁纸时切成纯透明 | ❌ | ❌ 只有「全透 / 实底」两态 |
+| **命令输入框** | EP 的 `--el-fill-color-blank`（实底色，从未接玻璃） | ❌ | ❌ |
+
+后果：菜单已经能随滑杆连续变化，终端却压着一块 preset 写死的板子，中间没有任何档位；
+一旦设壁纸又干脆全透，文字直接压在壁纸上没有兜底层。命令输入框更是栏里唯一的死色块。
+
+**改动**：
+1. `src/components/TerminalPanel.vue`：
+   - xterm 的 `theme.background` 恒设 `rgba(0, 0, 0, 0)`、`allowTransparency` 恒 `true`
+     （构造与主题 watch 两处），底色不再由 xterm 画。
+   - 删除 `terminalSeeThrough` / `wrapBg` 这套「全透 or 实底」的二态判断；
+     配色预设从此只管 16 色与光标，不再决定终端底色。
+   - `.terminal-wrap` 成为承载底色的那一层 div：默认 `transparent`（无壁纸模式下
+     `.shell-work` 已铺玻璃，终端再铺会双层叠加成 1-(1-0.38)²≈0.62，比侧栏明显更实）；
+     `html[data-translucent="1"]` 时铺 `var(--glass-bg)` + blur（此时工作区已透明，壁纸直出）。
+   - xterm 内部层（`.xterm` / `.xterm-screen` / `.xterm-viewport`）的透明覆盖从
+     条件类 `.terminal-bg-transparent` 改为常驻 `:deep()`。
+2. `src/components/CommandBar.vue`：`.cmd-slot :deep(.el-input__wrapper)` 背景改透明，
+   让命令栏那层玻璃成为唯一底色（只清背景，EP 的边框/聚焦环是 box-shadow，原样保留）。
+
+2b. src/composables/useRendererPref.ts：`resolveRenderer` 的 auto 分支从
+   「有背景图 → webgl，否则 canvas」改为**恒 webgl**。这是必须的配套改动：
+   旧逻辑的前提是「终端自己画一层不透底的 theme.background」，而这个前提
+   随本次玻璃化改造消失了 —— 终端背景现在恒透明，而 canvas 渲染器在
+   透明背景上会留拖影、输入字符看起来「跳跃」（TerminalPanel 里 loadRenderer
+   的长注释早有记载，本地 ConPTY 路径最明显）。webgl 不可用时 loadRenderer
+   仍会回退 canvas。设置面板的「自动」选项说明同步改为「WebGL（终端背景
+   透明，需 GPU 合成；不可用时自动回退 Canvas）」。
+
+**踩到的坑**：Vue scoped 样式里 `:global(html[data-translucent="1"]) .terminal-wrap`
+会被编译成 `html[data-translucent="1"] { background: … }` —— **后半截 `.terminal-wrap`
+直接丢失**（实测 CSSOM 只看到一条作用在 html 上的规则），终端一条玻璃都没铺。
+必须把整条选择器包进 `:global(...)`：`:global(html[data-translucent="1"] .terminal-wrap)`。
+
+**验证（浏览器探针实测 + 三张视觉截图，探针已删）**：
+
+| 区域 | 实心度 0%（透出模式） | 实心度 40% |
+|---|---|---|
+| 顶栏 | 0.091 | 0.455 |
+| 侧栏 | 0.091 | 0.455 |
+| 终端 `.terminal-wrap` | 0.091 | 0.455 |
+| 命令栏 | 0.091 | 0.455 |
+| 工作区 `.shell-work` | 0（壁纸直出，不叠加） | 0 |
+
+- xterm：`theme.background = "rgba(0, 0, 0, 0)"`、`allowTransparency = true` ✅
+- 无壁纸（glow）模式：`.terminal-wrap` = 0、`.shell-work` = 0.38 —— 只有一层玻璃，
+  不出现双层叠加 ✅
+- 命令输入框 `.el-input__wrapper` alpha = 0 ✅（露出命令栏玻璃）
+- 实心度 100%：工作区与命令栏均为 1.000 ✅
+
+**视觉确认**：0% / 40% 两档截图，侧栏、顶栏、终端区、命令栏四块同步透出同一张壁纸、
+同步变暗，无台阶、无某一块偏亮。终端内写入真实 `ls -la` 输出目验可读性：
+0% 档浅色文字压在彩虹渐变上偏弱（预期，这是「最透档」的固有代价），40% 档明显改善。
+
+**明确不做 / 未决**：
+- 未加独立的「终端背景透明度」滑杆（omp 有 `terminalBgOpacity`）：用户要求「同一个」
+  控制，复用界面实心度。
+- 未给 SftpPanel / 欢迎页补玻璃层：它们沿用 `.shell-work` 的玻璃（无壁纸模式）或在
+  透出模式下直出壁纸，属既有行为，本次未动。
+- 配色预设的 `terminal.background` 从此不再影响终端底色 —— 这是刻意的统一，
+  但意味着选 Solarized 等预设时不会再看到它那把专属终端底色。
+
+**补充（同日，用户定下限）**：用户要求「最低 0.2」。透出档 base 从
+`0.10 - 0.04×可见度`（0.091 起）改为**固定 0.20**（亮色 0.28 固定），
+即 `alpha = 0.2 + 0.8×solidity`。同时去掉 base 随壁纸清晰度的联动 ——
+联动本是为「拉满清晰度时壁纸更明显」服务，下限被可读性钉死后只剩
+0.20→0.16 的空间，收益不足以抵掉「同一滑杆位置透明度却不同」的困惑。
+清晰度滑杆仍通过 blur 与雾层浓度表达强度。
+
+实测（浏览器探针，暗色）：0%→0.200、25%→0.400、50%→0.600、75%→0.800、
+100%→1.000，线性无跳变；亮色 0%→0.280、100%→1.000。三档清晰度下 0% 均为
+0.200（联动确已移除）。四块（顶栏/侧栏/终端/命令栏）在 0% 档全部为 0.200。
+视觉截图确认：0.2 档下终端浅色文字压在彩虹壁纸上比 0.091 档明显更清晰，
+同时壁纸仍完整可见。
+
+**五问重启检查（阶段 217）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 终端底色与命令输入框接入与侧栏/顶栏/命令栏同一套玻璃变量，四块 alpha 实测完全一致。 |
+| 什么是我没做的？ | 独立的终端背景滑杆、SFTP/欢迎页的玻璃补齐、真机壁纸目验（浏览器截图已确认）。 |
+| 我想去哪里？ | 拉实心度滑杆时整窗（含终端与命令栏）同步变透/变实，没有哪一块掉队。 |
+| 我要去哪里？ | 真机设壁纸 → 拖滑杆 0%↔100% → 观察终端区与侧栏是否同步。 |
+| 什么可能导致偏离？ | 0% 档终端文字压壁纸的可读性偏弱（已目验），若用户觉得读不清需要自行拉高滑杆。 |
+| 下一步最小可验证动作？ | 真机连 SSH → 拖「界面实心度」滑杆 → 看终端区与侧栏同步变化。 |
+
+### 阶段 218 —— 壁纸「拉满也看不清」：壳层 backdrop-filter 固定 24px 才是模糊的真凶
+
+**需求（用户原话）**：「透明问题，我看背景又看不清了，背景拉满也看不清。是模糊态的，
+看下原因修复下」。
+
+**定位（源码 + 浏览器探针实证）**：模糊来自**两层**，用户只调到了其中一层。
+
+| 层 | 控制变量 | 清晰度拉满（80%）时 | 结果 |
+|---|---|---|---|
+| 壁纸层 `body::before` | `filter: blur(var(--wallpaper-blur))` | `(0.8-clarity)×4` = **0px** | 本来就不糊 |
+| 壳层玻璃 `backdrop-filter` | `blur(var(--glass-blur))` | 固定 **24px** | **糊成色块** |
+
+24px 是当初抄 ompDesktop 的「视觉签名」，但 omp 的背景是程序化径向光晕——本身
+没有细节，24px 糊不糊根本看不出来；换成真实照片壁纸，24px 必然只剩色块。用户把
+「壁纸清晰度」拉满只清掉了壁纸层那 0px，玻璃那层纹丝不动，所以体感是「拉满也没用」。
+
+**改动**（`src/styles/app.css`，透出模式块加一行）：
+
+```css
+html[data-translucent="1"] {
+  --glass-blur: calc(4px + 20px * (1 - var(--bg-visibility, 0.2)));
+}
+```
+
+`--bg-visibility` 是清晰度归一化（5%→0、80%→1）：
+
+| 清晰度 | 玻璃 blur | 壁纸 blur | 观感 |
+|---|---|---|---|
+| 5% | 24px | 3px | 全糊（弱背景） |
+| 22%（默认） | 19.5px | 2.3px | 毛玻璃 |
+| 80%（拉满） | **4px** | 0px | 背景清晰 |
+
+无壁纸模式（光晕 / 网格 / 纯底色）不加这条联动，保持 24px——那几种背景本身
+没有需要辨认的细节，糊一点反而更稳。
+
+**验证（浏览器探针 + 三档视觉截图，探针已删）**：
+- 实测 `--glass-blur`：5% → 24.0px、22% → 19.5px、80% → 4.0px（与公式一致）。
+- 无壁纸模式恒 24px（联动确未生效于该模式）。
+- 铺一张高细节 SVG（细网格 + 小字）三档并排截图：5%/22% 两档只剩色块，
+  80% 档网格线与文字都清晰可辨。
+- `npm run test:ts` 通过。
+
+**取舍**：
+- 玻璃 blur 降到 4px 后，壳层文字与壁纸细节会直接竞争，实心度低时认读变难 ——
+  这是「看清背景」的固有代价，滑杆可随时回退。
+- 弹层（下拉/对话框）也用 `--glass-blur`，透出模式下同样变清晰；它自身
+  alpha 0.52~0.68 仍能压住背景，未单独拆开。
+- 未动 `--glass-saturation: 180%`（壁纸色彩会偏饱和）：用户没提，且 omp 同值。
+
+**五问重启检查（阶段 218）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 把玻璃 backdrop-filter 的 24px 固定值改成随壁纸清晰度联动（4~24px），拉满时背景真正清晰。 |
+| 什么是我没做的？ | 未拆弹层的独立 blur、未调饱和度、未真机目验（浏览器截图已确认）。 |
+| 我想去哪里？ | 壁纸清晰度拉满时，透过壳层能看清壁纸细节。 |
+| 我要去哪里？ | 真机设壁纸 → 把「壁纸清晰度」拉到最右 → 看顶栏/侧栏/终端区是否变清晰。 |
+| 什么可能导致偏离？ | 若用户仍觉得糊，可能是壁纸原图分辨率不够或 `background-size: cover` 放大过度。 |
+| 下一步最小可验证动作？ | 真机拉清晰度滑杆到 80%，对比 22% 时的观感。 |
+
+### 阶段 219 —— 底栏冒英文错 `Channel send error`：exec 探针的死连接识别漏了最明确的信号
+
+- **需求**：用户实报终端底部状态栏出现
+  `Open exec channel failed: Open exec channel failed: Channel send error`
+  与「系统 unknown / CPU 0 核 / 内存 0 B / 磁盘 0 B」。
+
+- **日志实证**（`myshell-20768.log`，当日 ias@135.32.64.34 四个会话）：
+  - `03:25:16.861` 同一毫秒 **42 条** `exec channel open failed: … Disconnected`，
+    随后 `03:25:17~40` 转为 `Channel send error`，且**不带**
+    `attempting one-time reconnect` —— 即这个错误根本没进重连分支。
+  - `03:23:46.345 / .579 / .867` 连续三次 `reconnect succeeded, handle replaced`
+    之后仍失败：该账号是 `MaxSessions=1` 受限账号（阶段 209 已记录：同一连接上
+    开第二条通道，服务器直接断整条连接），exec 探针在它上面重连成功也必然再失败。
+
+- **根因（三个叠加）**：
+  1. `is_connection_dead`（ssh.rs）漏匹配 `Channel send error`。这是 russh
+     `Error::SendError`，语义是 handle 的 session task 已退出、sender 被 drop ——
+     连接已死**最明确**的信号，却不在白名单里，于是这类连接每次探测必失败。
+  2. 错误串双重包装：`open_exec_channel` 已 `format!("Open exec channel failed: {}")`，
+     `exec_once` 的两个 Err 分支再包一层，用户看到重复前缀。
+  3. 原始英文串经 `ssh_get_server_info` 原样返回，`ServerInfoPanel.vue` 的
+     `error` 直接渲染它；ai.rs 的巡检路径早有中文可操作提示，这条路径没有。
+
+- **改动**：
+  - `src-tauri/src/ssh.rs`：
+    - `is_connection_dead` 改为大小写不敏感 + 去空格归一化（russh 同一失败的显示文本
+      在版本间变过写法：`SendError` vs `Channel send error`，实测后者带空格，第一次
+      改成简单 contains 被自己的回归测试当场抓住），补 `senderror` 匹配。
+    - `open_exec_channel` 返回 russh 原始错误，前缀统一由 `exec_once` 加一次。
+    - `connection_dead_tests` 扩充：锁 `SendError` / `Channel send error` /
+      `Disconnected` / `disconnect` 四种写法，并保留 `Session not found` 不得重连。
+  - `src-tauri/src/main.rs`：`ssh_get_server_info` 把连接类错误翻成一句中文
+    （「当前 SSH 连接已失效，或该账号不允许额外会话通道」+ 指向「重新连接」按钮 +
+    说明单会话限制下服务器信息条不可用），底层错误留在括号里便于提单。
+    一处改动同时覆盖底栏与监控面板（两者共用同一 IPC 出口）。
+
+- **验证**：`cargo check` 通过（警告均为存量 winapi 命名）；`cargo test --lib
+  connection_dead` 1 passed；`npm run test:ts` 通过。真机路径未走（需 vault 主密码）。
+
+**取舍**：
+- 给 `is_connection_dead` 加 `SendError` 会让「handle 已死」的连接多拨一次号：
+  单飞锁（阶段 209）保证并发只拨一次，dial 失败即返回，不会成环。
+- 不为「单会话账号」做连接期探测/自动禁用底栏监控（YAGNI），只在错误文案里说明原因。
+- 未收敛 42 条同毫秒错误风暴（日志噪声，非用户可见；前端已有连续 2 次失败熔断兜底）。
+- 未让 exec 重连带活交互 PTY：阶段 209/215 两次记录过理由（`ssh_closed` 分不出
+  「用户 exit」与「网络断开」，自动重连会在正常退出后误弹回）。
+
+**五问重启检查（阶段 219）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 补上 `SendError`/`Channel send error` 这个漏掉的死连接信号，去掉错误串的双重前缀，并把底栏的英文错翻成可操作的中文提示。 |
+| 什么是我没做的？ | 单会话账号的探测期识别、42 条同毫秒错误风暴的收敛、PTY 随 exec 一起复活、真机 SSH 端到端验证。 |
+| 我想去哪里？ | 连接失效时底栏给出一句能照着做的话，且 exec 探针会自动重连重试一次。 |
+| 我要去哪里？ | 连一台会 idle 断开的服务器 → 静置到断 → 看底栏是否先自动恢复；仍失败时看是否中文提示且指引「重新连接」。 |
+| 什么可能导致偏离？ | 若服务器侧是 `MaxSessions=1`，重连成功后 exec 通道仍会被拒 —— 此时中文提示里的第二种情况就是用户看到的内容，属于预期而非回归。 |
+| 下一步最小可验证动作？ | 真机断开一个 SSH 会话（不断 tab），观察底栏 10 秒内的错误文案与熔断行为。 |
+
+### 阶段 220 —— MCP 工具外部反馈评估与落地（exec_channel / ssh_write_text / sentinel 折行 / 续行自愈）
+
+- **需求**：另一项目转来一份真实会话的 MyShell MCP 反馈（hermes agent 部署任务，主机 192.168.3.30），
+  九条问题按 P0/P1/P2 分级，要求评估合理性并实现合理的部分。
+
+- **逐条评估结论（全部有代码层举证）**：
+
+  | 条目 | 结论 |
+  |---|---|
+  | P0-1 `command_b64` 字符篡改 | 本仓库从 base64 解码（`myshell-mcp.rs:1041`）到 `writer.write_all`（`ssh.rs:949`）逐跳字节无损，无逐字符输入模拟；响应 `command` 字段显示的是**发送前**字符串，故污染发生在 MCP 上游（调用方 harness）。**但** GUI 路径「一次 bulk 写命令 + 80ms 后补写 sentinel」撞上远端交互式 shell 行编辑，是本地可修的真实嫌疑面 |
+  | P0-2 会话粘滞 | 成立。`useMcpBridge.ts:347` 快路径复用该连接持久 terminal tab，与 instructions 里「fresh non-interactive session」直接矛盾 |
+  | P1-1 6 秒延迟 | 成立，常量已定位：`IDLE_TIMEOUT_MS=5000` + 1000ms 轮询 + 80ms，且空闲回退 `exit_code ?? 0` 把未完成误报为成功 |
+  | P1-2 connection_lost | 部分成立：无头路径协议层二义为真，但 GUI 路径已有 `command_sent` 未上升为响应字段 |
+  | P2-1 `ssh://` 不可用 | **不在本仓库**：报错文本全仓 grep 零命中，属 harness 自己的 ssh:// 路由 |
+  | P2-2 heredoc 被破坏 | 同一根因；但「写文件不经 shell」的诉求合理 |
+  | P2-3 sftp 拒 ssh 连接 | 成立。六个工具硬传 `Some("sftp")`，而 sftp 子系统本就跑在 ssh 连接上 |
+  | P2-4 exit 130 无标记 | 成立。全仓无 `interrupted` 字段 |
+  | P2-5 中文 | 部分成立：输入链路字节精确，真实缺陷在显示侧的无状态 TextDecoder |
+
+- **改动**：
+  - `src-tauri/src/bin/myshell-mcp.rs`：
+    - `ssh_exec` 新增 `exec_channel`（`gui` 默认 / `pipe`）。`pipe` 走既有 `channel.exec(true, command)`
+      直连通道，完全绕开 GUI PTY 输入层与 sentinel 回显解析；GUI 失败不再把命令拉回 PTY。
+      `ssh_run` 本就始终走 exec 通道，**不加**此参数（加了只会误导）。
+    - 新增 `ssh_write_text` 工具：`content_b64`（或 `content`）→ SFTP 直达远端文件，
+      `mode: overwrite|append`。远端 shell 完全不解析内容，是「写凭据不被污染」唯一可靠路径。
+      敏感路径与 `ssh_read_text` 共用同一份确认门（`command_rules::is_secret_remote_path`）。
+    - 失败结果补 `delivered`（exec 请求已写入通道 → 非幂等命令不可盲目重发）与
+      `interrupted`（128+信号形态，130 = Ctrl-C）；gui 通道补 `completed`
+      （完成标记未确认时 `exit_code` 为 null，不再被 `?? 0` 伪造成成功）。
+    - `McpState::resolve_via_gui_sftp`：六个 sftp 工具先 sftp 后 ssh 回退
+      （复刻 `ssh_read_text:1761` 既有范式）。
+    - `SERVER_INSTRUCTIONS` 如实改写：删掉「fresh non-interactive session」承诺，
+      改为说明 gui 通道复用同一条持久 shell；新增「写凭据必须用 ssh_write_text」与
+      「何时用 pipe」两条 NORMATIVE 规范，以及 `delivered`/`interrupted`/`completed` 字段语义。
+  - `src/composables/useMcpBridge.ts`：
+    - sentinel 判定改为「可见字符→原始下标」映射后匹配与取码。折行时 readline 插在
+      sentinel 中间的光标移动转义会让原来的原始串匹配脱靶，那正是 6 秒延迟的直接诱因。
+    - PS2 续行检测：sentinel 回显带 `> ` 前缀即判定 shell 卡在续行态，自动补 Ctrl-C
+      并直接报错，不再让后续每条命令静默失效。
+    - 空闲回退改报 `exit_code: null` + `completed: false`，不再默认 0。
+    - 输出解码改带 `stream:true` 的单实例 TextDecoder。
+  - `src/components/TerminalPanel.vue`：`filterSentinel` 同样改流式解码器。
+  - `src-tauri/src/bin/myshell-cli.rs`：`exec --json` 补 `interrupted`（128+信号形态）与
+    `delivered`（exec 请求已写入通道）字段，与 MCP 侧同口径 —— 两个 JSON 出口的语义
+    不再各说一套。CLI 的 exec 本就走 `channel.exec` 直连通道，不受 GUI PTY 输入层影响，
+    故不需要 `exec_channel` 参数。
+  - `docs/mcp-integration-spec.md`：新增「一之二、选对执行通道」章节、`ssh_write_text`
+    用法、三个新结果字段语义、自检清单 4 项。
+  - `README.md` / `AGENTS.md`：工具计数 21 → 22（补 `ssh_write_text`），MCP 段落补
+    `exec_channel` 与新字段说明。
+
+- **验证**：
+  - `cargo test --bin myshell-mcp`：**27 passed**（新增 3 个：
+    `exec_channel_defaults_to_gui_and_lives_only_on_ssh_exec` 锁默认值不变 + ssh_run 不得暴露该参数；
+    `interrupted_flags_only_the_signal_shape` 锁 130/137/143 为 true 而 1/2/127/160 为 false；
+    `write_text_accepts_either_content_form` 锁 anyOf 二选一；并扩写
+    `instructions_state_the_encoding_norm` 覆盖新 needle）。
+  - `npm run test:ts`（vue-tsc）通过。
+  - 一次性探针脚本（`F:/tmp/mcp-sentinel-probe.ts`，跑完已删）17 项断言全过，覆盖：
+    折行回显（含 CSI 插在 sentinel 内部）、OSC 标题跳过、`:$?` 用户回显不得误匹配、
+    PS2 检出/正常执行不误报/带色 PS2 检出、非 sentinel 的 `>` 行不误报、
+    中文跨 chunk 流式解码无损（对照组：无状态 decode 同一处切割确实产出乱码）。
+  - 真机 SSH 端到端未走（需 vault 主密码 + 远端）。
+
+**取舍**：
+- `exec_channel` 默认保持 `gui`：改默认值会让现有用户的 `ssh_exec` 突然不再显示在终端里，
+  属用户可见行为变更，不在一份「评估反馈」的授权范围内。
+- 未实现反馈建议的 `command_echo_raw` 字节级回显：MCP 进程解码后到 PTY 逐跳无损已有举证，
+  加一个回显字段只会制造「两端比对」的假安全感；真正该修的上游（调用方 harness）不在本仓库。
+- 未给无头路径加 sentinel 式投递确认：exec 通道没有 PTY 回显可比对，协议层 genuinely 二义，
+  用 `delivered` 把「已写入但结果未知」这个真实语义暴露出来，比伪造一个确定性字段诚实。
+- `interrupted` 用 128–159 区间启发式而非精确信号判定：SSH exec 通道只传一个 u32 状态字，
+  不传信号号，「程序自己 exit(137)」与「被 SIGKILL」在协议层不可区分。要的是**告警**不是确定性。
+- 未做 P2-1（harness 的 `ssh://` 探测）与 P0-1 上游污染的修复：两者都不在本仓库代码内。
+- 未收敛 42 条同毫秒错误风暴等既有已知项（非本次反馈范围）。
+
+**五问重启检查（阶段 220）**：
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 评估九条外部反馈，落地七项：`exec_channel`、`ssh_write_text`、`delivered`/`interrupted`/`completed` 三字段、sftp 类型回退、sentinel 折行容错、PS2 续行自愈、流式 UTF-8 解码；并如实修正 instructions 里与实现矛盾的「fresh session」承诺。 |
+| 什么是我没做的？ | P0-1 上游（调用方 harness）污染、P2-1 harness 的 `ssh://` 探测、`command_echo_raw` 字节回显、真机 SSH 端到端验证。 |
+| 我想去哪里？ | AI 写凭据不再被字符污染（走 `ssh_write_text`），管道/重定向命令不再固定多等 6 秒且输出不再被剥空，续行卡死当场报错并自愈，中文输出不再变乱码。 |
+| 我要去哪里？ | 真机对一台服务器：先 `ssh_write_text` 写一个含中文与 `$`/引号的配置文件，再用 `ssh_read_text` 读回逐字节比对；再跑 `ss -ltnp \| grep <port>` 看 `duration_ms` 是否回落到百毫秒级。 |
+| 什么可能导致偏离？ | 若调用方仍用 heredoc 写凭据（未读 instructions），污染依旧 —— 那是使用侧问题，不是工具缺陷；`gui` 通道的默认行为未变，老调用方看不到任何变化。 |
+| 下一步最小可验证动作？ | 真机跑一次 `ssh_write_text` + `ssh_read_text` 往返比对，确认字节一致。 |
+
+### 阶段 221 —— 终端拖拽上传：把本地文件拖进 SSH 终端即传到远端当前目录
+
+- **动机**：SFTP 面板里上传要点「上传」→ 弹系统选择器 → 确认，而用户多数时候
+  正盯着终端、手里刚 cd 到目标目录。拖拽是最短路径。
+- **实现**：
+  - `src/components/TerminalPanel.vue`：
+    - 拖入检测走 Tauri 2 的**窗口级原生拖放**（`tauri://drag-enter/over/leave/drop`），
+      不是 DOM `dragover`/`drop`。原因：wry 在 WebView2 上注册了 `IDropTarget`
+      （`drag_drop_handler_enabled` 默认 true，本仓库未关闭），原生接管后
+      HTML5 拖放事件根本不会触发。落点判定用 `getBoundingClientRect` 比
+      `elementFromPoint` 更直接（坐标已是窗口物理坐标）。
+    - 落点命中本面板才响应：多标签/分屏并存时，只有指针下面那个终端上传。
+    - 「对应目录」用**哨兵探针**取真实 cwd：往 PTY 注入
+      `echo __MCP_CWD_<rand>__$PWD`，从输出流截回路径。不新增后端命令，
+      复用 MCP 既有的 sentinel 通道。3s 超时回退 `~`（后端 `resolve_path` 展开）。
+    - 传输复用既有 `sftpUpload`（`sftp_upload` 命令，会话内 SFTP 子系统），
+      进度/完成/取消全套事件与浮层版式对齐 SftpPanel。
+    - 本地终端（`connType === "local"`）直接忽略：没有 SSH 会话，
+      `sftp_upload` 无从打开子系统，报错不如不响应。
+    - 生命周期：拖放监听与 cwd 等待者都绑在本轮终端（`setupTerminal` 的
+      `closed` + `disposeFn`），重连/卸载不留悬挂 Promise 与定时器。
+  - `src/utils/sentinel-filter.ts`（新）：把原先内联在 TerminalPanel 的哨兵行
+    过滤器提成纯模块，cwd 探针与 MCP exit-code 哨兵共用一套「删行 + 旁路取值」。
+- **踩到的坑（探针脚本抓出，非推测）**：
+  - cwd 哨兵命名必须含 `__MCP` 前缀：半行缓存判定只看这个前缀，名字若自成一套
+    （最初用的 `__MYSHLL_CWD_`），被 chunk 切开的半行会被当普通内容立即放行，
+    用户眼前闪过半条 `echo __MYSH...`。
+  - 回显行与结果行都含 needle，必须区分：回显行是 `echo __MCP_CWD_x__$PWD`，
+    needle 后面跟的是 `$PWD` 字面量。用 `(?!\$)` 负向断言只认真实结果行——
+    否则回调拿到 "$PWD"，文件会被传到名为 "$PWD" 的目录里。
+  - 回显行不得触发回调：若也回调（传 null），等待者被提前终结，真正的结果行
+    随后到达时已经没人接了。删除则两种行都删（用户都不该看到）。
+- **取舍**：
+  - 拖入的文件夹不递归：交给后端 `sftp::upload` 的预统计阶段记为 per-file error
+    （"不是文件（已跳过）"），浮层照常展示。要递归得新增后端递归逻辑，
+    而 ZMODEM 那条路（`rz` + 选文件夹）已经支持。
+  - 不做「拖到 SFTP 面板反向下载」：本次只做用户点的这一方向。
+  - cwd 探针 3s 超时后回退 home，不再重试：交互式 shell 里 3 秒拿不到 `$PWD`
+    说明有东西卡着（全屏程序、sudo 密码提示），此时重试只会更卡。
+- **验证**：
+  - `npm run test:ts`（vue-tsc）通过。
+  - 一次性探针脚本（`F:/tmp/sentinel-probe.mjs`，跑完已删）11 项断言全过：
+    回显+结果行都被删、只回调结果行且拿到路径而非 `$PWD`、MCP 哨兵行照旧被删
+    （不回归）、无哨兵的尾巴立即放行（终端不卡）、半行哨兵缓存后整行删除、
+    切开的 cwd 值仍取出、非哨兵前缀行不被吞、空结果行删除且不回调、
+    含空格与中文的路径完整取出。
+  - 真机拖拽端到端未走（需 vault 主密码 + 一台已保存的远端连接）。
+
+  - 追加修正（同一阶段内）：落点判定的**坐标系错误**。Tauri drag-drop 载荷带的是
+    `PhysicalPosition`（物理像素）——wry 把 `ScreenToClient` 的结果原样传出，
+    经 tauri-runtime-wry 2.11.4 包成 PhysicalPosition 交给前端；而
+    `getBoundingClientRect()` 返回 CSS 像素。DPR ≠ 1 的屏幕（125%/150%/200%）
+    上两者不等，整个落点区域会按 DPR 缩放后偏移。已改为按
+    `devicePixelRatio` 换算后再比。真实验证：DPR=2 下面板中心的物理坐标
+    (300,200) 会被判成落在 CSS 矩形 [100,50,500,350] 之外——不修则高 DPI 屏
+    上拖到面板正中央都无响应。
+  - 追加验证（chromium 实测，非推算）：DPR=1 与模拟 DPR=2 两组断言全过
+    （缩放后命中、未缩放确实脱靶、面板外一点仍判外）；浮层几何审计通过
+    （贴齐面板底边、通栏宽、落点提示 `pointer-events:none` 不吃点击、
+    错误列表可滚动）；窄面板（260px）下长文件名正确省略且不撑破布局。
+  - 仍未验证：真机拖拽端到端（需 vault 主密码 + 已保存远端连接）；
+    `tauri://drag-*` 事件在桌面端的实际送达（浏览器无 Tauri 运行时，
+    这是环境限制，非代码缺陷）。
+
+### 阶段 222 —— 终端拖拽上传支持文件夹：远端重建目录树 + 同名目录先问再写
+
+- **动机**：阶段 221 只支持文件；拖整个文件夹进去会被后端按「不是文件（已跳过）」
+  逐项丢弃。用户实际场景是「多选一个顶层目录下的若干子文件夹与文件，一次拖进来」。
+- **实现**：
+  - `src-tauri/src/sftp.rs`：
+    - `plan_upload` + `expand_upload_dir`：本地递归展开为 `UploadPlan { dirs, files, errors }`。
+      每个拖入项以**自己的 basename** 成为目标目录下的根（`/a/src` → `<dest>/src`），
+      与单文件上传 / ZMODEM / 主流客户端一致；不做「保留上级目录」那种随场景变化的规则。
+      深度优先前序保证 `dirs` 父先子后（`create_dir` 不递归，顺序是硬约束）；
+      空目录与多层空链都保留；深度熔断 64 层只为挡符号链接成环，写在递归函数内部。
+      整棵树遍历放在 `spawn_blocking`，不占 tokio worker。
+    - `upload()`：先建目录再传文件。已存在的同名目录（`create_dir` 必失败）用
+      `stat` 确认后视为正常，否则记错误并把该目录放进 `failed_dirs` **短路整棵子树**
+      （否则一个 3 层目录会刷出几十条重复错误）。目录阶段也发进度
+      （`currentFile = "创建目录 i/n"`）并在每个目录前检查取消。
+    - `check_dir_conflicts`（新，只读）：目标目录存在性 + 批次内重名目录 +
+      远端同名目录。冲突判定用 `stat`（跟随软链）——指向目录的软链在用户眼里就是目录。
+    - 同名文件不提示，维持既有 `CREATE|TRUNCATE` 覆盖语义（与改动前一致）。
+    - `TransferDonePayload` 增加 `created_dirs`，让前端能说「已创建 N 个目录」。
+  - `src-tauri/src/main.rs`：注册 `sftp_check_dir_conflicts`。
+  - `src/api.ts`：`sftpCheckDirConflicts` + `SftpDirConflictReport`；`onSftpTransferDone`
+    增加第二个参数 `createdDirs`。
+  - `src/components/TerminalPanel.vue`：
+    - 拖入流程改为「取 cwd → 只读预检 → （重名剔除）→（冲突对话框）→ 上传」。
+    - 冲突对话框三出口：合并覆盖 / 跳过这些 / 取消（`MyDialog` 的 `#footer` 插槽）。
+    - ZMODEM 会话期间拒绝拖拽：此时键盘输入被吞以保护协议流，探针的 `echo` 会
+      直接打进字节流污染传输。
+    - cwd 探针失败、或预检发现目标目录不存在 → toast 告知并回退主目录；预检本身
+      失败（断连/权限）→ 中止整批，绝不降级成静默覆盖。
+    - 完成提示只由 `sftp_transfer_done` 事件触发（`createdDirs` 只有事件载荷带），
+      await 分支只收浮层状态，避免事件晚到一帧时出现两条 toast。
+- **踩到的坑**：
+  - myui 的 `hideFooter` 会连自定义 `#footer` 插槽一起不渲染
+    （源码 `hideFooter ? void 0 : { name: "footer" }`）——按类型注释「自定义 footer
+    请提供 #footer 插槽」加上 `hide-footer`，三个出口按钮一个都不会出现，对话框
+    彻底不可用。改为不传 `hideFooter`，靠插槽覆盖默认按钮。
+  - `TransferDonePayload` 加字段会波及 FTP 的两处构造点（同一事件契约共用），
+    一并补 `created_dirs: 0`。
+- **取舍**：
+  - 拖入项重名只拦**目录**：同名文件是既有覆盖语义，不能连带删掉。
+  - 重名目录只剔除、不自动改名：两棵不同的本地树落到同一远端路径，任何自动选择
+    都是替用户猜。
+  - 冲突提示只针对顶层拖入目录，不逐级询问：深层子目录在父目录新建时不可能已存在；
+    父目录选「合并」后其下同名子目录按合并语义继续。
+  - MCP 的 `sftp_upload` **没有**跟着支持目录：它有自己的 `sftp_upload_file`
+    （只开单个文件），不走 GUI 命令。计划里「改一行描述」的前提不成立，故描述
+    保持原样（仍然准确）；未给 MCP 加目录能力，避免扩大确认门与传输语义的改动面。
+- **验证**：
+  - `cargo test --lib upload_plan_tests`：**5 passed**（嵌套树的相对路径与父先子后、
+    空目录/多层空链保留、顶层单文件不泄漏本地目录、不存在路径只记 per-item 错误、
+    重名只命中目录）。
+  - `cargo check`：通过（仅既有 warning）。
+  - `npm run test:ts`（vue-tsc）：通过。
+  - 真机拖拽端到端未走（需 vault 主密码 + 已保存远端连接）；冲突对话框的实际渲染
+    未截图（浏览器侧无 Tauri 运行时、且应用卡在保险库门禁），按钮渲染条件按
+    myui 编译产物逐行核对。
+
+### 阶段 223 —— 自审（open-code-review delegate 模式）：拖拽上传的两个清理竞态
+
+- **审查方式**：`ocr delegate preview` → `ocr delegate rule` 取 Rust/前端规则集 →
+  宿主 agent 按规则逐文件审 diff。本轮 diff 里与拖拽上传相关的部分（sftp.rs /
+  ftp.rs / api.ts / TerminalPanel.vue / sentinel-filter.ts）过了一遍。
+- **问题清单与处置**：
+  1. **[中危｜真问题｜已修]** `beginDropUpload` 的订阅注册竞态：`onSftpTransferProgress`
+     / `onSftpTransferDone` 是异步的（IPC 往返），在 await 期间若 dispose 先跑完，
+     `closeDropTransfer()` 已经清空过 `dropUnlisten`，这两个 unlisten 再也不会被调用
+     —— 监听泄漏，且旧 requestId 的事件会在下一个会话里继续打到本面板。
+     修法：组件级 `dropListenersDetached` 标志，`closeDropTransfer` 置位，
+     `beginDropUpload` 在订阅到位后查一次，命中就自摘两个监听并直接返回。
+  2. **[中危｜真问题｜已修]** dispose 不清 `pendingDrop`：用户看到冲突对话框后
+     切换连接/关闭面板，`disposeFn` 清了监听与传输，但挂起的对话框仍记录着
+     旧 dest 与旧 sid；卸载前最后一次点到「合并覆盖」会用已断开的会话发起上传。
+     修法：`disposeFn` 里 `pendingDrop.value = null`。
+  3. **[驳回]** 规则「Collections/Performance：预分配 Vec」：`UploadPlan` 的
+     `dirs`/`files` 在递归前无法知道规模，`with_capacity` 只会是个猜错的数；
+     且这里不是热路径（一次拖拽一次展开），预先分配是噪声。
+  4. **[驳回]** 规则「Excessive clone()」：`plan_upload` 里 `local_path: p.clone()`
+     与 `relative: basename(p)` 都是必须的——`UploadTask` 要拥有路径，
+     而 `paths` 在整个展开过程中仍在被遍历。改成借用会让 `UploadPlan` 背上
+     生命周期参数，只为一个纯数据的搬运增加复杂度。
+- **回归**：新增 `sftp::upload_conflict_tests` 两个用例（144 passed，全绿）。
+  `duplicate_pruning_keeps_same_named_files` 锁住「同名目录才剔除、同名文件
+  必须留下」；`file_and_dir_roots_have_different_shapes` 锁住「目录以自己的
+  basename 为根，顶层文件不带任何目录」。
+- **未覆盖**：两个修复都是 dispose 时序，需要真机「传一半切标签」才能端到端观察，
+  当前只能由类型检查与人工推演保证。
+
+### 阶段 224 —— 拖拽上传通道自适应：SFTP 不可用自动降级 ZMODEM，双缺失给安装指引
+
+- **动机**：用户实测报「无法检查远端目标目录，已取消上传：SFTP session init
+  failed: Timeout」且拖入无任何反馈。根因是设计缺陷：拖拽上传无条件依赖 SFTP
+  子系统，而「SSH 连得上」不等于「SFTP 用得了」（restricted shell、chroot、
+  只开 exec 的跳板机、sftp-server 未装）。用户明确要求：先检测服务器支持
+  方式再上传，不具备条件时给出该装什么、怎么装。
+- **实现**：
+  - `src-tauri/src/ssh.rs`：
+    - `UploadCapabilities { sftp_available, zmodem_available, probe_completed,
+      package_manager, install_hint, message }`。
+    - `probe_upload_capabilities`：SFTP 子系统**真实开一次并完成 INIT 握手**
+      （带 8s 超时——挂起的服务器会让握手永久卡住，这正是用户症状）；lrzsz 与
+      包管理器走 `exec_once` 跑一条 POSIX sh 脚本（`command -v rz/sz` +
+      依次探 apt-get/dnf/yum/apk/zypper/pacman）。脚本用 `;` 分隔而不是
+      `&&`：`command -v` 失败返回非零，`&&` 会让后续探测全部短路。
+    - `parse_probe_output` 纯函数（单测直喂字符串）；`install_hint_for`
+      映射六个包管理器到具体安装命令。
+    - rz 与 sz 必须同时在：残缺安装按不可用处理，走安装指引。
+  - `src-tauri/src/sftp.rs`：`probe_sftp_subsystem`（复用 get_sftp_session
+    全路径，任何间接推断都可能与服务端真实行为不一致）。
+  - `AppState.upload_caps` 按 session_id 缓存（服务端不会中途装/卸软件，
+    重连换 session 自然失效，不做 TTL）。`probe_upload_capabilities` 命令
+    命中缓存直接返回。
+  - `src/components/TerminalPanel.vue`：
+    - 拖入流程：能力探测 → SFTP 可用走原路径；不可用但有 lrzsz 走 ZMODEM
+      （PTY 发 `rz`，12s 看门狗，`zmodem_start` 到达时把挂起路径直接交给
+      `commitNativeUpload`，不弹文件选择器）；两者皆无弹安装指引对话框
+      （命令一键复制 + SFTP 子系统启用方法）。
+    - SFTP 路径预检失败且 lrzsz 可用 → 自动换 ZMODEM 通道（探测与使用之间
+      服务端可能变化，别让用户白等）。
+    - **「准备中」遮罩**（用户报的第 1 个问题）：探测 + cwd 探针最长十几秒，
+      此前完全静默；现在复用 drop-hint 样式显示加载态。
+    - ZMODEM 通道没有同名目录弹窗（目录创建语义归远端 rz，客户端无法预检）；
+      cwd 探测失败直接取消而不是猜 home（此时往 PTY 发命令可能落进用户
+      开着的全屏程序里）。
+- **取舍**：
+  - 通道优先级 SFTP > ZMODEM：SFTP 协议更可靠且带完整冲突预检；ZMODEM 是
+    降级路径，接受「无同名目录弹窗」的行为差异。
+  - 探测没跑完（exec 也不可用/超时）→ 按 SFTP 试、失败如实报错，**不**建议
+    装 lrzsz——用户可能装不上，真正缺的是 exec 通道。
+  - ZMODEM 通道不做批次内重名目录剔除：rz 会把两棵树合并，与 SFTP 路径的
+    「拒绝」不同，接受这个差异（都安全，只是策略不同）。
+  - 探测结果按 session 缓存不做 TTL。
+- **验证**：
+  - `cargo test --lib`：152 passed（新增 `upload_caps_tests` 8 项：lrzsz 齐全
+    +apt、rz 缺 sz 判不可用、双缺失带安装命令、双缺失无包管理器不 panic、
+    SFTP 可用不提示安装、CRLF 输出、PM 行顺序无关、六个包管理器映射齐全）。
+  - `npm run test:ts` 通过。
+  - 真机端到端未走（需 vault 主密码 + 一台 SFTP 不可用的服务器）。
+
+### 阶段 225 —— 拖拽上传 ZMODEM 通道实测修复：rz 覆盖语义 + ZSKIP 不再卡死终端
+
+- **动机**：真机实测（ias@135.32.64.34:60018）暴露两个问题：① 拖入的文件在远端
+  已存在时 lrzsz 的 `rz` 直接回 ZSKIP 拒收，用户只看到「传输失败」；② 被拒后远端
+  `rz` 重新发出 ZMODEM 邀请，前端把它当成「用户手动敲 rz」弹了文件选择器，用户点
+  取消后终端卡死在 ZMODEM 模式（输入被吞，只能重连）。
+- **根因**：拖拽上传发的是裸 `rz`；lrzsz 对已存在文件的默认行为是跳过而非覆盖。
+  且 ZSKIP 在 zmodem_tx 里被当作致命错误直接 `Done`，会话结束但远端 rz 仍在等
+  下一个永远不会到的 offer。
+- **实现**：
+  - `src/components/TerminalPanel.vue`：
+    - 自动上传改发 `rz -y`（覆盖已存在文件），与 SFTP 路径的合并/覆盖语义对齐。
+    - 新增 `dragZmodemActive`：一次拖拽上传的 ZMODEM 会话进行中，远端 rz 再次
+      邀请（被拒重邀 / 多文件间隙）一律主动收场，绝不弹手动选择器。
+      在 onZmodemEnd / onZmodemError / rz 看门狗 / dispose 四处清理。
+    - 接入 `zmodem_file_skipped`：被跳过的文件名写到终端，不再静默丢失。
+  - `src-tauri/src/zmodem_tx.rs`：ZSKIP 从「致命错误 + Done」改为「产出
+    FileSkipped 事件 + 停在 WaitingZrinit2」，把「换下一个文件还是收尾」的决策
+    交回 ssh.rs（队列在那边，单文件 sender 看不到队列）。
+  - `src-tauri/src/ssh.rs`：reader 收到 FileSkipped 后有队列就
+    `send_zfile_offer` 换下一个文件，没队列就 `force_finish_for_timeout` 发
+    ZFIN 干净收尾（rz 收到 ZFIN 才会退出，不会挂着重新邀请）。
+  - `src-tauri/src/zmodem_tx.rs` 新增 `send_zfile_offer`（不消耗入站字节直接
+    产出 ZFILE 帧）——`feed(&[])` 因无帧可解析会直接返回空，不能复用。
+- **验证**：
+  - 新增 `zskip_continuation_tests` 两个用例：ZSKIP 不致命且停在 WaitingZrinit2、
+    `send_zfile_offer` 无入站字节也能产出合法 ZFILE 帧。
+  - `cargo check` 通过；`npm run test:ts` 通过。
+  - 真机复测未做（需用户再拖一次）。
+
+### 阶段 226 —— 拖拽上传 ZMODEM 卡死（第二轮）：ZFIN 回响被当成新的 rz 邀请
+
+- **动机**：阶段 225 修完后真机复测，截图显示终端序列：
+  `[ZMODEM] …chk.xml 被远端跳过` → `[ZMODEM 传输结束]` → `[ZMODEM 传输开始]`
+  → `[ZMODEM 传输结束]` → `[ZMODEM 传输开始]` + 选择器又弹，点取消仍卡死。
+- **根因**（与 225 不同，是上一层）：我们主动发 ZFIN 关会话，远端的 ZFIN
+  回响字节是 `**\x18B08…`，而 ZMODEM 自动启动针是 `**\x18B` —— **逐字节
+  相同**。回响落在 `TermMode::Normal`，被 `find_zmodem_start` 判定为「远端
+  又敲了一次 rz」，重新进入 Zmodem 模式并弹选择器。225 加的
+  `dragZmodemActive` 治不了这个：它在 `zmodem_end` 时就被清掉，而误检测
+  发生在 end 之后。
+- **修复**：`handle_incoming_data` 的 Normal 分支里，**抑制窗口内跳过
+  自动启动检测**（`suppress_until` 本就存在，此前只抑制输出 flush，没拦住
+  检测）。抑制窗口的语义正是「协议刚结束、噪声未落定」，此时不可能有真实
+  的用户敲 rz。同时把 ZSKIP 收尾路径的抑制窗口从 2s 延长到 5s——这条路径
+  确定会吞一个 ZFIN 回响，慢链路上 2s 会漏。
+- **回归**：新增 `zmodem_zfin_echo_tests::zfin_frame_bytes_match_the_autostart_needle`
+  锁住根因不变量（ZFIN 帧字节必须匹配 auto-start 针，普通终端文本必须不匹配）。
+  若有人改了针或 ZFIN 构造，这个测试先失败，而不是等用户再踩一次。
+- **取舍**：抑制期内一律不检测自动启动，代价是用户在协议结束后 500ms–5s 内
+  手动敲 `rz` 不会被识别（需再敲一次）。这个窗口内敲 rz 本就极少，且失败
+  代价只是「不生效」，远小于误检测导致的终端卡死。
+- **验证**：`cargo test --lib` 全量通过；真机复测未做。
+
+### 阶段 227 —— ZMODEM 取消后自启与历史命令卡死：收窄自动启动针 + 抑制期丢弃残留
+
+- **动机**：真机复测，`rz -y` 后点取消，终端出现 `cccccccc`（泄漏的 CAN 序列），
+  且「传输开始/结束」反复自启；另外上下方向键查历史命令会莫名卡住。
+- **根因**（前两轮都在治标）：
+  1. `ZMODEM_NEEDLES` 里有**裸 `\x18[ABC]`** 两条针（原意为「PTY echo 吃掉
+     前导 `**`」的兜底）。它让任何含 ZDLE 后跟 A/B/C 的字节流都命中自动启动
+     —— 包括 CAN 中止序列余波、shell 历史命令、二进制输出。这是自启与方向键
+     卡死的共同根因。
+  2. 抑制窗口只挡住了自动启动**扫描**，没有挡住数据本身：`append_capped`
+     照旧把 CAN 序列写进 buffer，`flush_buffer` 再把它吐到终端 —— 就是用户
+     看到的 `cccccccc`。
+  3. 裸针的原始理由不成立：远端 `rz` 自己发出的帧永远带完整 `ZPAD ZPAD ZDLE`，
+     echo 只影响我们输入的字节，不影响对端的帧。
+- **修复**：
+  - `ZMODEM_NEEDLES` 只保留规范前导 `**\x18[ABC]` 三条，删掉裸 ZDLE 兜底。
+  - `handle_incoming_data` 的 Normal 分支：抑制窗口内**提前返回并清空 buffer**，
+    协议残留既不进终端也不参与扫描。取代原来「先 append 再用 if 包住扫描」
+    的写法（那条路 scan 被挡住了，数据照样泄漏）。
+  - 取消路径（`ZmodemAbort`）的抑制窗口 500ms → 2s（阶段 226 已改，本次保留）。
+- **回归**：`zmodem_zfin_echo_tests` 新增两条 ——
+  `bare_zdle_form_is_not_an_autostart`（CAN 余波、历史命令中的 `\x18B` 不得命中）
+  与 `canonical_form_still_detected`（规范形式仍认，防止收窄过度）。
+- **取舍**：放弃「PTY echo 吃掉前导星号」的兜底后，若真有对端只发裸 ZDLE 帧，
+  将不再自动识别。该场景未在实测中出现，而裸针的误报代价（终端卡死、无法退出）
+  已被证实，故取严格一侧。
+- **验证**：`cargo test --lib` 全量通过；真机复测未做。
+
+### 阶段 228 —— ZMODEM 取消后仍自启：用持久锁断标志取代抑制窗口赌时间
+
+- **动机**：阶段 227 后真机复测，`rz -y` → 点取消，选择器仍再次弹出，终端无法退出。
+- **日志证据**：`sender task: aborted` 之后，`passthrough fallback (sender=None)`
+  每 10 秒出现一次，持续 18 秒以上 —— mode 被切回了 Zmodem。取消本身成功了，
+  是**取消之后**又被自动启动拉回去。
+- **根因**：rz 对 CAN 序列的**回复帧**晚于所有抑制窗口到达（实测 18s，试过
+  0.5s / 2s / 5s 全部落空），且该帧与一次全新的 `rz` 调用**字节完全相同**
+  （都是规范 `**\x18B` 帧）。用时间窗口赌「噪声何时落定」这个方向是错的。
+- **修复**：新增持久锁断标志 `zmodem_cancelled`。
+  - `ZmodemAbort` 时置位；置位期间自动启动检测一律拒绝进入 Zmodem 模式。
+  - 两条清除途径：① 用户敲键（`SessionCommand::Input`）—— 远端重新可交互；
+    ② 数据流里出现 shell 提示符（`looks_like_shell_prompt`：尾随空格 +
+    `$`/`#`/`>`/`%` 结尾）—— 用户不敲字也能恢复。
+  - 提示符判定刻意收窄：`total 48\r\ndrwxr-xr-x …`、行中间的 `$HOME` 都不得命中，
+    否则 chooser 会在普通输出上重开。
+- **取舍**：取消后到「出现提示符或用户敲键」之前，即使用户真的想立刻敲 `rz`
+  也会被拦一次。这是有意的——此刻根本无法区分「rz 的延迟回复」与「用户新的
+  rz」，而误放过的代价（终端卡死、只能重连）远大于多拦一次。
+- **回归**：`shell_prompt_detection_is_narrow_but_sufficient` 锁住提示符判定的
+  宽窄两端（bash/zsh/root/PS2 认，ls 输出与行中 `$` 不认）。
+- **验证**：`cargo test --lib` 全量通过；真机复测未做。
+
+### 阶段 229 —— 顶栏图标整排不显示：未注册图标名 + dev 服务过期预构建
+
+- **动机**：用户连续反馈「顶部图标不展示」。截图显示顶栏右侧仅剩三枚图标
+  （会话下拉、一枚、一枚），多窗口 / 监控 / AI / 快捷命令 / 设置均不可见。
+- **排查路径**（逐层排除，未靠猜测）：
+  1. 顶栏模板与 CSS 审阅 —— 六个按钮无条件渲染，结构无缺失。
+  2. myui `MyIconButton` 源码 —— 无任何隐藏逻辑，无条件渲染。
+  3. Vite 预构建缓存 —— 曾误判为脏数据，精确比对后确认干净（命中的
+     `placeholder` 是 myui 命令面板自身属性，非我误写内容）。
+  4. 浏览器 CDP 实测 —— 起隔离 Chrome 连 1420，注入 Tauri internals 桩让
+     AppShell 挂载（真实 Tauri 窗口不可 CDP）。
+  5. `resolveIcon` 逐个验证 + 全项目 75 个文件扫描。
+- **根因一（真因）**：v2.19.0 顶栏重构引入的四个图标名 `Columns` / `Rows` /
+  `Minimize` / `DataBoard` **从未在 myui 图标注册表登记**，`resolveIcon` 静默
+  回落 `Z.Unknown`（带问号的圆形占位）。`Robot` 虽在 LineIcons 中可用，但同排
+  其余 EP 系图标受第二个根因影响全部不可见，故整排看着都像「没显示」。
+- **根因二（真因，此前未识别）**：dev 服务进程内存中驻留**过期的 Vite 预构建**
+  输出。myui 于 11-11 升级（新 CSS 的 scopeId 族含 `33fa4ed0`），而 dev 服务
+  自 11-10 起未重启，仍服务旧 JS（运行时 scopeId `737a2551`）。myui 的宽高
+  规则写成 `.my-icon[data-v-33fa4ed0]{width:var(--my-icon-size)}`，scopeId
+  不匹配则**整条规则失配**，`.my-icon` 宽度塌成 0px，其内 Element Plus 系
+  图标 SVG（1024 viewBox）随之塌成 0×0。表现为「myui 自绘图标能显示、
+  EP 系图标全部不显示」的分界。
+  - 关键证据：`rm -rf node_modules/.vite` 后仍复现，浏览器依旧请求
+    `myui.js?v=16e9f6bb`（旧版本号）。必须**重启 dev 服务**才能丢弃内存中的
+    过期预构建，重启后 `?v=` 变为 `8bcb89b5`，scopeId 与 CSS 一致。
+- **修复**：
+  - 四个图标名改用已注册名（语义最近且不制造新冲突）：
+    `Columns`→`CopyDocument`（左右分屏）、`Rows`→`Files`（上下分屏）、
+    `Minimize`→`Fold`（退出分屏）、`DataBoard`→`Monitor`（监控面板）。
+    `Grid` 保留给多窗口（九宫格语义最贴切且用户已熟悉）。
+  - 全项目图标名扫描（75 文件 / 150 可用图标）确认缺失引用为 0。
+- **顺手加固**：`WindowControls.vue` 的 `getCurrentWindow()` 原先在 setup
+  **顶层同步调用**，非 Tauri 环境直接抛异常并中断整个 AppShell 的 setup
+  （探针实测：`#app` 只剩 132 字符、0 个按钮，整页白屏）。改为惰性获取，
+  失败只让窗口按钮退化为不可用，不再拖垮整壳。
+- **取舍**：分屏与监控图标接受语义降级。myui 是本地 git 依赖，为其补注册
+  这三个字形需改上游仓库，超出本次修复范围；若后续要做，正确位置是 myui
+  源仓库 `src/icons/line-icons.ts`，而非在消费方内联 SVG。
+- **验证**：CDP 实测 `scopeId=data-v-33fa4ed0`、`spanWidth=16px`、
+  `svgRect=16x16`，六个按钮 `isFallback` 全为 false；顶栏截图确认六枚图标
+  与窗口控制三钮全部清晰可见。`npm run test:ts` 通过。
+- **教训（操作层面）**：排查 UI 问题先用浏览器/CDP 拿真实 DOM 与计算样式，
+  不要反复审阅源码猜测。本次若一开始就测几何与计算宽度，两个根因都能直接
+  定位，不必绕过硬编码缓存误判。
+
+### 阶段 230 —— 删除终端分屏功能
+
+- **动机**：用户要求「上下分屏和左右分屏操作删除」。
+- **删除边界（自行拍板）**：采用连根删除，而非只删顶栏按钮。
+  理由：分屏状态只存内存（`panes.ts` 的 reactive Map，不持久化），
+  无数据残留风险；只删按钮会留下「已分屏 tab 无法退出」的死角，
+  且 store 与组件变成无入口的死代码，违背删除死重量原则。
+- **引用面盘点**（删除前查清，避免断链）：
+  - `SplitContainer.vue`：唯一消费者是 App.vue 的 `splitTreeOf` 分派。
+  - `src/store/panes.ts`：导出 11 个函数 + 4 个类型，消费者只有
+    App.vue（ensureTree/exitSplit/focusedPaneId/getTree/hasSplit/
+    splitPane/disposeTree/treeIds/PaneTree）与 SplitContainer.vue
+    （closePane/focusPane/resizePane/PaneNode）。
+  - 无跨模块引用，无持久化，无对应测试文件。
+- **删除清单**：
+  - `src/components/AppTopBar.vue`：三个分屏按钮 + `canSplit`/`isSplit`
+    props + `split`/`exit-split` emit。
+  - `src/App.vue`：panes store 导入、SplitContainer 导入、
+    `canSplit`/`activeSplit`/`activeFocusedPane` computed、
+    `splitTreeOf`/`doSplit`/`doExitSplit` 函数、tab 关闭时的
+    `disposeTree` 清理 watch、模板里的 SplitContainer 分派块、
+    传给 AppTopBar 的四个分屏绑定。
+  - `src/components/SplitContainer.vue`、`src/store/panes.ts`：整文件删除。
+- **未动**：`.work-panes` 容器（`flex:1` + `position:relative`，为
+  `.tab-stack` 绝对定位兜底，与分屏无关）；TerminalPanel 的 props
+  （本就无 `inputEnabled`/`resizeEnabled` 这类分屏专属属性）。
+- **验证**：`npm run test:ts` 通过；CDP 实测顶栏按钮列表为
+  会话下拉 / 多窗口 / 监控面板 / AI 助手 / 快捷命令 / 设置 +
+  窗口控制三钮，分屏按钮为 0，图标回落为 0，应用正常挂载
+  （`#app` innerHTML 20893 字符，对比白屏态的 132）。
+- **备注**：此次验证运行在纯 Vite 环境（Tauri dev 服务未起），
+  顺带证明了阶段 229 的 `WindowControls` 惰性化加固有效 ——
+  页面完整挂载，仅窗口按钮退化为不可用。
+
+### 阶段 231 —— ZMODEM 浮层取消未通知 Rust：取消后终端彻底锁死
+
+- **动机**：用户实测。拖拽上传三个文件 → 全部被远端 ZSKIP（同名已存在）
+  → 前端自动再发起一次 zmodem → 用户点浮层「取消」→ 浮层消失（看似成功）
+  → 之后终端无法输入命令。
+- **根因**：`TerminalPanel.vue` 的 `onZmodemCancel`（进度浮层取消钮）只调
+  `bridge?.abort()` —— 那是 **JS 版 zmodem 桥**的 abort。而当前上传走的是
+  **Rust 原生通道**（`zmodemStartUpload`），JS 桥的 abort 对它毫无作用。
+  于是：
+  - Rust 侧 `TermMode::Zmodem` 分支 `return Vec::new()`，继续吞掉所有
+    收发数据 → 终端「无法输入、也无输出」。
+  - 前端 2s 兜底只置 `isZmodem = false`，自己的标志清了，所以浮层消失、
+    看上去像成功退出；远端会话其实已被锁死。
+  - 这正是用户描述的「成功退出，但之后就无法输入命令了」。
+- **修复**：`onZmodemCancel` 补发 `sshSendZmodemAbort(sessionId)`。
+  Rust 的 `SessionCommand::ZmodemAbort` 分支**不检查 mode、无条件处理**：
+  发 CAN×8 + 8 个退格、`mode = Normal`、2s 抑制、emit `zmodem_end`、
+  清空 `zmodem_rx`/`tx_state.sender`/`file`/`queue`。前端补上这条 IPC 后
+  闭环成立。兜底定时器同时清 `uploadChooserOpen` 与 `dragZmodemActive`，
+  避免残留标志把用户此后每次手动 `rz` 都吃掉。
+- **为何此前没暴露**：其它取消入口（`commitNativeUpload` 空选择 /
+  `cancelNativeUpload` / Ctrl+C / `zmodemAcceptOffer` 失败）都显式调了
+  `sshSendZmodemAbort`，只有浮层这一处漏了。拖拽上传的残留标志
+  （`dragZmodemActive`）会把流程带进 `onZmodemStart` 的自动收场分支，
+  该分支走的是 `cancelNativeUpload`（有 abort），所以上一轮修完看着是好的；
+  用户这次在浮层上手动点取消，才走到这条漏掉的路。
+- **验证**：`npm run test:ts` 通过。真机复测未做——需要用户按原路径再跑
+  一次（拖入 → 被跳过 → 取消 → 敲命令）。
+- **遗留观察**（本次未改）：日志里 `receiver skipped the file (ZSKIP)`
+  说明 `rz -y` 未覆盖已存在文件。`-y` 是 lrzsz 版本相关行为，目前有三个
+  文件的明确提示且队列能继续、末个跳过后 ZFIN 干净收尾，属可接受降级；
+  若要彻底解决需在 SFTP 预检阶段删远端同名文件，代价是改变「不覆盖」
+  的安全默认，需用户确认后再做。
+
+### 阶段 232 —— ZMODEM 取消无限循环 + 取消后无法输入：删除 upload_aborted 标志
+
+- **动机**：用户实测。终端敲 `rz -y` → 弹选择器 → 点取消 → 立刻又弹
+  「传输开始」，无限重复（截图里 4 轮 `[dbg] zmodem_start upload:
+  auto=null drag=false` + `[ZMODEM 传输开始/结束]` 交替）；且此前还报过
+  取消后无法输入命令。
+- **日志证据**（阶段 231 加的 `[IN]` 诊断 + 既有 TX 日志）：
+  - `09:33:41.889 [IN] 1 bytes: "\r"` —— 用户回车发出 `rz -y`；
+  - `09:33:44.404 [TX] sender task: aborted, dropping 8 bytes` ——
+    **这 8 字节正是 abort 分支发的 CAN×8**，被 sender task 丢掉了；
+  - 之后没有任何 zmodem 正常收尾记录，只有用户又敲的两个 `\r`。
+- **根因**：`SessionCommand::ZmodemAbort` 分支的执行顺序是
+  `upload_aborted.store(true)` → `send_data(CAN×8)`。sender task 的循环
+  第一行就是 `if aborted { drop; break; }`，于是：
+  1. 8 个 CAN 连同后续所有批次被丢 → 远端 rz 永远收不到取消 → 继续发
+     ZRINIT → Rust 的自动启动针反复命中 → 前端反复 `zmodem_start`，
+     形成截图里的无限循环。
+  2. 同一分支还曾 `break` 让 sender task 退出 —— 它是整个会话唯一的写
+     通路，退出后用户敲的任何键都静默丢弃（「取消后无法输入命令」）。
+- **修复（两步）**：
+  1. 调换顺序：先 `send_data(CAN×8)` + 退格清理，再清 tx_state。
+  2. **整个 `upload_aborted` 机制删除**。理由：它想防的「取消后残留
+     上传数据混进远端 shell」已由 `tx_state.sender = None` +
+     `tx_state.queue.clear()` + `zmodem_cancelled` 覆盖（sender 没了，
+     文件数据无处产生）；而这个通道级标志的实际效果是让唯一的写通路
+     丢弃用户键盘输入，属于「用严重 bug 换一个不存在的好处」。
+     删除范围：AtomicBool 变量、sender task 的丢弃/break 分支、
+     `handle_incoming_data` 的参数、5 处 store(true/false)、相关注释。
+- **取舍**：删除后不再有「取消瞬间丢弃 mpsc 里已排队批次」的保护。
+  极端情况下（取消前一刻有 512KB 批次在队列里）那一批次会照常写出。
+  实测取消前 sender 已被 `tx_state.sender = None` 停止供数，队列里
+  最多剩一个已投递的批次，且是**合法文件数据**而非垃圾字节，
+  比丢 CAN 的代价小得多。
+- **验证**：`cargo check --bin myshell` 通过（无 error、无新增 warning、
+  无 upload_aborted 残留引用）。真机复测未做。
+- **顺带**：`ssh.rs` 的 `[IN]` 输入诊断日志保留（阶段 231 加的），
+  后续排查输入链路还用得上；若嫌日志吵可在发布前降为 debug。
+
+### 阶段 233 —— 上下键翻不出自己的命令：客户端注入的命令污染了 shell 历史
+
+- **动机**：用户报「当命令为 rz -y 的情况下，无法继续切换命令了」，截图显示
+  `rz -y` 敲完后光标停住、按上下键终端内容不变。
+- **排查转折**：阶段 231 加的 `[IN]` 日志证明方向键输入**完整到达 Rust 并
+  透传**（`[IN] 3 bytes: "\u{1b}[A"` 紧跟 `[TX] stream: 3 bytes`），
+  输入链路没有问题；阶段 232 加的 `[OUT]` 日志则暴露了真相：
+  ```
+  09:45:11.443 [OUT] "...退格×13 + ls\u{1b}[K"          ← 上键翻出 ls
+  09:45:11.672 [OUT] "echo __MCP_CWD_bahi6a1q__$PWD"     ← 下键翻出探针命令
+  09:45:11.928 [OUT] "export TMOUT=0 2>/dev/null"        ← 下键翻出 TMOUT 命令
+  ```
+  **远端历史里根本没有用户刚敲的 `rz -y`**，翻出来的全是客户端自动注入的
+  命令。用户自己的命令被挤到历史很后面，观感就是「切不动了」。
+- **根因**：客户端有两处往交互 PTY 注入命令，都未做历史隔离：
+  1. `TerminalPanel.vue` 的 `probeRemoteCwd` —— 拖拽上传前注入
+     `echo __MCP_CWD_<rand>$PWD` 取远端 cwd；
+  2. `ssh.rs` 的 `suppress_tmout` —— 连接建立时注入
+     `export TMOUT=0 2>/dev/null` 防 TMOUT 登出。
+  这两条都会按原样进入 bash/zsh 历史。
+- **修复**：两条注入命令都加**前导空格**，利用 bash 的
+  `HISTCONTROL=ignorespace` 与 zsh 的 `HISTORY_IGNORE` 使其不进历史。
+  代价：远端若没设 `HISTCONTROL`，空格不生效 —— 但那时这些命令本就不可见
+  （cwd 探针的回显与结果行被 sentinel filter 挡掉），进历史也只是噪音。
+- **未改**：`probeUploadCapabilities` 走独立 exec 通道
+  （`invoke("probe_upload_capabilities")`），不经过 PTY，无污染问题。
+- **验证**：`npm run test:ts` 通过。真机复测未做（需用户重连后按上下键确认
+  历史里只剩自己的命令）。
+- **备注**：此前的两次修复（阶段 231 浮层取消未通知 Rust、阶段 232
+  upload_aborted 吞掉 CAN）都是真实缺陷，日志证据充分；但用户描述的
+  「无法切换命令」最终定位在这里。三层问题叠在一起，逐层剥开才看到本质。
+
+### 阶段 234 —— rz 中止后远端 tty 停在 raw 模式：自动 + 手动双通道修复
+
+- **动机**：用户实测。终端出现 `rz -y[ias@34-prod ~]$`（rz 退出后提示符
+  直接接在同一行，无换行），随后「无法输入、无法删除编辑、无法切换命令，
+  回车才显示」。Ctrl+C 能退出该状态。
+- **日志证据**（阶段 233 的 `[IN]`/`[OUT]` 埋点）：
+  - 每个按键都有 25–90ms 的完整往返（`[IN] "l"` → `[OUT] "l"`），
+    方向键、退格也正常收发 —— **输入链路无问题**；
+  - `lslsls: command not found` 的成因是：上键翻到历史条目 `ls` 后继续
+    打字，readline 把字符追加到该条目末尾（`ls`+`lsls`），这是 readline
+    的标准行为，不是缺陷；
+  - `[OUT] " export TMOUT=0 2>/dev/null"` 带前导空格，但用户截图里该命令
+    仍出现在历史中 —— 那台机器 `HISTCONTROL` 为空，前导空格方案无效。
+- **根因**：`lrzsz` 的 `rz` 在读取数据前把 termios 设为 raw 模式（关闭
+  ECHO / ICANON / ISIG）。我们中止时发的 CAN×8 只被 `rz` 的协议层读取，
+  一旦 `rz` 没跑到自己的清理代码，termios 就永久停在坏状态：
+  ECHO 关 → 按键不回显；ICANON 关 → readline 收不到完整行，退格与方向键
+  全部失灵；只有 `\r` 能被当作 accept-line，于是「回车才显示」。
+  这个状态在协议层完全正常，客户端无从感知。
+- **修复（三部分）**：
+  1. **自动恢复**（`ssh.rs`）：`ZmodemAbort` 后设 `tty_restore_deadline`
+     = +1.2s。tick 到点后检查 `tty_saw_prompt`（由 `handle_incoming_data`
+     在 `looks_like_shell_prompt` 命中时置位）：见到提示符说明 tty 已自行
+     恢复，不发任何东西；没见到则补发 `\x03` + `" stty sane\r"`。
+     用提示符检测做闸门，避免对正常退出的 rz 注入多余命令。
+  2. **手动恢复**（前端）：命令栏新增「修复」按钮（Tools 图标），
+     经 `registerSessionAction` 注册的 `repair-terminal` 动作调用
+     `sendTo(Ctrl-C)` + `sendTo(" stty sane\r")`。覆盖任何把 tty 搞坏的
+     场景（rz 崩溃、vim 异常退出、`cat` 二进制），不必靠重连。
+  3. **历史隔离加固**：`HISTCONTROL` 为空的机器上，前导空格无效。
+     两处注入（cwd 探针、TMOUT）改为 `set +o history; <命令>; set -o history`
+     包裹，并在行首保留空格 —— 关闭动作发生在记录本条之前，故整行不入史。
+- **补齐日志**：`zmodem_start`/`zmodem_end`/`zmodem_error` 此前只发前端、
+  不进日志，导致本次排查把一次真实的中止误读成「rz 从未启动」，白绕一轮。
+  现统一走 `emit_zmodem_end` / `emit_zmodem_error` 两个辅助函数（19 处
+  end + 8 处 error 全部收口），日志带结束原因。
+- **`send_data` 不再静默失败**：写通道关闭时打 WARN + 丢弃字节数。
+  `upload_aborted` 那个 bug 之所以难查，正是因为字节被丢后毫无信号。
+- **诊断日志降级**：`[IN]` / `[OUT]` 逐键日志从 info 降回 debug，避免
+  淹没真实错误（本次日志 1000+ 行几乎全是按键往返）。
+- **方案 D 未采纳**：原计划「SFTP 可用时用 SFTP 取 cwd」不成立 ——
+  SFTP 的 `realpath(".")` 返回用户 home，与 shell 的当前工作目录无关
+  （`cd /opt/test` 后 SFTP 仍返回 home）。改用 `set +o history` 方案。
+- **验证**：`npm run test:ts` 通过；`cargo check --bin myshell` 零错误；
+  dev 服务已重编并运行（10:05:39 新实例）。真机复测未做 —— 需用户
+  敲 `rz -y` → 取消 → 立即打字，确认无需 Ctrl+C 即可输入。
+
+### 阶段 235 —— ZMODEM 取消路径全面收口：三条无兜底缺口
+
+- **动机**：用户要求复查「rz -y 不可操作 / 拖动上传 / 不可取消」三个问题。
+  此前四轮修复（阶段 231–234）解决了浮层取消漏发 abort、`upload_aborted`
+  吞 CAN、emit_zmodem_end 递归、tty raw 恢复，但端到端复查发现仍有路径
+  只做一半动作。
+- **复查方法**：枚举 `sshSendZmodemAbort` 全部 6 个调用点 + Ctrl+C 路径，
+  逐条核对「本地复位 isZmodem / 2s 兜底定时器 / 发 abort」三要素。
+- **缺口（3/6）**：
+  1. 选择器空选择取消（`commitNativeUpload([])`）——只发 abort，不复位、
+     无兜底。用户在 OS 文件对话框点「取消」就走这条路。
+  2. 上传启动失败（`zmodemStartUpload` reject）——同上。
+  3. 下载目录选择失败（`zmodemAcceptOffer` reject）——同上，下载方终端
+     同样会「能看不能打」。
+  这三条全靠 Rust 的 `zmodem_end` 事件兜底 —— 事件丢失（IPC 失败 / 会话
+  已死 / 事件竞态）时 `isZmodem` 卡 true，`onData` 吞掉所有按键，回到
+  用户报告的「不可操作」。
+- **修复**：新增 `abortZmodemSession(targetSid?)` 统一出口——发 abort +
+  立刻本地复位（isZmodem / uploadChooserOpen / dragZmodemActive）+
+  2s 兜底定时器（onZmodemEnd 到达时会清掉）。六条路径全部切换：
+  空选择、启动失败、目录失败、浮层取消（onZmodemCancel，替代手写的
+  同款逻辑）、手动取消钮（cancelNativeUpload 薄包装）、Ctrl+C（\x03
+  字节仍照常发往远端中断前台进程）。
+- **`targetSid` 参数**：setupTerminal 闭包里的事件处理器传当时的 `sid`——
+  组件重建后 `props.sessionId` 已换新值，迟到的旧事件不该误伤新会话。
+- **拖动上传路径复核**：拖入 → 能力探测（独立 exec 通道，不污染 PTY）→
+  cwd 探针（带 set +o history 隔离 + stderr 重定向）→ SFTP 优先 /
+  ZMODEM 降级；ZMODEM 分支的 rzWatchdog 与 onZmodemStart 之间无竞态
+  （start 处理器先清看门狗再提交）；dispose 时探针等待者、冲突对话框、
+  挂起的自动上传、看门狗全部收场。未发现新缺口。
+- **验证**：`npm run test:ts` 通过（本轮仅前端改动；Rust 侧 159 项在
+  阶段 234 已全绿）。真机复测仍欠 —— dev 端口 1420 被 Windows Hyper-V
+  动态排除段占据，需管理员 `net stop winnat` 后重启验证。
+
+### 阶段 236 —— 手动 rz 上传入口简化：直弹系统对话框，取消即关闭不选
+
+- **动机**：用户反馈 rz 弹出的「选择文件 / 选择文件夹 / 取消」三按钮内嵌
+  选择条多一步操作、徒增复杂且是卡死多发地（阶段 225–235 的多个 bug 都
+  发生在这条浮层的开/关/残留标志上）。期望：直接弹文件选择框，不选即取消。
+- **改动**（TerminalPanel.vue）：
+  - `onZmodemStart` 手动分支不再置 `uploadChooserOpen`，直接
+    `pickUploadFiles()` 弹系统文件选择框；
+  - 关闭不选 → `commitNativeUpload([])` → `abortZmodemSession()`（阶段
+    235 的统一出口：abort + 立刻复位 + 2s 兜底）——「取消」不再是独立
+    按钮而是「不选择」这个自然动作；
+  - `pickUploadFiles` 加 try/catch：对话框本身打不开也走空选择收场，
+    不搁浅会话；
+  - 删除 `uploadChooserOpen` 状态、内嵌选择条模板、`pickUploadFolder`、
+    `.upload-chooser`/`.chooser-*` CSS、诊断期遗留的 `[dbg]` 终端行。
+- **取舍**：手动 rz 不再能选文件夹 —— 文件夹上传统一走拖拽路径（拖入即
+  递归，SFTP 优先/ZMODEM 降级），能力无损，少一条 UI 分支。若日后要
+  「一个对话框混选文件+文件夹」，Windows 的 FOS_PICKFOLDERS 语义可支持，
+  但 rfd/Tauri dialog 插件未暴露该组合，跨平台行为不可控，不做。
+- **验证**：`npm run test:ts` 通过；`uploadChooserOpen`/`pickUploadFolder`/
+  `[dbg]` 引用清零。真机验证与阶段 235 同批（端口恢复后一并测）。
+
+### 阶段 237 —— 顶栏标签浏览器式收缩 + 侧栏顶排恒单行
+
+- **动机**：用户两项实报——① 侧栏拉宽 30px 后顶排动作钮仍折成两行；
+  ② 标签条用横向滚动条、单标签宽度空余大、操作钮悬停才可见、颜色不好看。
+- **改动**：
+  1. `AppSidebar.vue`：`.header-actions` 去 `flex-wrap: wrap`（恒单行）；
+     动作钮 `flex: 0 1 28px` + `min-width: 24px`（可压缩不换行）；
+     顶排内边距 8→6px。200px 最窄侧栏：12+6×24+5×1+8+28=197px 单行。
+  2. `AppTopBar.vue` 标签条：
+     - `.tab-item` `flex: 0 0 auto` → `flex: 1 1 0`（等分收缩）+ 上限
+       `max-width: 15em` + 下限 `min-width: 4.5em`；`.tabs-scroll`
+       `overflow: auto → hidden`（去滚动条）。
+     - 内容只显示服务器名称（`tabHost` 标识退役出条，`tabTitle` 悬停
+       保留完整 `用户@host`）；等宽字体改回 UI 字体。
+     - 关闭钮 Firefox 式常显：`opacity: 0` → `0.45`（悬停/活动全亮 1）；
+       广播钮维持悬停浮现（低频批量操作）。
+     - 对比度：非活动标签 `--text-secondary` → `--text-primary` + 整项
+       `opacity: 0.72`（活动态回到 1），层次与可读性兼顾。
+- **验证**（Chrome 探针 + 合成 10 标签 + 强制展开侧栏）：
+  - viewport 1251：10 标签各 80px 等宽、`overflowX=false`、活动标签
+    高亮可辨、关闭钮可见；侧栏 230px 时 6 钮全 28px 单行。
+  - viewport 900：10 标签各 54px（= 4.5em 下限）——空间再紧时超出
+    下限的标签被 `overflow:hidden` 裁掉，与浏览器超载行为一致；
+    「当前会话」下拉提供全量入口兜底。
+  - `npm run test:ts` 通过。
+- **取舍**：① 极端多标签（窄窗 + 10+ 个）时边缘标签被裁不可点——浏览器
+  同样如此，未做「图标化再收缩」的二段策略，复杂度不值；② 标签只显
+  名称意味着多开同一台机器时名称可能重复，区分靠图标/状态点/悬停；
+  ③ 用户@host 标识（2026-11-12 引入）整体退役出条，`tabHost` 函数仅存
+  于 `tabTitle` 供悬停。
+
+### 阶段 238 —— 顶栏/侧栏图标精简、标签溢出收纳、放行指示挪位
+
+- **动机**：用户三项实报——① 顶部宽度不够时「展开收起」被裁；② AI 的魔法棒
+  图标看着像"美化"；③ 快捷命令图标重复出现两次。连同上一轮未确认的三项
+  （标签溢出 `...`、删文档图标、放行 chip 挪位）合并执行。
+- **改动**：
+  1. `AppSidebar.vue`：折叠钮 `flex-shrink: 0`（永不压缩；`.header-actions`
+     加 `flex:1; min-width:0` 优先吸收压缩）；删除侧栏顶排的快捷命令钮
+     （与顶栏闪电入口重复，6→5 枚）。
+  2. `AppTopBar.vue`：AI 图标 `MagicStick`→`Robot`（myui LineIcons 已注册）；
+     触发钮删 `icon-name="Document"`（`SessionDropdownPanel` 的 iconName 改
+     可选、空则不渲染）；标签模板删关闭/广播钮（操作全走「当前会话」下拉），
+     `min-width` 4.5→3.2em；新增 `tabs-overflow`（…）钮 + ResizeObserver/
+     tabs-watch 溢出检测（`scrollWidth > clientWidth+1`），点击开同一面板；
+     放行 chip 挪到快捷命令左侧、文案「MCP 高危已放行」+ tooltip 注明
+     作用域。
+  3. 清理死代码：`canBroadcast`、`tab-broadcast`/`tab-close` CSS、侧栏
+     `openQuickCommands`。
+- **验证**：`npm run test:ts` 通过（中途修复两处编辑事故：recomputeAnchor
+  闭合括号与 store 导入被吞，均已补回并复检）。Chrome 探针合成场景：
+  4 标签不溢出 / 18 标签正确判定溢出（公式侧验证；按钮渲染由
+  tabs.length 的 watch + RO 驱动，探针直改 DOM 绕过了响应式，渲染路径
+  以类型检查与模板核对为准）；200px 侧栏下折叠钮 28px 完整、5 钮单行；
+  视觉模型核读：触发钮已是「0 徽标」无文档图标、AI 为机器人形、标签
+  等宽「图标+短名」、无滚动条。
+- **取舍**：① 探针无法驱动真实 tabs store，`...` 钮的出现/消失未做像素级
+  验证，靠 watch 逻辑与检测公式分侧验证；真机多开十几个标签可复核。
+  ② 放行仍是 MCP 进程级（用户上一轮已被告知），本轮只做 UI 去歧义；
+  「按连接放行」仍为待确认的独立项。
+
+### 阶段 239 —— MCP gui 通道按客户端进程隔离终端标签
+
+- **动机**：用户发现多个 MCP 进程（多个 AI 客户端各自拉起的 myshell-mcp）
+  操作同一个终端会话——命令交错、cwd/环境互相污染。根因：前端
+  `exec_in_tab` 按 connectionId 找「任一终端标签」复用，进程间共享同一条
+  持久 shell；执行互斥锁也按连接键控，只串行未隔离。
+- **实现**（三层）：
+  1. `myshell-mcp.rs`：`exec_in_tab` IPC 载荷新增 `client_pid`
+     （`std::process::id()`，每个 MCP 进程的稳定标识）。
+  2. `main.rs`：IPC handler 透传 `client_pid` 进 `mcp-gui-command` 事件。
+  3. `useMcpBridge.ts`：
+     - 新增进程级标签注册表 `mcpProcessTabs`（"连接:pid" → tabId）；
+     - exec 解析标签时优先取注册表里本进程的存活标签；无 pid（旧版 MCP）
+       回落旧的「任一同连接标签」行为，新旧二进制共存不炸；
+     - 新建标签路径改为按「调用前标签 id 快照」识别**本次新增**的标签
+       （不能按连接找已连接标签——本进程握手期间其它进程的旧标签可能
+       已连接，会登错标签、隔离失效）；
+     - 执行互斥锁键 `connection_id` → `"连接:pid"`：各自 PTY 各自串行，
+       进程间并行；
+     - startMcpBridge 内 watch tabs，标签被关即清注册项；返回统一 unlisten。
+- **文档同步**：initialize instructions 第 3 条与 EXECUTION CHANNEL 段改为
+  「one persistent shell per MCP CLIENT PROCESS」；`docs/mcp-integration-spec.md`
+  的 exec_channel 表格与说明同步，并注明「进程重启换 pid → 新标签，
+  shell 状态不跨重启延续」。
+- **验证**：`cargo test --bin myshell-mcp` 27 项全过（含
+  `instructions_state_the_encoding_norm` 对新文案的断言）；`cargo test --lib`
+  159 项全过；`npm run test:ts` 通过。真机双进程验证未做 —— 需要两个 AI
+  客户端同时连同一服务器各跑命令，确认 GUI 出两个标签、输出不串。
+- **生效条件**：GUI 侧改动随 dev HMR 生效；但 AI 客户端用的是**已安装的**
+  myshell-mcp.exe，需要 `cargo build --bin myshell-mcp` 重编并替换
+  （build-release 脚本在打包时自动带上）。旧 MCP + 新 GUI = 兼容共享；
+  新 MCP + 新 GUI = 进程隔离。
+- **取舍**：① open_connection（"在 GUI 中打开"）保持聚焦已有标签，不隔离
+  —— 它是给用户看的，不是给 AI 串行用的；② MCP 进程重启后旧标签成孤儿，
+  不自动关（断开≠退出，误杀风险大于孤儿标签），用户手动关。
+
+### 阶段 240 —— 多标签治理二轮：min-width 7em + 悬停关闭恢复
+
+- **动机**：用户实拍 20 个标签全挤成 "ia..."（3.2em 下限太小），且复调
+  「鼠标放上去应该可以展示 x 关闭」——上一轮删光标签操作钮后，逐个关闭
+  要去下拉面板，多标签场景太绕。
+- **改动**（AppTopBar.vue）：
+  - `.tab-item` min-width 3.2em → 7em：保证「图标 + 4-5 字 + 状态点
+    + 关闭钮」可读；20 标签在 823px 条宽下实测每个压至 84px 下限、
+    条内完整可见 9 个，其余裁切由 `…` 溢出钮收纳（clipped=true 会驱动
+    tabs watch 显示 `…`）。不再出现整排省略号重叠的观感。
+  - 悬停关闭钮恢复：Chrome 式（悬停/活动标签显示 ×，平时 opacity 0），
+    与 2026-11-12 的 Firefox 式常显不同——用户先要求常显、这轮改为悬停，
+    以用户最新要求为准。广播切换仍只在下拉（低频批量）。
+- **取舍**：条内可见标签数从「全部挤成省略号」变为「约 9 个可读 + 其余
+  收纳进 …」——用户要么看省略号、要么接受裁切收纳，二选一（浏览器同款
+  权衡，且我们无滚动条方案已定）。
+- **验证**：`npm run test:ts` 通过；Chrome 探针合成 20 标签实测上述几何。
+
+### 阶段 241 —— 悬停 × 套娃修复：绝对定位收进标签内
+
+- **动机**：用户实拍——悬停第 1 个标签，× 出现在第 2 个标签上；滑过去，
+  第 1 个的 × 消失、第 2 个的 × 出现在第 3 个上，“套娃”且点不中。
+- **根因**：× 用流内 flex 布局，而 myui 的 MyIconButton 默认宽 36px，
+  `.tab-close` 未覆盖尺寸；84px 标签里「图标 14 + gap×3 + 名称 + 状态点
+  8 + ×36」≈ 100px 放不下，`flex-shrink: 0` 又不让它缩 → × 溢出到右侧
+  相邻标签区域，视觉与点击目标都错位。
+- **修复**（AppTopBar.vue）：× 改**绝对定位**——`right: 4px; top: 50%;
+  translateY(-50%); 18px×18px`（覆盖库默认尺寸），盖住状态点（悬停时
+  状态点 opacity 0 让位）。绝对定位元素不再参与流宽计算，永不跳出标签
+  右缘。
+- **验证**：`npm run test:ts` 通过；探针实测——6 标签（无裁切）× 全部
+  在标签界内且命中自身；10 标签场景全部在界内（第 10 个位于裁切区，
+  真实场景不可见/不可悬停，无实际影响）。

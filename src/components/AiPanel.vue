@@ -459,7 +459,7 @@ function onSelectModel(supplierId: number, modelString: string): void {
     <header class="panel-header">
       <div class="header-titles">
         <span class="panel-title">
-          <MyIcon class="title-icon" :size="14" name="Robot" />
+          <MyIcon class="title-icon" :size="14" name="MagicStick" />
           AI 助手
         </span>
         <span class="ctx-label" :title="ctxLabel">上下文：{{ ctxLabel }}</span>

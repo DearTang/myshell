@@ -10,9 +10,21 @@ import {
   rollbackBackup,
   getAppVersion,
   getPreviousVersion,
+  readTextFile,
+  saveConnection,
   type BackupInfo,
+  type ConnectionConfig,
 } from "@/api";
+import {
+  parseCsv,
+  parseMobaXterm,
+  parsePuttyReg,
+  parseSecureCrt,
+  parseSshConfig,
+  type ImportError,
+} from "@/utils/importers";
 import { ui } from "@/store/ui";
+import { reloadConnections } from "@/store/connections";
 
 defineOptions({ name: "DataSection" });
 
@@ -33,6 +45,102 @@ const showExportDialog = ref(false);
 const importPass = ref("");
 const importPath = ref<string | null>(null);
 const showImportDialog = ref(false);
+
+// ── 外部工具导入（ssh_config / PuTTY / MobaXterm / SecureCRT / CSV）──
+// 两步走：选文件 → 解析预览（可勾选）→ 逐条 saveConnection。
+// 凭据一律不导入：这些格式要么不存密码，要么用各家私有方式加密，硬解
+// 只会制造错误的安全感。预览列表把密码/私钥列标注为「导入后需自行填写」。
+const extFormats = [
+  { key: "ssh_config", label: "OpenSSH ssh_config", ext: ["", "config", "conf"], parser: parseSshConfig },
+  { key: "putty", label: "PuTTY 注册表导出", ext: ["reg"], parser: parsePuttyReg },
+  { key: "moba", label: "MobaXterm", ext: ["mobaconf", "mxtsessions", "ini"], parser: parseMobaXterm },
+  { key: "securecrt", label: "SecureCRT", ext: ["ini", "dat"], parser: parseSecureCrt },
+  { key: "csv", label: "CSV", ext: ["csv"], parser: parseCsv },
+] as const;
+
+const showExtDialog = ref(false);
+const extBusy = ref(false);
+const extErr = ref<string | null>(null);
+/** 解析出来的草稿（含勾选状态）。 */
+const extDrafts = ref<(ConnectionConfig & { _checked: boolean })[]>([]);
+/** 解析过程中的逐条失败。 */
+const extParseErrors = ref<ImportError[]>([]);
+const extFileName = ref("");
+
+async function startExternalImport(): Promise<void> {
+  const selected = await open({
+    multiple: false,
+    filters: [
+      { name: "连接导出文件", extensions: ["config", "conf", "reg", "mobaconf", "mxtsessions", "ini", "dat", "csv", ""] },
+    ],
+  });
+  if (!selected || Array.isArray(selected)) return;
+  extBusy.value = true;
+  extErr.value = null;
+  try {
+    const text = await readTextFile(selected);
+    extFileName.value = selected.split(/[\\/]/).pop() ?? selected;
+    const parsed = pickParser(selected, text);
+    extParseErrors.value = parsed.errors;
+    extDrafts.value = parsed.configs.map((c) => ({ ...c, _checked: true }));
+    if (extDrafts.value.length === 0 && parsed.errors.length === 0) {
+      extErr.value = "文件里没有可导入的连接";
+      return;
+    }
+    showExtDialog.value = true;
+  } catch (e) {
+    extErr.value = `读取或解析失败：${e}`;
+  } finally {
+    extBusy.value = false;
+  }
+}
+
+/** 按扩展名选解析器；认不出来时按内容特征兜底。 */
+function pickParser(path: string, text: string) {
+  const lower = path.toLowerCase();
+  const byExt = extFormats.find((f) => f.ext.some((e) => e && lower.endsWith(`.${e}`)));
+  if (byExt) return byExt.parser(text);
+  // ssh_config：以 "Host " 开头的行
+  if (/^\s*Host\s+\S/im.test(text)) return parseSshConfig(text);
+  // PuTTY .reg：注册表段头
+  if (/SimonTatham\\PuTTY\\Sessions/i.test(text)) return parsePuttyReg(text);
+  // MobaXterm：SubRep= 键
+  if (/^\s*SubRep=/im.test(text)) return parseMobaXterm(text);
+  // SecureCRT：S:"..."= 键
+  if (/^\s*S:"/m.test(text)) return parseSecureCrt(text);
+  return parseCsv(text);
+}
+
+async function commitExternalImport(): Promise<void> {
+  const chosen = extDrafts.value.filter((d) => d._checked);
+  if (chosen.length === 0) {
+    extErr.value = "没有勾选任何连接";
+    return;
+  }
+  extBusy.value = true;
+  extErr.value = null;
+  const failed: string[] = [];
+  let ok = 0;
+  for (const d of chosen) {
+    try {
+      // 逐个保存：一个坏行不该拖垮整批，用户还能从错误列表里看出是哪个。
+      const { _checked, ...config } = d;
+      await saveConnection(config);
+      ok++;
+    } catch (e) {
+      failed.push(`${d.name || d.host}：${e}`);
+    }
+  }
+  extBusy.value = false;
+  if (failed.length > 0) {
+    extErr.value = `已导入 ${ok} 个，${failed.length} 个失败：\n${failed.join("\n")}`;
+  }
+  if (ok > 0) {
+    showExtDialog.value = false;
+    await reloadConnections();
+    emit("refresh");
+  }
+}
 
 // ── 版本备份与回退 ──
 const appVersion = ref("");
@@ -206,6 +314,16 @@ async function handleRollback(version: string): Promise<void> {
         <MyIcon :size="14" name="Download" />
         导入配置
       </MyButton>
+      <MyButton
+        variant="secondary"
+        class="io-btn"
+        :disabled="exportBusy || importBusy"
+        title="从 OpenSSH / PuTTY / MobaXterm / SecureCRT / CSV 迁移连接"
+        @click="startExternalImport"
+      >
+        <MyIcon :size="14" name="Connection" />
+        从外部工具导入
+      </MyButton>
     </div>
     <div class="count-hint">当前共有 {{ connectionCount }} 个连接</div>
 
@@ -306,6 +424,43 @@ async function handleRollback(version: string): Promise<void> {
         @click="handleExport"
       >
         {{ exportBusy ? "导出中..." : "导出" }}
+      </MyButton>
+    </div>
+  </MyDialog>
+
+  <!-- 外部工具导入：解析预览 + 勾选 + 逐条保存。
+       密码/私钥一律不导入（见 script 里的说明），所以每行都标一句
+       「导入后需自行填写凭据」，别让用户以为填完名字就能连。 -->
+  <MyDialog
+    v-model="showExtDialog"
+    title="从外部工具导入"
+    :width="640"
+    dismissable
+    @cancel="showExtDialog = false"
+  >
+    <div class="ext-intro">
+      已从 <b>{{ extFileName }}</b> 解析出下列连接。勾选要导入的条目，确认后写入连接列表。
+      密码与私钥不会从外部文件带入，导入后请逐个连接补填凭据。
+    </div>
+    <div v-if="extParseErrors.length > 0" class="ext-errors">
+      <div class="ext-errors-title">{{ extParseErrors.length }} 条未能解析：</div>
+      <div v-for="(e, i) in extParseErrors" :key="i" class="ext-error-row">
+        <b>{{ e.source }}</b> — {{ e.reason }}
+      </div>
+    </div>
+    <div class="ext-list">
+      <label v-for="(d, i) in extDrafts" :key="i" class="ext-row">
+        <input v-model="d._checked" type="checkbox" />
+        <span class="ext-name">{{ d.name }}</span>
+        <span class="ext-host">{{ d.username }}@{{ d.host }}:{{ d.port }}</span>
+        <span class="ext-type">{{ d.conn_type }}</span>
+        <span v-if="d.group_path && d.group_path !== '/'" class="ext-group">{{ d.group_path }}</span>
+      </label>
+    </div>
+    <div class="dialog-actions">
+      <MyButton variant="secondary" @click="showExtDialog = false">取消</MyButton>
+      <MyButton variant="primary" :loading="extBusy" @click="commitExternalImport">
+        导入勾选的 {{ extDrafts.filter((d) => d._checked).length }} 个
       </MyButton>
     </div>
   </MyDialog>
@@ -519,5 +674,77 @@ async function handleRollback(version: string): Promise<void> {
   gap: 10px;
   margin-top: 20px;
   justify-content: flex-end;
+}
+
+/* ── 外部工具导入预览 ── */
+.ext-intro {
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+  line-height: 1.6;
+  margin-bottom: 10px;
+}
+.ext-errors {
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--danger, #dc2626) 10%, transparent);
+  font-size: var(--fs-2xs);
+  color: var(--text-secondary);
+  max-height: 120px;
+  overflow-y: auto;
+}
+.ext-errors-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.ext-error-row {
+  line-height: 1.5;
+}
+.ext-list {
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.ext-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.ext-row:last-child {
+  border-bottom: none;
+}
+.ext-row:hover {
+  background: var(--bg-surface-hover);
+}
+.ext-name {
+  font-weight: 500;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+.ext-host {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--text-secondary);
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ext-type,
+.ext-group {
+  flex-shrink: 0;
+  font-size: var(--fs-2xs);
+  color: var(--text-tertiary);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle, rgba(127, 127, 127, 0.12));
 }
 </style>

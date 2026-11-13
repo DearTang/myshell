@@ -177,6 +177,10 @@ pub struct SshClient {
     /// Shared with `dial_and_authenticate` (which keeps a clone) because russh
     /// consumes the handler on connect and doesn't hand it back on failure.
     pub host_key_mismatch: Arc<Mutex<Option<(String, String)>>>,
+    /// Live SSH tunnels. Present so a server-initiated `forwarded-tcpip`
+    /// channel (remote `-R` forward) can be routed to the rule that asked for
+    /// it. `None` for connections that never use port forwarding.
+    pub port_forwards: Option<Arc<crate::forward::ForwardManager>>,
 }
 
 impl client::Handler for SshClient {
@@ -275,6 +279,45 @@ impl client::Handler for SshClient {
     fn adjust_window(&mut self, _channel: russh::ChannelId, window: u32) -> u32 {
         window.max(16 * 1024 * 1024)
     }
+
+    /// Server-initiated channel for a remote (`-R`) port forward: someone
+    /// connected to the port the server is listening on for us.
+    ///
+    /// Routing is by `(connected_address, connected_port)` — the only pair
+    /// the protocol gives us about which forward request the channel belongs
+    /// to. An unmatched channel is closed rather than accepted-and-dropped:
+    /// leaving it open would make the remote client hang until timeout.
+    ///
+    /// The pump runs as a detached task so this returns immediately and never
+    /// stalls the session's read loop (a slow local target dial would
+    /// otherwise freeze terminal output).
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        match self.port_forwards.as_ref() {
+            Some(mgr) => mgr.handle_forwarded_channel(
+                connected_address,
+                connected_port,
+                channel,
+            ),
+            None => {
+                log::warn!(
+                    "[ssh] forwarded-tcpip for {}:{} on a connection without \
+                     port forwarding — dropping",
+                    connected_address,
+                    connected_port
+                );
+                let _ = channel.close().await;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -306,17 +349,54 @@ const CAN: u8 = 0x18;
 /// ZPAD — ZMODEM frame padding byte ('*'), starts every frame header.
 const ZPAD: u8 = b'*';
 
-/// ZMODEM auto-start needles. The protocol uses three framing variants after
-/// the ZDLE escape byte:
-///   `ZBIN  = 'A'` — binary frame, CRC16
-///   `ZHEX  = 'B'` — hex frame    (lrzsz's rz/sz both send this first)
-///   `ZBIN32 = 'C'` — binary frame, CRC32
-/// The canonical lead-in is `ZPAD ZPAD ZDLE` = `**\x18`, but PTY echo can strip
-/// the leading `**`, so we also accept the bare `\x18[ABC]` form.
-const ZMODEM_NEEDLES: [&[u8]; 6] = [
-    b"**\x18A", b"**\x18B", b"**\x18C",  // canonical (prefer — earliest match wins)
-    b"\x18A",   b"\x18B",   b"\x18C",    // bare ZDLE fallback
+/// One-shot TMOUT suppression injected into the PTY right after the shell
+/// starts (gated by the `suppress_tmout` connect flag). Extracted as a named
+/// constant so a unit test can pin its shape: leading space (HISTCONTROL
+/// isolation), `set +o/-o history` wrapper (un-set HISTCONTROL hosts), and a
+/// `2>/dev/null` on EVERY command so non-bash login shells don't print
+/// "Illegal option" garbage on connect.
+const TMOUT_SUPPRESS_COMMAND: &[u8] =
+    b"\n set +o history 2>/dev/null; export TMOUT=0 2>/dev/null; set -o history 2>/dev/null\n";
+/// ZMODEM auto-start needles.
+///
+/// ONLY the canonical `ZPAD ZPAD ZDLE [ABC]` form is accepted. The bare
+/// `\x18[ABC]` fallback that used to live here was removed deliberately: it
+/// matched ANY byte stream containing ZDLE followed by 'A'/'B'/'C', which
+/// includes the tail of a CAN abort burst, shell history, and binary output.
+/// The observed symptoms were the upload chooser re-popping after a cancel
+/// and the terminal freezing on arrow-key history lookup.
+///
+/// The fallback's original justification — "PTY echo can strip the leading
+/// `**`" — does not hold: when the remote runs `rz`, the frames IT emits
+/// always carry the full `ZPAD ZPAD ZDLE` prefix, and echo only affects what
+/// WE type, never the peer's frames.
+const ZMODEM_NEEDLES: [&[u8]; 3] = [
+    b"**\x18A",
+    b"**\x18B",
+    b"**\x18C",
 ];
+
+/// True when the buffer's tail looks like an interactive shell prompt.
+///
+/// Used to clear the post-cancel auto-start lockout: once rz has exited, the
+/// remote prints a prompt (`user@host:~$ `, `# `, `> `) and a NEW `rz` typed by
+/// the user must be honoured again. Deliberately narrow — matching too eagerly
+/// would re-open the chooser on ordinary output.
+fn looks_like_shell_prompt(buf: &[u8]) -> bool {
+    // Only the tail matters, and only when it ends with the prompt's
+    // trailing space (shells emit `$ ` / `# ` and then wait for input).
+    let tail = &buf[buf.len().saturating_sub(64)..];
+    let s = String::from_utf8_lossy(tail);
+    let trimmed = s.trim_end();
+    // Reject if the tail is mid-line (no trailing space in the raw bytes).
+    if !buf.ends_with(b" ") && !buf.ends_with(b"\n") {
+        return false;
+    }
+    trimmed.ends_with('$')
+        || trimmed.ends_with('#')
+        || trimmed.ends_with('>')
+        || trimmed.ends_with("%") // zsh default
+}
 
 /// Scan `buf` for the earliest ZMODEM auto-start. Returns the index of the
 /// first byte of the match so the caller can split: prefix → terminal, suffix
@@ -562,6 +642,10 @@ pub async fn dial_and_authenticate(
         host: config.host.clone(),
         port: config.port,
         host_key_mismatch: Arc::clone(&host_key_mismatch),
+        // Every connection gets the manager so a remote forward can be
+        // started on any of them later; connections that never use it simply
+        // never see a `forwarded-tcpip` channel.
+        port_forwards: Some(Arc::clone(&state.port_forwards)),
     };
 
     // Branch on proxy config: if proxy_type is set, dial the proxy first
@@ -854,30 +938,13 @@ async fn channel_reader(
     // which deadlocks the sender task (write_all awaits window → reader can't
     // process WINDOW_ADJUST → window never reopens). 64 is safe.
     let (data_tx, data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    // Abort flag shared between the reader loop and the sender task. When a
-    // ZMODEM transfer is aborted (rz sends CAN, user clicks cancel, or an
-    // error occurs), we set this flag so the sender task DROPS all queued
-    // batches instead of writing them to the SSH channel — otherwise the
-    // data already buffered in the mpsc (up to 64 × 512 KB ≈ 32 MB) would
-    // keep flowing to rz's stdin AFTER rz has exited, printing as garbled
-    // terminal output.
-    let upload_aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sender_sid = session_id.clone();
     let data_sender_task = tokio::spawn({
-        let aborted = Arc::clone(&upload_aborted);
         async move {
             use tokio::io::AsyncWriteExt;
             let mut writer = writer;
             let mut rx = data_rx;
             while let Some(batch) = rx.recv().await {
-                // If the transfer was aborted, drain and discard all remaining
-                // batches to prevent post-abort ZMODEM data from reaching the
-                // remote shell as garbled input.
-                if aborted.load(std::sync::atomic::Ordering::Relaxed) {
-                    log::info!("[ssh:{}] [TX] sender task: aborted, dropping {} bytes", sender_sid, batch.len());
-                    while rx.recv().await.is_some() {}
-                    break;
-                }
                 let t0 = Instant::now();
                 if let Err(e) = writer.write_all(&batch[..]).await {
                     log::warn!("[ssh:{}] data sender task: write_all failed: {}", sender_sid, e);
@@ -901,7 +968,10 @@ async fn channel_reader(
     /// pump slowing to line speed. Never blocks on network state.
     async fn send_data(data_tx: &tokio::sync::mpsc::Sender<Vec<u8>>, data: &[u8]) {
         if data_tx.send(Vec::from(data)).await.is_err() {
-            // Sender task has exited (connection dropped).
+            // Sender task has exited (connection dropped). Log it: a silent
+            // failure here is what made an earlier "bytes never reached the
+            // remote" bug invisible in the logs.
+            log::warn!("send_data: writer task gone, {} bytes dropped", data.len());
         }
     }
     log::info!("[ssh:{}] channel_reader started", session_id);
@@ -922,9 +992,16 @@ async fn channel_reader(
     // TMOUT=...`; in that locked case there is no safe workaround (any periodic
     // PTY byte injection would corrupt editors like vim), so we leave it be.
     // Leading/trailing newlines make it a standalone line, not merged with the
-    // prompt.
+    // prompt. History isolation, two layers (same as the cwd probe in the
+    // frontend): the leading SPACE covers HISTCONTROL=ignorespace, and the
+    // `set +o history` / `set -o history` wrapper covers servers where
+    // HISTCONTROL is unset — measured one such host where the space alone left
+    // `export TMOUT=0` in the user's Up-arrow history. Every `set` also gets
+    // its own `2>/dev/null`: on non-bash login shells (sh/dash/fish) the
+    // history option doesn't exist and the bare `set` would print "Illegal
+    // option" garbage into the user's terminal on every connect.
     if suppress_tmout {
-        send_data(&data_tx, b"\nexport TMOUT=0 2>/dev/null\n").await;
+        send_data(&data_tx, TMOUT_SUPPRESS_COMMAND).await;
     }
 
     // Startup hold (GUI only): the frontend registers its `ssh_output`
@@ -952,6 +1029,36 @@ async fn channel_reader(
     // data until the deadline passes (500 ms covers lrzsz's full abort
     // response; the shell prompt appears later once the process exits).
     let mut suppress_until: Option<Instant> = None;
+
+    // Set when the user cancels a ZMODEM session (ZmodemAbort). While true,
+    // the auto-start scan refuses to re-enter Zmodem mode.
+    //
+    // Why a persistent flag instead of a longer suppress_until: rz does not
+    // necessarily answer a CAN burst within any fixed deadline. Measured: the
+    // reply arrived 18s after the abort, long past every window tried (0.5s,
+    // 2s, 5s). When it lands it looks exactly like a fresh `rz` invocation —
+    // same canonical `**\x18B` frame — so the scan re-enters Zmodem mode and
+    // the chooser pops again. The user has already cancelled once, so they
+    // will not cancel again; the terminal is stuck until reconnect.
+    //
+    // Cleared only by real user input or a shell prompt, i.e. evidence the
+    // remote is back to an interactive shell and a NEW `rz` is plausible.
+    let mut zmodem_cancelled = false;
+
+    // Pending terminal-restore after a ZMODEM abort. `rz` sets termios to raw
+    // mode (ECHO off, ICANON off) before reading; if it dies from our CAN burst
+    // without running its cleanup, the remote tty stays raw: keystrokes stop
+    // echoing, readline can't see complete lines, backspace/arrows misbehave,
+    // and only Enter yields a prompt. That state is invisible to us — the
+    // protocol layer is already clean — so we schedule a conditional repair:
+    // after the grace period, if no shell prompt was seen, send Ctrl-C +
+    // `stty sane`. Prompt detection is the gate that keeps a normally-exited
+    // rz from getting a stray command injected.
+    let mut tty_restore_deadline: Option<Instant> = None;
+    // Set by the reader whenever a shell prompt is observed while a restore is
+    // pending — that's proof the remote tty came back on its own, so the repair
+    // command must not be injected.
+    let mut tty_saw_prompt = false;
 
     // Native ZMODEM receiver — active only for downloads (remote `sz`).
     // When Some, incoming data is fed to the receiver instead of being
@@ -1045,18 +1152,13 @@ async fn channel_reader(
         // Promote any deferred upload-error cleanup into actual side-effects
         // BEFORE the select, so all borrows are fresh.
         if let Some(msg) = last_upload_error.take() {
-            sink.emit("zmodem_error", &serde_json::json!({
-                "sessionId": session_id, "message": msg
-            }));
+            emit_zmodem_error(&*sink, &session_id, &msg);
             mode = TermMode::Normal;
             suppress_until = Some(Instant::now() + Duration::from_millis(500));
-            // Signal the sender task to drop all queued batches — prevents
-            // post-abort ZMODEM data from reaching the shell as garbled input.
-            upload_aborted.store(true, std::sync::atomic::Ordering::Relaxed);
             tx_state.sender = None;
             tx_state.file = None;
             tx_state.queue.clear();
-            sink.emit("zmodem_end", &session_id.to_string());
+            emit_zmodem_end(&*sink, &session_id, "session ended");
             // Don't continue — fall through to select!; the new state is
             // already consistent.
         }
@@ -1067,6 +1169,12 @@ async fn channel_reader(
             // Commands from the frontend take priority so input latency stays low.
             cmd = command_rx.recv() => match cmd {
                 Some(SessionCommand::Input(data)) => {
+                    // Real user keystrokes mean the remote is interactive again
+                    // — a subsequent `rz` typed by the user must work.
+                    zmodem_cancelled = false;
+                    // 只记字节数不记内容：sudo/passwd/mysql 的交互提示下，
+                    // 用户敲的是密码 —— 秘密不分级，debug 也不落。
+                    log::debug!("[ssh:{}] [IN] {} bytes", session_id, data.len());
                     send_data(&data_tx, &data[..]).await;
                 }
                 Some(SessionCommand::Resize { cols, rows }) => {
@@ -1078,12 +1186,18 @@ async fn channel_reader(
                     send_data(&data_tx, &data[..]).await;
                 }
                 Some(SessionCommand::ZmodemAbort) => {
-                    // Signal sender task to drop queued batches FIRST, before
-                    // sending the CAN sequence — otherwise buffered upload data
-                    // would interleave with the abort bytes.
-                    upload_aborted.store(true, std::sync::atomic::Ordering::Relaxed);
                     // lrzsz abort sequence: 8× CAN + a few backspaces to clean
                     // the remote's PTY line state.
+                    //
+                    // 顺序要紧：CAN 必须在清空 tx_state 之前发出去，且发送路上
+                    // 不能有任何「丢弃后续批次」的开关。旧代码先在 reader 里
+                    // store(true) 再 send，sender task 看到标志就把这 8 个 CAN
+                    // 连同后续所有字节一起丢掉 —— 远端 rz 永远收不到取消，
+                    // 继续发 ZRINIT，Rust 反复自动启动，前端 zmodem_start
+                    // 无限循环（实测「rz -y 取消不可以退出，一直重复这个过程」，
+                    // 日志 `sender task: aborted, dropping 8 bytes` 正是被丢
+                    // 的 CAN）。同一标志还曾让 sender task 直接 break 退出，
+                    // 之后用户敲的任何键都发不出去（「取消后无法输入命令」）。
                     let abort = [CAN; 8];
                     send_data(&data_tx, &abort[..]).await;
                     let cleanup: &[u8] = b"\x08\x08\x08\x08\x08\x08\x08\x08";
@@ -1091,10 +1205,28 @@ async fn channel_reader(
                     // Close the disk task so any pending file is flushed.
                     let _ = diskq.send(DiskJob::Close);
                     // Immediately switch to Normal + suppress post-abort noise
-                    // (CAN bursts, error text, ZFERR, OO) for 500 ms.
+                    // (CAN bursts, error text, ZFERR, OO) for 2s. 500ms was
+                    // too short: rz takes a moment to notice the CAN burst and
+                    // exit, and whatever it prints on the way out (error text,
+                    // the shell prompt) lands in Normal mode after the window
+                    // expires. Bytes carrying `**\x18B` then re-trigger the
+                    // auto-start scan and the chooser pops a second time.
                     mode = TermMode::Normal;
-                    suppress_until = Some(Instant::now() + Duration::from_millis(500));
-                    sink.emit("zmodem_end", &session_id);
+                    suppress_until = Some(Instant::now() + Duration::from_millis(2000));
+                    // Refuse auto-start until the remote is demonstrably back
+                    // at a shell prompt (or the user types). rz's reply to the
+                    // CAN burst can arrive many seconds later — measured 18s —
+                    // and it is byte-identical to a fresh `rz` invocation.
+                    zmodem_cancelled = true;
+                    // 1.2s 后若仍没见到 shell 提示符，说明 rz 死于我们的 CAN
+                    // 而没跑自己的 termios 清理 —— 远端 tty 停在 raw 模式
+                    // （不回显、readline 收不到整行、退格/方向键全乱，
+                    // 只有回车能出东西）。见 tty_restore_deadline 的注释。
+                    // 取 2.4s 而不是 1.2s：suppress_until 是 2s，早于它发送
+                    // 的 stty sane 会被仍在退出的 rz 当成协议字节吃掉。
+                    tty_restore_deadline = Some(Instant::now() + Duration::from_millis(2400));
+                    tty_saw_prompt = false;
+                    emit_zmodem_end(&*sink, &session_id, "aborted by user (CAN×8 sent)");
                     // Drop any native receiver/sender so a subsequent transfer starts clean.
                     zmodem_rx = None;
                     tx_state.sender = None;
@@ -1107,7 +1239,7 @@ async fn channel_reader(
                     if mode == TermMode::Zmodem {
                         mode = TermMode::Normal;
                         suppress_until = Some(Instant::now() + Duration::from_millis(500));
-                        sink.emit("zmodem_end", &session_id);
+                        emit_zmodem_end(&*sink, &session_id, "session ended");
                     }
                     let _ = diskq.send(DiskJob::Close);
                     zmodem_rx = None;
@@ -1150,8 +1282,6 @@ async fn channel_reader(
                     // how ZMODEM (a file-only protocol) carries a folder.
                     // Open the first, queue the rest, feed any buffered
                     // ZRINIT to kick off the handshake.
-                    // Reset the abort flag — a fresh transfer starts here.
-                    upload_aborted.store(false, std::sync::atomic::Ordering::Relaxed);
                     log::info!("[ssh:{}] ZmodemStartUpload: {} paths, pending={} bytes", session_id, paths.len(), tx_state.pending.len());
                     if paths.is_empty() {
                         log::warn!("[ssh:{}] zmodem_start_upload with empty paths", session_id);
@@ -1181,9 +1311,7 @@ async fn channel_reader(
                                     }
                                 }
                                 Err(e) => {
-                                    sink.emit("zmodem_error", &serde_json::json!({
-                                        "sessionId": session_id, "message": e
-                                    }));
+                                    emit_zmodem_error(&*sink, &session_id, &e);
                                 }
                             }
                         } else {
@@ -1196,15 +1324,15 @@ async fn channel_reader(
                             } else {
                                 walk_errors.join("; ")
                             };
-                            sink.emit("zmodem_error", &serde_json::json!({
-                                "sessionId": session_id, "message": detail
-                            }));
-                            upload_aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                            emit_zmodem_error(&*sink, &session_id, &detail);
                             let abort = [CAN; 8];
                             send_data(&data_tx, &abort[..]).await;
                             mode = TermMode::Normal;
                             suppress_until = Some(Instant::now() + Duration::from_millis(500));
-                            sink.emit("zmodem_end", &session_id);
+                            emit_zmodem_end(&*sink, &session_id, "session ended");
+                            tx_state.sender = None;
+                            tx_state.file = None;
+                            tx_state.queue.clear();
                         }
                     }
                 }
@@ -1250,6 +1378,14 @@ async fn channel_reader(
                     // normal ZFIN), lrzsz emits CAN bursts, error text, ZFERR
                     // frames, and "OO". Suppress ALL incoming data until the
                     // deadline passes so none of it renders as terminal garbage.
+                    //
+                    // 抑制之前先看原始字节：这段时间正是 rz 退出、shell
+                    // 重新打印提示符的窗口，而 tty 恢复判定要靠它。若等数据
+                    // 进了 handle_incoming_data 再检测，提示符早被这里丢掉了，
+                    // 闸门永远不成立、每次都会多发一条 stty sane。
+                    if tty_restore_deadline.is_some() && looks_like_shell_prompt(data) {
+                        tty_saw_prompt = true;
+                    }
                     let data: &[u8] = if let Some(deadline) = suppress_until {
                         if Instant::now() < deadline {
                             &[][..] // still suppressing — discard
@@ -1263,8 +1399,9 @@ async fn channel_reader(
                     if !data.is_empty() {
                         let to_send = handle_incoming_data(
                             &*sink, &session_id, data, &mut buffer, &mut last_flush,
-                            &mut mode, &mut suppress_until, &mut zmodem_rx, &diskq,
-                            &mut tx_state, &upload_aborted, &mut rx_last_progress,
+                            &mut mode, &mut suppress_until, &mut zmodem_cancelled,
+                            &mut zmodem_rx, &diskq,
+                            &mut tx_state, &mut rx_last_progress, &mut tty_saw_prompt,
                         );
                         // Drain decoded payload from the receiver to the
                         // background disk task — this is just an unbounded
@@ -1406,7 +1543,7 @@ async fn channel_reader(
                     log::info!("[ssh:{}] EOF", session_id);
                     flush_buffer(&*sink, &session_id, &mut buffer);
                     if mode == TermMode::Zmodem {
-                        sink.emit("zmodem_end", &session_id);
+                        emit_zmodem_end(&*sink, &session_id, "session ended");
                     }
                     sink.emit("ssh_closed", &session_id);
                     break;
@@ -1415,7 +1552,7 @@ async fn channel_reader(
                     log::info!("[ssh:{}] Close", session_id);
                     flush_buffer(&*sink, &session_id, &mut buffer);
                     if mode == TermMode::Zmodem {
-                        sink.emit("zmodem_end", &session_id);
+                        emit_zmodem_end(&*sink, &session_id, "session ended");
                     }
                     sink.emit("ssh_closed", &session_id);
                     break;
@@ -1424,7 +1561,7 @@ async fn channel_reader(
                     log::info!("[ssh:{}] channel.wait returned None", session_id);
                     flush_buffer(&*sink, &session_id, &mut buffer);
                     if mode == TermMode::Zmodem {
-                        sink.emit("zmodem_end", &session_id);
+                        emit_zmodem_end(&*sink, &session_id, "session ended");
                     }
                     sink.emit("ssh_closed", &session_id);
                     break;
@@ -1508,6 +1645,41 @@ async fn channel_reader(
                         }
                     }
                 }
+                // Terminal-restore fallback after a ZMODEM abort. If the grace
+                // period elapsed and no shell prompt arrived (prompt detection
+                // clears the deadline), rz died from our CAN without restoring
+                // termios — the remote tty is raw and every keystroke is
+                // effectively lost. Ctrl-C first (中断可能残留的前台进程，并让
+                // readline 放弃当前行), then `stty sane` (ECHO/ICANON/ISIG 恢复).
+                // 前导空格：配了 HISTCONTROL=ignorespace 的机器上不进历史。
+                if let Some(deadline) = tty_restore_deadline {
+                    if Instant::now() >= deadline {
+                        tty_restore_deadline = None;
+                        if tty_saw_prompt {
+                            log::info!(
+                                "[ssh:{}] zmodem abort: shell prompt seen, tty looks healthy",
+                                session_id
+                            );
+                        } else {
+                            send_data(&data_tx, b"\x03").await;
+                            send_data(&data_tx, b" stty sane\r").await;
+                            log::warn!(
+                                "[ssh:{}] zmodem abort: no prompt after grace period → sent Ctrl-C + stty sane",
+                                session_id
+                            );
+                            sink.emit(
+                                "ssh_output",
+                                &SshOutputPayload {
+                                    session_id: session_id.clone(),
+                                    data: "\r\n\x1b[33m[ZMODEM] 已恢复远端终端设置（stty sane）\x1b[0m\r\n"
+                                        .as_bytes()
+                                        .to_vec(),
+                                },
+                            );
+                        }
+                        tty_saw_prompt = false;
+                    }
+                }
                 // ZMODEM upload timeout: if the sender has been waiting in
                 // WaitingZrinit2 (post-ZEOF) for too long without rz
                 // acknowledging, force end the session. 30s covers large
@@ -1536,7 +1708,7 @@ async fn channel_reader(
                             tx_state.sender = None;
                             tx_state.file = None;
                             tx_state.queue.clear();
-                            sink.emit("zmodem_end", &session_id.to_string());
+                            emit_zmodem_end(&*sink, &session_id, "session ended");
                             }
                         }
                     }
@@ -1581,15 +1753,16 @@ async fn channel_reader(
                         // goes to the hung sz instead of the shell.
                         send_data(&data_tx, &[CAN; 8]).await;
                         send_data(&data_tx, b"\x08\x08\x08\x08\x08\x08\x08\x08").await;
-                        sink.emit("zmodem_error", &serde_json::json!({
-                            "sessionId": session_id,
-                            "message": "ZMODEM 接收超时：远端 30 秒没有任何数据，会话已结束"
-                        }));
+                        emit_zmodem_error(
+                            &*sink,
+                            &session_id,
+                            "ZMODEM 接收超时：远端 30 秒没有任何数据，会话已结束",
+                        );
                         let _ = diskq.send(DiskJob::Close);
                         mode = TermMode::Normal;
                         suppress_until = Some(Instant::now() + Duration::from_millis(500));
                         zmodem_rx = None;
-                        sink.emit("zmodem_end", &session_id.to_string());
+                        emit_zmodem_end(&*sink, &session_id, "session ended");
                     }
                 }
                 // ZMODEM download fast-fail on plain text: sz that fails to
@@ -1624,15 +1797,16 @@ async fn channel_reader(
                         }
                         send_data(&data_tx, &[CAN; 8]).await;
                         send_data(&data_tx, b"\x08\x08\x08\x08\x08\x08\x08\x08").await;
-                        sink.emit("zmodem_error", &serde_json::json!({
-                            "sessionId": session_id,
-                            "message": "远端 sz 未发送文件即退出（常见原因：无读取权限），已退出 ZMODEM 模式"
-                        }));
+                        emit_zmodem_error(
+                            &*sink,
+                            &session_id,
+                            "远端 sz 未发送文件即退出（常见原因：无读取权限），已退出 ZMODEM 模式",
+                        );
                         let _ = diskq.send(DiskJob::Close);
                         mode = TermMode::Normal;
                         suppress_until = Some(Instant::now() + Duration::from_millis(500));
                         zmodem_rx = None;
-                        sink.emit("zmodem_end", &session_id.to_string());
+                        emit_zmodem_end(&*sink, &session_id, "session ended");
                     }
                 }
                 }
@@ -1713,23 +1887,55 @@ fn handle_incoming_data(
     last_flush: &mut Instant,
     mode: &mut TermMode,
     suppress_until: &mut Option<Instant>,
+    zmodem_cancelled: &mut bool,
     zmodem_rx: &mut Option<ZmodemReceiver>,
     disk: &DiskSink,
     tx_state: &mut TxSession,
-    upload_aborted: &std::sync::atomic::AtomicBool,
     rx_last_progress: &mut Option<Instant>,
+    tty_saw_prompt: &mut bool,
 ) -> Vec<u8> {
     match *mode {
         TermMode::Normal => {
+            // Post-session suppress window: the CAN burst we sent (and rz's
+            // reply) is still in flight. Dropping it here — rather than
+            // letting it reach the terminal — is what keeps `cccccccc` from
+            // appearing after a cancel, and keeps the abort tail from
+            // re-triggering the auto-start scan below.
+            if matches!(suppress_until, Some(t) if Instant::now() < *t) {
+                buffer.clear();
+                return Vec::new();
+            }
+
             // Append to the shared terminal/ZMODEM-scan buffer. If no needle is
             // found the existing 16ms tick will coalesce-flush it as terminal
             // output via append_capped's threshold logic.
             append_capped(sink, session_id, buffer, data, last_flush);
 
+            // A shell prompt means the remote is interactive again: rz has
+            // exited and the user could legitimately start a new transfer.
+            // This is the second (keystroke-free) way to clear the post-cancel
+            // lockout — without it, a user who never types would be locked out
+            // until they press a key.
+            if looks_like_shell_prompt(buffer) {
+                // 提示符出现 = 远端 tty 已被 rz 正常恢复（或从未坏掉），
+                // 待办的 stty sane 不必再发。
+                *tty_saw_prompt = true;
+                if *zmodem_cancelled {
+                    *zmodem_cancelled = false;
+                }
+            }
+
             // Re-scan the full buffer for the ZMODEM auto-start sequence. It can
             // land anywhere — typically right after a prompt — so we can't only
             // look at the tail.
-            if let Some(idx) = find_zmodem_start(buffer) {
+            //
+            // The suppress window is already handled by the early return above,
+            // so by the time we get here the buffer holds genuine terminal data.
+            // Only the canonical `ZPAD ZPAD ZDLE [ABC]` form counts as a start
+            // (see ZMODEM_NEEDLES) — the bare-ZDLE fallback that used to live
+            // here matched abort-burst tails and shell history.
+            if !*zmodem_cancelled {
+                if let Some(idx) = find_zmodem_start(buffer) {
                 // Split: bytes [0..idx] stay as terminal output; bytes [idx..]
                 // become the first ZMODEM frame.
                 let tail: Vec<u8> = buffer[idx..].to_vec();
@@ -1749,6 +1955,10 @@ fn handle_incoming_data(
                     // Buffer the initial ZRINIT for the native sender.
                     *mode = TermMode::Zmodem;
                     *zmodem_rx = None;
+                    log::info!(
+                        "[ssh:{}] zmodem_start direction=upload (remote rz invited)",
+                        session_id
+                    );
                     sink.emit(
                         "zmodem_start",
                         &ZmodemStartPayload {
@@ -1772,6 +1982,10 @@ fn handle_incoming_data(
                 // Download (remote `sz`) — native receiver active.
                 *mode = TermMode::Zmodem;
                 if rx.take_start_signal() {
+                    log::info!(
+                        "[ssh:{}] zmodem_start direction=download (remote sz started)",
+                        session_id
+                    );
                     sink.emit(
                         "zmodem_start",
                         &ZmodemStartPayload {
@@ -1798,11 +2012,12 @@ fn handle_incoming_data(
                     *mode = TermMode::Normal;
                     *suppress_until = Some(Instant::now() + Duration::from_millis(500));
                     *zmodem_rx = None;
-                    sink.emit("zmodem_end", &session_id.to_string());
+                    emit_zmodem_end(&*sink, &session_id, "session ended");
                 } else {
                     *zmodem_rx = Some(rx);
                 }
                 return send;
+                }
             }
             Vec::new()
         }
@@ -1811,6 +2026,10 @@ fn handle_incoming_data(
                 // Native download path — data goes straight to disk, no JS IPC.
                 let actions = rx.feed(data);
                 if rx.take_start_signal() {
+                    log::info!(
+                        "[ssh:{}] zmodem_start direction=download (receiver handshake)",
+                        session_id
+                    );
                     sink.emit(
                         "zmodem_start",
                         &ZmodemStartPayload {
@@ -1844,7 +2063,7 @@ fn handle_incoming_data(
                     *zmodem_rx = None;
                     // Tell the frontend the session is over so the progress
                     // overlay hides. Without this the UI stays at 100% forever.
-                    sink.emit("zmodem_end", &session_id.to_string());
+                    emit_zmodem_end(&*sink, &session_id, "session ended");
                 }
                 return send;
             }
@@ -1872,16 +2091,13 @@ fn handle_incoming_data(
                                 tx_state.file = Some(new_file);
                             }
                             Err(e) => {
-                                sink.emit("zmodem_error", &serde_json::json!({
-                                    "sessionId": session_id, "message": e
-                                }));
+                                emit_zmodem_error(&*sink, &session_id, &e);
                                 *mode = TermMode::Normal;
                                 *suppress_until = Some(Instant::now() + Duration::from_millis(500));
-                                upload_aborted.store(true, std::sync::atomic::Ordering::Relaxed);
                                 tx_state.sender = None;
                                 tx_state.file = None;
                                 tx_state.queue.clear();
-                                sink.emit("zmodem_end", &session_id.to_string());
+                                emit_zmodem_end(&*sink, &session_id, "session ended");
                                 return Vec::new();
                             }
                         }
@@ -1902,47 +2118,94 @@ fn handle_incoming_data(
                     log::info!("[ssh:{}] [TX] WaitingZrinit2 + non-protocol data — fast finish", session_id);
                     let zfin = sender.force_finish_for_timeout();
                     all_send.extend_from_slice(&zfin);
-                    // Do NOT set upload_aborted here — the file data is already
-                    // fully queued/sent and this is a normal (non-error) finish.
-                    // Setting abort would make the sender task DROP in-flight
-                    // data still in the mpsc, corrupting the transfer.
                     *mode = TermMode::Normal;
                     *suppress_until = Some(Instant::now() + Duration::from_millis(2000));
                     tx_state.sender = None;
                     tx_state.file = None;
                     tx_state.queue.clear();
-                    sink.emit("zmodem_end", &session_id.to_string());
+                    emit_zmodem_end(&*sink, &session_id, "session ended");
                     return all_send;
                 }
 
                 let actions = sender.feed(data);
                 log::info!("[ssh:{}] [TX] feed: send={} events={}", session_id, actions.send.len(), actions.events.len());
                 all_send.extend_from_slice(&actions.send);
+                // Track ZSKIP separately: it needs the QUEUE to decide, and the
+                // queue lives here, not in the single-file sender.
+                let mut skipped_name: Option<String> = None;
+                for ev in &actions.events {
+                    if let TxEvent::FileSkipped { name } = ev {
+                        skipped_name = Some(name.clone());
+                    }
+                }
                 dispatch_tx_events(sink, session_id, &actions.events, &mut tx_ended, &mut tx_error);
 
                 if let Some(msg) = tx_error {
-                    sink.emit("zmodem_error", &serde_json::json!({
-                        "sessionId": session_id, "message": msg
-                    }));
+                    emit_zmodem_error(&*sink, &session_id, &msg);
                     *mode = TermMode::Normal;
                     *suppress_until = Some(Instant::now() + Duration::from_millis(500));
-                    upload_aborted.store(true, std::sync::atomic::Ordering::Relaxed);
                     tx_state.sender = None;
                     tx_state.file = None;
                     tx_state.queue.clear();
-                    sink.emit("zmodem_end", &session_id.to_string());
+                    emit_zmodem_end(&*sink, &session_id, "session ended");
                     return Vec::new();
+                }
+
+                // Receiver skipped the current file (ZSKIP). Continue with the
+                // next queued file if there is one; otherwise close the
+                // session properly (ZFIN) so rz exits instead of sitting
+                // there waiting for an offer that never comes — that wait is
+                // what previously re-invited ZMODEM, popped the manual
+                // chooser, and stranded the terminal in Zmodem mode.
+                if let Some(name) = skipped_name {
+                    if let Some(next) = tx_state.queue.pop_front() {
+                        log::info!("[ssh:{}] [TX] '{}' skipped — offering next '{}'", session_id, name, next.name);
+                        match start_upload_next_file(&next) {
+                            Ok((mut new_sender, new_file)) => {
+                                let offer = new_sender.send_zfile_offer();
+                                *sender = new_sender;
+                                tx_state.file = Some(new_file);
+                                all_send.extend_from_slice(&offer);
+                            }
+                            Err(e) => {
+                                emit_zmodem_error(&*sink, &session_id, &e);
+                                *mode = TermMode::Normal;
+                                *suppress_until = Some(Instant::now() + Duration::from_millis(500));
+                                tx_state.sender = None;
+                                tx_state.file = None;
+                                tx_state.queue.clear();
+                                emit_zmodem_end(&*sink, &session_id, "session ended");
+                                return Vec::new();
+                            }
+                        }
+                    } else {
+                        log::warn!("[ssh:{}] [TX] last file '{}' skipped — closing session with ZFIN", session_id, name);
+                        let zfin = sender.force_finish_for_timeout();
+                        all_send.extend_from_slice(&zfin);
+                        *mode = TermMode::Normal;
+                        // 5s, not the usual 500ms/2s: this path KNOWS a ZFIN
+                        // echo is coming back, and that echo's bytes
+                        // (`**\x18B08…`) match the auto-start needle
+                        // `**\x18B` byte-for-byte. A slow link can delay it
+                        // past 2s, at which point the window has expired and
+                        // the echo re-enters Zmodem mode (chooser pops a
+                        // second time; cancelling strands the terminal).
+                        *suppress_until = Some(Instant::now() + Duration::from_millis(5000));
+                        tx_state.sender = None;
+                        tx_state.file = None;
+                        tx_state.queue.clear();
+                        emit_zmodem_end(&*sink, &session_id, "session ended");
+                        return all_send;
+                    }
                 }
 
                 if tx_ended {
                     *mode = TermMode::Normal;
                     *suppress_until = Some(Instant::now() + Duration::from_millis(500));
-                    // Normal ZFIN completion — do NOT set upload_aborted; the
-                    // sender task may still be flushing the final data batches.
                     tx_state.sender = None;
                     tx_state.file = None;
                     tx_state.queue.clear();
-                    sink.emit("zmodem_end", &session_id.to_string());
+                    emit_zmodem_end(&*sink, &session_id, "session ended");
                     return all_send;
                 }
 
@@ -1965,7 +2228,7 @@ fn handle_incoming_data(
             if is_zmodem_end(data) {
                 *mode = TermMode::Normal;
                 *suppress_until = Some(Instant::now() + Duration::from_millis(500));
-                sink.emit("zmodem_end", &session_id);
+                emit_zmodem_end(&*sink, &session_id, "session ended");
             }
             Vec::new()
         }
@@ -2130,6 +2393,16 @@ fn dispatch_tx_events(
                     "bytesWritten": bytes
                 }));
             }
+            TxEvent::FileSkipped { name } => {
+                // Receiver refused the file (ZSKIP). Not fatal by itself —
+                // the reader continues with the next queued file or closes
+                // the session cleanly. Surface it so the user knows why a
+                // file from a multi-file batch never landed.
+                sink.emit("zmodem_file_skipped", &serde_json::json!({
+                    "sessionId": session_id,
+                    "fileName": name
+                }));
+            }
             TxEvent::SessionEnd => {
                 *ended = true;
             }
@@ -2185,6 +2458,12 @@ fn dispatch_tx_events_throttled(
                     "sessionId": session_id,
                     "fileName": name,
                     "bytesWritten": bytes
+                }));
+            }
+            TxEvent::FileSkipped { name } => {
+                sink.emit("zmodem_file_skipped", &serde_json::json!({
+                    "sessionId": session_id,
+                    "fileName": name
                 }));
             }
             TxEvent::SessionEnd => {
@@ -2303,6 +2582,26 @@ fn dispatch_rx_actions(
     (actions.send, ended, disk)
 }
 
+/// Emit `zmodem_error` and log it. Same rationale as `emit_zmodem_end`:
+/// an error that only reaches the UI leaves no trace in the log, so a failed
+/// transfer looks like it never happened when reading logs after the fact.
+fn emit_zmodem_error(sink: &dyn EventSink, session_id: &str, message: &str) {
+    log::warn!("[ssh:{}] zmodem_error: {}", session_id, message);
+    sink.emit(
+        "zmodem_error",
+        &serde_json::json!({ "sessionId": session_id, "message": message }),
+    );
+}
+
+/// Emit `zmodem_end` and log why. Every ZMODEM session exit (normal ZFIN,
+/// abort, error, timeout) funnels through here so a session's end is ALWAYS
+/// visible in the log. Without this the start/end events were invisible and a
+/// real abort looked identical to "rz never started" during debugging.
+fn emit_zmodem_end(sink: &dyn EventSink, session_id: &str, reason: &str) {
+    log::info!("[ssh:{}] zmodem_end ({})", session_id, reason);
+    sink.emit("zmodem_end", &session_id.to_string());
+}
+
 fn flush_buffer(sink: &dyn EventSink, session_id: &str, buffer: &mut Vec<u8>) {
     if buffer.is_empty() {
         return;
@@ -2311,7 +2610,7 @@ fn flush_buffer(sink: &dyn EventSink, session_id: &str, buffer: &mut Vec<u8>) {
         session_id: session_id.to_string(),
         data: std::mem::take(buffer),
     };
-    log::debug!("[ssh:{}] flush {} bytes → ssh_output", session_id, payload.data.len());
+    log::debug!("[ssh:{}] [OUT] flush {} bytes → ssh_output", session_id, payload.data.len());
     sink.emit("ssh_output", &payload);
 }
 
@@ -2442,6 +2741,29 @@ pub async fn disconnect(
         sessions.remove(session_id)
     };
 
+    // Tear down port-forwarding tunnels owned by this session BEFORE the
+    // handle drops. A local rule's listener is a plain OS socket that would
+    // keep accepting connections with no SSH connection left to carry them
+    // — clients would hang until timeout instead of getting a fast refusal.
+    // Remote rules must additionally tell the server to stop listening, which
+    // needs the handle, so this ordering is required rather than cosmetic.
+    let owned = state.port_forwards.stop_for_session(session_id);
+    if !owned.is_empty() {
+        log::info!(
+            "[ssh:{}] stopped {} port-forward tunnel(s) with the session",
+            session_id,
+            owned.len()
+        );
+        if let Some(session) = session.as_ref() {
+            for rule_id in &owned {
+                state
+                    .port_forwards
+                    .release_remote(rule_id, &session.handle)
+                    .await;
+            }
+        }
+    }
+
     if let Some(session) = session {
         // Signal the reader to close the shell channel gracefully. Best-effort:
         // for an SFTP-only account the reader already exited, so this send is a
@@ -2562,17 +2884,34 @@ pub async fn zmodem_start_upload(
 /// transport is dead (so a reconnect is worth trying)? russh surfaces these
 /// as stringified errors — we match on substrings because the error types
 /// aren't all public.
+///
+/// Case-insensitive and whitespace-insensitive: russh's display text for the
+/// same failure has varied in capitalisation *and* spacing across versions
+/// (`SendError` vs "Channel send error"), and a missed match silently turns
+/// into "no reconnect, error on every probe".
+///
+/// `SendError` (`channel_open_session` fails when the handle's session task has
+/// already exited — the sender was dropped) is the *clearest* death signal
+/// there is: no packets will ever flow again on this handle.
 fn is_connection_dead(err: &str) -> bool {
-    err.contains("ConnectFailed")
-        || err.contains("disconnect")
-        || err.contains("Connection reset")
-        || err.contains("broken pipe")
-        || err.contains("channel open")
-        || err.contains("Session not found")
+    let e = err.to_ascii_lowercase();
+    // Whitespace dropped so "Channel send error" and "SendError" are one match.
+    let flat = e.replace(' ', "");
+    flat.contains("connectfailed")
+        || flat.contains("senderror")
+        || flat.contains("disconnect")
+        || flat.contains("connectionreset")
+        || flat.contains("brokenpipe")
+        || e.contains("channel open")
 }
 
 /// Open a new session channel on the existing handle. Extracted so exec_once
 /// can retry it after a reconnect without duplicating the handle-lookup logic.
+///
+/// Returns the russh error string as-is: `exec_once` adds the single
+/// "Open exec channel failed: " prefix for both the first attempt and the
+/// post-reconnect retry (it used to prefix here too, producing
+/// "Open exec channel failed: Open exec channel failed: …" to the user).
 async fn open_exec_channel(
     state: &AppState,
     session_id: &str,
@@ -2587,8 +2926,14 @@ async fn open_exec_channel(
     handle
         .channel_open_session()
         .await
-        .map_err(|e| format!("Open exec channel failed: {}", e))
+        .map_err(|e| e.to_string())
 }
+
+// Per-session single-flight locks for exec_once's transparent reconnect.
+// Keyed by session UUID; entries are tiny and live for the process lifetime.
+static RECONNECT_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Re-establish the SSH connection for an existing session: dial + auth using
 /// the stored config, then replace the handle in the sessions map. The
@@ -2605,6 +2950,31 @@ async fn reconnect_session(state: &AppState, session_id: &str) -> Result<(), Str
             .ok_or_else(|| "Session not found".to_string())?;
         Arc::clone(&s.config)
     };
+    // Single-flight: concurrent exec_once calls that all notice the dead
+    // connection must not each dial+auth (log evidence: 3 dials in the same
+    // millisecond). Everyone snapshots the handle pointer, waits on a
+    // per-session lock, and whoever finds the handle already replaced by the
+    // winner skips its own dial and reuses the fresh connection.
+    let lock = {
+        let mut table = RECONNECT_LOCKS.lock().map_err(|e| e.to_string())?;
+        table.entry(session_id.to_string()).or_default().clone()
+    };
+    // usize (not a raw pointer) so the future stays Send across the await.
+    let handle_before: Option<usize> = {
+        let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+        sessions.get(session_id).map(|s| Arc::as_ptr(&s.handle) as usize)
+    };
+    let _guard = lock.lock().await;
+    {
+        let sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+        if sessions.get(session_id).map(|s| Arc::as_ptr(&s.handle) as usize) != handle_before {
+            log::info!(
+                "[ssh:{}] reconnect already done by a concurrent call, reusing handle",
+                session_id
+            );
+            return Ok(());
+        }
+    }
     log::info!("[ssh:{}] reconnecting for exec_once (dial+auth)", session_id);
     let new_handle = dial_and_authenticate(state, &config, false).await?;
     // Replace the handle in the map. The old handle's Arc may still be held by
@@ -2631,11 +3001,12 @@ pub async fn exec_once(
     command: &str,
 ) -> Result<String, String> {
     // First attempt with the current handle. On a connection-dead error
-    // (ConnectFailed / channel open fail), transparently reconnect once:
-    // dial + auth with the session's stored config, replace the handle in the
-    // sessions map, then retry the channel open + exec. This makes one-shot
-    // probes (AI health inspection, server-info) resilient to idle-disconnect
-    // without forcing the user to manually reconnect the tab.
+    // (ConnectFailed / SendError / Disconnected / channel open fail),
+    // transparently reconnect once: dial + auth with the session's stored
+    // config, replace the handle in the sessions map, then retry the channel
+    // open + exec. This makes one-shot probes (AI health inspection,
+    // server-info) resilient to idle-disconnect without forcing the user to
+    // manually reconnect the tab.
     let mut channel = match open_exec_channel(state, session_id).await {
         Ok(ch) => ch,
         Err(first_err) if is_connection_dead(&first_err) => {
@@ -2755,5 +3126,360 @@ mod upload_expand_tests {
             collect_upload_files(&["Z:\\definitely\\not\\here.abc".to_string()]);
         assert!(queue.is_empty());
         assert_eq!(errors.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tmout_inject_tests {
+    use super::TMOUT_SUPPRESS_COMMAND;
+
+    /// 注入命令的形状不变量。修前这个字符串没有对 set 做 stderr 重定向，
+    /// 非 bash 登录 shell（sh/dash/fish）每次连接都打 "Illegal option" 垃圾行。
+    #[test]
+    fn tmout_command_silences_every_set_on_non_bash_shells() {
+        let s = std::str::from_utf8(TMOUT_SUPPRESS_COMMAND).unwrap();
+        // 每个 set 都必须自带重定向（不能只靠行尾那个）。
+        assert!(s.contains("set +o history 2>/dev/null"));
+        assert!(s.contains("set -o history 2>/dev/null"));
+        // 前导空格保留 —— HISTCONTROL=ignorespace 的历史隔离层。
+        assert!(s.starts_with("\n set "));
+    }
+}
+
+#[cfg(test)]
+mod connection_dead_tests {
+    use super::is_connection_dead;
+    #[test]
+    fn session_not_found_is_not_connection_death() {
+        // Map miss = the session was explicitly disconnected (ssh_disconnect
+        // removed it) or never existed. Dialing cannot resurrect it — exec_once
+        // must surface the error instead of attempting a one-time reconnect
+        // log evidence: a polling panel retried every 5s against a removed
+        // session, 7104 times in one day, each attempting a pointless dial.
+        assert!(!is_connection_dead("Session not found"));
+        // SendError = the handle's session task exited (sender dropped): no
+        // packets will ever flow on this handle again. Missing this match made
+        // dead connections error on every probe instead of reconnecting once.
+        assert!(is_connection_dead("SendError"));
+        assert!(is_connection_dead(
+            "Open exec channel failed: Channel send error"
+        ));
+        // Capitalisation is not stable across russh versions.
+        assert!(is_connection_dead("Disconnected"));
+        assert!(is_connection_dead("disconnect"));
+        assert!(is_connection_dead(
+            "Open exec channel failed: Failed to open channel (ConnectFailed)"
+        ));
+        assert!(is_connection_dead("channel open failed"));
+    }
+}
+
+#[cfg(test)]
+mod zmodem_zfin_echo_tests {
+    use super::{find_zmodem_start, looks_like_shell_prompt};
+
+    /// 根因不变量：ZFIN 帧的字节与 ZMODEM 自动启动针**逐字节相同**。
+    ///
+    /// 这是「会话结束后选择器又弹一次」那个 bug 的根：我们发 ZFIN 关会话，
+    /// 远端的回响字节 `**\x18B08…` 与 auto-start 针 `**\x18B` 匹配，于是被
+    /// `find_zmodem_start` 当成「远端又敲了一次 rz」，重新进入 Zmodem 模式。
+    /// 用户点取消后终端卡死（输入被吞），只能重连。
+    ///
+    /// 这条测试锁住「为什么抑制窗口内必须跳过自动启动检测」—— 若哪天有人
+    /// 改了针或 ZFIN 的构造，这里会先失败，而不是等到用户再踩一次坑。
+    #[test]
+    fn zfin_frame_bytes_match_the_autostart_needle() {
+        // 与 zmodem_tx::build_hex_header(ZFIN) 的字节布局一致：
+        // ZPAD ZPAD ZDLE ZHEX + "08" + 8 个 0 + CRC + CR LF + XON
+        let zfin_like: Vec<u8> = {
+            let mut v = vec![b'*', b'*', 0x18, b'B'];
+            v.extend_from_slice(b"0800000000000000");
+            v.extend_from_slice(b"0000\r\n");
+            v.push(0x11);
+            v
+        };
+        assert!(
+            find_zmodem_start(&zfin_like).is_some(),
+            "ZFIN 帧必须匹配 auto-start 针 —— 这是抑制窗口存在的原因"
+        );
+
+        // 反向：普通终端文本不得匹配，否则每次 ls 都会误入 ZMODEM。
+        assert!(find_zmodem_start(b"user@host:~$ ").is_none());
+    }
+
+    /// 裸 ZDLE 针（`\x18[ABC]`，不带 `**` 前导）曾被当作「PTY echo 吃掉
+    /// 前导星号」的兜底而存在。实测代价远大于收益：它让任何含 ZDLE 后跟
+    /// A/B/C 的字节流都命中，包括 CAN 中止序列的余波、shell 历史命令、
+    /// 二进制输出 —— 表现为取消后选择器反复自启、上下方向键查历史卡死。
+    ///
+    /// 这条测试锁住「只认规范前导」：真实场景中远端 rz 发出的帧永远带完整
+    /// `ZPAD ZPAD ZDLE`，而 echo 只影响我们自己的输入，不影响对端的帧。
+    #[test]
+    fn bare_zdle_form_is_not_an_autostart() {
+        // CAN 中止序列的余波：一串 0x18 后跟任意字节
+        let can_tail = vec![0x18, 0x18, 0x18, 0x42, 0x18, 0x18];
+        assert!(
+            find_zmodem_start(&can_tail).is_none(),
+            "裸 \\x18B 不得算作自动启动 —— 这正是取消后自启的根因"
+        );
+
+        // 历史命令里恰好出现 ZDLE + 'B'（例如粘贴过的二进制/转义内容）
+        assert!(find_zmodem_start(b"ls -la\x18Bfoo").is_none());
+    }
+
+    /// 规范形式仍然认 —— 别把收窄做成「再也不识别」。
+    #[test]
+    fn canonical_form_still_detected() {
+        assert!(find_zmodem_start(b"prompt$ **\x18B08").is_some());
+        assert!(find_zmodem_start(b"**\x18A").is_some());
+        assert!(find_zmodem_start(b"**\x18C").is_some());
+    }
+
+    /// shell 提示符判定：取消后恢复自动启动的唯一无输入途径。
+    /// 过宽会让 chooser 在普通输出上重开，过严则用户不敲字就永远锁死。
+    #[test]
+    fn shell_prompt_detection_is_narrow_but_sufficient() {
+        // 常见提示符（bash / zsh / root / PS2 续行）
+        assert!(looks_like_shell_prompt(b"user@host:~$ "));
+        assert!(looks_like_shell_prompt(b"[root@ias34 /]# "));
+        assert!(looks_like_shell_prompt(b"> ")); // PS2
+        assert!(looks_like_shell_prompt(b"ias@34-prod ~% ")); // zsh
+
+        // 普通输出不得判定为提示符
+        assert!(!looks_like_shell_prompt(b"total 48\ndrwxr-xr-x 2 user user 4096 "));
+        assert!(!looks_like_shell_prompt(b"a.txt\n"));
+        // 行中间的 $ 不算（没有尾随空格）
+        assert!(!looks_like_shell_prompt(b"echo $HOME"));
+    }
+}
+
+// ============ Upload capability probe (drag-drop upload channel selection) ============
+//
+// 拖拽上传原本无条件走 SFTP 子系统。真实环境里「连得上 SSH」不等于「用得了
+// SFTP」——restricted shell、chroot、只开 exec 的跳板机、嵌入式设备都会拒绝
+// `request_subsystem("sftp")`，用户看到的是「无法检查远端目标目录，已取消上传：
+// SFTP session init failed: Timeout」，没有任何可操作的下一步。
+//
+// 探测一次服务端的实际上传能力，让上传走能用的那条路，并在两条路都没有时
+// 给出「装什么、怎么装」的具体指引，而不是一句无法执行的错误。
+//
+// 探测走 exec 通道（`exec_once`）而不是 PTY：PTY 会被用户正在跑的全屏程序
+// 占用，exec 通道独立、且 exec_once 自带一次性重连。
+
+/// 服务端上传能力的探测结果。
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadCapabilities {
+    /// `request_subsystem("sftp")` 是否可用。
+    pub sftp_available: bool,
+    /// 远端是否同时有 `rz` 与 `sz`（lrzsz）。
+    pub zmodem_available: bool,
+    /// 探测是否跑完。false = exec 也不可用（或超时），此时两条路径都未确认。
+    pub probe_completed: bool,
+    /// 探测到的包管理器（用于生成安装命令）。
+    pub package_manager: Option<String>,
+    /// 装 lrzsz 的具体命令；探测到包管理器时才有。
+    pub install_hint: Option<String>,
+    /// 探测过程中的说明（失败原因等），展示给用户。
+    pub message: Option<String>,
+}
+
+/// 探测脚本：一次性问完「有没有 rz/sz」与「用哪个包管理器」。
+///
+/// 每条命令单独一行输出，用 `;` 分隔而不是 `&&`：任一探测命令不存在时
+/// `command -v` 返回非零，`&&` 会让后面全部不执行，最后两行永远拿不到。
+/// POSIX sh 兼容（不用 bash 特性）：服务端可能是 dash / busybox。
+const PROBE_SCRIPT: &str = "command -v rz >/dev/null 2>&1 && echo HAS_RZ; \
+command -v sz >/dev/null 2>&1 && echo HAS_SZ; \
+for pm in apt-get dnf yum apk zypper pacman; do command -v $pm >/dev/null 2>&1 && echo PM=$pm && break; done";
+
+/// 探测超时。与 `ssh_get_server_info` 的 8 秒同量级——探测失败不该让拖拽
+/// 卡住，未知就退回「上传时再判」。
+const PROBE_TIMEOUT_SECS: u64 = 8;
+
+/// 包管理器 → 安装 lrzsz 的命令。用于「两条上传路径都不可用」时的可操作提示。
+fn install_hint_for(pm: &str) -> Option<&'static str> {
+    match pm {
+        "apt-get" => Some("sudo apt-get update && sudo apt-get install -y lrzsz"),
+        "dnf" => Some("sudo dnf install -y lrzsz"),
+        "yum" => Some("sudo yum install -y lrzsz"),
+        "apk" => Some("sudo apk add lrzsz"),
+        "zypper" => Some("sudo zypper install -y lrzsz"),
+        "pacman" => Some("sudo pacman -S --noconfirm lrzsz"),
+        _ => None,
+    }
+}
+
+/// 探测服务端的上传能力。
+///
+/// SFTP 可用性单独试一次子系统请求（`get_sftp_session` 的同一路径）；lrzsz
+/// 与包管理器走 exec 脚本。exec 不可用（restricted shell / 超时）时
+/// `probe_completed = false`，调用方据此走「上传时失败再降级」。
+pub async fn probe_upload_capabilities(
+    state: &AppState,
+    session_id: &str,
+) -> UploadCapabilities {
+    // SFTP：真实开一次子系统，失败即不可用。这比任何间接推断都可靠。
+    // 必须带超时——挂起的服务器（收到子系统请求后不应答）会让握手永久
+    // 卡住，探测死等，拖拽上传就卡在这一步，这正是要修的用户症状。
+    let sftp_available = tokio::time::timeout(
+        std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+        super::sftp::probe_sftp_subsystem(state, session_id),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+
+    let mut caps = UploadCapabilities {
+        sftp_available,
+        ..Default::default()
+    };
+
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+        exec_once(state, session_id, PROBE_SCRIPT),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            // exec 也不可用：两条路都没确认。不明说「装 lrzsz」——用户可能
+            // 装不了，而且真正缺的是 exec 通道本身。
+            caps.probe_completed = false;
+            caps.message = Some(format!("无法探测服务端能力：{}", e));
+            return caps;
+        }
+        Err(_) => {
+            caps.probe_completed = false;
+            caps.message = Some("探测服务端能力超时".to_string());
+            return caps;
+        }
+    };
+
+    caps.probe_completed = true;
+    parse_probe_output(&output, sftp_available, &mut caps);
+    caps
+}
+
+/// 解析探测脚本的输出并填充 `caps`。纯函数，单测直接喂字符串。
+///
+/// zmodem 可用要求 rz 与 sz **同时**在：上传要 rz、（下载/完整性）要 sz，
+/// 只有其中一个说明装的是残缺包，按不可用处理走安装指引。
+fn parse_probe_output(output: &str, sftp_available: bool, caps: &mut UploadCapabilities) {
+    let mut has_rz = false;
+    let mut has_sz = false;
+    for line in output.lines() {
+        let line = line.trim();
+        match line {
+            "HAS_RZ" => has_rz = true,
+            "HAS_SZ" => has_sz = true,
+            _ => {
+                if let Some(pm) = line.strip_prefix("PM=") {
+                    let pm = pm.trim();
+                    caps.package_manager = Some(pm.to_string());
+                    caps.install_hint = install_hint_for(pm).map(|s| s.to_string());
+                }
+            }
+        }
+    }
+    caps.zmodem_available = has_rz && has_sz;
+
+    if !sftp_available && !caps.zmodem_available {
+        caps.message = Some(match &caps.install_hint {
+            Some(hint) => format!("服务端既不支持 SFTP 子系统，也没有 lrzsz。可安装：{}", hint),
+            None => "服务端既不支持 SFTP 子系统，也没有 lrzsz。请安装 lrzsz 后重试。".to_string(),
+        });
+    }
+}
+
+#[cfg(test)]
+mod upload_caps_tests {
+    use super::{install_hint_for, parse_probe_output, UploadCapabilities};
+
+    fn parse(output: &str, sftp: bool) -> UploadCapabilities {
+        // probe_completed 由 probe_upload_capabilities 在调用解析前置位
+        // （exec 探测已成功才会走到解析），这里复现同样的前置状态。
+        let mut caps = UploadCapabilities {
+            sftp_available: sftp,
+            probe_completed: true,
+            ..Default::default()
+        };
+        parse_probe_output(output, sftp, &mut caps);
+        caps
+    }
+
+    /// lrzsz 齐全 + apt：ZMODEM 可用、给出 apt 安装命令。
+    #[test]
+    fn full_lrzsz_with_apt() {
+        let caps = parse("HAS_RZ\nHAS_SZ\nPM=apt-get\n", false);
+        assert!(caps.zmodem_available);
+        assert!(!caps.sftp_available);
+        assert_eq!(caps.package_manager.as_deref(), Some("apt-get"));
+        assert_eq!(
+            caps.install_hint.as_deref(),
+            Some("sudo apt-get update && sudo apt-get install -y lrzsz")
+        );
+        // 有 ZMODEM 就不是死路，不生成「两条路都没有」的提示。
+        assert!(caps.message.is_none());
+    }
+
+    /// 只有 rz 没有 sz（残缺安装）：按不可用处理，走安装指引。
+    #[test]
+    fn rz_without_sz_is_unavailable() {
+        let caps = parse("HAS_RZ\nPM=dnf\n", false);
+        assert!(!caps.zmodem_available);
+        assert!(caps.message.is_some());
+        assert!(caps.message.as_deref().unwrap().contains("lrzsz"));
+    }
+
+    /// 两条路都没有 + 探到包管理器：提示里带具体安装命令。
+    #[test]
+    fn nothing_available_gives_install_hint() {
+        let caps = parse("PM=apk\n", false);
+        assert!(!caps.zmodem_available && !caps.sftp_available);
+        assert!(caps.probe_completed);
+        let msg = caps.message.as_deref().unwrap();
+        assert!(msg.contains("apk add lrzsz"), "提示应含安装命令：{}", msg);
+    }
+
+    /// 两条路都没有 + 没探到包管理器：提示仍可读，不 panic。
+    #[test]
+    fn nothing_available_without_pm() {
+        let caps = parse("", false);
+        assert!(caps.message.is_some());
+        assert!(caps.install_hint.is_none());
+    }
+
+    /// SFTP 可用时即使没有 lrzsz 也不提示安装（不需要）。
+    #[test]
+    fn sftp_available_silences_hint() {
+        let caps = parse("", true);
+        assert!(caps.sftp_available);
+        assert!(caps.message.is_none());
+    }
+
+    /// 输出可能带 \r（部分 shell 的 echo）：trim 后仍能识别。
+    #[test]
+    fn crlf_output_still_parses() {
+        let caps = parse("HAS_RZ\r\nHAS_SZ\r\nPM=pacman\r\n", false);
+        assert!(caps.zmodem_available);
+        assert_eq!(caps.package_manager.as_deref(), Some("pacman"));
+    }
+
+    /// 脚本用 `;` 分隔而不是 `&&`：前一条失败后 PM= 仍会出现——这里锁住
+    /// PM= 行独立于 HAS_RZ/HAS_SZ 的解析（不依赖顺序）。
+    #[test]
+    fn pm_line_parses_regardless_of_order() {
+        let caps = parse("PM=zypper\nHAS_RZ\nHAS_SZ\n", false);
+        assert!(caps.zmodem_available);
+        assert_eq!(caps.package_manager.as_deref(), Some("zypper"));
+    }
+
+    #[test]
+    fn install_hint_covers_all_known_pms() {
+        for pm in ["apt-get", "dnf", "yum", "apk", "zypper", "pacman"] {
+            assert!(install_hint_for(pm).is_some(), "{} 应有安装命令", pm);
+        }
+        assert!(install_hint_for("brew").is_none());
     }
 }

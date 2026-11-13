@@ -6,7 +6,7 @@
      面板挂载关系与旧 App.tsx 一致：所有 tab 的面板绝对定位堆叠（visibility
      切换），保住 xterm 容器真实尺寸。 -->
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { MyButton } from "myui";
 import { ackWhatsnew, getAppVersion, getWhatsnewAck, openExternalUrl } from "./api";
 import {
@@ -15,7 +15,7 @@ import {
   reportVersion,
   setStatsConsent,
 } from "./lib/usageStats";
-import { ui, closeConnectionDialog, connectionDialog, applyUiAppearance } from "@/store/ui";
+import { ui, closeConnectionDialog, connectionDialog, applyUiAppearance, persistUi } from "@/store/ui";
 import { reloadConnections, connectionsStore } from "@/store/connections";
 import {
   sessions,
@@ -43,6 +43,7 @@ import AppTopBar from "@/components/AppTopBar.vue";
 import AppSidebar from "@/components/AppSidebar.vue";
 import WindowControls from "@/components/WindowControls.vue";
 import TerminalPanel from "@/components/TerminalPanel.vue";
+import MonitorPanel from "@/components/MonitorPanel.vue";
 import SftpPanel from "@/components/SftpPanel.vue";
 import MultiWindowGrid from "@/components/MultiWindowGrid.vue";
 import ServerInfoPanel from "@/components/ServerInfoPanel.vue";
@@ -71,6 +72,14 @@ let uninstallFontShortcuts: (() => void) | null = null;
 
 const activeTab = computed<Tab | undefined>(() => sessions.tabs.find((t) => t.id === sessions.activeTabId));
 const hasTabs = computed(() => sessions.tabs.length > 0);
+
+/** 监控面板开关。顶栏一枚按钮切换，打开时面板吸附右缘（AI 栏下方）。
+    面板自身在 open=false 时不渲染内容也不轮询。 */
+const monitorOpen = ref(false);
+
+function toggleMonitor(): void {
+  monitorOpen.value = !monitorOpen.value;
+}
 
 // ── 保险库就绪后的启动序列（版本/更新/统计/MCP 桥/连接列表） ──
 async function onVaultReady(): Promise<void> {
@@ -226,6 +235,12 @@ function onBottomScreenshot(): void {
   callSessionAction(bottomCommandTab.value?.sessionId, "screenshot");
 }
 
+/** 底部命令栏的「🔧 修复」：终端被远端程序改坏（不回显、退格/方向键失灵）
+ *  时发 Ctrl-C + stty sane。实现同样在 TerminalPanel（要用它的 sendTo）。 */
+function onBottomRepairTerminal(): void {
+  callSessionAction(bottomCommandTab.value?.sessionId, "repair-terminal");
+}
+
 /** 两个调用方的载荷不同：TerminalPanel 转发的是 connectionId；壳层底部那条
  *  CommandBar 自己的 emit 不带参数，回落到活动标签的连接。 */
 function onOpenQuickCommandsManage(cid?: string): void {
@@ -252,8 +267,16 @@ function onOpenQuickCommandsManage(cid?: string): void {
       'no-ai': !ui.showAiPanel,
     }"
   >
-    <AppTopBar class="shell-topbar" />
-    <AppSidebar class="shell-side" />
+    <AppTopBar
+      class="shell-topbar"
+      :monitor-open="monitorOpen"
+      @toggle-monitor="toggleMonitor"
+    />
+    <AppSidebar
+      class="shell-side"
+      :collapsed="ui.sidebarCollapsed"
+      @toggle-collapse="ui.sidebarCollapsed = !ui.sidebarCollapsed; persistUi()"
+    />
 
     <main class="shell-work">
       <!-- 多窗口网格 -->
@@ -323,22 +346,23 @@ function onOpenQuickCommandsManage(cid?: string): void {
             </div>
 
             <!-- SFTP/FTP 面板 -->
-            <SftpPanel
-              v-else-if="tab.type !== 'terminal'"
-              :session-id="tab.sessionId"
-              :source="tab.type === 'ftp' ? 'ftp' : 'ssh'"
-              full-height
-              :status="tab.status"
-              @reconnect="reconnectTab(tab.id)"
-              @disconnected="tab.status = 'disconnected'"
-            />
+            <template v-else-if="tab.type !== 'terminal'">
+              <SftpPanel
+                :session-id="tab.sessionId"
+                :source="tab.type === 'ftp' ? 'ftp' : 'ssh'"
+                full-height
+                :status="tab.status"
+                @reconnect="reconnectTab(tab.id)"
+                @disconnected="tab.status = 'disconnected'"
+              />
+            </template>
 
             <!-- 终端面板。:command-bar="false" —— 命令栏已提升到壳层底部行，
-                 由下面 .shell-bottom 统一渲染一条给活动标签用 -->
+                 由下面 .shell-bottom 统一渲染一条给活动标签用。 -->
             <TerminalPanel
-              v-else
+              v-else-if="tab.type === 'terminal'"
               :tab-id="tab.id"
-              :session-id="tab.sessionId"
+              :session-id="tab.sessionId!"
               :connection-id="tab.connectionId ?? ''"
               :conn-type="tab.connType"
               :font-override="tab.config?.terminal_font"
@@ -381,6 +405,7 @@ function onOpenQuickCommandsManage(cid?: string): void {
         @reconnect="reconnectTab(bottomCommandTab.tab.id)"
         @open-quick-commands-manage="onOpenQuickCommandsManage"
         @screenshot="onBottomScreenshot"
+        @repair-terminal="onBottomRepairTerminal"
       />
 
       <ServerInfoPanel
@@ -389,6 +414,16 @@ function onOpenQuickCommandsManage(cid?: string): void {
         :active="true"
       />
     </div>
+
+    <!-- 监控面板：多主机资源一览，吸附工作区右缘（与 AI 栏同一侧但不重叠时
+         并排；AI 栏开着时监控面板盖在它外面，关面板即恢复）。
+         只在非多窗口模式下出现 —— 多窗口网格每格自带终端，面板没有锚点。 -->
+    <MonitorPanel
+      v-if="!ui.multiWindowMode"
+      class="shell-monitor"
+      :open="monitorOpen"
+      @close="monitorOpen = false"
+    />
 
     <!-- AI 助手（右栏） -->
     <AiPanel
@@ -549,6 +584,10 @@ function onOpenQuickCommandsManage(cid?: string): void {
   gap: 12px;
   color: var(--text-muted);
   font-size: var(--fs-md);
+  /* 必须高于终端面板（z-index:1）：遮罩与 TerminalPanel 是同层兄弟，
+     缺层会被 xterm 的 canvas（.xterm-link-layer）吃掉点击 ——
+     「连接失败」页的按钮点不动（实测命中的是 CANVAS）。 */
+  z-index: 20;
 }
 
 .connecting-icon {
@@ -564,6 +603,14 @@ function onOpenQuickCommandsManage(cid?: string): void {
   align-items: center;
   justify-content: center;
   padding: 32px;
+  /* 同上：必须压过终端面板，否则 xterm canvas 挡住「关闭 / 重新连接」。
+     底色用半透明玻璃而非 --bg-overlay（0.7 的遮罩色会把壁纸整片压暗，
+     与刚做的「工作区透出壁纸」相悖）；错误态本就不该透出终端内容，
+     故用近不透明的深色底 + 轻微模糊。 */
+  z-index: 20;
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur, 12px));
+  -webkit-backdrop-filter: blur(var(--glass-blur, 12px));
 }
 
 .error-icon {

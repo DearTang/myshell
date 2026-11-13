@@ -21,30 +21,46 @@ defineOptions({ name: "WindowControls" });
 /** 门禁页背景是深色渐变，按钮默认色需比顶栏更亮一档才看得清。 */
 withDefaults(defineProps<{ tone?: "topbar" | "overlay" }>(), { tone: "topbar" });
 
-const win = getCurrentWindow();
+/** 惰性取窗口句柄：`getCurrentWindow()` 在非 Tauri 环境（裸浏览器预览、
+ *  单元测试）会因缺少 `__TAURI_INTERNALS__` 直接抛异常。放在 setup 顶层
+ *  同步调用时，该异常会中断整个 AppShell 的 setup —— 表现为整页白屏而非
+ *  仅窗口按钮失效，故推迟到首次使用时再取，失败只让按钮退化为不可用。 */
+let win: ReturnType<typeof getCurrentWindow> | null = null;
+function currentWin(): ReturnType<typeof getCurrentWindow> | null {
+  if (win === null) {
+    try {
+      win = getCurrentWindow();
+    } catch {
+      return null;
+    }
+  }
+  return win;
+}
 const isMaximized = ref(false);
 let unlistenResized: UnlistenFn | null = null;
 
 function minimizeWin(): void {
-  void win.minimize().catch(() => {
+  void currentWin()?.minimize().catch(() => {
     /* best-effort */
   });
 }
 
 function toggleMaximize(): void {
-  void win.toggleMaximize().catch(() => {
+  void currentWin()?.toggleMaximize().catch(() => {
     /* best-effort */
   });
 }
 
 function closeWin(): void {
-  void win.close().catch(() => {
+  void currentWin()?.close().catch(() => {
     /* best-effort */
   });
 }
 
 onMounted(() => {
-  void win
+  const w = currentWin();
+  if (!w) return;
+  void w
     .isMaximized()
     .then((m) => {
       isMaximized.value = m;
@@ -52,9 +68,9 @@ onMounted(() => {
     .catch(() => {
       /* 权限缺失时按钮退化为普通图标 */
     });
-  void win
+  void w
     .onResized(async () => {
-      isMaximized.value = await win.isMaximized().catch(() => isMaximized.value);
+      isMaximized.value = await w.isMaximized().catch(() => isMaximized.value);
     })
     .then((fn) => {
       unlistenResized = fn;

@@ -6,8 +6,8 @@
      内嵌本栏最右（omp desktop 式一行顶栏），空白区域可拖动窗口。 -->
 <script setup lang="ts">
 import { MyButton, MyIcon, MyIconButton, MyStatusDot, type MyTone } from "myui";
-import { computed, onMounted, onUnmounted, ref } from "vue";
-import { persistUi, setMcpSessionAllowed, ui } from "@/store/ui";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { setMcpSessionAllowed, ui } from "@/store/ui";
 import {
   broadcastAll,
   closeDisconnected,
@@ -32,6 +32,15 @@ import {
 
 defineOptions({ name: "AppTopBar" });
 
+const props = defineProps<{
+  /** 监控面板是否打开（顶栏按钮的激活态）。 */
+  monitorOpen: boolean;
+}>();
+
+const emit = defineEmits<{
+  "toggle-monitor": [];
+}>();
+
 type TabStatus = NonNullable<Tab["status"]>;
 
 // 状态指示器的颜色与图标（与旧 TabBar 一致）
@@ -52,15 +61,42 @@ function statusOf(tab: Tab): (typeof STATUS_CONFIG)[TabStatus] {
   return STATUS_CONFIG[tab.status || "connected"];
 }
 
-function canBroadcast(tab: Tab): boolean {
-  return tab.type === "terminal" && tab.connType === "ssh" && tab.status === "connected";
-}
+/* canBroadcast 已随标签上的广播钮一起删除（操作走「当前会话」下拉）。 */
 
 const broadcastCount = computed(() => sessions.broadcastIds.size);
 
 const downTabCount = computed(
   () => sessions.tabs.filter((t) => t.status === "disconnected" || t.status === "error").length,
 );
+
+/** 标签的主连接标识：`用户名@host` 或 `用户名@host:port`。
+ *
+ * 取不到 config 的标签（本地终端 / 早期会话）返回空串，模板据此决定是否渲染
+ * 这一截，避免出现 "undefined@undefined"。
+ *
+ * 端口 22（SSH 默认）省略 —— 默认端口不增加信息量，却让每个标签都长一截。
+ *
+ * 为什么用 `用户@host` 而不是「名称 + host」两截：多开会场景下真正区分标签的
+ * 是「连哪台机器、用哪个账号」，名称可以重复（两台都叫 prod），用户@host 不会。
+ * 名称移到 title 里悬停可看全，不占条上宽度。 */
+function tabHost(tab: Tab): string {
+  const user = tab.config?.username?.trim();
+  const host = tab.config?.host?.trim();
+  if (!host) return "";
+  const port = tab.config?.port;
+  const hostPort = port && port !== 22 ? `${host}:${port}` : host;
+  return user ? `${user}@${hostPort}` : hostPort;
+}
+
+/** 标签悬停提示：名称 + 完整连接标识。
+ *
+ * 条上只显示 `用户@host`（省宽度），名称与端口进 title —— 悬停即可看全，
+ * 这是「条上精简、悬停完整」的拆法：条上永远不因为信息多而换行或被截断，
+ * 完整信息也不丢失。 */
+function tabTitle(tab: Tab): string {
+  const id = tabHost(tab);
+  return id ? `${tab.name} — ${id}` : tab.name;
+}
 
 // ── 下拉面板开关 ──
 // 2026-10-10：「当前会话」与「广播」两个触发钮合并为一个（两者列的都是标签页，
@@ -89,6 +125,39 @@ function recomputeAnchor(): void {
   const rect = readAnchorRect(sessionsTriggerRef.value?.$el ?? null);
   if (rect) anchor.value = rect;
 }
+
+// ── 标签溢出检测 ──
+// 标签条 overflow:hidden 等分收缩，标签数 × min-width 超过条宽时边缘标签
+// 被裁 —— tabs-overflow（…）钮在此时出现，收纳被裁标签的查看/切换入口。
+// tabsScrollRef 上同时挂 ResizeObserver 与 tabs 变化的 nextTick 重算：
+// 窗口拖宽/拖窄、开关标签都会即时翻转溢出态（有一帧延迟，可接受）。
+const tabsScrollRef = ref<HTMLDivElement | null>();
+const tabsOverflow = ref(false);
+
+function recomputeTabsOverflow(): void {
+  const el = tabsScrollRef.value;
+  if (!el) return;
+  // 减去溢出钮自身宽度：它出现后要让出的空间不算进“是否还有标签被裁”。
+  tabsOverflow.value = el.scrollWidth > el.clientWidth + 1;
+}
+
+let tabsRo: ResizeObserver | null = null;
+
+watch(
+  () => sessions.tabs.length,
+  () => void nextTick(recomputeTabsOverflow),
+);
+
+onMounted(() => {
+  tabsRo = new ResizeObserver(() => recomputeTabsOverflow());
+  if (tabsScrollRef.value) tabsRo.observe(tabsScrollRef.value);
+  recomputeTabsOverflow();
+});
+
+onUnmounted(() => {
+  tabsRo?.disconnect();
+  tabsRo = null;
+});
 
 // 窗口控制按钮已抽到 WindowControls.vue（与保险库门禁页共用）。
 
@@ -152,11 +221,6 @@ function rowSecondaryAction(tab: Tab): RowSecondaryActionInfo | undefined {
 
 // ── 壳层动作 ──
 
-function toggleSidebar(): void {
-  ui.sidebarCollapsed = !ui.sidebarCollapsed;
-  persistUi();
-}
-
 function openQuickCommands(): void {
   ui.qcInitialConnectionId = null;
   ui.showQuickCommands = true;
@@ -175,47 +239,16 @@ function revokeSessionAllowed(): void {
   <!-- data-tauri-drag-region：元素自身空白处可拖动窗口（子元素不受影响）；
        标签条空白区同样可拖（Chrome/omp 式）。双击空白 = 最大化/还原。 -->
   <header class="app-topbar" data-tauri-drag-region>
-    <!-- 左：侧栏折叠 + 品牌区 -->
-    <div class="topbar-left">
-      <!-- 全站唯一的侧栏收起/展开入口（用户指定）。此前侧栏头部另有一枚同功能按钮，
-         隐藏态下那枚根本点不到，留着只是重复入口 —— 已删除。 -->
-      <MyIconButton
-        :title="ui.sidebarCollapsed ? '显示侧栏' : '隐藏侧栏'"
-        class="icon-btn"
-        :label="ui.sidebarCollapsed ? '显示侧栏' : '隐藏侧栏'"
-        size="17"
-        :name="ui.sidebarCollapsed ? 'Expand' : 'Fold'"
-        :aria-expanded="!ui.sidebarCollapsed"
-        @click="toggleSidebar"
-      />
-      <div class="brand">
-        <!-- 内联矢量品牌标记 >_（与应用图标同款），随主题令牌变色 -->
-        <svg class="brand-mark" viewBox="0 0 64 64" fill="none" role="img" aria-label="MyShell">
-          <defs>
-            <linearGradient id="app-topbar-brand-grad" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0" style="stop-color: var(--accent-primary-hover)" />
-              <stop offset="0.5" style="stop-color: var(--accent-primary)" />
-              <stop offset="1" style="stop-color: var(--accent-secondary)" />
-            </linearGradient>
-          </defs>
-          <!-- 折号 `>`：顶点在左，开口朝右 -->
-          <path
-            d="M35 19 L16 32 L35 45"
-            stroke="url(#app-topbar-brand-grad)"
-            stroke-width="6.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          />
-          <!-- 光标 `_` -->
-          <rect x="37" y="42" width="13" height="5" rx="2.5" style="fill: var(--accent-secondary)" />
-        </svg>
-        <span class="brand-name">MyShell</span>
-      </div>
-    </div>
+    <!-- 左：标签条直接占满左侧。品牌展示（>_ 图标 + MyShell 文字）已删除
+         —— 侧栏折叠后这一块会滑到窗口最左，与侧栏顶排的图标排重复占位，
+         且产品名在侧栏顶排 / 欢迎页 / 关于对话框已有多处展示，顶栏这处属冗余。
+         此处保留空的 .topbar-left 是为了：标签条（.tab-strip）是 flex:1 的
+         中间项，删掉左容器会让 flex 分配变化，标签条将贴到窗口最左。 -->
+    <div class="topbar-left" />
 
-    <!-- 中：标签条（横向滚动）+ 右侧下拉触发钮 -->
+    <!-- 中：标签条（浏览器式等分收缩） -->
     <div class="tab-strip">
-      <div class="tabs-scroll" data-tauri-drag-region>
+      <div ref="tabsScrollRef" class="tabs-scroll" data-tauri-drag-region>
         <div
           v-for="tab in sessions.tabs"
           :key="tab.id"
@@ -233,11 +266,13 @@ function revokeSessionAllowed(): void {
           <!-- 连接类型图标（随标签文字着色） -->
           <ConnIcon class="tab-icon" :type="tab.connType || 'ssh'" :size="14" :name="tab.name" />
 
-          <!-- 标签名（广播组优先于错误态着色，与旧版三元表达式一致） -->
+          <!-- 主标识：服务器名称（用户指定：条上只要名称，完整 用户@host
+               信息进 title 悬停看全）。名称可重复 —— 多开同一台机器时靠
+               图标/状态点与 title 区分，这是「信息密度让位可用宽度」的取舍。 -->
           <span
             class="tab-name"
             :class="{ 'is-error': (tab.status || 'connected') === 'error', 'in-broadcast': sessions.broadcastIds.has(tab.id) }"
-            :title="tab.name"
+            :title="tabTitle(tab)"
           >
             {{ tab.name }}
           </span>
@@ -250,27 +285,8 @@ function revokeSessionAllowed(): void {
             :aria-label="statusOf(tab).label"
           />
 
-          <!-- 广播切换 -->
-          <MyIconButton
-            :title="
-              sessions.broadcastIds.has(tab.id)
-                ? `广播组中（共 ${broadcastCount} 个 tab）— 点击退出`
-                : '加入广播'
-            "
-            v-if="canBroadcast(tab)"
-            class="tab-broadcast"
-            :label="
-              sessions.broadcastIds.has(tab.id)
-                ? `广播组中（共 ${broadcastCount} 个 tab）— 点击退出`
-                : '加入广播'
-            "
-            :active="sessions.broadcastIds.has(tab.id)"
-            size="12"
-            name="Promotion"
-            @click.stop="toggleBroadcast(tab.id)"
-          />
-
-          <!-- 关闭钮 -->
+          <!-- 悬停关闭（用户复调：多标签场景下逐个去下拉关闭太绕）。
+               悬停/活动标签显示，平时不占视觉；广播切换仍走下拉（低频）。 -->
           <MyIconButton
             title="关闭标签"
             class="tab-close"
@@ -280,15 +296,30 @@ function revokeSessionAllowed(): void {
             @click.stop="closeTab(tab.id)"
           />
         </div>
-      </div>
 
+        <!-- 溢出收纳：标签条放不下（有标签被裁）时出现，点击打开同一个
+             「当前会话」面板查看/切换/关闭全部标签。 -->
+        <button
+          v-if="tabsOverflow"
+          class="tabs-overflow"
+          title="更多标签页…"
+          @click="toggleSessionsPanel"
+        >
+          …
+        </button>
+      </div>
+    </div>
+
+    <!-- 右：壳层动作钮。「当前会话」触发钮从标签条移到这一组的最左：
+         顶栏图标按要求**靠右成一排**（ompDesktop 的 topbar-right 同款做法），
+         标签条独占左侧剩余空间，标签再多也不会把动作钮挤出视口。 -->
+    <div class="topbar-actions">
       <!-- 「当前会话」触发钮（常驻：标签再多也能一键看全量列表）——
            2026-10-10 起同时承载广播状态：有广播成员时整钮转强调色，
            并在计数右侧挂一枚 📡 N 徽标。广播的增删在面板内完成。 -->
       <DropdownTrigger
         ref="sessionsTriggerRef"
-        icon-name="Document"
-        label="当前会话"
+        label=""
         :count="sessions.tabs.length"
         :broadcast-count="broadcastCount"
         :active="openPanel"
@@ -300,23 +331,7 @@ function revokeSessionAllowed(): void {
         "
         @click="toggleSessionsPanel"
       />
-    </div>
-
-    <!-- 右：壳层动作钮 -->
-    <div class="topbar-actions">
-      <!-- 会话放行指示器：MCP 高危命令「本轮会话均允许」授权期间常驻显示，
-           点击即可撤销（撤销后下一次高危命令重新弹窗确认） -->
-      <MyButton
-        v-if="ui.mcpSessionAllowed"
-        variant="ghost-success"
-        size="small"
-        class="session-allowed-chip"
-        title="本轮会话已放行全部高危命令（点击撤销，撤销后重新弹窗确认）"
-        @click="revokeSessionAllowed"
-      >
-        <MyIcon :size="13" name="Unlock" />
-        <span>已放行高危</span>
-      </MyButton>
+      <!-- 会话放行指示器已挪至「快捷命令」左侧（见下），此处不再重复。 -->
       <MyIconButton
         title="多窗口"
         class="icon-btn"
@@ -326,6 +341,15 @@ function revokeSessionAllowed(): void {
         @click="ui.showMultiWindowPicker = true"
       />
       <MyIconButton
+        title="监控面板"
+        class="icon-btn"
+        label="监控面板"
+        size="16"
+        name="Monitor"
+        :active="monitorOpen"
+        @click="emit('toggle-monitor')"
+      />
+      <MyIconButton
         title="AI 助手"
         class="icon-btn"
         label="AI 助手"
@@ -333,6 +357,21 @@ function revokeSessionAllowed(): void {
         name="Robot"
         @click="ui.showAiPanel = !ui.showAiPanel"
       />
+      <!-- 会话放行指示器：MCP 高危命令「本轮会话均允许」授权期间常驻显示，
+           点击撤销。挪到快捷命令左侧（用户指定）；文案带 MCP 前缀 ——
+           放行作用于 MCP 工具发起的命令（进程级），与终端标签无关，
+           靠近终端动作区时必须自我说明，消除「属于当前标签」的歧义。 -->
+      <MyButton
+        v-if="ui.mcpSessionAllowed"
+        variant="ghost-success"
+        size="small"
+        class="session-allowed-chip"
+        title="MCP 工具发起的高危命令已放行（点击撤销，撤销后恢复逐条确认）。作用于 MCP 客户端会话，与终端标签无关。"
+        @click="revokeSessionAllowed"
+      >
+        <MyIcon :size="13" name="Unlock" />
+        <span>MCP 高危已放行</span>
+      </MyButton>
       <MyIconButton
         title="快捷命令"
         class="icon-btn"
@@ -390,29 +429,36 @@ function revokeSessionAllowed(): void {
   background: var(--surface-translucent);
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
-  border-bottom: 1px solid var(--border-subtle);
+  /* 与侧栏（.side）完全同配方：侧栏右缘用的是 --glass-border + --glass-highlight，
+     顶栏此前用 --border-subtle 且无高光，两块拼成同一整排时右缘出现
+     双重边框 + 高光台阶（截图红框处的接缝）。 */
+  border-bottom: 1px solid var(--glass-border);
+  box-shadow: var(--glass-highlight);
 }
 
-/* ─── 左：折叠钮 + 品牌 ───
-   侧栏顶排现在是壳层第一行左列（.side-header），本栏从第 2 列起 ——
-   左侧不再需要 8px 内边距去跟窗口边缘拉开，改成 4px 与侧栏顶排的
-   右内边距（8px）合起来约 12px 的视觉缝隙。 */
+/* ─── 左：占位 ───
+   品牌展示（>_ 图标 + MyShell 文字）已删除，此处只留一个零宽占位容器：
+   标签条是 flex:1 的中间项，若把左容器整个删掉，flex 分配会让标签条贴到
+   窗口最左缘。保留空容器 + flex-shrink:0 + 零内边距，视觉上与删除等价，
+   布局上维持「侧栏顶排 → 标签条」的既有节奏。 */
 .topbar-left {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 0 4px;
   flex-shrink: 0;
+  padding: 0;
 }
 
 /* 顶栏动作钮：外观（悬停/按下/禁用/焦点环）由 MyIconButton 承担，
-   这里只固定尺寸与静止态次级文字色，并把悬停改成强调色系——
-   库的默认悬停是中性 bg-elevated，本项目一律「悬停变主色」。 */
+   这里只固定尺寸与静止态文字色，并把悬停改成强调色系——
+   库的默认悬停是中性 bg-elevated，本项目一律「悬停变主色」。
+   静止态用 --text-primary 而非 --text-secondary：浅色模式下 secondary
+   （oklch 0.45）压在 0.985 玻璃上约 4.3:1，图标发虚（用户实报
+   「浅色模式图标对比度不够」）；primary 浅色 0.2、暗色 0.92 都清晰。 */
 .icon-btn {
   width: 32px;
   height: 32px;
   flex-shrink: 0;
-  color: var(--text-secondary);
+  color: var(--text-primary);
 }
 
 .icon-btn:hover {
@@ -424,27 +470,6 @@ function revokeSessionAllowed(): void {
 .icon-btn:active {
   background: var(--bg-surface-active);
   color: var(--accent-primary-hover);
-}
-
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 2px 6px;
-}
-
-.brand-mark {
-  width: 24px;
-  height: 24px;
-  display: block;
-}
-
-.brand-name {
-  color: var(--text-primary);
-  font-size: var(--fs-md);
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  white-space: nowrap;
 }
 
 /* ─── 中：标签条 ─── */
@@ -461,26 +486,38 @@ function revokeSessionAllowed(): void {
   flex: 1;
   min-width: 0;
   height: 100%;
-  overflow: auto;
+  /* 浏览器式：标签等分收缩塞满条宽，不出现横向滚动条（用户指定）。
+     极端多标签时每个压到 min-width 出省略号，悬停 title 看全。 */
+  overflow: hidden;
 }
-
 .tab-item {
   position: relative;
   height: 100%;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 14px;
+  gap: 6px;
+  padding: 0 8px 0 14px;
   font-size: var(--fs-xs);
   cursor: pointer;
   border-right: 1px solid var(--border-subtle);
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--text-primary);
+  /* 对比度：非活动标签原用 --text-secondary（暗色 oklch 0.68），压在玻璃
+     顶栏上发虚（用户实报「看不清/颜色不对」）。全亮则活动/非活动无层次
+     —— 折中：primary 基色 + 非活动态 0.72 不透明度，活动态回到 1。 */
+  opacity: 0.72;
   white-space: nowrap;
-  min-width: 0;
+  /* 浏览器式等分收缩（用户指定，替代 2026-11-12 的「不收缩+滚动」方案）：
+     flex:1 1 0 让所有标签均分条宽；max-width 15em 保证标签少时不单个
+     占满整条；min-width 7em 保证「图标 + 4-5 个字 + 状态点」可读
+     （2026-11-13 用户实拍 20 标签全挤成 "ia..."）—— 再多放不下就裁切，
+     由条尾 … 溢出钮收纳。 */
+  flex: 1 1 0;
+  max-width: 15em;
+  min-width: 7em;
   transition:
     background var(--duration-fast) var(--ease-in-out),
-    color var(--duration-fast) var(--ease-in-out);
+    opacity var(--duration-fast) var(--ease-in-out);
 }
 
 .tab-item:hover:not(.is-active) {
@@ -490,6 +527,7 @@ function revokeSessionAllowed(): void {
 .tab-item.is-active {
   background: var(--bg-base);
   color: var(--text-primary);
+  opacity: 1;
 }
 
 .tab-active-bar {
@@ -517,7 +555,13 @@ function revokeSessionAllowed(): void {
   flex-shrink: 0;
 }
 
+/* 主标识：服务器名称（UI 字体 —— 内容是名称不是地址，等宽字体那层
+   「连接标识」的视觉区分随 用户@host 一起移除了）。tab 内只有文本随
+   宽窄伸缩（图标/状态点/关闭钮定宽），min-width:1.5em 保证极端多标签
+   时至少露出 1-2 个字符 + 省略号，完整信息悬停 title 看。 */
 .tab-name {
+  flex: 1 1 auto;
+  min-width: 1.5em;
   overflow: hidden;
   text-overflow: ellipsis;
   font-weight: 400;
@@ -542,19 +586,21 @@ function revokeSessionAllowed(): void {
   transform: scale(0.9);
 }
 
-/* 广播开关与关闭钮：外观由 MyIconButton 承担（含 active 态与 aria-pressed），
-   这里只保留标签条密度与「在组内着成功色」的原有意图。 */
-.tab-broadcast {
-  flex-shrink: 0;
-  opacity: 0.55;
-}
-
-.tab-broadcast:hover {
-  opacity: 1;
-}
-
+/* 悬停关闭钮（2026-11-13 复调恢复：多标签下逐个去下拉关太绕）。Chrome 式
+   —— 悬停/活动标签显示，平时透明不占视觉。
+   **绝对定位**是关键（2026-11-13 用户实拍：流内布局时 MyIconButton 默认
+   36px 宽放不进 84px 标签，× 溢出画到右侧相邻标签上 —— 悬停 tab1 的 ×
+   出现在 tab2、滑过去又串到 tab3，“套娃”且点不中）。定位在标签右侧内
+   缘，盖住状态点（悬停时状态点让位），永不跳出本标签范围。 */
 .tab-close {
-  flex-shrink: 0;
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 18px !important;
+  height: 18px !important;
+  min-width: 0 !important;
+  padding: 0 !important;
   opacity: 0;
   transition: opacity var(--duration-fast) var(--ease-in-out);
 }
@@ -564,10 +610,35 @@ function revokeSessionAllowed(): void {
   opacity: 1;
 }
 
+/* 悬停时状态点让位给 ×：两者都靠右，避免叠在一起 */
+.tab-item:hover .tab-status,
+.tab-item.is-active .tab-status {
+  opacity: 0;
+}
+
 .tab-close:hover {
   opacity: 1;
   background: var(--error-muted);
   color: var(--error);
+}
+
+/* 溢出收纳钮（…）：标签条有标签被裁时出现，点击打开「当前会话」面板。
+   定宽不参与等分；与标签同密度。 */
+.tabs-overflow {
+  flex: 0 0 auto;
+  height: 100%;
+  padding: 0 10px;
+  border: none;
+  border-left: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+
+.tabs-overflow:hover {
+  background: var(--bg-surface-hover);
+  color: var(--accent-primary);
 }
 
 /* ─── DropdownTrigger（本组件的 <button class="el-button dropdown-trigger">

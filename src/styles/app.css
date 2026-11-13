@@ -33,6 +33,9 @@
      由外观设置的两个滑杆写入 html 内联样式。 */
   --ui-solidity: 0.25;
   --ui-popup-solidity: 0.55;
+  /* 主题色相（0-360）：外观设置「主题色」滑杆写入 html 内联样式覆盖；
+     强调色族 / 光晕 / 玻璃色度分量全部由它派生（ompDesktop 同款旋钮）。 */
+  --accent-hue: 180;
 
   /* 壳层顶排高度：侧栏顶排 / 顶栏拼成窗口最上面同一整排。 */
   --chrome-top-height: 44px;
@@ -41,63 +44,93 @@
   --motion-scale: 1;
 }
 
-/* ─── MyShell 令牌层：默认（暗色 Carbon） ─── */
+/* ─── MyShell 令牌层：暗色（对齐 ompDesktop：oklch 基础底 + 色相派生强调色）───
+   UI 颜色不再随终端配色预设走：中性底（bg/text/border）在暗/亮两个主题块
+   各定义一版；强调色族由 --accent-hue（外观设置的「主题色」滑杆）运行期
+   派生。终端配色预设只管 xterm 的 16 色。 */
 :root,
 [data-theme="dark"] {
-  --bg-base: #0d1117;
-  --bg-elevated: #161b22;
-  --bg-surface: #21262d;
-  --bg-surface-hover: #292e36;
-  --bg-surface-active: #323841;
-  --bg-input: #1a1f26;
-  --bg-input-hover: #242930;
-  --bg-overlay: rgba(0, 0, 0, 0.75);
+  --bg-base: oklch(0.15 0.012 250);
+  --bg-elevated: oklch(0.19 0.014 250);
+  --bg-surface: oklch(0.22 0.016 250);
+  --bg-surface-hover: oklch(0.26 0.018 250);
+  --bg-surface-active: oklch(0.3 0.018 250);
+  --bg-input: oklch(0.17 0.013 250);
+  --bg-input-hover: oklch(0.21 0.015 250);
+  --bg-overlay: oklch(0.05 0.005 250 / 0.7);
 
-  --text-primary: #e6edf3;
-  --text-secondary: #8b949e;
-  --text-tertiary: #6e7681;
-  --text-muted: #484f58;
-  --text-inverse: #0d1117;
+  --text-primary: oklch(0.92 0.004 250);
+  --text-secondary: oklch(0.78 0.012 250);
+  --text-tertiary: oklch(0.68 0.012 250);
+  --text-muted: oklch(0.6 0.01 250);
+  --text-inverse: oklch(0.15 0.012 250);
 
-  --accent-primary: #58a6ff;
-  --accent-primary-hover: #79c0ff;
-  --accent-primary-muted: rgba(88, 166, 255, 0.12);
-  --accent-secondary: #39d2c0;
-  --accent-secondary-muted: rgba(57, 210, 192, 0.12);
+  /* 主强调色族：色相跟随 --accent-hue（默认青绿 180，ompDesktop 同款） */
+  --accent-primary: oklch(0.72 0.15 var(--accent-hue));
+  --accent-primary-hover: oklch(0.77 0.14 var(--accent-hue));
+  --accent-primary-active: oklch(0.67 0.15 var(--accent-hue));
+  --accent-primary-muted: oklch(0.72 0.15 var(--accent-hue) / 0.12);
+  /* 副强调色固定青绿色相、不随主题色漂移：它是连接类型的语义色
+     （sftp 图标 / 标签页），稳定可辨识比跟主题协调更重要。 */
+  --accent-secondary: oklch(0.72 0.13 165);
+  --accent-secondary-muted: oklch(0.72 0.13 165 / 0.12);
 
-  --success: #3fb950;
-  --success-muted: rgba(63, 185, 80, 0.12);
-  --warning: #d29922;
-  --warning-muted: rgba(210, 153, 34, 0.12);
-  --error: #f85149;
-  --error-muted: rgba(248, 81, 73, 0.12);
-  --info: #58a6ff;
-  --info-muted: rgba(88, 166, 255, 0.12);
+  --success: oklch(0.7 0.17 160);
+  --success-muted: oklch(0.7 0.17 160 / 0.12);
+  --warning: oklch(0.75 0.16 75);
+  --warning-muted: oklch(0.75 0.16 75 / 0.12);
+  --error: oklch(0.62 0.24 27);
+  --error-muted: oklch(0.62 0.24 27 / 0.12);
+  --info: oklch(0.7 0.13 230);
+  --info-muted: oklch(0.7 0.13 230 / 0.12);
 
-  --border-default: rgba(255, 255, 255, 0.08);
-  --border-subtle: rgba(255, 255, 255, 0.05);
-  --border-emphasis: rgba(255, 255, 255, 0.14);
-  --border-accent: rgba(88, 166, 255, 0.4);
+  --border-default: oklch(0.28 0.015 250);
+  --border-subtle: oklch(0.24 0.014 250);
+  --border-emphasis: oklch(0.34 0.016 250);
+  --border-accent: oklch(0.72 0.15 var(--accent-hue) / 0.4);
 
-  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
-  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
-  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.6);
-  --shadow-glow: 0 0 20px rgba(88, 166, 255, 0.2);
+  --shadow-xs: 0 1px 2px oklch(0.05 0 0 / 0.3);
+  --shadow-sm: 0 2px 4px oklch(0.05 0 0 / 0.3);
+  --shadow-md: 0 4px 12px oklch(0.05 0 0 / 0.4);
+  --shadow-lg: 0 8px 24px oklch(0.03 0 0 / 0.5);
+  --shadow-xl: 0 16px 48px oklch(0.03 0 0 / 0.6);
+  --shadow-glow: 0 0 20px oklch(0.72 0.15 var(--accent-hue) / 0.2);
+  /* 环境光晕（glow 背景模式与强调元素微光，ompDesktop 同源） */
+  --glow-accent: 0 0 40px oklch(0.72 0.15 var(--accent-hue) / 0.15);
 
-  /* 玻璃族实心度插值（真正的 --glass-bg 定义在下方 myui 令牌桥里，见那里的
-     特异性说明）：alpha 在基线（0.55）与 1（全实底）之间，一个滑杆同时控制
-     顶栏/侧栏/AI 栏/底栏的「透出程度」。
-     这里只放**不与环境撞名**的中间变量（--glass-alpha*），因为 myui 自己
-     也声明了 --glass-bg 且写在 `html.dark`（特异性 0,1,1），比本块的
-     `:root`（0,1,0）高 —— 直接在这里写 --glass-bg 在深色模式下会被盖掉。 */
-  --glass-alpha: calc(0.55 + 0.45 * var(--ui-solidity, 0.25));
-  /* 弹窗/浮层族：独立滑杆，默认比常驻界面更实 —— 弹层直接压在其他文字上，
-     太透会和背后内容糊在一起。 */
-  --glass-alpha-popup: calc(0.72 + 0.28 * var(--ui-popup-solidity, 0.55));
-  --glass-border: rgba(255, 255, 255, 0.08);
-  --glass-blur: 12px;
+  /* 玻璃族实心度插值（真正的 --glass-bg* 定义在下方 myui 令牌桥里，见那里的
+     特异性说明）：alpha 在「基线」与 1（全实底）之间线性插值。
+     三档对应三类表面（ompDesktop 同款分层，去掉 MyShell 没有的 sticky
+     悬浮卡 float 档）：
+     - base（0.38）：壳层 —— 顶栏/侧栏/AI 栏/底栏
+     - strong（0.70）：贴在壳层之上的次级面板（监控面板）
+     - popup（0.70）：EP 浮层/对话框/下拉，走独立滑杆（弹层直接压在
+       文字上，默认比常驻界面更实才读得清）
+     这里只放**不与环境撞名**的中间变量（`--glass-alpha` 系列与 `--glass-tint`），
+     因为 myui 自己也声明了 --glass-bg 且写在 `html.dark`（特异性 0,1,1），
+     比本块的 `:root`（0,1,0）高 —— 直接在这里写 --glass-bg 会被盖掉。
+
+     base 基线 0.38→0.48（2026-11-10 二度回调）：0.38 是上一轮为「更透」降下来的，
+     但 tint 明度 0.17 的暗色玻璃压在暗色壁纸上时，0.38 只是把「一层明确的暗板」
+     换成「一层略浅的暗板」—— 用户实报「不透明度拉到最低还是不透明」。ompDesktop
+     的暗色 --glass-bg 基线是 0.48，同一张壁纸下它的壳层能看出是「一层有厚度的
+     玻璃」而不是「一块板」，差别就在这 0.10 的 alpha 让壁纸的明暗层次透上来。
+     0.48 起 + blur24 仍是毛玻璃观感，拉满仍回到 1.0 全实底。 */
+  --glass-alpha: calc(0.48 + 0.52 * var(--ui-solidity, 0));
+  --glass-alpha-strong: calc(0.7 + 0.3 * var(--ui-solidity, 0));
+  --glass-alpha-popup: calc(0.7 + 0.3 * var(--ui-popup-solidity, 0.55));
+  /* 玻璃底色的 oklch 前两参（明度 彩度）+ 色相：低色度跟随主题色，
+     让外壳与主题色共享同一色相脉络而非固定中性深色（ompDesktop 同款）。 */
+  --glass-tint: 0.17 0.014 var(--accent-hue);
+  /* 玻璃边框跟卡面明暗走：暗色卡面配白边（光感边缘），亮色必须深边。 */
+  --glass-border: oklch(1 0 0 / 0.1);
+  --glass-border-strong: oklch(1 0 0 / 0.18);
+  /* 顶部内高光：模拟环境光反射的玻璃细节（ompDesktop 同款）。 */
+  --glass-highlight: inset 0 1px 0 oklch(1 0 0 / 0.08);
+  /* 层次玻璃：blur 24 是 ompDesktop 的视觉签名（足够糊掉壁纸细节，
+     让低 alpha 卡面上的文字保持可读）。 */
+  --glass-blur: 24px;
+  --glass-saturation: 180%;
 
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-out-back: cubic-bezier(0.34, 1.56, 0.64, 1);
@@ -112,11 +145,17 @@
   --radius-xl: 20px;
   --radius-full: 9999px;
 
-  /* 连接类型色（ssh 主蓝 / sftp 副青 / ftp 黄 / local 灰） */
+  /* 连接类型色（ssh 随主题色 / sftp 固定青 / ftp 黄 / local 中性灰） */
   --conn-ssh: var(--accent-primary);
   --conn-sftp: var(--accent-secondary);
-  --conn-ftp: #d29922;
-  --conn-local: #8b949e;
+  --conn-ftp: oklch(0.75 0.16 75);
+  --conn-local: oklch(0.68 0.012 250);
+
+  /* 字体栈（ompDesktop 同源：Inter 优先，中文回退系统栈） */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", "SF Mono", Consolas,
+    "Liberation Mono", "Courier New", monospace;
 
   /* 壁纸透明度兜底（运行时由 store/appearance.ts 写入 html 内联样式覆盖） */
   --app-bg-opacity: 0.85;
@@ -137,56 +176,117 @@ html .el-drawer {
   --el-bg-color: var(--glass-bg-popup);
 }
 
-/* ─── MyShell 令牌层：浅色 Carbon ─── */
+/* ─── MyShell 令牌层：浅色（oklch；强调色族同样由 --accent-hue 派生，明度/
+   彩度按浅色档重调 —— 同一色相在浅底上要压暗才能保持对比度）─── */
 [data-theme="light"] {
-  --bg-base: #ffffff;
-  --bg-elevated: #f6f8fa;
-  --bg-surface: #f0f2f5;
-  --bg-surface-hover: #e8eaed;
-  --bg-surface-active: #dfe1e5;
-  --bg-input: #ffffff;
-  --bg-input-hover: #f6f8fa;
-  --bg-overlay: rgba(0, 0, 0, 0.4);
+  --bg-base: oklch(0.985 0.002 250);
+  --bg-elevated: oklch(0.97 0.003 250);
+  --bg-surface: oklch(1 0 0);
+  --bg-surface-hover: oklch(0.955 0.004 250);
+  --bg-surface-active: oklch(0.92 0.005 250);
+  --bg-input: oklch(1 0 0);
+  --bg-input-hover: oklch(0.97 0.003 250);
+  --bg-overlay: oklch(0.2 0.005 250 / 0.4);
 
-  --text-primary: #1f2328;
-  --text-secondary: #59636e;
-  --text-tertiary: #8c959f;
-  --text-muted: #afb8c1;
-  --text-inverse: #ffffff;
+  --text-primary: oklch(0.2 0.01 250);
+  --text-secondary: oklch(0.45 0.012 250);
+  --text-tertiary: oklch(0.52 0.01 250);
+  --text-muted: oklch(0.62 0.005 250);
+  --text-inverse: oklch(0.99 0 0);
 
-  --accent-primary: #0969da;
-  --accent-primary-hover: #218bff;
-  --accent-primary-muted: rgba(9, 105, 218, 0.1);
-  --accent-secondary: #1b7c83;
-  --accent-secondary-muted: rgba(27, 124, 131, 0.1);
+  --accent-primary: oklch(0.51 0.13 var(--accent-hue));
+  --accent-primary-hover: oklch(0.46 0.14 var(--accent-hue));
+  --accent-primary-active: oklch(0.42 0.14 var(--accent-hue));
+  --accent-primary-muted: oklch(0.51 0.13 var(--accent-hue) / 0.1);
+  --accent-secondary: oklch(0.55 0.11 165);
+  --accent-secondary-muted: oklch(0.55 0.11 165 / 0.1);
 
-  --success: #1a7f37;
-  --success-muted: rgba(26, 127, 55, 0.1);
-  --warning: #9a6700;
-  --warning-muted: rgba(154, 103, 0, 0.1);
-  --error: #cf222e;
-  --error-muted: rgba(207, 34, 46, 0.1);
-  --info: #0969da;
-  --info-muted: rgba(9, 105, 218, 0.1);
+  --success: oklch(0.5 0.15 160);
+  --success-muted: oklch(0.5 0.15 160 / 0.1);
+  --warning: oklch(0.53 0.16 75);
+  --warning-muted: oklch(0.53 0.16 75 / 0.1);
+  --error: oklch(0.5 0.22 27);
+  --error-muted: oklch(0.5 0.22 27 / 0.1);
+  --info: oklch(0.52 0.13 230);
+  --info-muted: oklch(0.52 0.13 230 / 0.1);
 
-  --border-default: rgba(0, 0, 0, 0.08);
-  --border-subtle: rgba(0, 0, 0, 0.04);
-  --border-emphasis: rgba(0, 0, 0, 0.15);
-  --border-accent: rgba(9, 105, 218, 0.4);
+  --border-default: oklch(0.9 0.004 250);
+  --border-subtle: oklch(0.94 0.003 250);
+  --border-emphasis: oklch(0.82 0.006 250);
+  --border-accent: oklch(0.51 0.13 var(--accent-hue) / 0.4);
 
-  --shadow-glow: 0 0 20px rgba(9, 105, 218, 0.15);
-  /* 浅色玻璃的基线 alpha 比暗色更高（0.6 起）：浅色文字对比度依赖浅底，
-     透太多壁纸的亮部会直接吃掉深色文字。 */
-  --glass-alpha: calc(0.6 + 0.4 * var(--ui-solidity, 0.25));
-  --glass-alpha-popup: calc(0.8 + 0.2 * var(--ui-popup-solidity, 0.55));
-  --glass-border: rgba(0, 0, 0, 0.06);
+  --shadow-glow: 0 0 20px oklch(0.51 0.13 var(--accent-hue) / 0.15);
+  --glow-accent: 0 0 40px oklch(0.55 0.13 var(--accent-hue) / 0.12);
 
-  --conn-ftp: #9a6700;
-  --conn-local: #59636e;
+  /* 浅色玻璃 alpha 基线高于暗色（ompDesktop 同口径：浅色 --glass-bg 0.72 起）：
+     浅色文字对比度依赖浅底，透太多壁纸亮部会直接吃掉深色文字；再降要同步加 blur 或
+     加深卡面文字，不能单降 alpha。
+     此前 MyShell 用 0.60，比 omp 低一档 —— 同 tint 下壳层比工作区更灰，
+     无壁纸时整屏发灰蓝（实测截图：浅色常规模式壳层与工作区都压一层灰）。
+     0.72 起在无壁纸模式下是一层接近白的磨砂，拉满仍回到 1.0 全实底。 */
+  --glass-alpha: calc(0.72 + 0.28 * var(--ui-solidity, 0));
+  --glass-alpha-strong: calc(0.72 + 0.28 * var(--ui-solidity, 0));
+  --glass-alpha-popup: calc(0.72 + 0.28 * var(--ui-popup-solidity, 0.55));
+  /* 底色不取纯白（oklch 1）而取 0.985 + 微量主题色相：纯白卡面压在亮色
+     壁纸上与背景糊成一片，「这是一层浮在上面的玻璃」看不出来。
+     tint 与 --bg-base 同为 0.985（ompDesktop 同口径）：上一轮为「让玻璃面
+     与实底面可辨」把 tint 提到 0.995，但更亮的玻璃面在浅色下把深色文字的
+     对比度稀释掉了 —— 用户实报「浅色模式的文字和底色的对比度还是不够」。
+     分层改由 alpha 差（玻璃 0.72 vs 实底 1.0）与边框表达，不再靠亮度差。 */
+  --glass-tint: 0.985 0.012 var(--accent-hue);
+  /* 边框跟卡面明暗走：亮色近白卡面必须深边，白边等于没有边。 */
+  --glass-border: oklch(0.2 0.01 250 / 0.06);
+  --glass-border-strong: oklch(0.2 0.01 250 / 0.12);
+  /* 浅色高光降一档（0.3）：0.5+ 在近白卡面上等于一层实心亮边。 */
+  --glass-highlight: inset 0 1px 0 oklch(1 0 0 / 0.3);
+
+  --conn-ftp: oklch(0.53 0.16 75);
+  --conn-local: oklch(0.45 0.012 250);
 }
 
+/* ─── 透出模式（html[data-translucent="1"]：设了壁纸时由 appearance store
+   自动挂上，非独立开关）──
+   表面全族从常规基线降为轻纱玻璃——壁纸连续透过整窗，壳层只留一层可读性
+   薄雾。暗色 base 0.20、strong 0.26；亮色 base 0.50、strong 0.66。
+   亮色保留更高基线：浅色文字对比度依赖白底，壁纸亮部会直接吃掉深色文字
+   的对比度。插值区间补到 1，滑杆拉满仍回到全实底。
+
+   **最低 0.20 是硬下限**（2026-11-10 用户定：0.10 档终端浅色文字压在壁纸上
+   读不清）。此前 base 随壁纸清晰度联动再降 0.04（0.10→0.06 档），联动本
+   就是为「拉满清晰度时背景更明显」服务的；一旦下限被可读性钉死，那点空间
+   （0.20→0.16）收益不足以抵掉「同一滑杆位置透明度却不同」的困惑，故去掉，
+   base 固定。清晰度滑杆仍通过壁纸自身模糊与雾层浓度表达强度。
+   公式 alpha = base + (1-base)×solidity 保持 solidity=1 → 完全不透明。
+
+   **玻璃模糊恒定 24px**（对齐 ompDesktop：它的 --glass-blur 也是固定 24px，
+   不随任何滑杆联动）：2026-11-10 曾把 blur 改成随壁纸清晰度联动
+   （4 + 20×(1-可见度)），想让「拉满清晰度」时背景真的变清楚。但那条联动
+   把模糊度变成了清晰度滑杆的隐式副作用 —— 用户想单独调壳层模糊时无从下手
+   （实报「菜单和会话框的底部框无法调整模糊度」），且清晰度拉满后壳层只剩
+   4px 模糊，文字直接压在壁纸细节上反而更难读。
+   壁纸清晰度现在只驱动两件事：壁纸自身的 filter（--wallpaper-blur，见
+   store/appearance.ts 的 applyBgImage）与雾层浓度（body::after）。
+   omp 同构：它的 backgroundOpacity 也只作用于背景图层，不碰 --glass-blur。 */
+html[data-translucent="1"] {
+  --glass-alpha: calc(0.2 + 0.8 * var(--ui-solidity, 0));
+  --glass-alpha-strong: calc(0.26 + 0.74 * var(--ui-solidity, 0));
+  --glass-alpha-popup: calc(0.52 + 0.48 * var(--ui-popup-solidity, 0.55));
+}
+
+/* 浅色透出档对齐 ompDesktop 实测值（omp: light translucent base 0.5 / strong 0.66）：
+   此前 MyShell 用 0.28 / 0.46，比 omp 实一档——omp 那两档是「壁纸明确可见、
+   深色文字仍压得住」的回调值，而 MyShell 同一张壁纸下壳层偏白，用户比对后报
+   「跟 omp 还是不一样」。浅色已保留高于暗色的基线（omp 同样如此：浅色文字
+   对比度依赖白底，壁纸亮部会直接吃掉深色文字）。 */
+html[data-translucent="1"][data-theme="light"] {
+  --glass-alpha: calc(0.5 + 0.5 * var(--ui-solidity, 0));
+  --glass-alpha-strong: calc(0.66 + 0.34 * var(--ui-solidity, 0));
+  --glass-alpha-popup: calc(0.68 + 0.32 * var(--ui-popup-solidity, 0.55));
+}
+
+
 /* ─── myui 令牌桥：把 myui 组件消费的名字映射到 MyShell 令牌上，
-       让 33 套配色预设与深浅主题自动生效于 myui 组件 ───
+       让深浅主题与主题色相自动生效于 myui 组件 ───
    选择器必须带上 html.dark / html.light：myui 自己的定义写在
    `:root, html.dark { ... }`（特异性 0,1,1），若此处只写 `:root`（0,1,0）
    会**整条链都抢不过**——myui 组件会一直用 myui 内置的青色强调色，
@@ -202,21 +302,22 @@ html.light {
   --border-base: var(--border-default);
   --border-strong: var(--border-emphasis);
   --text-disabled: var(--text-muted);
-  --surface-translucent: var(--glass-bg);
+  /* 内容面板面（ompDesktop 的 --surface-translucent 口径）：**比 --glass-bg 实
+     一档**（0.55 vs 0.48）。omp 把这两者分成两个变量是有意的——壳层玻璃负责
+     「透出壁纸」，内容面板要压住背后的滚动正文，同值会让面板内容与壳层糊在
+     一起。此前 MyShell 直接把它映射到 --glass-bg，等于丢掉了这一档。 */
+  --surface-translucent: oklch(var(--glass-tint) / calc(0.55 + 0.45 * var(--ui-solidity, 0)));
   --surface-translucent-hover: var(--bg-surface-hover);
   /* 玻璃底色：**必须在桥上定义**（而不是各主题块），因为 myui 自己也声明了
      --glass-bg 且写在 `html.dark`（特异性 0,1,1），比 `:root`（0,1,0）高。
      本桥选择器同样带 html.dark / html.light（特异性持平），靠源码顺序
-     （app.css 最后加载）取胜 —— 与下面 --accent 那批同一个道理。
-     底色取 --bg-elevated：33 套预设各自定义它，玻璃自动跟着预设走，
-     预设不必再单独写一遍 --glass-bg（themes.ts 里那 10 处覆盖已删除，
-     写死 rgba 会绕过实心度公式，滑杆对那几套预设静默失效）。 */
-  --glass-bg: color-mix(in srgb, var(--bg-elevated) calc(var(--glass-alpha, 0.55) * 100%), transparent);
-  --glass-bg-popup: color-mix(
-    in srgb,
-    var(--bg-elevated) calc(var(--glass-alpha-popup, 0.72) * 100%),
-    transparent
-  );
+     （app.css 最后加载）取胜 —— 与上面 --accent 那批同一个道理。
+     底色用 oklch(明度 彩度 主题色相 / alpha)：色度分量来自主题块的
+     --glass-tint（暗 0.17/0.014，亮 0.985/0.012），alpha 由三档
+     --glass-alpha* 按实心度插值 —— 色相随主题色走、透明度随滑杆走。 */
+  --glass-bg: oklch(var(--glass-tint) / var(--glass-alpha, 0.38));
+  --glass-bg-strong: oklch(var(--glass-tint) / var(--glass-alpha-strong, 0.7));
+  --glass-bg-popup: oklch(var(--glass-tint) / var(--glass-alpha-popup, 0.7));
   /* 浮层表面：把 EP 的三条浮层底色都指到弹窗实心度算出的那档玻璃。
      - --el-bg-color-overlay：下拉 / popper / notification
      - --el-dialog-bg-color：**对话框自己的变量**，EP 把它默认成
@@ -250,6 +351,23 @@ html.light {
   --ui-sidebar-w: 260px;
   --ui-ai-w: 380px;
   --ui-gap: 0px;
+}
+
+/* ─── 透出模式的内容面板面覆盖 ───
+   必须放在上面的令牌桥**之后**并用 html.dark/html.light 抬高特异性到 (0,2,1)：
+   令牌桥本身是 `:root, html.dark, html.light`（0,1,1），若只在
+   `html[data-translucent="1"]`（也是 0,1,1）里写 --surface-translucent，
+   源码顺序在桥之前 → 整条被桥盖掉，实测暗色透出档仍是 0.55。
+   侧栏 / 顶栏 / AI 栏用的正是这一档：不降档的话，用户把「界面实心度」拉到
+   最低，看到的侧栏顶栏还是一块 0.55 的实板 —— 「拉到底还不透明」的根因。 */
+html.dark[data-translucent="1"] {
+  --surface-translucent: oklch(var(--glass-tint) / calc(0.3 + 0.7 * var(--ui-solidity, 0)));
+  --surface-translucent-hover: oklch(var(--glass-tint) / calc(0.4 + 0.6 * var(--ui-solidity, 0)));
+}
+
+html.light[data-translucent="1"] {
+  --surface-translucent: oklch(var(--glass-tint) / calc(0.5 + 0.5 * var(--ui-solidity, 0)));
+  --surface-translucent-hover: oklch(var(--glass-tint) / calc(0.6 + 0.4 * var(--ui-solidity, 0)));
 }
 
 /* ═══════════════ 基础样式 ═══════════════ */
@@ -286,15 +404,22 @@ body {
   color: var(--text-primary);
   /* 正文基线走阶梯（14px × --fs-scale），不再是写死的 13px */
   font-size: var(--fs-md);
-  font-family: var(--font-sans, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif);
+  font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   font-variant-numeric: tabular-nums;
 }
 
-/* ─── 壁纸图层（全窗透出，对齐 ompDesktop）──
-   独立 fixed 层铺窗口底层：内容靠壳层半透明玻璃透出它。
-   z-index 必须为负，否则绘制顺序上会盖住全部 static 内容
-   （ompDesktop 实测整窗只剩壁纸）。 */
+/* ─── 背景图层（全窗，四模式；对齐 ompDesktop）──
+   独立 fixed 层铺窗口底层，内容靠壳层半透明玻璃透出它。
+   z-index 必须为负，否则绘制顺序上会盖住全部 static 内容。
+   模式由 html[data-background-mode] 决定（appearance store 写入）：
+   - image：壁纸（--app-bg-image 由 store 写内联，含 URL 消毒）；
+     壁纸本体 opacity 恒为 1（可见度交给壳层实心度，两套透明度会竞争），
+     强度滑杆转译为 --wallpaper-blur（越低越模糊）。
+   - glow：主题色环境光晕 —— 顶部两团径向渐变（跟随 --accent-hue），
+     营造「有光源」的氛围底（ompDesktop 默认模式）。
+   - grid：细网格纹理 —— 1px 线按 32px 间距平铺，工程图纸气质；
+     亮暗两侧线色分别取白/黑低透明度。 */
 body::before {
   content: "";
   position: fixed;
@@ -305,10 +430,55 @@ body::before {
   background-size: cover;
   background-position: center;
   background-repeat: no-repeat;
-  /* 透明度沿用外观设置的滑杆（10-100%）；没设壁纸时 --app-bg-image 为 none，
-     整层不绘制任何像素。 */
-  opacity: var(--app-bg-opacity, 0.85);
-  transition: opacity var(--duration-normal) var(--ease-in-out);
+  /* 强度滑杆（0.05-0.8）：image 模式下控制模糊量（清晰度反向映射，
+     由 store 写 --wallpaper-blur），壁纸本体保持全不透明。 */
+  filter: blur(var(--wallpaper-blur, 0px));
+  opacity: 1;
+  transition: filter var(--duration-normal) var(--ease-in-out);
+}
+
+/* glow / grid：绘制在 body::before 的背景层上（--app-bg-image 为 none
+   时壁纸不绘制，此处的程序化背景接管整层）。强度由 opacity 表达。 */
+html[data-background-mode="glow"] body::before {
+  background-image:
+    radial-gradient(
+      42% 36% at 18% 8%,
+      oklch(0.72 0.15 var(--accent-hue) / calc(var(--app-bg-opacity, 0.22) * 0.5)),
+      transparent 70%
+    ),
+    radial-gradient(
+      50% 42% at 85% 92%,
+      oklch(0.72 0.15 calc(var(--accent-hue) + 60) / calc(var(--app-bg-opacity, 0.22) * 0.4)),
+      transparent 75%
+    );
+  background-size: auto;
+  background-position: center;
+  background-repeat: no-repeat;
+  filter: none;
+}
+
+html[data-background-mode="grid"] body::before {
+  background-image:
+    linear-gradient(to right, var(--grid-line-color) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid-line-color) 1px, transparent 1px);
+  background-size: 32px 32px;
+  background-position: center;
+  background-repeat: repeat;
+  filter: none;
+  opacity: var(--app-bg-opacity, 0.22);
+}
+
+/* 网格线取色跟主题明暗走（暗底白线 / 亮底黑线），线透明度随强度。 */
+[data-theme="dark"] {
+  --grid-line-color: oklch(1 0 0 / calc(var(--app-bg-opacity, 0.22) * 0.35));
+}
+[data-theme="light"] {
+  --grid-line-color: oklch(0 0 0 / calc(var(--app-bg-opacity, 0.22) * 0.3));
+}
+
+html[data-background-mode="none"] body::before {
+  background-image: none;
+  filter: none;
 }
 
 /* 可读性遮罩：垫在壁纸与界面之间，只把最亮/最暗的极端部分拉回可读范围。
@@ -341,12 +511,16 @@ body::after {
 
 /* 壁纸可读性遮罩的取色：亮色垫薄白雾、暗色垫薄黑雾。
    只在真设了壁纸时（html[data-wallpaper="1"]）才上雾 —— 无壁纸时遮罩必须
-   完全透明，否则会给基础底色平白加一层雾、整窗变暗。 */
+   完全透明，否则会给基础底色平白加一层雾、整窗变暗。
+   基数 0.12/0.10（2026-11-10 对齐 ompDesktop 实测下调：omp 无整窗雾层，
+   0.28 是用户报「壁纸看不清」的贡献层之一；MyShell 保留极薄一层是因为
+   有 omp 没有的全屏终端场景，裸文字直接压壁纸需要兜底）。仍随清晰度
+   稀释一半：拉满清晰度时约 0.06。 */
 [data-theme="dark"] {
-  --wallpaper-scrim-color: rgba(13, 17, 23, 0.28);
+  --wallpaper-scrim-color: rgba(13, 17, 23, calc(0.12 * (1 - 0.5 * var(--bg-visibility, 0.2))));
 }
 [data-theme="light"] {
-  --wallpaper-scrim-color: rgba(255, 255, 255, 0.22);
+  --wallpaper-scrim-color: rgba(255, 255, 255, calc(0.10 * (1 - 0.5 * var(--bg-visibility, 0.2))));
 }
 html[data-wallpaper="1"] body::after {
   background: var(--wallpaper-scrim-color, transparent);
@@ -409,15 +583,21 @@ html.motion-off *::after {
   overflow: hidden;
 }
 
-/* 侧栏「隐藏」态：第一列宽度直接归零，侧栏本身 display:none。
-   此前是收成 44px 窄条，靠一枚骑跨右缘的圆形浮钮才能展开；那枚钮已删除
-   （收起/展开只保留顶栏最左一枚 ☰），窄条既没有展开入口也没有信息量，
-   留着等于一条 44px 的死区。display:none 而非只把宽度设 0，是为了连带把
-   侧栏里那一堆可聚焦的连接行 / 动作钮从 Tab 序与无障碍树里摘掉——
-   宽度为 0 但仍可聚焦，会让键盘用户走进看不见的地方。
-   组件仍挂在树上（display:none 不卸载），连接树展开态 / 搜索词都不丢。 */
+/* 侧栏「隐藏」态：第一列收成 44px 窄条（与顶排同高的一列），侧栏本体压到
+   同宽并只露出顶排那一枚折叠/展开钮（ompDesktop 的 .is-collapsed 同款做法：
+   它的折叠态也是留下一条可点的窄条，而不是把侧栏彻底抹掉）。
+
+   为什么不是宽度 0：宽度 0 时 .side-header 的 space-between 会把两个子项
+   都压成 0 宽（实测折叠钮 rect.width = 0），overflow:hidden 再把溢出部分
+   裁掉 —— 结果是「侧栏消失了且没有任何展开入口」，用户只能重启应用
+   （实报：左侧菜单栏不见了、无法展开）。留 44px 窄条，折叠钮就有 28px 的
+   可点区域，一职到底。
+
+   侧栏本体用 visibility:hidden 把连接行 / 常规动作钮从 Tab 序与无障碍树里
+   摘掉（原 display:none 的职责），顶排与其内的折叠钮在下面两条规则里单独
+   放回可见可点。组件仍挂在树上（不卸载），连接树展开态 / 搜索词都不丢。 */
 .app-shell.sidebar-collapsed {
-  grid-template-columns: 0 minmax(0, 1fr) auto;
+  grid-template-columns: var(--chrome-top-height) minmax(0, 1fr) auto;
 }
 
 .app-shell.no-ai {
@@ -429,15 +609,40 @@ html.motion-off *::after {
 }
 
 .app-shell.sidebar-collapsed.no-ai {
-  grid-template-columns: 0 minmax(0, 1fr);
+  grid-template-columns: var(--chrome-top-height) minmax(0, 1fr);
 }
 
+/* 折叠态侧栏本体：压到 44px 窄条同宽，其余内容裁掉。
+   顶排与其内的折叠钮在下面两条规则里单独放回可见可点。 */
 .app-shell.sidebar-collapsed > .shell-side {
+  width: var(--chrome-top-height);
+  min-width: var(--chrome-top-height);
+  overflow: hidden;
+  border-right: 1px solid var(--glass-border);
+  visibility: hidden;
+  transition: width 0.2s var(--ease-in-out);
+}
+
+/* 顶排是折叠态唯一的可见入口：44px 宽的一条，常规动作钮隐藏后，
+   折叠钮由 space-between 落在右缘 —— 与展开态的「折叠钮靠右」位置一致，
+   用户收起再展开看到的按钮不会跳。 */
+.app-shell.sidebar-collapsed > .shell-side > .side-header {
+  visibility: visible;
+  width: var(--chrome-top-height);
+  padding: 0 8px;
+}
+
+/* 顶排里的常规动作钮在折叠态一并隐藏：窄条只放得下一枚按钮，
+   侧栏都收起来了，那些动作也无处可去。只留最右那枚折叠/展开钮。 */
+.app-shell.sidebar-collapsed > .shell-side > .side-header > .header-actions {
   display: none;
 }
 
 /* 底栏容器：命令栏 + 服务器状态栏。两者都可能不渲染（SFTP/欢迎页/多窗口模式），
-   此时整行高度为 0，不留空带。只占侧栏右侧的两列（第 2~3 列）。 */
+   此时整行高度为 0，不留空带。只占侧栏右侧的两列。
+   铺 base 档玻璃：壳层四边（侧栏/顶栏/底栏/AI 栏）都是 --glass-bg +
+   --glass-border + --glass-highlight 同一配方，此前这里无底，壁纸从命令栏
+   背后直穿，与另外三边观感不一致。 */
 .app-shell > .shell-bottom {
   grid-area: bottom;
   display: flex;
@@ -445,6 +650,11 @@ html.motion-off *::after {
   min-width: 0;
   position: relative;
   z-index: 2;
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  border-top: 1px solid var(--glass-border);
+  box-shadow: var(--glass-highlight);
 }
 
 .app-shell > .shell-side {
@@ -471,20 +681,26 @@ html.motion-off *::after {
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  /* 工作区是「壁纸透出」的唯一主场（终端/SFTP/欢迎页都在这），
-     所以它的底色也按实心度插值：0 → 全透明（壁纸完整透出），
-     1 → 完全不透明（与顶栏/侧栏一起变成实底）。
-     少这一层的话，实心度拉满时终端区仍会露出一整张壁纸 ——
-     实测滑杆 100% 时终端背景还是一片照片，因为终端容器是透明的。
-     底色取 --bg-elevated 而非 --bg-base：侧栏/顶栏用的是 --glass-bg
-     （由 --bg-elevated 算出），工作区若用更深的 --bg-base，
-     实心度拉满后三块交界处会出现一道台阶（实测 1302x802 窗口下
-     侧栏右缘可见 1~2px 色差带）。 */
-  background: color-mix(
-    in srgb,
-    var(--bg-elevated) calc(var(--ui-solidity, 0.25) * 100%),
-    transparent
-  );
+  /* 工作区是「壁纸透出」的主场（终端/SFTP/欢迎页都在这），底色走 base
+     档玻璃（与侧栏/顶栏同一档）：三块表面的透明度由同一公式驱动，
+     交界处不会出现透明度台阶（旧公式 color-mix(--bg-elevated × solidity)
+     与壳层的 alpha 基线不同，实心度中段可见色差带）。
+     终端自带背景色遮住大半，这层主要影响 SFTP/欢迎页与终端未铺满的边缘。 */
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+}
+
+/* 透出模式下工作区完全透明（对齐 ompDesktop 的 .app-content）：壁纸本体
+   原样透出，玻璃只留在侧栏/顶栏/底栏/AI 栏与浮层。设壁纸后整块工作区
+   玻璃（暗底 0.475 + blur24）会把壁纸压暗并糊掉细节——用户对比 ompDesktop
+   同一张壁纸实测报「看不清背景图」。无壁纸模式不走这条，保持玻璃底。
+   终端文字的可读性兜底：清晰度滑杆（模糊壁纸）+ 界面实心度（加厚壳层）
+   + 上方雾层（透出基数 0.12，随清晰度稀释）。 */
+html[data-translucent="1"] .app-shell > .shell-work {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .app-shell > .shell-ai {
@@ -495,6 +711,7 @@ html.motion-off *::after {
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
   border-left: 1px solid var(--glass-border);
+  box-shadow: var(--glass-highlight);
   position: relative;
   z-index: 2;
 }

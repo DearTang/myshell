@@ -15,16 +15,17 @@
 
 ### 窗口与界面
 - **字号一处可调**：全部界面字号收口到七级阶梯（`--fs-2xs` ~ `--fs-3xl`，正文基线 14px），设置 → 外观的「界面字号」滑杆（12–18px）与 `Ctrl+=` / `Ctrl+-` / `Ctrl+0` 快捷键改同一个旋钮，正文、按钮、下拉、弹窗文字一起缩放；原先把 279 处字号写成像素字面量，无法整体调整。焦点在终端里时同一组快捷键改的是**终端字号**（10–22px），两者互不干扰
-- **玻璃实心度可调**：设置 → 外观的「界面实心度」「弹窗实心度」两个滑杆控制顶栏 / 侧栏 / AI 栏 / 底栏 / 工作区 / 设置页以及全部对话框与浮层的透出程度（拉满即完全不透明）。玻璃底色改由所选配色预设的 `--bg-elevated` 实时算出，33 套预设自动跟随，不再各写一遍写死的 `rgba`
-- **壁纸铺满全窗**：背景图从「只在终端工作区可见」改为整窗壁纸层，侧栏、顶栏、AI 栏、设置页按实心度透出它；配一层极淡的可读性遮罩（仅在有壁纸时上雾），深浅主题各用一套取色
+- **玻璃实心度可调**：设置 → 外观的「界面实心度」「弹窗实心度」两个滑杆控制顶栏 / 侧栏 / AI 栏 / 底栏 / 工作区 / 设置页以及全部对话框与浮层的透出程度。界面档 **0–100% 一比一**（0% 为最透，壁纸/背景图形几乎完整透出；拉满为完全不透明），弹窗档保留下限 40%（浮层压在文字上，可读性优先）。玻璃分三档（壳层 / 次级面板 / 弹层）由 oklch 色调层 + 实心度插值合成，深浅主题各一套实测基线；设了壁纸时自动进入轻纱透出态，整窗连续透出壁纸
+- **壁纸铺满全窗 + 背景四模式**：背景可选主题色光晕 / 网格纹理 / 本地壁纸 / 纯底色四种模式；壁纸经导入收进应用自管目录（白名单格式、16MB 上限，不再撑爆本地存储），强度滑杆双向语义（壁纸=清晰度，图形=浓度），旧 base64 壁纸启动自动迁移。**清晰度滑杆同时控制壳层磨砂的模糊量**（4~24px）：拉满时壁纸层与玻璃层都变清晰，拉到最低则是重磨砂的弱背景
 - **顶栏与侧栏拼成连续一整排**：侧栏自带的动作行固定 44px（与顶栏同高、同一条底边线），壳层第一行改为「侧栏顶排 + 顶栏」，对齐 ompDesktop 的整排口径；该行空白处可拖动窗口
 - **设置页改成三件套布局**：44px 顶排 + 200px 左侧分组导航 + 右侧圆角玻璃内容卡（描边 + 内高光 + 阴影），正文限宽 940px 居中，卡片头显示当前类目标题
 - **界面动效可关**：设置 → 外观的「界面动效」开关一次性停掉全部过渡与动画（改根变量 + 压 `animation`/`transition`，不逐条删组件样式）
 - **无边框一行顶栏**（omp desktop 式）：去掉系统标题栏，窗口最小化/最大化/关闭按钮内嵌顶栏右缘（关闭钮悬停系统红）；顶栏与标签条空白处可拖动窗口，双击空白最大化/还原，最大化/还原图标随窗口状态切换
 - **更新日志弹一次**：版本升级后首次启动自动展示更新日志，确认后由后端文件（`whatsnew-ack`）记忆，不再依赖 WebView localStorage（其 LevelDB 损坏后会导致每次启动都弹）
-- **暗色界面对比度**：侧栏与顶栏的可点元素（头部操作图标、文件夹图标、连接行 ⋯ 按钮等）静止态即可辨认，悬停以主题强调色（胶囊底 + 左侧竖条）反馈，而非仅提亮灰阶；对 33 套配色预设与深浅主题逐一校验
+- **暗色界面对比度**：侧栏与顶栏的可点元素（头部操作图标、文件夹图标、连接行 ⋯ 按钮等）静止态即可辨认，悬停以主题强调色（胶囊底 + 左侧竖条）反馈，而非仅提亮灰阶；对深浅主题与主题色滑杆逐一校验
 - **侧栏层级与展开箭头**：文件夹（菜单）与连接（会话）用「亮度差 ≥1.5x + 字重 500/600」双通道分级，暗色下一眼可分；展开箭头用 myui 的 ArrowRight / ArrowDown 独立图标 14px（折叠向右、展开向下），替换原先 8px 字符 `›`（几乎不可见）
-- **配色预设全局生效**：33 套预设与深浅主题对全部界面元素统一生效（含 myui/Element Plus 组件——按钮、开关、滑块、进度条、输入框等均跟随所选预设的强调色），修复了此前 myui 组件恒为库内置青色、预设仅影响壳层的问题；状态色淡底（success / warning / danger / info 的 `-subtle`）也已接入令牌桥，不再回落为 myui 内置配色
+- **主题色一钮全站生效**：界面强调色族（按钮 / 选中态 / 焦点环 / 光晕 / 链接）全部由 oklch 色相派生，设置 → 外观的「主题色」滑杆 0–360° 连续取色，深浅主题各自适配亮度；终端配色预设与界面颜色解耦（预设只管终端 16 色），自定义终端配色仍是独立资产
+- **外观主题快照**：当前全套外观（深浅 / 主题色 / 两档实心度 / 字号 / 背景 / 终端配色）存为命名主题（最多 12 套，256KB 预算），跨场景一键切换 / 更新 / 删除，正在使用的主题高亮「当前」
 - **全站图标统一走 myui**：103 处 `el-icon` + `@element-plus/icons-vue` 全部切到 `MyIcon` 与 myui 图标注册表（46 个在用字形逐一核对命中，137 个注册图标），**依赖已整体移除**，不再有 Element Plus 与 myui 两套图标体系并存
 - **自建 UI 不再耦合 Element Plus 内部结构**：5 个对话框的 body/footer 样式改走 `MyDialog` 的 `bodyClass`/`footerClass`（全库 `.el-dialog__*` 类名引用清零）、ZMODEM 进度条用 `MyProgress` 的 `transitionDuration`、窗口三联钮用 `MyWindowControls`、命令栏钉住钮用 `MyIconButton` 的 `active` 并补上 `aria-pressed`；myui 换底层时不会静默失效
 - **浮层一律有 click-outside 与 Esc**：历史命令、快捷命令、AI 模型选择器三处此前是手搓绝对定位面板，点外部或按 Esc 都不关闭（模型选择器必须选完模型才关），现统一走 `MyPopover`；连接行「⋯」菜单走 `MyDropdown`，一并去掉自建的全屏遮罩与手工翻转判定，菜单五项（连接 / 编辑 / 重命名 / 复制 / 删除）均可正常触发
@@ -58,9 +59,13 @@
 - 代理支持（SOCKS5、HTTP）
 - **连接高级选项**（SSH/SFTP）：地址族（自动 / 强制 IPv4 / 强制 IPv6，绕开 IPv6 黑洞）、每连接连接超时、SSH Keepalive 间隔
 - **主机密钥变更自助恢复**（SSH/SFTP）：服务器重装/换密钥导致主机指纹变化时，报错明确列出新旧指纹（而非含糊的 "Unknown server key"），错误屏的「重新连接」按钮变为「重置密钥并重连」，一键自动清除旧记录并重新信任（保留 MITM 防护，不自动接受）
+- **侧栏三种视图**：搜索框右侧切换树形（分组层级）/ 列表（扁平按名）/ 网格（卡片），偏好持久化；连接多、分组浅时列表比树更快扫读
+- **从外部工具导入**：设置 → 数据管理 → 「从外部工具导入」支持 OpenSSH `ssh_config`、PuTTY 注册表导出（`.reg`）、MobaXterm（`.mobaconf`）、SecureCRT、CSV 五种格式；解析后预览可勾选，逐条报告失败原因（缺 HostName、通配 Host、不支持 telnet 等）；通配 Host 与 `ProxyJump` 分别按「跳过」与「记进连接名」处理，密码与私钥一律不导入（各家存储私有且多为混淆非加密，硬解只会制造错误的安全感），导入后需自行补填凭据
 
 ### 终端功能
 - 基于 xterm.js 的高性能终端模拟
+- **键盘输入即时生效**：单 pane 与多窗口模式下敲字符立刻回显、回车即刻执行，窗口尺寸实时同步给远端（此前输入被前端门禁整条吞掉，表现为「敲了没反应、enter 无效」）
+- **终端底色与菜单同源**：会话窗口的底色由一层玻璃 div 承载（颜色随主题色、透明度随「界面实心度」滑杆），xterm 自身背景恒透明只负责画字；命令输入框也不再是自己一块实底。顶栏 / 侧栏 / 终端区 / 命令栏四块实测同步变化，拖滑杆时整窗一起变透或变实。终端配色预设从此只管 16 色与光标，不再决定底色。最透档保留约 20% 的薄玻璃（不随清晰度再降），避免终端浅色文字压在壁纸上读不清
 - Catppuccin Mocha 深色主题
 - **暗黑模式**：支持深色/浅色主题切换
 - 终端自适应尺寸调整
@@ -70,11 +75,13 @@
 - **快捷命令**：全局快捷命令 + 服务器专属快捷命令，多行命令按行顺序一键执行（`#` 注释与空行自动跳过），支持广播到多终端；支持**行间延迟**——三档模式：`##delay:500`（或 `##delay:1s`）在两行之间精确等待、固定延迟、或「智能等待」（监听终端输出，等上一行输出静止后再发下一行，自动适配命令速度、能处理 `sudo`/`mysql` 密码提示）；在「设置 → 快捷命令」配置
 - **广播输入**：同时向多个终端发送相同命令
 - ZMODEM 协议支持（rz/sz 文件传输）：原生 Rust 收发（零 JS 数据路径），128 KB 子包批量直写 SSH channel，双向进度 IPC 事件 100ms 节流削减跨进程开销（进度条紧贴实时数字），传输期间进度条实时显示、取消可用；`sz -r 目录` 递归下载文件夹（接收端按 offer 相对路径自动建目录镜像子树，路径段清洗防 `..`/盘符逃逸），rz 上传可选文件夹递归（ZFILE offer 携带相对路径，lrzsz rz 在远端自动重建目录树）；远端中止（文件无权限 / 是目录 / 进程被杀）时自动识别 lrzsz 取消序列与 ZABORT 帧，sz 无权限报错文本 2 秒内回显终端并快速退出，30s 静默超时兜底——超时/中止均发送 CAN 序列敲掉挂死的 sz 保证 shell 立即可用并显示失败原因；文件/文件夹选择器弹出前微移鼠标指针显形（绕过 WebView2「键入时隐藏指针」缺陷）。协议为单流串行——多文件按顺序传输，无并发
-- 服务器状态实时监控（CPU、内存、磁盘）
+- 服务器状态实时监控（CPU、内存、磁盘）：底栏常驻当前会话速览（5s 轮询）
+- **多主机监控面板**：顶栏「监控面板」打开右侧详情视图，一屏看所有已打开终端的连接；列可选（CPU / 内存 / 磁盘 / 磁盘 I/O / 网络 / 延迟），刷新率 1–30s 可调，行内一键打开终端；磁盘 I/O 只统计硬件块设备（分区与 dm-/md- 等堆叠设备不计入，避免同一份 I/O 被数两遍），网络只统计物理网卡（lo 与 veth/docker/br-/tun 等虚拟设备不计入），延迟为到本机 loopback 的 TCP 连接耗时；探测复用该连接已有的 SSH 会话，不额外建连
 - **本地终端**：直连本地 PowerShell / CMD / WSL / 自定义 shell，作为可保存的连接，体验等同 SSH 终端
 - **终端字体**：从系统已安装字体下拉选择（也可手输），默认字体栈 Nerd Font 优先，正确渲染 Powerline / 图标字形（Oh My Posh / Starship / powerlevel10k 等）；支持**按连接单独覆盖字体**
 - **本地终端编码自适应**：cmd / Windows PowerShell 5.1 启动自动切 UTF-8，中文系统不再 GBK 乱码；并向 shell 声明 `TERM=xterm-256color` / `COLORTERM=truecolor`，提示符引擎完整渲染
 - **终端截图**：每个终端窗口工具栏的 📷 按钮一键截取当前终端画面（仅终端 viewport，不含标签栏/工具栏/输入命令栏），自动保存到「设置 → MCP 支持 → 附件目录」配置的目录，文件名带毫秒防覆盖；直接读 xterm buffer 自绘，完整还原颜色（16 色/216 cube/24 灰阶/24-bit RGB）和文字属性（bold/italic/underline/inverse）
+- **端口转发**：SSH 本地（-L）与远程（-R）隧道。本地转发把远端服务映射到本机端口（访问内网数据库/管理后台不用再手敲 `ssh -L`），远程转发把本机服务暴露给远端；规则持久化在「设置 → 端口转发」管理（新建/编辑/删除/启停/实时字节计数），每条隧道独立拨一条 SSH 连接（关闭配置它的终端标签不会影响隧道），断开连接时自动清理；CLI 同款 `myshell-cli forward list/start/stop`
 
 ### 文件传输
 - SFTP/FTP/FTPS 文件浏览器
@@ -83,6 +90,7 @@
 - **FTP/FTPS 上传下载**：与 SFTP 同一套传输 UI（进度浮层 / 取消 / 错误列表）；FTP 无并行数据连接能力，下载按顺序执行
 - **文件夹递归下载**：勾选文件夹一键下载整个子树（空目录保留，符号链接循环有深度保护），本地按 `<目标目录>/<文件夹名>/...` 镜像；远端文件名严格按单一路径组件校验（反斜杠/盘符/保留设备名等非法名报错跳过），构建目标前检查符号链接，杜绝越出下载目录
 - **SFTP 多文件并发下载**：可设并发线程数（设置 → 文件传输，默认 3，1–16），所有线程复用同一条 SSH 连接，海量小文件提速明显
+- **终端拖拽上传（通道自适应）**：把本地文件或**整个文件夹**拖进 SSH 终端面板即上传到「当前所在的远端目录」。先探测服务端能力（按会话缓存）：SFTP 子系统可用走 SFTP（文件夹按「拖入项自己的名字」在远端重建目录树，递归到叶子、空目录保留；远端已存在同名目录时先弹窗询问「合并覆盖 / 跳过这些 / 取消」）；SFTP 不可用但远端有 lrzsz 自动改走 ZMODEM（发 `rz`，远端按相对路径重建目录树）；两者都没有时弹出安装指引——按探测到的包管理器给出具体安装命令（apt/dnf/yum/apk/zypper/pacman）并可一键复制。拖入后有「准备中」遮罩与落点高亮，传输中有进度浮层（可取消）；同名目录混拖会被拒绝并提示分开拖入
 - 目录导航历史记录
 
 ### 诊断与日志
@@ -105,6 +113,7 @@
 - **黑名单分词器重写**：判定不再对原始文本直接套正则——先去引号、跳过分组符与控制关键字、剥离中性 wrapper，再把真实命令名归位到命令位。`'rm' -rf /x`、`( rm -rf /x )`、`{ rm -rf /x; }`、`do rm -rf "$f"`、`nohup 'rm' -rf /x`、`/bin/rm -rf /x` 此前均可无确认执行（一个引号即击穿整套规则），现在全部拦截；仅重写命令头 token，参数逐字节保留，不会把引号内的 `;` 变成假分段边界
 - **确认门 fail-closed**：GUI 与 CLI 在规则加载/解析失败时一律弹窗或拒绝执行，绝不因一次 IPC/IO 错误放行；规则文件写入改为 tmp+rename 原子替换，杜绝半截 JSON 静默降级为更弱的内置默认
 - **zsh MULTIOS 写重定向**：仅 `>&<数字fd>` 视为 fd 复制；`echo x >&/etc/crontab` 此前判定为安全（zsh 把 `>&file` 解释为 `&>file`），现在会拦截
+- **敏感文件读取确认门**：读取服务器凭证文件（SSH 私钥、`.env`、`/etc/shadow`、云凭证、kubeconfig、shell 历史等）一律弹人工确认——内容会直接进入 AI 对话上下文，等同把凭证交给模型。覆盖 `ssh_exec`（cat/head/grep/base64 等读取动作）与 `ssh_read_text` 两个入口，跨段形态（`for f in .env; do cat $f; done`）也拦。该规则是**不可配置的安全底线**（与命令替换、写重定向同级），不随用户规则文件降级
 - SSH 主机键 TOFU 验证（按 `(host, port)` 隔离，指纹变更自动拒绝）
 - 严格 CSP 白名单（关闭 XSS 暴露面）
 - OSC 52 剪贴板劫持防护
@@ -174,6 +183,9 @@ myshell-cli sftp get myserver /etc/hosts ./hosts     # 下载文件
 myshell-cli sftp put myserver ./file.txt /tmp/       # 上传文件
 myshell-cli test myserver                            # 测试连接
 myshell-cli ssh myserver                             # 交互式终端
+myshell-cli forward list --json                      # 列出端口转发规则与运行状态
+myshell-cli forward start <规则ID>                    # 启动隧道（阻塞到 Ctrl+C）
+myshell-cli forward stop <规则ID>                     # 停止隧道
 ```
 
 Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
@@ -194,7 +206,7 @@ Vault 解锁：使用 `--passphrase` 参数，或交互式提示。
 ```
 
 > **安全模型**：MCP server 不存储 vault 密码，也不持有解密密钥。所有服务器访问必须经过 MyShell GUI——ssh_exec 在 GUI 终端标签页内执行（用户已在 GUI 中解锁 vault），SFTP 工具通过 IPC 向 GUI 请求解密后的连接凭证。GUI↔MCP 的 localhost IPC 桥要求**每条命令携带随机会话令牌**（写入用户配置目录的端口文件中，受用户目录 ACL 保护；令牌缺失/错误一律在分发动作前拒绝），本机其他用户的进程无法再窃取凭证。端口文件带看门狗自愈（被误删后 5 秒内自动重发布），MCP 在启动 GUI 前探测 myshell.exe 进程存活，不会对运行中的 GUI 盲目启动第二实例。**所有工具（除任务状态查询）都要求保险库已解锁**：GUI 未运行时 MCP 自动拉起应用（含识别并清理崩溃残留的 IPC 端口文件）；保险库锁定时先把 MyShell 窗口置顶（密码门正对用户），再**在本次调用内等待解锁，最长 20 秒**——期间输入主密码则本次调用直接继续执行，超时才返回结构化的「保险库未解锁」错误（20 秒上限刻意低于客户端约 30 秒请求预算，不会死等成传输超时）。锁定状态下连 `list_connections` 都不可用，AI 无法获取任何连接元数据。
-暴露 21 个 MCP 工具：`vault_status`、`list_connections`、`ssh_exec`、`ssh_run`、`ssh_status`、`ssh_cancel`、`ssh_read_text`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`、`zmodem_status`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。 `vault_status` 是唯一的免门禁只读探针：返回 `gui_running`/`initialized`/`unlocked` 三个布尔与 `vault_state`。门禁的调用内等待（20 秒）已覆盖常见解锁场景，它退为**兜底轮询**——仅当工具等待超时且重试仍返回 `vault_locked` 时，AI 才用它每 5 秒查一次（约 2 分钟上限），查到 `unlocked` 后重试原工具。上传覆盖 / 删除 / 重命名 / 项目传输 / zmodem 上传这六类不可逆操作的确认弹窗现在渲染在 MyShell 界面内（此前是系统原生对话框，会藏在窗口后面，漏看即等于漏掉确认）；180 秒无响应一律按「拒绝」处理。**为 AI 调用方做的稳定性设计**（接入前请读 [MCP 接入规范](docs/mcp-integration-spec.md)）：命令行既可用 `command` 也可用 `command_b64`（base64 免转义，含引号/反斜杠/`$`/正则花括号的复杂命令不再因 JSON 转义而失败）；`ssh_read_text` 直接读远端文本文件（优先 SFTP，无 SFTP 自动回退 shell 并正确转义路径），不必再手拼 `cat`；工具输出统一剥离终端控制序列（CSI 颜色 / OSC 标题与超链接），返回值补 `duration_ms` / `timed_out` / `truncated` / `command` 回显；任何失败都带机器可读的 `error_kind`（permission_denied、timeout、busy、connection_lost 等 10 类）与下一步 `hint`；慢命令不再阻塞整个服务器——每个工具调用独立执行（期间 `ssh_status` / `ssh_cancel` 与其他连接的调用照常响应）。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过；命令类确认（`ssh_exec` / `ssh_run`）会逐条列出命中的黑名单规则及具体危害说明，弹窗出现时 MyShell 窗口自动置顶、聚焦并闪烁任务栏，避免人工审核被遗漏；用户点「取消」拒绝时返回硬性停止（HARD STOP）错误——AI 必须立即停止当前任务的所有后续操作（不重试、不换工具绕过）、向用户输出任务进度说明，并等待用户明确确认是否继续（`ssh_run` 后台任务拒绝后经 `ssh_status` 同样处理）。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz -r`/`rz`（lrzsz）走 ZMODEM 协议传输文件，双向支持目录递归（zmodem_download 子树按相对路径镜像到 local_dir；zmodem_upload 目录展开后按相对路径 offer，远端 rz 重建目录树），用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 zmodem_*，技术性失败（如远端无 lrzsz）时再回退 sftp_*。
+暴露 22 个 MCP 工具：`vault_status`、`list_connections`、`ssh_exec`、`ssh_run`、`ssh_status`、`ssh_cancel`、`ssh_read_text`、`ssh_write_text`、`sftp_list`、`sftp_download`、`sftp_upload`、`sftp_mkdir`、`sftp_remove`、`sftp_rename`、`upload_project`、`download_project`、`test_connection`、`screenshot_terminal`、`open_in_gui`、`zmodem_download`、`zmodem_upload`、`zmodem_status`。连接参数支持三种形式：name / group-path / host-IP；重名场景自动按工具类型（ssh vs sftp）消歧。 `vault_status` 是唯一的免门禁只读探针：返回 `gui_running`/`initialized`/`unlocked` 三个布尔与 `vault_state`。门禁的调用内等待（20 秒）已覆盖常见解锁场景，它退为**兜底轮询**——仅当工具等待超时且重试仍返回 `vault_locked` 时，AI 才用它每 5 秒查一次（约 2 分钟上限），查到 `unlocked` 后重试原工具。上传覆盖 / 删除 / 重命名 / 项目传输 / zmodem 上传这六类不可逆操作的确认弹窗现在渲染在 MyShell 界面内（此前是系统原生对话框，会藏在窗口后面，漏看即等于漏掉确认）；180 秒无响应一律按「拒绝」处理。**为 AI 调用方做的稳定性设计**（接入前请读 [MCP 接入规范](docs/mcp-integration-spec.md)）：命令行既可用 `command` 也可用 `command_b64`（base64 免转义，含引号/反斜杠/`$`/正则花括号的复杂命令不再因 JSON 转义而失败）；`ssh_read_text` 直接读远端文本文件（优先 SFTP，无 SFTP 自动回退 shell 并正确转义路径），不必再手拼 `cat`；`ssh_write_text` 是它的写侧对应——内容以 base64 经 SFTP 通道直达远端文件，远端 shell 完全不解析，是写凭据/配置值/脚本唯一不会被字符污染路径（`ssh_exec` + heredoc 即使套 base64 也会把字节过一遍交互式 shell 的行编辑器）；`ssh_exec` 可选 `exec_channel`（`gui` 默认在可见终端标签页执行并复用同一条持久 shell / `pipe` 直连 SSH exec 通道，无 PTY、无 shell 状态、退出码来自远端进程本身，用于写凭据、长命令、含管道重定向或 heredoc 的场景）；失败结果带 `delivered`（命令已写入通道，非幂等命令不可盲目重发）、`interrupted`（退出码呈 128+信号形态，Ctrl-C=130）、`completed: false`（gui 通道完成标记未确认，`exit_code` 为 null 即未知而非 0）；工具输出统一剥离终端控制序列（CSI 颜色 / OSC 标题与超链接），返回值补 `duration_ms` / `timed_out` / `truncated` / `command` 回显；任何失败都带机器可读的 `error_kind`（permission_denied、timeout、busy、connection_lost 等 10 类）与下一步 `hint`；慢命令不再阻塞整个服务器——每个工具调用独立执行（期间 `ssh_status` / `ssh_cancel` 与其他连接的调用照常响应）。高危操作（`ssh_exec` / `sftp_remove` / `sftp_rename` / `sftp_upload` / `zmodem_upload`）必须弹 OS 级对话框人工确认，AI 无法跳过；命令类确认（`ssh_exec` / `ssh_run`）会逐条列出命中的黑名单规则及具体危害说明，弹窗出现时 MyShell 窗口自动置顶、聚焦并闪烁任务栏，避免人工审核被遗漏；用户点「取消」拒绝时返回硬性停止（HARD STOP）错误——AI 必须立即停止当前任务的所有后续操作（不重试、不换工具绕过）、向用户输出任务进度说明，并等待用户明确确认是否继续（`ssh_run` 后台任务拒绝后经 `ssh_status` 同样处理）。`open_in_gui` 通过 localhost IPC 通道驱动 GUI 打开连接 tab 并聚焦窗口（需 GUI 正在运行）：支持 `tab_type`（auto/terminal/sftp，可对 SSH 连接强制开 SFTP 文件浏览 tab），默认聚焦已有 tab（同一连接已打开时切换过去不重复开）。`zmodem_download`/`zmodem_upload` 通过远端 `sz -r`/`rz`（lrzsz）走 ZMODEM 协议传输文件，双向支持目录递归（zmodem_download 子树按相对路径镜像到 local_dir；zmodem_upload 目录展开后按相对路径 offer，远端 rz 重建目录树），用于 SFTP 子系统不可用的受限 shell / 堡垒机 / 嵌入式设备场景——优先用 zmodem_*，技术性失败（如远端无 lrzsz）时再回退 sftp_*。
 
 ## 更新日志
 
@@ -393,6 +405,7 @@ MCP 稳定性修复：修复所有工具 30 秒超时的根因，锁定保险库
 **🐛 修复**
 
 - **启动后窗口延迟显示 4 秒**：Vue 迁移时丢失的前端 dom-ready 首帧信号已补回，不再每次启动白等 4 秒兜底
+- **Vue 迁移丢失的全局前端错误捕获**：未捕获错误与未处理 rejection 曾随 React→Vue 重构整块消失（前端报错不再落盘），同时丢失对 xterm `syncScrollArea` race 的 `preventDefault` 抑制——缺它时 WebView2 可能把该错误升级为渲染进程致命错误，整个界面冻结只能杀进程。已等价补回，两个 listener + race 抑制 + `writeFrontendLog` 上报一并恢复
 - **主按钮在暗色下"糊成一片白"**：禁用态白字压浅底仅 1.58:1、启用态白字压强调色仅 2.26:1，改为中性面 + 反色文字（7.5:1）
 - **33 套配色预设对 myui / Element Plus 组件从未生效**：CSS 令牌桥的选择器特异性被 myui 的 `html.dark` 压过，桥接的 11 个令牌全部失效——按钮/开关/滑块/进度条等 27 个组件恒为库内置青色。补齐选择器后全部跟随所选预设
 - **侧栏"菜单"与"会话"层级被压平**：文件夹名与连接名对比度仅差 1.16x 导致分不清，改为亮度差 1.6x + 字重 500/600 双通道分级

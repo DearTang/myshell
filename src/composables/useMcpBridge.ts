@@ -1,6 +1,7 @@
 // MCP ↔ GUI 桥：监听 MCP 服务器的 open_connection / exec_in_tab 命令。
 // 从旧 App.tsx 的 mcp-gui-command useEffect 原样移植（sentinel 三层完成策略、
 // 每连接执行互斥锁 + 陈旧锁自愈、GUI 确认对话框），语义零改动。
+import { watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   checkCommandConfirmation,
@@ -25,6 +26,9 @@ interface McpGuiCommand {
   timeout?: number;
   /** MCP 侧已获会话授权（用户此前选过「本轮会话均允许」）→ 跳过确认弹窗 */
   session_allowed?: boolean;
+  /** 调用方进程标识（myshell-mcp 的 pid）：exec 通道按 (连接, pid) 隔离终端
+   *  标签 —— 每个 MCP 客户端进程一条独立持久 shell，多进程不串台。 */
+  client_pid?: number;
   /** `mcp_confirm`（不可逆文件操作确认）：被请求的操作名称，如「上传文件（可能覆盖）」 */
   operation?: string;
   /** `mcp_confirm`：目标连接名，用于弹窗标题 */
@@ -42,8 +46,14 @@ interface McpGuiCommand {
 const mcpExecLocks = new Map<string, number>();
 const MCP_LOCK_STALE_MS = 60_000;
 
+// 进程级终端标签注册表："连接id:客户端pid" → tabId。exec_in_tab 据此复用
+// 本进程自己的标签；标签被用户关掉后从这里清除（startMcpBridge 内 watch）。
+// MCP 进程重启换 pid → 自然落新键、开新标签，旧标签留作孤儿由用户手关
+//（断开≠退出，不自动关）。
+const mcpProcessTabs = new Map<string, string>();
+
 export async function startMcpBridge(): Promise<UnlistenFn> {
-  return listen<McpGuiCommand>("mcp-gui-command", (event) => {
+  const unlisten = await listen<McpGuiCommand>("mcp-gui-command", (event) => {
     const { action, connection_id } = event.payload;
 
     // ── mcp_confirm：不可逆文件操作的人工确认（GUI 内渲染）──
@@ -88,21 +98,24 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
       const requestId = event.payload.request_id;
       const command = event.payload.command;
       const timeoutMs = (event.payload.timeout || 30) * 1000;
+      // 进程级隔离键：连接 × MCP 客户端进程。pid 缺失（旧版 MCP 二进制）时
+      // 落到 ":0"，与历史“共享单标签”行为兼容 —— 新版 MCP 一起升级即隔离。
+      const processKey = `${connection_id}:${event.payload.client_pid ?? 0}`;
 
       // 互斥锁检查 + 陈旧锁自愈（阈值随本请求 timeout 放大）
       const lockStaleMs = Math.max(MCP_LOCK_STALE_MS, timeoutMs + 10_000);
-      const existingLockAt = mcpExecLocks.get(connection_id);
+      const existingLockAt = mcpExecLocks.get(processKey);
       if (existingLockAt !== undefined) {
         const lockAge = Date.now() - existingLockAt;
         if (lockAge > lockStaleMs) {
-          console.warn(`[mcp-exec] stale lock on ${connection_id} (${lockAge}ms old), force-releasing`);
-          mcpExecLocks.delete(connection_id);
+          console.warn(`[mcp-exec] stale lock on ${processKey} (${lockAge}ms old), force-releasing`);
+          mcpExecLocks.delete(processKey);
         } else {
           const remainSec = Math.ceil((lockStaleMs - lockAge) / 1000);
           mcpExecResult(requestId, {
             ok: false,
             error:
-              `上一条命令仍在该服务器的终端中执行（已运行约 ${Math.round(lockAge / 1000)} 秒）。` +
+              `上一条命令仍在本进程该服务器的终端中执行（已运行约 ${Math.round(lockAge / 1000)} 秒）。` +
               "交互式终端一次只能跑一条命令，请等待上一条结束后重试" +
               (remainSec > 0 ? `（预计最多再等 ${remainSec} 秒）` : "") +
               "。命令未发送到远端，可以安全重试。" +
@@ -112,8 +125,7 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
           return;
         }
       }
-      mcpExecLocks.set(connection_id, Date.now());
-
+      mcpExecLocks.set(processKey, Date.now());
       // 会话级授权标记：用户在本次确认框点了「本轮会话均允许」时为 true，
       // 随执行结果回传 MCP（其进程内记住，后续所有确认点直接放行）。
       let sessionAllowedGranted = false;
@@ -134,12 +146,14 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
       // 输出订阅的解绑钩子，由 runExec 在挂好监听后装入。finishExec 统一调用它，
       // 保证「看门狗超时」「硬超时」「正常收尾」三条路径都不会漏掉 IPC 监听。
       let stopOutput: (() => void) | null = null;
-      const finishExec = (result: { ok: boolean; stdout?: string; exit_code?: number; error?: string }) => {
+      // exit_code 允许 null：空闲回退时命令「是否跑完」未确认，如实上报 null
+      // 而不是默认 0。completed 缺省视为 true（快命令的正常路径不带该字段）。
+      const finishExec = (result: { ok: boolean; stdout?: string; exit_code?: number | null; completed?: boolean; error?: string }) => {
         if (settled) return;
         settled = true;
         clearTimeout(watchdog);
         stopOutput?.();
-        mcpExecLocks.delete(connection_id);
+        mcpExecLocks.delete(processKey);
         const payload: Record<string, unknown> = { ...result, command_sent: commandSent };
         if (sessionAllowedGranted) payload.session_allowed = true;
         if (sessionRevoked) payload.session_revoked = true;
@@ -163,7 +177,17 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
         });
       }, timeoutMs + 9_000);
 
-      const existingTab = sessions.tabs.find((t) => t.connectionId === connection_id && t.type === "terminal");
+      // 进程级标签解析：优先用注册表里本进程自己的标签（且仍存活）；
+      // 旧版 MCP（无 client_pid → pid=0）回落到历史行为「任一同连接终端标签」，
+      // 保证新旧二进制共存期间不炸。
+      const registeredId = mcpProcessTabs.get(processKey);
+      let existingTab = registeredId
+        ? sessions.tabs.find((t) => t.id === registeredId && t.connectionId === connection_id && t.type === "terminal")
+        : undefined;
+      if (!existingTab && !event.payload.client_pid) {
+        existingTab = sessions.tabs.find((t) => t.connectionId === connection_id && t.type === "terminal");
+      }
+      if (existingTab) mcpProcessTabs.set(processKey, existingTab.id);
 
       const runExec = async (sessionId: string) => {
         // ── GUI 侧命令确认（黑名单命中时）──
@@ -221,9 +245,80 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
         let timedOut = false;
         let lastDataAt = Date.now();
         let sawSentinelEcho = false;
+        // 流式解码器：PTY 输出按 16ms/16KiB 批量 flush，一个多字节 UTF-8 字符
+        // （中文）恰好被切成两片时，无状态 decode 会把前半段变成不可恢复的
+        // U+FFFD。带 stream:true 的单实例解码器跨 chunk 保留那半个字符。
+        const decoder = new TextDecoder("utf-8", { fatal: false });
+
+        // 在原始字节流里跳过 ANSI/OSC 转义与 \r 之后找 sentinel 结果行，
+        // 返回 [buf 中的原始下标, 退出码]；找不到返回 null。
+        //
+        // 折行时 readline 会在行中间插入光标移动转义（CSI），且这些转义恰好
+        // 可能落在 sentinel 内部 —— 所以在原始串上 startsWith 会脱靶，而那
+        // 正是「含管道/重定向的命令固定多等 5-6 秒」的根因。做法：先构造
+        // 「可见字符 → 原始下标」的映射，再在可见文本上匹配并取码，最后把
+        // 下标翻译回原始位置（截断输出要用）。
+        const findSentinelResult = (buf: string, from: number): [number, number] | null => {
+          // 一遍扫描：剥掉转义，同时记录每个可见字符的原始下标。
+          let visible = "";
+          const map: number[] = [];
+          let i = from;
+          while (i < buf.length) {
+            const ch = buf[i];
+            if (ch === "\x1b") {
+              if (buf[i + 1] === "[") {
+                i += 2;
+                while (i < buf.length && !/[a-zA-Z]/.test(buf[i])) i += 1;
+                i += 1;
+                continue;
+              }
+              if (buf[i + 1] === "]") {
+                i += 2;
+                while (i < buf.length && buf[i] !== "\x07" && buf[i] !== "\x1b") i += 1;
+                i += buf[i] === "\x07" ? 1 : 2;
+                continue;
+              }
+              i += 2;
+              continue;
+            }
+            if (ch === "\r") {
+              i += 1;
+              continue;
+            }
+            visible += ch;
+            map.push(i);
+            i += 1;
+          }
+          // 二遍：在可见文本上找结果行。只认 `:<数字>`：命令回显里的是 `:$?`，
+          // `$` 不是数字，借此把「用户输入的那一行」和「echo 真正打出的结果」
+          // 区分开。
+          const vIdx = visible.indexOf(sentinel);
+          if (vIdx < 0) return null;
+          const after = visible.slice(vIdx + sentinel.length);
+          const codeMatch = /^:(\d+)/.exec(after);
+          if (!codeMatch) return null;
+          return [map[vIdx], parseInt(codeMatch[1], 10)];
+        };
+
+        // 去掉 ANSI/OSC 与 \r 的可见文本，仅用于提示符形态判断。
+        // 续行（PS2）检测：shell 因上一条命令引号/heredoc 未闭合而停在 `>`
+        // 时，我们注入的命令与 sentinel 都会被当作续行文本回显，每行带 `> `
+        // 前缀且永不执行。正常执行时该行前缀是 PS1（`user@host:~$ `），`>`
+        // 不在行首 —— 这就是判别式。命中即补 Ctrl+C 清场并快速失败，而不是
+        // 让后续每条命令都静默失效（反馈 P0-2）。
+        const detectContinuation = (buf: string): boolean =>
+          /(?:^|\n)>\s*echo __MCP_DONE_/.test(
+            buf
+              .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "")
+              .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+              .replace(/\r/g, "")
+              .slice(-4096),
+          );
 
         // 输出收尾：截 sentinel、归一化换行、剥命令回显与 helper 行（保留 ANSI 颜色）
-        const finalizeOutput = (exitCode: number | null) => {
+        // completed=false 表示「没能确认命令跑完」（空闲回退/超时兜底），此时
+        // exit_code 必须原样上报 null，不能默认成 0 —— 那会把未完成当成成功。
+        const finalizeOutput = (exitCode: number | null, completed: boolean) => {
           done = true;
           let stdout = outputBuf;
           const sentinelRe = new RegExp(sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ":(\\d+)");
@@ -265,13 +360,20 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
           // 刻意不清 ANSI：AI 看到的颜色与终端一致
           stdout = stdout.replace(/^\n+/, "").replace(/\n+$/, "");
 
-          finishExec({ ok: true, stdout, exit_code: exitCode ?? 0 });
+          finishExec({
+            ok: true,
+            stdout,
+            // 未能确认完成时如实上报 null + completed=false：把「没等到结果」
+            // 静默转成 0 会让调用方把未执行的命令当成成功。
+            exit_code: completed ? (exitCode ?? 0) : null,
+            completed,
+          });
         };
 
         const unlistenOutput = await onSshOutput(sessionId, (data) => {
           if (done) return;
           lastDataAt = Date.now();
-          outputBuf += new TextDecoder("utf-8", { fatal: false }).decode(data);
+          outputBuf += decoder.decode(data, { stream: true });
 
           const MAX_OUTPUT = 4 * 1024 * 1024;
           if (outputBuf.length > MAX_OUTPUT) {
@@ -282,14 +384,28 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
             sawSentinelEcho = true;
           }
 
-          const sentinelRe = new RegExp(sentinel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ":(\\d+)");
-          const tailSearch = outputBuf.slice(-16 * 1024);
-          const tailMatch = tailSearch.match(sentinelRe);
-          if (!tailMatch) return;
-          const matchIndex = outputBuf.length - tailSearch.length + (tailMatch.index ?? 0);
-          const exitCode = parseInt(tailMatch[1], 10);
+          // 续行自愈：一旦看到 sentinel 回显带 `> ` 前缀，说明 shell 仍停在
+          // PS2（上一条命令引号未闭合）。此时发 Ctrl+C 清场并直接失败——
+          // 继续等只会让每条命令都静默失效（反馈 P0-2：连续 7 次全部进 `>`）。
+          if (!done && detectContinuation(outputBuf)) {
+            sshSend(sessionId, "\x03").catch(() => {});
+            finishExec({
+              ok: false,
+              error:
+                "上一命令的引号/heredoc 未闭合，shell 仍处于续行（>）状态，本条命令未被执行。" +
+                "已自动发送 Ctrl+C 恢复提示符；请重试，并检查前一条命令是否缺少闭合引号。",
+            });
+            return;
+          }
+
+          // 折行容错匹配：回显被 readline 折行时会插入光标移动转义，
+          // 直接在原始串上匹配 sentinel 结果行会脱靶，进而触发 5 秒空闲
+          // 回退 —— 那正是「含 | / 2>&1 / ; 的命令固定 6 秒」的来源。
+          const found = findSentinelResult(outputBuf, Math.max(0, outputBuf.length - 64 * 1024));
+          if (!found) return;
+          const [matchIndex, exitCode] = found;
           outputBuf = outputBuf.slice(0, matchIndex);
-          finalizeOutput(exitCode);
+          finalizeOutput(exitCode, true);
         });
         // 监听已挂好 —— 交给 finishExec 统一解绑（看门狗/硬超时/正常收尾都走它）。
         stopOutput = unlistenOutput;
@@ -338,7 +454,9 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
           }
           if (sawSentinelEcho && Date.now() - lastDataAt >= IDLE_TIMEOUT_MS) {
             clearInterval(idleCheck);
-            finalizeOutput(null);
+            // completed=false：这是兜底收场，不是确认完成。旧代码在这里报
+            // exit_code 0，让「sentinel 脱靶」伪装成命令成功。
+            finalizeOutput(null, false);
           }
         }, 1000);
 
@@ -373,30 +491,30 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
           finishExec({ ok: false, error: `重连失败: ${e}` });
         });
       } else {
-        // 新 tab 路径：开 tab + 连接，轮询等连上后执行。
-        // 等连上的预算单独封顶 30s：旧实现用整个命令 timeout 去等连接，一条
-        // timeout=60s 的调用可能把 60s 全花在建连上，命令还没发就超时了。
+        // 新 tab 路径：开 tab + 连接，轮询等**本次新建**的标签连上后执行。
+        // 不能再按 connectionId 找“任一已连接终端标签”——本进程的新标签还在
+        // 握手时，其它进程的旧标签可能已连接，那样会登错标签、隔离失效。
+        // 用「调用前已有标签 id 快照」识别新增的那一个。
+        const idsBefore = new Set(sessions.tabs.map((t) => t.id));
         connect(config);
         let attempts = 0;
         const maxAttempts = Math.min(Math.floor(timeoutMs / 500), 60);
         const checkInterval = setInterval(() => {
           attempts++;
-          const errTab = sessions.tabs.find(
-            (t) => t.connectionId === connection_id && t.type === "terminal" && t.status === "error",
+          const tab = sessions.tabs.find(
+            (t) => !idsBefore.has(t.id) && t.connectionId === connection_id && t.type === "terminal",
           );
-          if (errTab) {
+          if (tab && tab.status === "error") {
             clearInterval(checkInterval);
             finishExec({
               ok: false,
-              error: `连接失败：${errTab.errorMessage || "请检查保险库是否已解锁"}`,
+              error: `连接失败：${tab.errorMessage || "请检查保险库是否已解锁"}`,
             });
             return;
           }
-          const tab = sessions.tabs.find(
-            (t) => t.connectionId === connection_id && t.type === "terminal" && t.status === "connected" && t.sessionId,
-          );
-          if (tab && tab.sessionId) {
+          if (tab && tab.sessionId && tab.status === "connected") {
             clearInterval(checkInterval);
+            mcpProcessTabs.set(processKey, tab.id);
             sessions.activeTabId = tab.id;
             runExec(tab.sessionId).catch((e) => {
               finishExec({ ok: false, error: `执行失败: ${e}` });
@@ -437,4 +555,19 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
       connect(config);
     }
   });
+  // 注册表清理：用户关掉某进程的终端标签后，其注册项随之失效，下次 exec
+  // 会为该进程开新标签（而不是复用已死的 tabId）。
+  const stopWatch = watch(
+    () => sessions.tabs.map((t) => t.id).join(","),
+    () => {
+      const live = new Set(sessions.tabs.map((t) => t.id));
+      for (const [key, tabId] of mcpProcessTabs) {
+        if (!live.has(tabId)) mcpProcessTabs.delete(key);
+      }
+    },
+  );
+  return () => {
+    unlisten();
+    stopWatch();
+  };
 }

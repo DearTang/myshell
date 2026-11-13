@@ -27,24 +27,36 @@ watch(
   ([sessionId, active]) => {
     if (!active) return;
     let cancelled = false;
+    let tid: ReturnType<typeof setInterval> | undefined;
+    // 连续失败熔断：会话被删除/死亡后，轮询只会每 5s 刷一条错（日志实测
+    // 单个死会话一天被重试 7104 次）。连续 2 次失败即停表；sessionId/active
+    // 变化时本 watch 重建，自动恢复轮询。
+    let fails = 0;
     const refresh = async (): Promise<void> => {
       try {
         const v = await sshGetServerInfo(sessionId);
         if (!cancelled) {
           info.value = v;
           error.value = null;
+          fails = 0;
         }
       } catch (e) {
-        if (!cancelled) error.value = String(e);
+        if (!cancelled) {
+          error.value = String(e);
+          if (++fails >= 2 && tid !== undefined) {
+            clearInterval(tid);
+            tid = undefined;
+          }
+        }
       }
     };
     void refresh();
-    const tid = setInterval(() => {
+    tid = setInterval(() => {
       void refresh();
     }, 5000);
     return () => {
       cancelled = true;
-      clearInterval(tid);
+      if (tid !== undefined) clearInterval(tid);
     };
   },
   { immediate: true },

@@ -27,8 +27,11 @@ createApp({
   setup() {
     return () =>
       h("div", { class: "app-shell sidebar-collapsed no-ai" }, [
-        h(AppTopBar, { class: "shell-topbar" }),
-        h(AppSidebar, { class: "shell-side" }),
+        h(AppTopBar, {
+          class: "shell-topbar",
+          monitorOpen: false,
+        }),
+        h(AppSidebar, { class: "shell-side", collapsed: true }),
         h("main", { class: "shell-work" }, [
           h(
             "div",

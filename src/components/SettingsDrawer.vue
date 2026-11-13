@@ -11,6 +11,7 @@ import AiSection from "@/components/settings/AiSection.vue";
 import McpSection from "@/components/settings/McpSection.vue";
 import MultiWindowSection from "@/components/settings/MultiWindowSection.vue";
 import TransferSection from "@/components/settings/TransferSection.vue";
+import ForwardSection from "@/components/settings/ForwardSection.vue";
 import SecuritySection from "@/components/settings/SecuritySection.vue";
 import DataSection from "@/components/settings/DataSection.vue";
 import QuickCommandsSection from "@/components/settings/QuickCommandsSection.vue";
@@ -35,6 +36,7 @@ const categories = [
   { id: "mcp", label: "MCP 支持", icon: "Connection" },
   { id: "multiWindow", label: "多窗口", icon: "Grid" },
   { id: "transfer", label: "文件传输", icon: "Upload" },
+  { id: "forward", label: "端口转发", icon: "Shuffle" },
   { id: "security", label: "安全", icon: "Lock" },
   { id: "data", label: "数据管理", icon: "Files" },
   { id: "quickCommands", label: "快捷命令", icon: "Lightning" },
@@ -122,6 +124,9 @@ function onNavSelect(key: string): void {
             </div>
             <div v-show="activeCategory === 'transfer'" class="category-pane">
               <TransferSection v-if="visited.has('transfer')" />
+            </div>
+            <div v-show="activeCategory === 'forward'" class="category-pane">
+              <ForwardSection v-if="visited.has('forward')" />
             </div>
             <div v-show="activeCategory === 'security'" class="category-pane">
               <SecuritySection v-if="visited.has('security')" />

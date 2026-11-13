@@ -38,11 +38,8 @@ export interface TerminalTheme {
   brightWhite: string;
 }
 
-export type UIVariables = Partial<Record<string, string>>;
-
 export interface ColorPaletteVariant {
   terminal: TerminalTheme;
-  ui: UIVariables;
 }
 
 export interface ColorPalette {
@@ -52,8 +49,14 @@ export interface ColorPalette {
   light: ColorPaletteVariant;
 }
 
+/** 背景模式：glow=主题色光晕 / grid=网格纹理 / image=壁纸 / none=纯底色。 */
+export type BackgroundMode = "glow" | "grid" | "image" | "none";
+
 export interface BackgroundImageConfig {
-  dataUrl: string | null;
+  mode: BackgroundMode;
+  /** image 模式下的壁纸 URL（asset 协议 / data: / http(s)；其余模式空串）。 */
+  image: string;
+  /** 背景强度 0.05-0.8（越低越淡；image 模式还反向决定壁纸模糊量）。 */
   opacity: number;
 }
 
@@ -75,7 +78,7 @@ export const TERMINAL_FONT_SIZE_MIN = 10;
 export const TERMINAL_FONT_SIZE_MAX = 22;
 
 export const DEFAULT_PALETTE_ID = "carbon";
-export const DEFAULT_BG_IMAGE: BackgroundImageConfig = { dataUrl: null, opacity: 0.85 };
+export const DEFAULT_BG_IMAGE: BackgroundImageConfig = { mode: "glow", image: "", opacity: 0.22 };
 
 /**
  * Default terminal font stack. Nerd Font families are listed FIRST so the
@@ -132,44 +135,6 @@ const c1Dark: ColorPaletteVariant = {
     brightCyan:         "#56d4dd",
     brightWhite:        "#f0f6fc",
   },
-  ui: {
-    "--bg-base": "#0d1117",
-    "--bg-elevated": "#161b22",
-    "--bg-surface": "#21262d",
-    "--bg-surface-hover": "#292e36",
-    "--bg-surface-active": "#323841",
-    "--bg-input": "#1a1f26",
-    "--bg-input-hover": "#242930",
-    "--text-primary": "#e6edf3",
-    "--text-secondary": "#8b949e",
-    "--text-tertiary": "#6e7681",
-    "--text-muted": "#484f58",
-    "--accent-primary": "#58a6ff",
-    "--accent-primary-hover": "#79c0ff",
-    "--accent-primary-muted": "rgba(88,166,255,0.12)",
-    "--accent-secondary": "#39d2c0",
-    "--accent-secondary-muted": "rgba(57,210,192,0.12)",
-    "--success": "#3fb950",
-    "--success-muted": "rgba(63,185,80,0.12)",
-    "--warning": "#d29922",
-    "--warning-muted": "rgba(210,153,34,0.12)",
-    "--error": "#f85149",
-    "--error-muted": "rgba(248,81,73,0.12)",
-    "--info": "#58a6ff",
-    "--info-muted": "rgba(88,166,255,0.12)",
-    "--border-default": "rgba(255,255,255,0.08)",
-    "--border-subtle": "rgba(255,255,255,0.05)",
-    "--border-emphasis": "rgba(255,255,255,0.14)",
-    "--border-accent": "rgba(88,166,255,0.4)",
-    "--shadow-xs": "0 1px 2px rgba(0,0,0,0.3)",
-    "--shadow-sm": "0 2px 4px rgba(0,0,0,0.3)",
-    "--shadow-md": "0 4px 12px rgba(0,0,0,0.4)",
-    "--shadow-lg": "0 8px 24px rgba(0,0,0,0.5)",
-    "--shadow-xl": "0 16px 48px rgba(0,0,0,0.6)",
-    "--shadow-glow": "0 0 20px rgba(88,166,255,0.2)",
-    "--glass-border": "rgba(255,255,255,0.08)",
-    "--glass-blur": "12px",
-  },
 };
 
 const c1Light: ColorPaletteVariant = {
@@ -195,35 +160,6 @@ const c1Light: ColorPaletteVariant = {
     brightMagenta:      "#a475f9",
     brightCyan:         "#3192a0",
     brightWhite:        "#1f2328",
-  },
-  ui: {
-    "--bg-base": "#ffffff",
-    "--bg-elevated": "#f6f8fa",
-    "--bg-surface": "#f0f2f5",
-    "--bg-surface-hover": "#e8eaed",
-    "--bg-surface-active": "#dfe1e5",
-    "--bg-input": "#ffffff",
-    "--bg-input-hover": "#f6f8fa",
-    "--text-primary": "#1f2328",
-    "--text-secondary": "#59636e",
-    "--text-tertiary": "#8c959f",
-    "--text-muted": "#afb8c1",
-    "--accent-primary": "#0969da",
-    "--accent-primary-hover": "#218bff",
-    "--accent-primary-muted": "rgba(9,105,218,0.1)",
-    "--accent-secondary": "#1b7c83",
-    "--accent-secondary-muted": "rgba(27,124,131,0.1)",
-    "--success": "#1a7f37",
-    "--warning": "#9a6700",
-    "--error": "#cf222e",
-    "--info": "#0969da",
-    "--border-default": "rgba(0,0,0,0.08)",
-    "--border-subtle": "rgba(0,0,0,0.04)",
-    "--border-emphasis": "rgba(0,0,0,0.15)",
-    "--border-accent": "rgba(9,105,218,0.4)",
-    "--shadow-glow": "0 0 20px rgba(9,105,218,0.15)",
-    "--glass-border": "rgba(0,0,0,0.06)",
-    "--glass-blur": "12px",
   },
 };
 
@@ -252,17 +188,6 @@ const c2Dark: ColorPaletteVariant = {
     brightCyan:         "#b8f2ff",
     brightWhite:        "#ffffff",
   },
-  ui: {
-    "--bg-base": "#1e1f29", "--bg-elevated": "#282a36", "--bg-surface": "#343746",
-    "--bg-surface-hover": "#3d3f53", "--bg-surface-active": "#44475a",
-    "--bg-input": "#2a2c3d", "--bg-input-hover": "#34364b",
-    "--accent-primary": "#c4a0ff", "--accent-primary-hover": "#ddc4ff",
-    "--accent-primary-muted": "rgba(196,160,255,0.15)", "--accent-secondary": "#8be9fd",
-    "--accent-secondary-muted": "rgba(139,233,253,0.15)",
-    "--success": "#69f0a8", "--warning": "#f4d370", "--error": "#ff6e6e", "--info": "#8be9fd",
-    "--border-accent": "rgba(196,160,255,0.4)", "--shadow-glow": "0 0 20px rgba(196,160,255,0.25)",
-    "--glass-border": "rgba(255,255,255,0.08)",
-  },
 };
 
 const c2Light: ColorPaletteVariant = {
@@ -278,11 +203,6 @@ const c2Light: ColorPaletteVariant = {
     brightBlack:        "#bfbfbf", brightRed: "#e86671", brightGreen: "#5ce088",
     brightYellow:       "#d4a520", brightBlue: "#c49af5", brightMagenta: "#ec7cc0",
     brightCyan:         "#3db8b0", brightWhite: "#44475a",
-  },
-  ui: {
-    "--bg-base": "#f8f8f2", "--bg-elevated": "#ffffff", "--bg-surface": "#f0f0ec",
-    "--bg-surface-hover": "#e6e6e0", "--accent-primary": "#a86ef0",
-    "--accent-primary-hover": "#c49af5", "--accent-secondary": "#18918e",
   },
 };
 
@@ -313,17 +233,6 @@ const c3Dark: ColorPaletteVariant = {
     brightCyan:         "#aeddd9",
     brightWhite:        "#eceff4",
   },
-  ui: {
-    "--bg-base": "#242933", "--bg-elevated": "#2e3440", "--bg-surface": "#3b4252",
-    "--bg-surface-hover": "#434c5e", "--bg-surface-active": "#4c566a",
-    "--bg-input": "#353b4a", "--bg-input-hover": "#3f4758",
-    "--accent-primary": "#8cc4c0", "--accent-primary-hover": "#aeddd9",
-    "--accent-primary-muted": "rgba(140,196,192,0.15)", "--accent-secondary": "#89b4d4",
-    "--accent-secondary-muted": "rgba(137,180,212,0.15)",
-    "--success": "#a3be8c", "--warning": "#ebcb8b", "--error": "#c26970", "--info": "#8cc4c0",
-    "--border-accent": "rgba(140,196,192,0.4)", "--shadow-glow": "0 0 20px rgba(140,196,192,0.2)",
-    "--glass-border": "rgba(255,255,255,0.06)",
-  },
 };
 
 const c3Light: ColorPaletteVariant = {
@@ -339,11 +248,6 @@ const c3Light: ColorPaletteVariant = {
     brightBlack:        "#6c7a92", brightRed: "#d9888e", brightGreen: "#96b580",
     brightYellow:       "#daad58", brightBlue: "#7da3ce", brightMagenta: "#b58eb2",
     brightCyan:         "#7aaba8", brightWhite: "#eceff4",
-  },
-  ui: {
-    "--bg-base": "#eceff4", "--bg-elevated": "#ffffff", "--bg-surface": "#e5e9f0",
-    "--bg-surface-hover": "#d8dee9", "--accent-primary": "#5a81b0",
-    "--accent-primary-hover": "#7da3ce", "--accent-secondary": "#5a8d8a",
   },
 };
 
@@ -374,17 +278,6 @@ const c4Dark: ColorPaletteVariant = {
     brightCyan:         "#40c0b8",
     brightWhite:        "#fdf6e3",
   },
-  ui: {
-    "--bg-base": "#001f27", "--bg-elevated": "#002b36", "--bg-surface": "#073642",
-    "--bg-surface-hover": "#0d4959", "--bg-surface-active": "#11576b",
-    "--bg-input": "#05323f", "--bg-input-hover": "#0a3f4d",
-    "--accent-primary": "#4da0e0", "--accent-primary-hover": "#6dbdf0",
-    "--accent-primary-muted": "rgba(77,160,224,0.15)", "--accent-secondary": "#2aa198",
-    "--accent-secondary-muted": "rgba(42,161,152,0.15)",
-    "--success": "#859900", "--warning": "#c48d00", "--error": "#dc322f", "--info": "#4da0e0",
-    "--border-accent": "rgba(77,160,224,0.4)", "--shadow-glow": "0 0 20px rgba(77,160,224,0.2)",
-    "--glass-border": "rgba(255,255,255,0.06)",
-  },
 };
 
 const c4Light: ColorPaletteVariant = {
@@ -400,11 +293,6 @@ const c4Light: ColorPaletteVariant = {
     brightBlack:        "#8a9a9e", brightRed: "#e85450", brightGreen: "#8a9e1a",
     brightYellow:       "#c48d00", brightBlue: "#4da0e0", brightMagenta: "#d35890",
     brightCyan:         "#30a098", brightWhite: "#fdf6e3",
-  },
-  ui: {
-    "--bg-base": "#fdf6e3", "--bg-elevated": "#ffffff", "--bg-surface": "#eee8d5",
-    "--bg-surface-hover": "#e0d9c3", "--accent-primary": "#287bb5",
-    "--accent-primary-hover": "#4da0e0", "--accent-secondary": "#1e807a",
   },
 };
 
@@ -435,17 +323,6 @@ const c5Dark: ColorPaletteVariant = {
     brightCyan:         "#8ec07c",
     brightWhite:        "#f2e5bc",
   },
-  ui: {
-    "--bg-base": "#1d2021", "--bg-elevated": "#282828", "--bg-surface": "#3c3836",
-    "--bg-surface-hover": "#504945", "--bg-surface-active": "#665c54",
-    "--bg-input": "#32302f", "--bg-input-hover": "#3c3836",
-    "--accent-primary": "#d79921", "--accent-primary-hover": "#fabd2f",
-    "--accent-primary-muted": "rgba(215,153,33,0.15)", "--accent-secondary": "#6ba8a8",
-    "--accent-secondary-muted": "rgba(107,168,168,0.15)",
-    "--success": "#98971a", "--warning": "#d79921", "--error": "#e04040", "--info": "#6ba8a8",
-    "--border-accent": "rgba(215,153,33,0.4)", "--shadow-glow": "0 0 20px rgba(215,153,33,0.25)",
-    "--glass-border": "rgba(255,255,255,0.06)",
-  },
 };
 
 const c5Light: ColorPaletteVariant = {
@@ -461,11 +338,6 @@ const c5Light: ColorPaletteVariant = {
     brightBlack:        "#a89984", brightRed: "#e04040", brightGreen: "#98971a",
     brightYellow:       "#d79921", brightBlue: "#6ba8a8", brightMagenta: "#b16286",
     brightCyan:         "#689d6a", brightWhite: "#282828",
-  },
-  ui: {
-    "--bg-base": "#fbf1c7", "--bg-elevated": "#ffffff", "--bg-surface": "#f2e5bc",
-    "--bg-surface-hover": "#ebdbb2", "--accent-primary": "#b57614",
-    "--accent-primary-hover": "#d79921", "--accent-secondary": "#4d7a7a",
   },
 };
 
@@ -494,17 +366,6 @@ const c6Dark: ColorPaletteVariant = {
     brightCyan:         "#76cdd7",
     brightWhite:        "#ffffff",
   },
-  ui: {
-    "--bg-base": "#21252b", "--bg-elevated": "#282c34", "--bg-surface": "#313640",
-    "--bg-surface-hover": "#3b404b", "--bg-surface-active": "#444a57",
-    "--bg-input": "#2c313a", "--bg-input-hover": "#353b47",
-    "--accent-primary": "#72b1f0", "--accent-primary-hover": "#90c8f5",
-    "--accent-primary-muted": "rgba(114,177,240,0.15)", "--accent-secondary": "#56b6c2",
-    "--accent-secondary-muted": "rgba(86,182,194,0.15)",
-    "--success": "#98c379", "--warning": "#e5c07b", "--error": "#e06c75", "--info": "#72b1f0",
-    "--border-accent": "rgba(114,177,240,0.4)", "--shadow-glow": "0 0 20px rgba(114,177,240,0.25)",
-    "--glass-border": "rgba(255,255,255,0.08)",
-  },
 };
 
 const c6Light: ColorPaletteVariant = {
@@ -520,11 +381,6 @@ const c6Light: ColorPaletteVariant = {
     brightBlack:        "#a0a1a7", brightRed: "#e86671", brightGreen: "#6ebd68",
     brightYellow:       "#d99a20", brightBlue: "#6598f5", brightMagenta: "#c04ac0",
     brightCyan:         "#20a0d8", brightWhite: "#383a42",
-  },
-  ui: {
-    "--bg-base": "#fafafa", "--bg-elevated": "#ffffff", "--bg-surface": "#f0f0f1",
-    "--bg-surface-hover": "#e5e5e6", "--accent-primary": "#4078f2",
-    "--accent-primary-hover": "#6598f5", "--accent-secondary": "#0184bc",
   },
 };
 
@@ -553,17 +409,6 @@ const c7Dark: ColorPaletteVariant = {
     brightCyan:         "#bef5ed",
     brightWhite:        "#f9f8f5",
   },
-  ui: {
-    "--bg-base": "#1e1f1a", "--bg-elevated": "#272822", "--bg-surface": "#34352e",
-    "--bg-surface-hover": "#3e3f36", "--bg-surface-active": "#49483e",
-    "--bg-input": "#2d2e27", "--bg-input-hover": "#373830",
-    "--accent-primary": "#a6e22e", "--accent-primary-hover": "#beee50",
-    "--accent-primary-muted": "rgba(166,226,46,0.15)", "--accent-secondary": "#66d9ef",
-    "--accent-secondary-muted": "rgba(102,217,239,0.15)",
-    "--success": "#a6e22e", "--warning": "#e6db74", "--error": "#f92672", "--info": "#66d9ef",
-    "--border-accent": "rgba(166,226,46,0.4)", "--shadow-glow": "0 0 20px rgba(166,226,46,0.2)",
-    "--glass-border": "rgba(255,255,255,0.08)",
-  },
 };
 
 const c7Light: ColorPaletteVariant = {
@@ -579,11 +424,6 @@ const c7Light: ColorPaletteVariant = {
     brightBlack:        "#75715e", brightRed: "#f05070", brightGreen: "#a6e22e",
     brightYellow:       "#d4a020", brightBlue: "#4cc8e0", brightMagenta: "#ae60f0",
     brightCyan:         "#68d0b8", brightWhite: "#f9f8f5",
-  },
-  ui: {
-    "--bg-base": "#f9f8f5", "--bg-elevated": "#ffffff", "--bg-surface": "#f0efe9",
-    "--bg-surface-hover": "#e6e5e0", "--accent-primary": "#80b010",
-    "--accent-primary-hover": "#a6e22e", "--accent-secondary": "#2cacc8",
   },
 };
 
@@ -613,17 +453,6 @@ const c8Dark: ColorPaletteVariant = {
     brightCyan:         "#a0dcff",
     brightWhite:        "#dce0ff",
   },
-  ui: {
-    "--bg-base": "#13141d", "--bg-elevated": "#1a1b26", "--bg-surface": "#24283b",
-    "--bg-surface-hover": "#2f334d", "--bg-surface-active": "#3b4261",
-    "--bg-input": "#1e2030", "--bg-input-hover": "#292e42",
-    "--accent-primary": "#7aa2f7", "--accent-primary-hover": "#9dbcf9",
-    "--accent-primary-muted": "rgba(122,162,247,0.15)", "--accent-secondary": "#7dcfff",
-    "--accent-secondary-muted": "rgba(125,207,255,0.15)",
-    "--success": "#9ece6a", "--warning": "#e0af68", "--error": "#f7768e", "--info": "#7aa2f7",
-    "--border-accent": "rgba(122,162,247,0.4)", "--shadow-glow": "0 0 20px rgba(122,162,247,0.3)",
-    "--glass-border": "rgba(255,255,255,0.06)",
-  },
 };
 
 const c8Light: ColorPaletteVariant = {
@@ -639,11 +468,6 @@ const c8Light: ColorPaletteVariant = {
     brightBlack:        "#9699a3", brightRed: "#a85968", brightGreen: "#5e7840",
     brightYellow:       "#a87528", brightBlue: "#5a74d8", brightMagenta: "#786098",
     brightCyan:         "#286888", brightWhite: "#1a1b26",
-  },
-  ui: {
-    "--bg-base": "#d5d6db", "--bg-elevated": "#e9eaed", "--bg-surface": "#cbccd1",
-    "--bg-surface-hover": "#c0c1c8", "--accent-primary": "#3a58c0",
-    "--accent-primary-hover": "#5a74d8", "--accent-secondary": "#0f4b6e",
   },
 };
 
@@ -672,17 +496,6 @@ const c9Dark: ColorPaletteVariant = {
     brightCyan:         "#a4d8b0",
     brightWhite:        "#f0ecd8",
   },
-  ui: {
-    "--bg-base": "#232a2e", "--bg-elevated": "#2d353b", "--bg-surface": "#343f44",
-    "--bg-surface-hover": "#3d484d", "--bg-surface-active": "#475258",
-    "--bg-input": "#303b40", "--bg-input-hover": "#3a454a",
-    "--accent-primary": "#a7c080", "--accent-primary-hover": "#c0d9a0",
-    "--accent-primary-muted": "rgba(167,192,128,0.15)", "--accent-secondary": "#7fbbb3",
-    "--accent-secondary-muted": "rgba(127,187,179,0.15)",
-    "--success": "#a7c080", "--warning": "#dbbc7f", "--error": "#e67e80", "--info": "#7fbbb3",
-    "--border-accent": "rgba(167,192,128,0.4)", "--shadow-glow": "0 0 20px rgba(167,192,128,0.2)",
-    "--glass-border": "rgba(255,255,255,0.06)",
-  },
 };
 
 const c9Light: ColorPaletteVariant = {
@@ -698,11 +511,6 @@ const c9Light: ColorPaletteVariant = {
     brightBlack:        "#939f91", brightRed: "#ee7070", brightGreen: "#98b020",
     brightYellow:       "#daa020", brightBlue: "#58b0e0", brightMagenta: "#e878c0",
     brightCyan:         "#50c098", brightWhite: "#2d353b",
-  },
-  ui: {
-    "--bg-base": "#f6f2e4", "--bg-elevated": "#ffffff", "--bg-surface": "#ede7d5",
-    "--bg-surface-hover": "#e0dac5", "--accent-primary": "#7d9400",
-    "--accent-primary-hover": "#98b020", "--accent-secondary": "#3a94c5",
   },
 };
 
@@ -731,7 +539,6 @@ const c10Dark: ColorPaletteVariant = {
     brightCyan:         "#bcf0e8",
     brightWhite:        "#c6caf0",
   },
-  ui: {},
 };
 
 const c10Light: ColorPaletteVariant = {
@@ -748,7 +555,6 @@ const c10Light: ColorPaletteVariant = {
     brightYellow:       "#e8a840", brightBlue: "#5b8cf0", brightMagenta: "#f292d6",
     brightCyan:         "#2db5a8", brightWhite: "#bcc0cc",
   },
-  ui: {},
 };
 
 // ===========================================================================

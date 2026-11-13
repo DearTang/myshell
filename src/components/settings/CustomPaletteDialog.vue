@@ -9,51 +9,31 @@ import { MyButton, MyColorField, MyDialog, MyInput } from "myui";
 defineOptions({ name: "CustomPaletteDialog" });
 
 const props = defineProps<{
-  accent: string;
   bg: string;
-  accentValid: boolean;
   bgValid: boolean;
 }>();
 
 const emit = defineEmits<{
-  "update:accent": [value: string];
   "update:bg": [value: string];
   save: [];
   close: [];
 }>();
 
-const canSave = computed(() => props.accentValid && props.bgValid);
+const canSave = computed(() => props.bgValid);
 </script>
 
 <template>
   <MyDialog
     :model-value="true"
-    title="自定义主题"
+    title="自定义终端配色"
     :width="400"
     :dismissable="false"
     hide-footer
     @cancel="emit('close')"
   >
-    <div class="dialog-intro">选择主题色和终端背景色，保存为自定义主题</div>
-
-    <div class="field">
-      <label class="field-label">主题色<span class="req">*</span></label>
-      <div class="color-row">
-        <!-- 与旧原生 input[type=color] 一致：非法文本时选色器回退展示默认色。 -->
-        <MyColorField
-          class="color-picker"
-          :model-value="accentValid ? accent : '#6366f1'"
-          bare
-          @update:model-value="emit('update:accent', $event ?? '')"
-        />
-        <MyInput
-          :model-value="accent"
-          :error="accentValid ? '' : '请输入合法的颜色值，如 #6366f1 或 #f1f'"
-          placeholder="#6366f1"
-          class="color-text"
-          @update:model-value="emit('update:accent', $event)"
-        />
-      </div>
+    <div class="dialog-intro">
+      自定义预设只覆盖终端背景色（其余 16 色沿用 Carbon 基线）。界面强调色请用「外观
+      → 主题色」滑杆调整。
     </div>
 
     <div class="field">
@@ -75,10 +55,9 @@ const canSave = computed(() => props.accentValid && props.bgValid);
       </div>
     </div>
 
-    <!-- 预览 -->
-    <div class="preview" :style="{ background: bg, borderColor: accent }">
-      <div class="preview-label">预览</div>
-      <div class="preview-button" :style="{ background: accent }">主题按钮</div>
+    <!-- 预览：光标色条复用预设卡片同款（Carbon 光标色），直观看到成品形态 -->
+    <div class="preview" :style="{ background: bg }">
+      <div class="preview-label">终端背景预览</div>
     </div>
 
     <div class="dialog-actions">
@@ -86,7 +65,7 @@ const canSave = computed(() => props.accentValid && props.bgValid);
       <MyButton
         variant="primary"
         :disabled="!canSave"
-        :title="canSave ? undefined : '请输入合法的主题色和背景色'"
+        :title="canSave ? undefined : '请输入合法的背景色'"
         @click="emit('save')"
       >
         保存
@@ -94,6 +73,7 @@ const canSave = computed(() => props.accentValid && props.bgValid);
     </div>
   </MyDialog>
 </template>
+
 
 <style scoped>
 .dialog-intro {

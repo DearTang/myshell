@@ -1,6 +1,6 @@
 [package]
 name = "myshell"
-version = "2.19.0"
+version = "2.20.0"
 edition = "2021"
 description = "A Rust-based SSH/SFTP shell tool"
 # Three binaries share this crate (myshell / myshell-cli / myshell-mcp). `tauri dev`
@@ -28,7 +28,7 @@ path = "src/bin/myshell-mcp.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["image-ico"] }
+tauri = { version = "2", features = ["image-ico", "protocol-asset"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }

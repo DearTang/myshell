@@ -63,6 +63,13 @@ enum TxState {
     WaitingZrinit2,
     /// ZFIN sent; waiting for the receiver's ZFIN, then we emit "OO".
     WaitingZfin,
+    /// The receiver skipped the current file (ZSKIP). Inert: the reader must
+    /// either replace this sender with the next queued file or send ZFIN.
+    /// Exists so the skip does not reuse WaitingZrinit2 (whose
+    /// `is_waiting_for_next_file()` would make the reader pop the queue a
+    /// second time and offer a duplicate ZFILE) nor WaitingZfin (whose
+    /// header branch answers an unrelated ZFIN with "OO").
+    FileSkipped,
     /// Session complete.
     Done,
 }
@@ -77,7 +84,7 @@ pub struct TxActions {
 }
 
 /// Events emitted by the sender.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum TxEvent {
     /// The session has started (ZRINIT received, ZFILE being sent).
     Started,
@@ -85,6 +92,10 @@ pub enum TxEvent {
     Progress { sent: u64, total: u64 },
     /// The file has been fully sent (ZEOF acknowledged).
     FileComplete { name: String, bytes: u64 },
+    /// The receiver declined this file (ZSKIP). The reader decides whether
+    /// the session continues (more files queued) or closes — the queue lives
+    /// in ssh.rs, not in this single-file sender.
+    FileSkipped { name: String },
     /// The entire ZMODEM session ended cleanly.
     SessionEnd,
     /// Fatal error — caller should abort.
@@ -169,6 +180,24 @@ impl ZmodemSender {
         self.state == TxState::Done
     }
 
+    /// Build the ZFILE offer frame for the current file WITHOUT consuming any
+    /// inbound bytes, and move to WaitingZrpos.
+    ///
+    /// Needed when the reader advances the queue itself (a ZSKIP with more
+    /// files left): at that moment there is no inbound frame to feed, yet we
+    /// must offer the next file immediately. `zsinit_sent` must already be
+    /// true (`new_for_next_file`) so this matches the normal multi-file path —
+    /// resending ZSINIT makes rz abort to the shell.
+    pub fn send_zfile_offer(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.started_emitted {
+            self.started_emitted = true;
+        }
+        out.extend_from_slice(&self.build_zfile_frame());
+        self.state = TxState::WaitingZrpos;
+        out
+    }
+
     /// Debug helper: current state name for logging.
     pub fn state_name(&self) -> &'static str {
         match self.state {
@@ -178,6 +207,7 @@ impl ZmodemSender {
             TxState::SendingData => "SendingData",
             TxState::WaitingZrinit2 => "WaitingZrinit2",
             TxState::WaitingZfin => "WaitingZfin",
+            TxState::FileSkipped => "FileSkipped",
             TxState::Done => "Done",
         }
     }
@@ -491,11 +521,27 @@ impl ZmodemSender {
                         true
                     }
                     frame_type::ZSKIP => {
-                        // Receiver declined the file.
+                        // Receiver declined the file. NOT fatal on its own —
+                        // lrzsz's rz skips an existing file unless `-y`, and a
+                        // batch may contain several. Whether the session
+                        // continues (next file) or closes (last one) is a
+                        // decision about the QUEUE, which lives in the reader
+                        // (ssh.rs), not in this single-file sender. Emit an
+                        // event and let the reader act; just stop here.
+                        //
+                        // Deliberately NOT WaitingZrinit2: that state makes the
+                        // reader's multi-file swap fire on the NEXT inbound
+                        // chunk, popping the queue a second time and offering
+                        // a duplicate ZFILE (the reader already advanced the
+                        // queue when it handled this very event). Not
+                        // WaitingZfin either: its header branch answers an
+                        // unrelated ZFIN with "OO". `FileSkipped` is inert for
+                        // every other branch.
+                        log::warn!("[zmodem_tx] receiver skipped the file (ZSKIP)");
                         actions
                             .events
-                            .push(TxEvent::Error("接收方跳过了该文件（ZSKIP）".into()));
-                        self.state = TxState::Done;
+                            .push(TxEvent::FileSkipped { name: self.name.clone() });
+                        self.state = TxState::FileSkipped;
                         true
                     }
                     frame_type::ZFERR => {
@@ -556,6 +602,14 @@ impl ZmodemSender {
                     actions.events.push(TxEvent::SessionEnd);
                     self.state = TxState::Done;
                 }
+                true
+            }
+            TxState::FileSkipped => {
+                // Inert: the reader replaces this sender or sends ZFIN. Any
+                // stray frame from the receiver (ZRINIT for the next file,
+                // ZACK noise) must not trigger a second offer — the reader
+                // owns that decision and already acted on the FileSkipped
+                // event. Swallow everything here.
                 true
             }
             TxState::Done => false,
@@ -843,4 +897,74 @@ fn needs_zdle_escape(b: u8) -> bool {
     // leaves it alone. Escaping 0x7F injects spurious ZDLE bytes that corrupt
     // the subpacket frame structure and cause rz to reject every ZDATA block.
     (b & 0x60) == 0
+}
+
+
+#[cfg(test)]
+mod zskip_continuation_tests {
+    use super::{frame_type, ZmodemSender};
+
+    /// 构造一个合法的 hex 帧头。直接复用生产代码的 build_hex_header：
+    /// 手搓字节曾漏掉第二个 ZPAD 与 CRC/CRLF，喂进去的帧根本不被解析，
+    /// 测试等于什么都没验证（还假模假式地绿了）。
+    fn hex_header(typenum: u8, data: [u8; 4]) -> Vec<u8> {
+        ZmodemSender::new("probe".into(), 0, 0).build_hex_header(typenum, data)
+    }
+
+    /// ZSKIP 必须**不致命**：sender 进入 WaitingZrinit2 等待 reader 推进队列，
+    /// 而不是直接 Done —— 否则远端 rz 会一直等下一个永远不来的 offer，
+    /// 重新发出 ZMODEM 邀请，前端误弹手动选择器（用户实测卡死现场）。
+    #[test]
+    fn zskip_is_not_fatal_and_defers_to_reader() {
+        let mut s = ZmodemSender::new("a.txt".into(), 10, 0);
+        // 握手到「ZFILE 已发出、等待接收方裁决」：ZRINIT → ZACK。
+        // 注意不能喂 ZRPOS —— 它会把 sender 直接推进 SendingData，
+        // 而 ZSKIP 只会出现在 ZRPOS 之前的 WaitingZrpos 状态。
+        let _ = s.feed(&hex_header(frame_type::ZRINIT, [0, 0, 0, 0x23]));
+        let _ = s.feed(&hex_header(frame_type::ZACK, [0, 0, 0, 0]));
+        assert_eq!(s.state_name(), "WaitingZrpos");
+
+        let actions = s.feed(&hex_header(frame_type::ZSKIP, [0, 0, 0, 0]));
+
+        assert!(
+            !actions
+                .events
+                .iter()
+                .any(|e| matches!(e, super::TxEvent::Error(_))),
+            "ZSKIP 不得是致命错误：{:?}",
+            actions.events
+        );
+        assert!(
+            actions
+                .events
+                .iter()
+                .any(|e| matches!(e, super::TxEvent::FileSkipped { .. })),
+            "ZSKIP 必须产出 FileSkipped 事件：{:?}",
+            actions.events
+        );
+        assert_eq!(s.state_name(), "FileSkipped");
+    }
+
+    /// `send_zfile_offer` 必须在**不喂任何入站字节**的情况下产出 ZFILE 帧。
+    /// 这是 ZSKIP 后推进队列的唯一途径：那一刻没有入站帧可 feed，
+    /// 而 `feed(&[])` 因无帧可解析直接返回空。
+    #[test]
+    fn send_zfile_offer_emits_zfile_without_inbound_bytes() {
+        let mut s = ZmodemSender::new_for_next_file("b.txt".into(), 20, 0);
+        let offer = s.send_zfile_offer();
+
+        assert!(offer.len() > 8, "offer 不应为空：{:?}", offer);
+        // ZFILE 用 binary16 帧头：ZPAD ZDLE ZBIN（单 ZPAD，与 hex 头的
+        // 双 ZPAD 不同）。ZBIN = b'A'。
+        assert_eq!(
+            &offer[..3],
+            &[super::ZPAD, super::ZDLE, b'A'],
+            "offer 应是 binary16 帧头"
+        );
+        assert_eq!(s.state_name(), "WaitingZrpos", "offer 后应等待接收方 ZRPOS");
+
+        // 重复调用只验证状态机已推进、帧结构不变（不会因调用次数改变形状）。
+        let again = s.send_zfile_offer();
+        assert_eq!(again.len(), offer.len(), "重复调用不应改变帧结构");
+    }
 }

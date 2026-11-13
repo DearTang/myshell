@@ -137,6 +137,18 @@ pub fn command_needs_confirmation(command: &str, rules: &CommandRules) -> bool {
         return true;
     }
 
+    // 1b. Reading a credential file is also a hard floor. It lives HERE, not
+    //     in the user-editable blacklist, on purpose: `blacklist` is
+    //     persisted as a snapshot in the user's rules file, so a rule added
+    //     to `default_blacklist()` never reaches users who already have a
+    //     rules file (serde only fills in a MISSING field). A secret-read
+    //     rule that only applies to fresh installs would leave every
+    //     existing user unprotected — exactly the class of silent safety
+    //     downgrade this module refuses elsewhere.
+    if has_secret_read_across_segments(cmd) {
+        return true;
+    }
+
     let blacklist_re = compile_all(&rules.blacklist);
     let whitelist_re = compile_all(&rules.whitelist);
 
@@ -155,18 +167,25 @@ pub fn command_needs_confirmation(command: &str, rules: &CommandRules) -> bool {
             continue;
         }
         any_segment = true;
-        // Blacklist matches the raw segment, the wrapper-stripped view, AND the
-        // command-position view. The last one is what closes the quoting /
+        // Blacklist matches the raw segment, the wrapper-stripped view, AND
+        // the command-position view. The last one is what closes the quoting /
         // grouping / control-keyword bypass: `'rm' -rf /x` and `( rm -rf /x )`
         // both put `rm` at a position no raw-text regex could see.
         let stripped = wrapper_stripped_view(seg);
         let positioned = command_position_view(seg);
         if blacklist_re.iter().any(|re| re.is_match(seg))
-            || (stripped != seg && blacklist_re.iter().any(|re| re.is_match(stripped)))
+            || (stripped != seg && blacklist_re.iter().any(|re| re.is_match(&stripped)))
             || (positioned != seg && blacklist_re.iter().any(|re| re.is_match(&positioned)))
         {
             return true;
         }
+    }
+
+    // 2b. Secret read spanning several segments: the credential path and the
+    //     reader can live in different segments (`for f in .env; do cat $f;
+    //     done`), which the per-segment pass cannot see.
+    if has_secret_read_across_segments(cmd) {
+        return true;
     }
 
     if !any_segment {
@@ -260,8 +279,13 @@ fn is_wrapper_zone_token(tok: &str) -> bool {
             && head.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
             && head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     }
-    // bare number / duration / CPU list: digits mixed with [a-z.-], ≥1 digit
-    tok.chars().any(|c| c.is_ascii_digit())
+    // bare number / duration / CPU list: digits mixed with [a-z.-], ≥1 digit.
+    // The token must START with a digit — that is the shape of a duration
+    // ("10s", "0-3"). Without that anchor, real command names that merely
+    // contain a digit ("base64", "sha256sum", "md5sum") were swallowed as
+    // wrapper-argument tokens, which moved the command position onto the
+    // ARGUMENT and hid the command from the blacklist.
+    tok.starts_with(|c: char| c.is_ascii_digit())
         && tok
             .chars()
             .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c.is_ascii_lowercase())
@@ -491,6 +515,94 @@ fn has_write_redirect(cmd: &str) -> bool {
     false
 }
 
+/// Path fragments pointing at credentials or secret files on a REMOTE server.
+///
+/// Shared by two gates so they cannot drift apart:
+///   - `ssh_exec` — reading one of these through a shell command puts the file
+///     content straight into the AI conversation. That is the same leak as
+///     uploading it, one step earlier, so the reader-command rule in
+///     [`default_blacklist`] combines these paths with the reader commands.
+///   - `ssh_read_text` — the path arrives directly, no shell involved.
+///
+/// Case-insensitive: every use compiles with `(?i)`.
+pub const SECRET_PATH_PATTERNS: &[&str] = &[
+    r"\.ssh/",                          // 私钥 / authorized_keys / 已知主机
+    r"\.env\b",                         // 环境变量文件（.env、.env.local …）
+    r"/etc/(shadow|gshadow|sudoers)",   // 系统口令与提权配置
+    r"\.aws/credentials",               // AWS 凭证
+    r"\.config/gcloud/",                // GCP 凭证
+    r"\.azure/",                        // Azure 凭证
+    r"\.kube/config",                   // kubeconfig
+    r"\.docker/config\.json",           // 镜像仓库凭证
+    r"\w+_history\b",                   // shell / 数据库历史（常含明文口令）
+    r"\.pem\b",                         // 私钥文件
+    r"\.key\b",                         // 私钥文件
+    r"\bid_(rsa|ed25519|ecdsa|dsa)\b",  // 私钥副本（不在 .ssh 下时）
+    r"\.git-credentials",               // git 凭证
+    r"\.netrc",                         // netrc 凭证
+];
+
+/// Commands whose OUTPUT is the file content — the ones that can carry a
+/// secret into the AI conversation. Everything else (`ls`, `stat`, `du` …)
+/// only reveals that a path exists, which is not a leak.
+const SECRET_READER_COMMANDS: &[&str] = &[
+    "cat", "tac", "head", "tail", "less", "more", "strings", "xxd", "hexdump", "od", "base64",
+    "grep", "egrep", "fgrep", "zgrep", "awk", "sed", "openssl", "ssh-keygen",
+];
+
+/// The alternation over [`SECRET_PATH_PATTERNS`], shared by the path gate
+/// and the command-level secret-read check.
+static SECRET_PATH_ALTERNATION: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| SECRET_PATH_PATTERNS.join("|"));
+
+/// The harm description shown for every secret-read hit.
+const SECRET_READ_NOTE: &str = "读取密钥或凭证文件（私钥、.env、/etc/shadow、云凭证等）：内容会直接进入 AI 对话上下文，等同把服务器凭证交给模型";
+
+/// True when `path` points at a credential or secret file on the remote
+/// server. Used by `ssh_read_text`, which receives a path instead of a
+/// command — the same list the command blacklist is built from.
+pub fn is_secret_remote_path(path: &str) -> bool {
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(&format!("(?i)({})", SECRET_PATH_ALTERNATION.as_str()))
+            .expect("SECRET_PATH_PATTERNS must compile")
+    });
+    RE.is_match(path)
+}
+
+/// True when `cmd` is a command that PRINTS file content.
+fn is_secret_reader(cmd: &str) -> bool {
+    let cmd = cmd.to_ascii_lowercase();
+    SECRET_READER_COMMANDS.contains(&cmd.as_str())
+}
+
+/// True when the command names a credential file AND performs a read — even
+/// when the two live in different segments.
+///
+/// The per-segment blacklist cannot see this shape: in
+/// `for f in .env; do cat $f; done` the path is in the loop header and the
+/// reader is in the body, so neither segment contains both. Checking the
+/// WHOLE command for each half closes it. A command that only lists a secret
+/// path (`ls ~/.ssh`) still runs free — that reveals existence, not content.
+///
+/// The reader is matched as ANY token of the segment, not just the command
+/// position: `sudo cat key` and `xargs cat` put the reader behind a prefix
+/// that has nothing to do with the file being read.
+fn has_secret_read_across_segments(cmd: &str) -> bool {
+    if !is_secret_remote_path(cmd) {
+        return false;
+    }
+    split_shell_segments(cmd).iter().any(|seg| {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            return false;
+        }
+        token_spans(seg).iter().any(|(start, end)| {
+            let tok = unquote(&seg[*start..*end]);
+            is_secret_reader(&tok)
+        })
+    })
+}
+
 /// Default blacklist regexes. Each must match a command that should confirm.
 ///
 /// Convention: each pattern starts with `(^|[;&|]\s*)` to match the command
@@ -642,6 +754,10 @@ pub fn default_blacklist() -> Vec<String> {
         r"(^|[;&|]\s*)(terraform|tofu|ansible|helm)\b".into(),
         // Cloud provider CLIs
         r"(^|[;&|]\s*)(aws|gcloud|az|aliyun|tccli|ossutil)\b".into(),
+        // NOTE: reading a credential file is NOT listed here. It is a hard
+        // safety floor (see `command_needs_confirmation`) because the
+        // blacklist is persisted as a snapshot in the user's rules file —
+        // a rule added here would never reach existing users.
     ]
 }
 
@@ -867,7 +983,14 @@ pub fn command_danger_reasons(command: &str, rules: &CommandRules) -> Vec<String
         }
     }
 
-    // 3. Strict mode: only surfaces when nothing else fired (otherwise the
+    // 3. Secret read spanning several segments — the per-segment blacklist
+    //    pass cannot see it, so surface it here too (the dialog must explain
+    //    the verdict, not just show a bare "高危").
+    if has_secret_read_across_segments(cmd) {
+        add(&mut reasons, SECRET_READ_NOTE);
+    }
+
+    // 4. Strict mode: only surfaces when nothing else fired (otherwise the
     //    more specific notes above already explain the verdict).
     if reasons.is_empty() && rules.confirm_unknown {
         add(&mut reasons, UNKNOWN_NOTE);
@@ -1567,5 +1690,140 @@ mod tests {
         // untouched when the head is already the command
         assert_eq!(command_position_view("rm -rf /x"), "rm -rf /x");
         assert_eq!(command_position_view("git commit -m \"fix; rm\""), "git commit -m \"fix; rm\"");
+    }
+
+    // ── Secret file reads (SSH credential leak) ──
+
+    #[test]
+    fn reading_a_credential_file_confirms() {
+        // The leak: ssh_exec returns stdout to the AI, so reading a private
+        // key hands it to the model. Every reader form must confirm.
+        for cmd in [
+            "cat ~/.ssh/id_rsa",
+            "cat /root/.ssh/id_ed25519",
+            "cat .env",
+            "cat /srv/app/.env.production",
+            "head -n 5 /etc/shadow",
+            "tail -20 /var/log/.env",
+            "strings /home/u/.ssh/id_rsa",
+            "base64 ~/.aws/credentials",
+            "grep -r password /etc/sudoers",
+            "xxd /root/.kube/config",
+            "od /home/u/.docker/config.json",
+            "less ~/.netrc",
+        ] {
+            assert!(
+                command_needs_confirmation(cmd, &r()),
+                "reading a credential file must confirm: {}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn secret_reads_confirm_through_wrapper_and_chain_shapes() {
+        // Same bypass shapes the blacklist already closes: the reader may sit
+        // behind a neutral wrapper, a control keyword, or a chain segment.
+        assert!(command_needs_confirmation("nohup cat ~/.ssh/id_rsa", &r()));
+        assert!(command_needs_confirmation("cat notes.txt; cat ~/.ssh/id_rsa", &r()));
+        assert!(command_needs_confirmation("for f in .env; do cat $f; done", &r()));
+        assert!(command_needs_confirmation("cat /etc/passwd | grep root", &r()) == false);
+    }
+
+    #[test]
+    fn ordinary_reads_stay_free() {
+        // Low-friction guard: the rule must not turn ordinary file reading
+        // into a confirmation prompt.
+        for cmd in [
+            "cat /etc/hostname",
+            "cat /var/log/app.log",
+            "cat README.md",
+            "tail -n 50 /var/log/nginx/access.log",
+            "grep ERROR /var/log/syslog",
+            "ls -la ~/.ssh",     // existence only — not a content read
+            "stat /etc/passwd",
+            "du -sh /home",
+        ] {
+            assert!(
+                !command_needs_confirmation(cmd, &r()),
+                "ordinary read must stay free: {}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn command_names_containing_digits_keep_their_command_position() {
+        // Regression: `base64` / `sha256sum` / `md5sum` contain a digit, and
+        // the wrapper-zone heuristic used to swallow them as a duration-like
+        // token — moving the command position onto the ARGUMENT and hiding
+        // the command from the blacklist.
+        assert_eq!(command_position_view("base64 ~/.aws/credentials"), "base64 ~/.aws/credentials");
+        assert_eq!(command_position_view("sha256sum key"), "sha256sum key");
+        // a real duration is still a wrapper-zone token
+        assert!(is_wrapper_zone_token("10s"));
+        assert!(is_wrapper_zone_token("0-3"));
+        assert!(!is_wrapper_zone_token("base64"));
+        assert!(!is_wrapper_zone_token("sha256sum"));
+    }
+
+    #[test]
+    fn secret_path_rule_is_shared_with_the_path_gate() {
+        // Sync guard: the command-level secret-read check and
+        // `is_secret_remote_path` (used by ssh_read_text) must come from ONE
+        // list, or the two entrances gate different files.
+        assert!(is_secret_remote_path("~/.ssh/id_rsa"));
+        assert!(is_secret_remote_path("/srv/app/.env"));
+        assert!(is_secret_remote_path("/etc/shadow"));
+        assert!(is_secret_remote_path("/root/.aws/credentials"));
+        assert!(!is_secret_remote_path("/var/log/app.log"));
+        assert!(!is_secret_remote_path("/etc/hostname"));
+        assert!(!is_secret_remote_path("/home/u/notes.txt"));
+    }
+
+    #[test]
+    fn secret_read_is_a_hard_floor_not_a_configurable_rule() {
+        // The user's blacklist is persisted as a SNAPSHOT in their rules
+        // file, so a rule living there never reaches users who already have
+        // one. The secret-read gate must therefore hold even with an EMPTY
+        // blacklist — that is the shape of an existing user's file.
+        let mut rules = CommandRules::default();
+        rules.blacklist.clear();
+        rules.whitelist.clear();
+        assert!(
+            command_needs_confirmation("cat ~/.ssh/id_rsa", &rules),
+            "secret read must confirm even with an empty blacklist"
+        );
+        assert!(
+            command_needs_confirmation("cat /srv/app/.env", &rules),
+            "secret read must confirm even with an empty blacklist"
+        );
+        // ...and it must not be listed in the editable blacklist either
+        // (that would only protect fresh installs).
+        assert!(
+            !default_blacklist()
+                .iter()
+                .any(|p| p.contains(SECRET_PATH_ALTERNATION.as_str())),
+            "the secret-read rule must not live in the user-editable blacklist"
+        );
+    }
+
+    #[test]
+    fn secret_read_reports_a_harm_reason() {
+        // The confirmation dialog must explain the verdict, not just say
+        // "高危".
+        let reasons = command_danger_reasons("cat ~/.ssh/id_rsa", &r());
+        assert!(
+            reasons.iter().any(|x| x.contains("凭证")),
+            "missing secret-read harm reason: {:?}",
+            reasons
+        );
+        // The cross-segment shape too.
+        let reasons = command_danger_reasons("for f in .env; do cat $f; done", &r());
+        assert!(
+            reasons.iter().any(|x| x.contains("凭证")),
+            "missing cross-segment secret-read harm reason: {:?}",
+            reasons
+        );
     }
 }

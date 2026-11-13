@@ -67,8 +67,10 @@ export function readAnchorRect(el: HTMLElement | null): { right: number; top: nu
 export const DropdownTrigger = defineComponent({
   name: "DropdownTrigger",
   props: {
-    iconName: { type: String, required: true },
-    label: { type: String, required: true },
+    iconName: { type: String, default: "" },
+    /** 触发钮文案。**可选**：传空串即纯图标模式（顶栏图标靠右、不展示文字），
+     *  计数与广播徽标仍保留 —— 它们才是「有几个会话」的信息本体。 */
+    label: { type: String, default: "" },
     count: { type: Number, required: true },
     /** 广播组成员数；0 时不渲染 📡 徽标。 */
     broadcastCount: { type: Number, default: 0 },
@@ -108,8 +110,15 @@ export const DropdownTrigger = defineComponent({
             // 没有 gap。这里自己包一层；类名归本组件所有，AppTopBar 用
             // :deep(.trigger-row) 命中即可，不依赖任何 EP 内部结构。
             h("span", { class: "trigger-row" }, [
-              h(MyIcon, { size: 14, name: props.iconName, class: "trigger-icon", decorative: true }),
-              h("span", { class: "trigger-label" }, props.label),
+              // iconName 为空 → 不渲染主图标（顶栏「当前会话」已精简为
+              // 仅计数徽标：终端图标+N —— 原文档图标与计数徽标的图标
+              // 语义重复，用户实报“文本图标没用”）。
+              props.iconName
+                ? h(MyIcon, { size: 14, name: props.iconName, class: "trigger-icon", decorative: true })
+                : null,
+              // 文字 span 整体不渲染而不是渲染空 span：空 span 仍占一个 flex
+              // 子位，会把后面的计数徽标推偏。
+              props.label ? h("span", { class: "trigger-label" }, props.label) : null,
               // 两枚计数徽标都带图标，构成一对：「N 个终端会话」与「其中 N 个在广播组」。
               // 此前只有广播那枚有图标（📡 纸飞机），会话那枚是光秃秃的数字，两枚
               // 形态不一致、读起来对不上号。会话数用 Terminal 图标 —— 它数的正是终端

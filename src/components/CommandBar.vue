@@ -51,6 +51,8 @@ const emit = defineEmits<{
   (e: "open-quick-commands-manage"): void;
   /** 截取终端视口 PNG（不含底栏）。保存到设置的附件目录。 */
   (e: "screenshot"): void;
+  /** 手动修复远端终端设置（Ctrl-C + stty sane）。终端被程序改坏时用。 */
+  (e: "repair-terminal"): void;
 }>();
 
 // ============ Quick command parsing & inter-line delay ============
@@ -523,6 +525,20 @@ function firstLine(cmd: string): string {
       </template>
     </MyPopover>
 
+    <!-- Repair-terminal button — recovers a remote tty left in raw mode by a
+         crashed program (rz killed mid-transfer, crashed vim, `cat` on a
+         binary). Symptom: keystrokes don't echo and only Enter produces
+         output. Sends Ctrl-C + `stty sane`. -->
+    <MyButton
+      class="bar-btn"
+      size="small"
+      title="修复终端：发送 Ctrl-C + stty sane（终端不回显/按键无效时用）"
+      @click="emit('repair-terminal')"
+    >
+      <MyIcon :size="14" name="Tools" />
+      <span v-if="showLabels">修复</span>
+    </MyButton>
+
     <!-- Screenshot button — captures the terminal viewport only (this
          CommandBar is excluded by the capture util). Saves to the
          attachment dir configured in Settings → MCP 支持. -->
@@ -576,14 +592,15 @@ function firstLine(cmd: string): string {
                      此前是裸 button + opacity 0.4/1 区分两态——同图标仅靠深浅
                      区分对低对比用户不可辨，也没有 aria-pressed，屏幕阅读器读不出
                      状态；现由底色+前景色双通道表达。图标也从 Top（向上箭头，
-                     语义是"向上移动"）换成库自绘的 Pushpin（斜置 45° 经典图钉）。 -->
+                     语义是"向上移动"）换成 Star（星标；原计划的 Pushpin 在
+                     myui 图标集里并不存在，会渲染成 Unknown 占位）。 -->
                 <MyIconButton
                   :title="item.pinned ? '取消钉住' : '钉住'"
                   class="pin-btn"
                   :label="item.pinned ? '取消钉住' : '钉住'"
                   :active="item.pinned"
                   size="14"
-                  name="Pushpin"
+                  name="Star"
                   @click.stop="handlePin(item)"
                 />
 
@@ -652,6 +669,15 @@ function firstLine(cmd: string): string {
 .cmd-slot {
   flex: 0 1 50%;
   min-width: 0;
+}
+
+/* 输入框底色改透明：命令栏本身已是 var(--glass-bg)（颜色随主题色、alpha
+   随界面实心度），输入框若再压一层 EP 的 --el-fill-color-blank 实底，
+   整条栏就只有左右两端透、中间那块是死色 —— 与侧栏/顶栏的观感割裂。
+   只清背景，边框与聚焦环（EP 用 box-shadow 画的）原样保留。
+   特异性 (0,2,0) 高于 EP 的 .el-input__wrapper (0,1,0)，无需 !important。 */
+.cmd-slot :deep(.el-input__wrapper) {
+  background-color: transparent;
 }
 
 /* 输入框与工具钮之间的弹性空档 */

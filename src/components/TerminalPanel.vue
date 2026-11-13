@@ -7,7 +7,7 @@
      - 所有 tab 面板常驻挂载（App.vue 用绝对定位 + visibility 切换），
        xterm 容器必须保持真实尺寸。 -->
 <script setup lang="ts">
-import { MyButton, MyIcon, toast } from "myui";
+import { MyButton, MyDialog, MyIcon, MyProgress, toast } from "myui";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
@@ -21,16 +21,23 @@ import {
   localResize,
   localSend,
   nudgeMouseCursor,
+  onSftpTransferDone,
+  onSftpTransferProgress,
   onSshClosed,
   onSshOutput,
   onZmodemEnd,
   onZmodemError,
   onZmodemFileComplete,
+  onZmodemFileSkipped,
   onZmodemOffer,
   onZmodemProgress,
   onZmodemRaw,
   onZmodemStart,
   saveScreenshot,
+  sftpCancelTransfer,
+  sftpCheckDirConflicts,
+  sftpUpload,
+  probeUploadCapabilities,
   showInFolder,
   sshReady,
   sshResize,
@@ -39,11 +46,18 @@ import {
   zmodemAcceptOffer,
   zmodemStartUpload,
 } from "@/api";
-import type { ConnType, Tab } from "@/api";
+import type {
+  ConnType,
+  SftpDirConflictReport,
+  SftpTransferProgressPayload,
+  UploadCapabilities,
+  Tab,
+} from "@/api";
 import { open } from "@tauri-apps/plugin-dialog";
 import { captureTerminalToDataUrl } from "@/utils/screenshot";
+import { createSentinelFilter } from "@/utils/sentinel-filter";
 import { recordKeystroke } from "@/utils/cmd-buffer";
-import { appearance, getActivePalette } from "@/store/appearance";
+import { getActivePalette } from "@/store/appearance";
 import {
   refreshCommandHistory,
   registerSessionAction,
@@ -61,53 +75,69 @@ import "@xterm/xterm/css/xterm.css";
 
 defineOptions({ name: "TerminalPanel" });
 
-const props = defineProps<{
-  /** STABLE tab identifier — never changes across reconnects. Keeps the
-   * component instance (and thus the TerminalPanel DOM) stable across a
-   * reconnect; only `sessionId` is replaced, and the sessionId watch rebinds
-   * the terminal lifecycle without remounting this component. */
-  tabId: string;
-  sessionId: string;
-  /** Tab connection type — selects ssh_* vs local_* backend commands.
-   * Defaults to "ssh". sftp/ftp tabs never render a TerminalPanel. */
-  connType?: ConnType;
-  /** ConnectionConfig.id this session belongs to. Used as the persistence
-   * key for command history — survives reconnect (sessionId changes each
-   * connect, connectionId doesn't). Empty for sessions without a backing
-   * connection row (shouldn't normally happen). */
-  connectionId: string;
-  /** Per-connection terminal font override (family name). When set, wins over
-   * the global terminal font for this tab. Undefined/empty → use global. */
-  fontOverride?: string;
-  /** Terminal renderer backend preference ("auto" | "dom" | "canvas" |
-   * "webgl"). "auto" = canvas by default, WebGL when a background image needs
-   * transparency. Fixed per app (not per-connection); read once at terminal
-   * setup. */
-  rendererBackend: RendererBackend;
-  /** When non-empty (and contains more than just this tab's own sessionId),
-   * every keystroke is mirrored to all listed sessions in addition to the
-   * local one. Read live from props so toggling broadcast on/off doesn't
-   * need to re-bind onData. */
-  broadcastTargets: string[];
-  /** Whether this panel is the currently-visible tab. All tabs stay mounted
-   * (so their xterm history + onSshOutput subscriptions persist across tab
-   * switches); we only refit and refocus when this becomes the active tab. */
-  active: boolean;
-  /** Connection status: "connecting" | "connected" | "disconnected" | "error" */
-  status?: Tab["status"];
-  /** Tab display name — used as part of the screenshot filename when the
-   * user hits the 📷 button in CommandBar. */
-  connectionName?: string;
-  /** Terminal text captured from the previous xterm instance before a
-   * reconnect. If present when the terminal (re)builds, it's written to the
-   * new terminal to restore scrollback history. The caller is responsible
-   * for clearing it (via snapshot-consumed) so it's only restored once. */
-  reconnectSnapshot?: string;
-  /** 是否在本面板内部渲染命令栏。默认 true（多窗口网格：每个格子自带一条）。
-   *  2026-10-10 起主标签区传 false —— 命令栏被提升到壳层底部行，由 App.vue 统一
-   *  渲染一条给活动标签用，与服务器状态栏一起贯穿整个窗口宽度。 */
-  commandBar?: boolean;
-}>();
+const props = withDefaults(
+  defineProps<{
+    /** STABLE tab identifier — never changes across reconnects. Keeps the
+     * component instance (and thus the TerminalPanel DOM) stable across a
+     * reconnect; only `sessionId` is replaced, and the sessionId watch rebinds
+     * the terminal lifecycle without remounting this component. */
+    tabId: string;
+    sessionId: string;
+    /** Tab connection type — selects ssh_* vs local_* backend commands.
+     * Defaults to "ssh". sftp/ftp tabs never render a TerminalPanel. */
+    connType?: ConnType;
+    /** ConnectionConfig.id this session belongs to. Used as the persistence
+     * key for command history — survives reconnect (sessionId changes each
+     * connect, connectionId doesn't). Empty for sessions without a backing
+     * connection row (shouldn't normally happen). */
+    connectionId: string;
+    /** Per-connection terminal font override (family name). When set, wins over
+     * the global terminal font for this tab. Undefined/empty → use global. */
+    fontOverride?: string;
+    /** Terminal renderer backend preference ("auto" | "dom" | "canvas" |
+     * "webgl"). "auto" = canvas by default, WebGL when a background image needs
+     * transparency. Fixed per app (not per-connection); read once at terminal
+     * setup. */
+    rendererBackend: RendererBackend;
+    /** When non-empty (and contains more than just this tab's own sessionId),
+     * every keystroke is mirrored to all listed sessions in addition to the
+     * local one. Read live from props so toggling broadcast on/off doesn't
+     * need to re-bind onData. */
+    broadcastTargets: string[];
+    /** Whether this panel is the currently-visible tab. All tabs stay mounted
+     * (so their xterm history + onSshOutput subscriptions persist across tab
+     * switches); we only refit and refocus when this becomes the active tab. */
+    active: boolean;
+    /** Connection status: "connecting" | "connected" | "disconnected" | "error" */
+    status?: Tab["status"];
+    /** Tab display name — used as part of the screenshot filename when the
+     * user hits the 📷 button in CommandBar. */
+    connectionName?: string;
+    /** Terminal text captured from the previous xterm instance before a
+     * reconnect. If present when the terminal (re)builds, it's written to the
+     * new terminal to restore scrollback history. The caller is responsible
+     * for clearing it (via snapshot-consumed) so it's only restored once. */
+    reconnectSnapshot?: string;
+    /** 是否在本面板内部渲染命令栏。默认 true（多窗口网格：每个格子自带一条）。
+     *  2026-10-10 起主标签区传 false —— 命令栏被提升到壳层底部行，由 App.vue 统一
+     *  渲染一条给活动标签用，与服务器状态栏一起贯穿整个窗口宽度。 */
+    commandBar?: boolean;
+    /** 分屏叶子专用：false 时本叶子不把 keystroke 发给后端（焦点在别的
+     *  叶子上），但 xterm 仍照常渲染输出。默认 true —— 单 pane 与多窗口
+     *  网格的调用点不传即为焦点行为，零改动。 */
+    inputEnabled?: boolean;
+    /** 分屏叶子专用：false 时本叶子的 fit() 只做本地测量，不把 cols/rows
+     *  推给远端。SSH PTY 只有一个 window size，多个 xterm 各自 resize
+     *  会互相打架；只有焦点叶子的尺寸能代表这个会话。默认 true。 */
+    resizeEnabled?: boolean;
+  }>(),
+  // 三个可选 boolean prop 必须显式声明默认值。Vue 3 对 Boolean 类型的
+  // prop 有 boolean casting：调用点不传时它被解析成 **false**（不是
+  // undefined）—— 于是「不传即默认开启」的门禁会反过来把调用点全部拦死
+  // （实测：单 pane 与多窗口网格不传 inputEnabled，终端输入被整条吞掉，
+  // 表现为「敲了没反应、enter 无效」）。给了 default 后 casting 不再介入。
+  { commandBar: true, inputEnabled: true, resizeEnabled: true },
+);
 
 const emit = defineEmits<{
   /** Phase 3: registers the xterm instance with the session-store registry
@@ -211,11 +241,205 @@ const zmodemStatus = ref<ZmodemStatus>({
   startTime: 0,
 });
 
-// Inline chooser shown when the remote runs `rz`: OS dialogs can't mix
-// files and folders in one pick, so we ask which kind to send first.
-// Folders are expanded recursively on the Rust side (ZFILE offers carry
-// relative paths; lrzsz rz recreates the tree remotely).
-const uploadChooserOpen = ref(false);
+// 手动 rz 的文件选择直接弹系统对话框（见 onZmodemStart → pickUploadFiles）；
+// 内嵌「文件/文件夹」二选一浮层已删除 —— 多一步中间层是卡死多发地，
+// 文件夹上传由拖拽路径承担（拖入即递归）。
+
+// ── 拖拽上传（把本地文件拖进终端 → SFTP 上传到远端当前目录）──
+// Tauri 2 的拖放是窗口级原生事件（tauri://drag-*），不是 DOM dragover ——
+// WebView2 里 HTML5 拖放被 wry 的 IDropTarget 接管，前端 dragover/drop
+// 永远不会触发。所以这里在 onMounted 里订阅窗口事件，再自己判断落点
+// 是否在本面板内。
+const fileDropActive = ref(false);
+/** in-flight 拖拽上传；null = 无浮层。 */
+const dropTransfer = ref<{
+  phase: "upload";
+  currentFile: string;
+  fileIndex: number;
+  fileCount: number;
+  bytesDone: number;
+  bytesTotal: number;
+  errors: string[];
+  done: boolean;
+  startTime: number;
+  requestId: string;
+} | null>(null);
+const dropTickNow = ref(Date.now());
+let dropTickTimer: ReturnType<typeof setInterval> | null = null;
+let dropUnlisten: Array<() => void> = [];
+/** 取远端 cwd 的 in-flight 哨兵等待；同时只允许一次（拖一堆文件不会并发）。 */
+let cwdProbe: Promise<string | null> | null = null;
+/** 拖放落点判定用：本面板 DOM 是否覆盖 (x, y)。 */
+const panelEl = ref<HTMLElement | null>(null);
+
+/** 远端已存在同名目录时挂起的待确认上传（null = 无对话框）。 */
+const pendingDrop = ref<null | {
+  dest: string;
+  paths: string[];
+  conflictNames: string[];
+}>(null);
+/** 两条上传通道都不可用时的安装指引（null = 无对话框）。 */
+const capsUnavailable = ref<null | { message: string | null; hint: string | null }>(null);
+
+/** 拖拽上传走 ZMODEM 通道时挂起的待传路径；onZmodemStart 见到它就不弹选择器。 */
+const autoUploadPaths = ref<string[] | null>(null);
+/** rz 启动看门狗：12s 内没等到 zmodem_start 就按「rz 不可用」收场。 */
+let rzWatchdog: ReturnType<typeof setTimeout> | null = null;
+
+/** 拖入后、通道确定前的「准备中」遮罩（能力探测 + cwd 探针可长达十几秒）。 */
+const dropPreparing = ref(false);
+
+/** 一次拖拽上传的 ZMODEM 会话是否还在进行。true 期间，远端 rz 再次发出
+ *  ZMODEM 邀请（被拒后重邀、多文件间隙）一律主动收场，绝不弹手动选择器 ——
+ *  实测：文件被 ZSKIP 后 rz 会重新邀请，选择器弹出来用户点取消反而卡死。 */
+const dragZmodemActive = ref(false);
+
+/** 本地路径的 basename（拖入路径可能是 Windows 或 POSIX 分隔符）。 */
+function basenameOf(p: string): string {
+  const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  return i >= 0 ? p.slice(i + 1) : p;
+}
+
+// ── 拖拽上传：发起传输 / 冲突出口 / 计时器 ──
+// 放在组件作用域而不是 setupTerminal 内：冲突对话框由模板直接调用。
+/** 真正发起传输（预检与用户确认都已完成）。 */
+async function beginDropUpload(paths: string[], dest: string): Promise<void> {
+  if (paths.length === 0) return;
+  const requestId = crypto.randomUUID();
+  dropTransfer.value = {
+    phase: "upload",
+    currentFile: "",
+    fileIndex: 0,
+    fileCount: 0,
+    bytesDone: 0,
+    bytesTotal: 0,
+    errors: [],
+    done: false,
+    startTime: Date.now(),
+    requestId,
+  };
+  startDropTick();
+  // 先订阅再调用：最早的 progress 事件不能丢（与 SftpPanel.runTransfer 同序）。
+  // 订阅本身是异步的（IPC 往返）：在 await 期间 dispose 可能先跑完，那时
+  // closeDropTransfer 已经退过、拿不到这两个 unlisten，监听就会泄漏（并在
+  // 下一个会话里继续收到旧 requestId 的事件）。所以用一个显式标志让
+  // closeDropTransfer 知道「有订阅在路上」，等它们到位再补摘。
+  dropListenersDetached = false;
+  const unP = await onSftpTransferProgress(requestId, (p: SftpTransferProgressPayload) => {
+    const tr = dropTransfer.value;
+    if (!tr || tr.requestId !== requestId) return;
+    tr.currentFile = p.currentFile;
+    tr.fileIndex = p.fileIndex;
+    tr.fileCount = p.fileCount;
+    tr.bytesDone = p.bytesDone;
+    tr.bytesTotal = p.bytesTotal;
+  });
+  const unD = await onSftpTransferDone(requestId, (errors, createdDirs) => {
+    const tr = dropTransfer.value;
+    if (!tr || tr.requestId !== requestId) return;
+    tr.done = true;
+    tr.errors = errors;
+    dropTickNow.value = Date.now();
+    // 完成提示只在这里发：createdDirs 只有事件载荷带，命令返回值没有。
+    // await 分支若也发，事件晚到一帧就会变成两条 toast。
+    announceDropResult(tr.fileCount, createdDirs);
+  });
+  if (dropListenersDetached) {
+    // 订阅还没到位，closeDropTransfer 已经执行过——立刻自摘，别泄漏。
+    dropListenersDetached = false;
+    unP();
+    unD();
+    return;
+  }
+  dropUnlisten.push(unP, unD);
+  try {
+    await sftpUpload(props.sessionId, paths, dest, requestId);
+    // 事件通常已先到；若还没到，只把浮层收成「完成」态，不重复提示。
+    const tr = dropTransfer.value;
+    if (tr && tr.requestId === requestId && !tr.done) {
+      tr.done = true;
+      dropTickNow.value = Date.now();
+    }
+  } catch (e) {
+    const tr = dropTransfer.value;
+    if (tr && tr.requestId === requestId) {
+      tr.done = true;
+      tr.errors = [...tr.errors, String(e)];
+      dropTickNow.value = Date.now();
+    }
+  }
+}
+
+/** 完成提示。目录数由后端给出（前端从进度事件里推不出来）。 */
+function announceDropResult(fileCount: number, createdDirs: number): void {
+  const files = Math.max(0, fileCount);
+  if (files === 0 && createdDirs === 0) return;
+  let msg: string;
+  if (files > 0 && createdDirs > 0) msg = `已上传 ${files} 个文件，创建 ${createdDirs} 个目录`;
+  else if (files > 0) msg = `已上传 ${files} 个文件`;
+  else msg = `已创建 ${createdDirs} 个目录`;
+  toast(msg, { type: "success", duration: 4000 });
+}
+
+/** 冲突对话框的三个出口。 */
+function resolveDropConflict(choice: "merge" | "skip" | "cancel"): void {
+  const pending = pendingDrop.value;
+  pendingDrop.value = null;
+  if (!pending) return;
+  if (choice === "cancel") return;
+  let paths = pending.paths;
+  if (choice === "skip") {
+    const names = new Set(pending.conflictNames);
+    paths = pending.paths.filter((p) => !names.has(basenameOf(p)));
+    if (paths.length === 0) {
+      toast("已存在的目录均已跳过，没有需要上传的内容", { type: "info", duration: 4000 });
+      return;
+    }
+  }
+  void beginDropUpload(paths, pending.dest);
+}
+
+/** 传输监听是否已被 closeDropTransfer 摘除（供 beginDropUpload 在订阅
+ * 到位的瞬间判断自己是不是迟到了）。 */
+let dropListenersDetached = false;
+
+function startDropTick(): void {
+  stopDropTick();
+  dropTickNow.value = Date.now();
+  dropTickTimer = setInterval(() => {
+    dropTickNow.value = Date.now();
+  }, 1000);
+}
+
+
+function stopDropTick(): void {
+  if (dropTickTimer !== null) {
+    clearInterval(dropTickTimer);
+    dropTickTimer = null;
+  }
+}
+function closeDropTransfer(): void {
+  stopDropTick();
+  dropUnlisten.forEach((u) => u());
+  dropUnlisten = [];
+  // 让「订阅还在路上」的 beginDropUpload 自行摘除刚拿到的监听。
+  dropListenersDetached = true;
+  dropTransfer.value = null;
+}
+function onCancelDropTransfer(): void {
+  const tr = dropTransfer.value;
+  if (!tr) return;
+  sftpCancelTransfer(tr.requestId).catch(() => {});
+}
+/** 复制安装指引到剪贴板（安装指引对话框的「复制」按钮）。 */
+function copyInstallHint(): void {
+  const hint = capsUnavailable.value?.hint;
+  if (!hint) return;
+  void navigator.clipboard
+    .writeText(hint)
+    .then(() => toast("已复制安装命令", { type: "success", duration: 2500 }))
+    .catch(() => toast("复制失败，请手动选择命令复制", { type: "warning", duration: 3000 }));
+}
 
 // Screenshot 状态——迁移到 myui 的 toast 后只剩"正在截取"这一瞬时态：
 // 成功/失败两种结果都改由 toast 承载（成功带「打开」动作，失败带类型色），
@@ -227,22 +451,23 @@ const activePalette = computed(() => getActivePalette());
 const terminalTheme = computed(() =>
   (ui.isDark ? activePalette.value.dark : activePalette.value.light).terminal,
 );
-const bgImage = computed(() => appearance.bgImage);
-const hasBgImage = computed(() => bgImage.value.dataUrl !== null);
+// 终端背景恒透明（底色由 .terminal-wrap 的玻璃承载），渲染器选择不再依赖
+// 「有没有背景图」—— 见 useRendererPref.resolveRenderer 的说明。
 // Per-connection override wins over the global setting; empty → global.
 const fontFamily = computed(() =>
   props.fontOverride ? resolveFontStack(props.fontOverride) : resolveFontStack(primaryFont.value),
 );
-// 终端背景是否让壁纸透出：既要设了壁纸，也要界面实心度还没拉到全实底。
-// 实心度 = 1 表示「完全不透明」—— 此时顶栏/侧栏/AI 栏都变实色，终端若继续
-// 透出壁纸就是唯一的例外（实测：滑杆拉满后终端区仍是一张图）。
-// 阈值取 0.999 而非 1：滑杆落在 100% 时算出的是浮点数，等值比较不可靠。
-const terminalSeeThrough = computed(
-  () => hasBgImage.value && appearance.uiSolidity < 0.999,
-);
-const wrapBg = computed(() =>
-  terminalSeeThrough.value ? "transparent" : terminalTheme.value.background,
-);
+// ── 终端底色：与侧栏/顶栏/命令栏共用同一套玻璃 ──
+// 这里曾经是「设了壁纸且实心度 <1 → 纯透明，否则用配色预设的写死底色」
+// 的二选一。后果是终端区与菜单彻底割裂：菜单能拉到几乎全透，终端却压着
+// 一块 preset 写死的板子（如 #0d1117），中间没有任何档位；一旦设壁纸又
+// 干脆全透，文字直接压在壁纸上没有兜底层。
+//
+// 现在改成 ompDesktop 的方式：**底色交给 .terminal-wrap 这一层 div**，
+// 它用 var(--glass-bg)（颜色随主题色相、alpha 随界面实心度滑杆，与侧栏
+// 顶栏完全同源）；xterm 只负责画字（theme.background 恒透明、
+// allowTransparency 常开）。配色预设从此只管 16 色与光标，不再决定终端底色。
+// 铺在哪一层见样式段 .terminal-wrap 的注释（避免与工作区双层叠加）。
 
 // Route send/resize to the ssh_* or local_* backend depending on the tab's
 // connection type. Read live from props so the closures bound in
@@ -253,12 +478,36 @@ const sendTo = (sid: string, data: string): Promise<void> =>
 const resizeTo = (sid: string, cols: number, rows: number): Promise<void> =>
   props.connType === "local" ? localResize(sid, cols, rows) : sshResize(sid, cols, rows);
 
+/** 取消 ZMODEM 会话的统一出口：发 abort + 立刻本地复位 + 2s 兜底。
+ *
+ * 三个动作缺一不可：
+ * - 发 abort 让 Rust 走 CAN×8、切回 Normal、发 zmodem_end、清 sender；
+ * - 本地立刻复位 isZmodem —— `onData` 在它为 true 时吞掉所有按键，多等
+ *   一拍就是「终端不可操作」；
+ * - 2s 兜底防 zmodem_end 丢失（IPC 失败 / 会话已死）。Rust 的 abort 分支
+ *   正常会在一个 IPC 往返内回 end，到时 onZmodemEnd 会清掉这个定时器。
+ *
+ * `targetSid`：setupTerminal 闭包里的事件处理器要传当时的 `sid` ——
+ * 组件重建后 props.sessionId 已换新值，迟到的旧事件不该误伤新会话。
+ */
+function abortZmodemSession(targetSid: string = props.sessionId): void {
+  isZmodem = false;
+  dragZmodemActive.value = false;
+  sshSendZmodemAbort(targetSid).catch(() => {});
+  if (abortTimeout) clearTimeout(abortTimeout);
+  abortTimeout = setTimeout(() => {
+    isZmodem = false;
+    dragZmodemActive.value = false;
+    abortTimeout = null;
+    term?.write("\r\n\x1b[33m[abort 超时 — 强制重置]\x1b[0m\r\n");
+  }, 2000);
+}
+
 /** Hand the picked files/folders to the native Rust uploader, or abort
  * when the user dismissed the picker without a selection. */
 async function commitNativeUpload(paths: string[]): Promise<void> {
-  uploadChooserOpen.value = false;
   if (paths.length === 0) {
-    sshSendZmodemAbort(props.sessionId).catch(() => {});
+    abortZmodemSession();
     return;
   }
   try {
@@ -280,27 +529,25 @@ async function commitNativeUpload(paths: string[]): Promise<void> {
     };
   } catch (e) {
     console.error("native upload start failed:", e);
-    sshSendZmodemAbort(props.sessionId).catch(() => {});
+    abortZmodemSession();
   }
 }
 
 async function pickUploadFiles(): Promise<void> {
   await nudgeMouseCursor().catch(() => {});
-  const selected = await open({ multiple: true });
-  const paths: string[] = !selected ? [] : Array.isArray(selected) ? selected : [selected];
-  await commitNativeUpload(paths);
-}
-
-async function pickUploadFolder(): Promise<void> {
-  await nudgeMouseCursor().catch(() => {});
-  const selected = await open({ directory: true, multiple: true });
+  let selected: string | string[] | null = null;
+  try {
+    selected = await open({ multiple: true });
+  } catch (e) {
+    // 对话框本身失败也不能搁浅会话：走空选择 = 取消。
+    console.error("upload file picker failed:", e);
+  }
   const paths: string[] = !selected ? [] : Array.isArray(selected) ? selected : [selected];
   await commitNativeUpload(paths);
 }
 
 function cancelNativeUpload(): void {
-  uploadChooserOpen.value = false;
-  sshSendZmodemAbort(props.sessionId).catch(() => {});
+  abortZmodemSession();
 }
 
 /** Capture the terminal viewport and save it to the attachment directory.
@@ -357,17 +604,35 @@ async function openSavedPath(path: string): Promise<void> {
 // sessionId 查不到动作，截图会静默失灵。
 const runScreenshot = (): void => void handleScreenshot();
 
+/** 手动修复远端终端设置。
+ *
+ * 远端程序（lrzsz 的 rz/sz、崩溃的 vim、`cat` 二进制文件）可能把 tty 留在
+ * raw 模式：不回显、readline 收不到整行、退格与方向键全乱，只有回车能出东西。
+ * 客户端侧无法感知，只能靠用户手动触发。发 Ctrl-C（中断残留前台进程并让
+ * readline 放弃当前行）+ `stty sane`（恢复 ECHO/ICANON/ISIG）。
+ * 前导空格：配了 HISTCONTROL=ignorespace 的机器上不进历史。 */
+function repairTerminal(): void {
+  sendTo(props.sessionId, "\x03").catch(() => {});
+  void sendTo(props.sessionId, " stty sane\r").catch(() => {});
+  term?.write("\r\n\x1b[33m[终端] 已发送 Ctrl-C + stty sane\x1b[0m\r\n");
+}
+
+const runRepairTerminal = (): void => repairTerminal();
+
 watch(
   () => props.sessionId,
   (sid, oldSid) => {
     if (oldSid) unregisterSessionAction(oldSid, "screenshot");
+    if (oldSid) unregisterSessionAction(oldSid, "repair-terminal");
     registerSessionAction(sid, "screenshot", runScreenshot);
+    registerSessionAction(sid, "repair-terminal", runRepairTerminal);
   },
   { immediate: true },
 );
 
 onUnmounted(() => {
   unregisterSessionAction(props.sessionId, "screenshot");
+  unregisterSessionAction(props.sessionId, "repair-terminal");
 });
 
 // ── Native ZMODEM download 辅助（目录记忆 + 路径净化） ──
@@ -427,6 +692,13 @@ function setupTerminal(): void {
   let unlistenZmodemOffer: UnlistenFn | null = null;
   let unlistenZmodemProgress: UnlistenFn | null = null;
   let unlistenZmodemFileComplete: UnlistenFn | null = null;
+  let unlistenZmodemFileSkipped: UnlistenFn | null = null;
+
+  // 拖拽上传的 cwd 探针等待者：filterSentinel 在输出流里截到哨兵行时
+  // 逐个 resolve。生命周期绑定本轮终端（dispose 时清空并以 null 收场）。
+  const cwdWaiters: Array<(cwd: string | null) => void> = [];
+  // 窗口级拖放事件的 unlisten；dispose 时统一取消。
+  let dragEventUnlisten: UnlistenFn[] = [];
 
   const t = new Terminal({
     cursorBlink: true,
@@ -445,10 +717,13 @@ function setupTerminal(): void {
       ...terminalTheme.value,
       ...forceVisibleCursor(terminalTheme.value),
       selectionBackground: visibleSelection(terminalTheme.value.selectionBackground),
-      ...(terminalSeeThrough.value ? { background: "rgba(0, 0, 0, 0)" } : {}),
+      // 恒定透明：底色由 .terminal-wrap 的 var(--glass-bg) 承载，
+      // xterm 若再画一层实底，玻璃就被彻底挡住（见 .terminal-wrap 处注释）。
+      background: "rgba(0, 0, 0, 0)",
     },
     allowProposedApi: true,
-    allowTransparency: terminalSeeThrough.value,
+    // 常开：xterm 背景透明需要它，且与实心度无关 —— 底色现在恒由玻璃 div 提供。
+    allowTransparency: true,
   });
 
   const fit = new FitAddon();
@@ -479,7 +754,7 @@ function setupTerminal(): void {
   // (old GPU/drivers). Toggling the background-image setting or the
   // renderer pref after open needs a tab reopen to switch renderers (this
   // runs once per terminal build).
-  const renderer = resolveRenderer(props.rendererBackend, hasBgImage.value);
+  const renderer = resolveRenderer(props.rendererBackend);
   const loadRenderer = (): void => {
     if (renderer === "webgl") {
       try {
@@ -606,7 +881,22 @@ function setupTerminal(): void {
   // of them in parallel — the local session is included in the list so
   // a single loop handles both single + multi target cases.
   t.onData((data) => {
-    if (isZmodem) return;
+    // ZMODEM 会话期间吞掉键盘输入，防止用户敲键污染协议流。
+    // 唯一例外是 Ctrl+C（\x03）：会话卡住（rz 挂起、zmodem_end 丢失）时
+    // 这是用户手里唯一的自救手段。lrzsz 的 canit() 本身就以 CAN 序列响应
+    // SIGINT，把它交给 shell 反而能中断挂住的 rz。
+    if (isZmodem && data !== "\x03") return;
+    // Ctrl+C 在 ZMODEM 期间还要额外补一次 abort：光把字节转给 shell 未必
+    // 能唤醒已经卡死的 rz，而 Rust 侧的 ZmodemAbort 会发完整 CAN 序列并
+    // 立刻切回 Normal + 发 zmodem_end。
+    if (isZmodem && data === "\x03") {
+      // 统一出口（复位 + abort + 2s 兜底）；\x03 字节本身仍照常发往远端
+      // （下面的 sendTo）—— 直接中断远端前台进程是它份内的活。
+      abortZmodemSession();
+    }
+    // 分屏：非焦点叶子只渲染不发送。PTY 是单个会话，两个 xterm 同时
+    // 往里写会让光标位置错乱、命令交叉。
+    if (props.inputEnabled === false) return;
     const targets = props.broadcastTargets;
     const destinations = targets.length > 0 ? targets : [props.sessionId];
     // Fire-and-forget. Promise.allSettled already swallows per-target
@@ -660,6 +950,9 @@ function setupTerminal(): void {
     if (t.cols < prevCols - 10) {
       console.warn(`[TerminalPanel] cols shrank ${prevCols}→${t.cols} at container ${w}x${h}`);
     }
+    // 分屏：非焦点叶子 fit 完就停。本地栅格已经跟着容器变了，但远端的
+    // window size 只能有一个值 —— 推第二次会把上一个叶子的尺寸覆盖掉。
+    if (props.resizeEnabled === false) return;
     resizeTo(props.sessionId, t.cols, t.rows).catch(() => {});
     for (const targetSid of props.broadcastTargets) {
       if (targetSid !== props.sessionId) {
@@ -675,50 +968,18 @@ function setupTerminal(): void {
     zmodemStatus.value = s;
   });
 
-  // ── MCP sentinel line filter ──────────────────────────────────────
-  // When the MCP server runs ssh_exec in show_in_gui mode, App.tsx sends
-  // a sentinel line `echo __MCP_DONE_<rand>__:$?` to capture the exit
-  // code. That line + its output would be visible in the terminal as
-  // noise. We filter out any line containing `__MCP_DONE_` before it
-  // reaches xterm.
-  //
-  // CRITICAL: we must NOT buffer incomplete lines that don't look like
-  // they could be a sentinel — otherwise the shell prompt, user
-  // keystrokes, and all interactive output get stuck in the buffer until
-  // a newline arrives, breaking the terminal completely. Only buffer a
-  // partial line if it contains the sentinel prefix "__MCP" (meaning it
-  // might be a sentinel line split across chunks).
-  let sentinelLineBuf = "";
-  const SENTINEL_PREFIX = "__MCP";
-  const SENTINEL_NEEDLE = "__MCP_DONE_";
-  const filterSentinel = (data: Uint8Array): Uint8Array | null => {
-    const chunk = new TextDecoder("utf-8", { fatal: false }).decode(data);
-    // Prepend any previously buffered partial line, then process.
-    sentinelLineBuf += chunk;
-    const outLines: string[] = [];
-    let start = 0;
-    for (;;) {
-      const nl = sentinelLineBuf.indexOf("\n", start);
-      if (nl < 0) break; // incomplete line at the tail
-      const line = sentinelLineBuf.slice(start, nl + 1);
-      if (!line.includes(SENTINEL_NEEDLE)) outLines.push(line);
-      start = nl + 1;
-    }
-    // Tail = incomplete line (no trailing \n).
-    const tail = sentinelLineBuf.slice(start);
-    if (tail.includes(SENTINEL_PREFIX)) {
-      // This partial line looks like it might be a sentinel — buffer it
-      // until we see the rest (next chunk will have the \n).
-      sentinelLineBuf = tail;
-    } else {
-      // Normal content (prompt, keystrokes, output) — output immediately,
-      // don't buffer. Reset the buffer.
-      if (tail) outLines.push(tail);
-      sentinelLineBuf = "";
-    }
-    if (outLines.length === 0) return null; // whole chunk was a buffered sentinel
-    return new TextEncoder().encode(outLines.join(""));
-  };
+  // ── 哨兵行过滤 ────────────────────────────────────────────────────
+  // MCP 的 `__MCP_DONE_<rand>__:$?` 与拖拽上传的 cwd 探针
+  // `__MYSHLL_CWD_<rand>__$PWD` 都会在终端里留下用户不需要的回显行，
+  // 统一由 utils/sentinel-filter 在数据进 xterm 前删掉。cwd 值经回调
+  // 旁路取出给 cwdWaiters（同一个 pass 里取值 + 删行，不会分叉）。
+  // 规则与踩过的坑见该模块的文档注释。
+  const sentinel = createSentinelFilter((cwd) => {
+    if (cwdWaiters.length === 0) return;
+    const waiters = cwdWaiters.splice(0);
+    for (const w of waiters) w(cwd);
+  });
+  const filterSentinel = (data: Uint8Array): Uint8Array | null => sentinel.feed(data);
 
   onSshOutput(sid, (data) => {
     if (closed) return;
@@ -802,10 +1063,35 @@ function setupTerminal(): void {
       nativeDir = null;
       nativeCancelled = false;
     } else if (direction === "upload") {
-      // Native upload: show the inline files-vs-folder chooser (the OS
-      // dialog can't select both kinds at once). The chosen paths then go
-      // through zmodemStartUpload — folders are recursed in Rust.
-      uploadChooserOpen.value = true;
+      // 拖拽上传的自动路径：等的就是这一刻。把挂起的路径直接交给
+      // zmodemStartUpload（它自己点亮进度浮层），不弹文件选择器。
+      if (autoUploadPaths.value !== null) {
+        const paths = autoUploadPaths.value;
+        autoUploadPaths.value = null;
+        if (rzWatchdog !== null) {
+          clearTimeout(rzWatchdog);
+          rzWatchdog = null;
+        }
+        void commitNativeUpload(paths);
+      } else if (dragZmodemActive.value) {
+        // 同一轮拖拽上传还在进行（远端 rz 被拒后重新邀请 / 多文件间隙的
+        // ZRINIT），此时弹选择器等于把用户拽回手动流程。主动收场。
+        //
+        // 必须立刻自清：dragZmodemActive 是模块级 ref，若上一次拖拽上传
+        // 的清理路径漏了（看门狗未触发 / onZmodemEnd 未达），残留的 true
+        // 会把用户此后每一次手动 `rz` 都吃掉 —— abort → end → rz 再邀请
+        // → 再 abort，形成截图里那种「开始/结束」无限循环，选择器永远
+        // 不弹。自清后最多误吃一次。
+        dragZmodemActive.value = false;
+        cancelNativeUpload();
+        t.write("\r\n\x1b[33m[拖拽上传] 传输已结束\x1b[0m\r\n");
+      } else {
+        // 手动 rz：直接弹系统文件选择框，不再经过内嵌的「文件/文件夹」
+        // 二选一中间层（用户反馈：多一步徒增复杂且是卡死多发地）。关闭
+        // 对话框不选 = 取消（commitNativeUpload 的空路径走 abortZmodemSession）。
+        // 文件夹上传走拖拽路径（拖入即递归），不在这条手动路径上保留。
+        void pickUploadFiles();
+      }
     }
     t.write("\r\n\x1b[36m[ZMODEM 传输开始 — 终端输入已屏蔽]\x1b[0m\r\n");
   })
@@ -851,7 +1137,9 @@ function setupTerminal(): void {
         // 所以这里一旦不吭声，会话就永远停在 ZMODEM 模式：终端吞掉所有后续
         // 输出、按键也进不去，用户只能 Ctrl+C。先发取消序列再报给用户。
         console.error("zmodemAcceptOffer failed:", e);
-        sshSendZmodemAbort(props.sessionId).catch(() => {});
+        // 统一出口：这里原先只发 abort 不复位 isZmodem 也不设兜底，
+        // zmodem_end 丢失时下载方终端同样「能看不能打」。
+        abortZmodemSession(sid);
         t.write(
           `\r\n\x1b[31m[ZMODEM 错误] 无法选择保存目录或提交失败，已取消本次传输：${e}\x1b[0m\r\n`,
         );
@@ -900,12 +1188,26 @@ function setupTerminal(): void {
     })
     .catch((e) => console.error("Failed to subscribe to zmodem_file_complete:", e));
 
+  // Receiver declined a file (ZSKIP). Not fatal — the transfer continues
+  // with the remaining files (rz skips an existing file unless `-y`).
+  // Tell the user which file never landed instead of silently dropping it.
+  onZmodemFileSkipped(sid, (p) => {
+    t.write(
+      `\r\n\x1b[33m[ZMODEM] ${p.fileName} 被远端跳过（同名文件已存在）\x1b[0m\r\n`,
+    );
+  })
+    .then((un) => {
+      if (closed) un();
+      else unlistenZmodemFileSkipped = un;
+    })
+    .catch((e) => console.error("Failed to subscribe to zmodem_file_skipped:", e));
+
   onZmodemEnd(sid, () => {
     isZmodem = false;
     nativeDownload = false;
     nativeDir = null;
     nativeCancelled = false;
-    uploadChooserOpen.value = false;
+    dragZmodemActive.value = false;
     b.reset();
     // Cancel any pending force-reset — the Rust backend reported an
     // orderly ZFIN/CAN sequence so the bridge is clean.
@@ -929,6 +1231,14 @@ function setupTerminal(): void {
   onZmodemError(sid, (message) => {
     zmodemStatus.value = { ...zmodemStatus.value, error: message };
     t.write(`\r\n\x1b[31m[ZMODEM 错误] ${message}\x1b[0m\r\n`);
+    // error 语义 = 传输已终结。isZmodem 若不复位，onData 全部被吞 ——
+    // zmodem_end 丢失/迟到时终端表现为「能看不能打」（用户实报）。
+    // Rust 侧 error 后通常还发 end（那里会再清一次，重复复位幂等）。
+    isZmodem = false;
+    nativeDownload = false;
+    nativeDir = null;
+    nativeCancelled = false;
+    dragZmodemActive.value = false;
   })
     .then((un) => {
       if (closed) un();
@@ -948,6 +1258,267 @@ function setupTerminal(): void {
     t.write("\r\n\x1b[33m[—— 以上为重连前历史，连接已重建 ——]\x1b[0m\r\n");
     emit("snapshot-consumed");
   }
+
+  // ── 拖拽上传：取远端 cwd ──────────────────────────────────────────
+  // 往 PTY 注入一条带哨兵的 `echo __MCP_CWD_<rand>__$PWD`，从输出流
+  // 截回真实 cwd（回显与结果行都被上面的 filterSentinel 挡掉，用户看不到）。
+  // 复用 MCP sentinel 的既有通道，不新增后端命令。
+  // 哨兵命名约束见 utils/sentinel-filter：必须含 "__MCP" 前缀，否则被
+  // chunk 切开的半行不会被缓存；needle 与回显行的区分靠结果行正则。
+  // 3s 超时 → resolve(null)，调用方回退 home（"~"，后端 resolve_path 处理）。
+  const CWD_PROBE_TIMEOUT_MS = 3000;
+  function probeRemoteCwd(): Promise<string | null> {
+    if (cwdProbe) return cwdProbe;
+    const token = Math.random().toString(36).slice(2, 10);
+    cwdProbe = new Promise<string | null>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const done = (v: string | null) => {
+        if (timer !== null) clearTimeout(timer);
+        const i = cwdWaiters.indexOf(onHit);
+        if (i >= 0) cwdWaiters.splice(i, 1);
+        cwdProbe = null;
+        resolve(v);
+      };
+      const onHit = (cwd: string | null) => done(cwd);
+      cwdWaiters.push(onHit);
+      timer = setTimeout(() => done(null), CWD_PROBE_TIMEOUT_MS);
+      // 两条隔离手段叠加，覆盖不同的远端配置：
+      // 1) 前导空格 —— HISTCONTROL=ignorespace 的机器直接跳过记录；
+      // 2) `set +o history` 包裹 —— 没设 HISTCONTROL 时仍能阻止本条及后续
+      //    命令写入历史（关闭动作发生在记录本条之前，故本条也不入史）。
+      // 每个 set 都带 2>/dev/null：非 bash 登录 shell（sh/dash/fish）没有
+      // history 选项，裸 set 会在用户终端打出 "Illegal option" 垃圾行。
+      // 实测某台机器 HISTCONTROL 为空，仅靠空格无效，上下键仍会翻出探针。
+      sendTo(
+        sid,
+        ` set +o history 2>/dev/null; echo __MCP_CWD_${token}__$PWD; set -o history 2>/dev/null\n`,
+      ).catch(() => done(null));
+    });
+    return cwdProbe;
+  }
+
+  // ── 拖拽上传：通道选择与执行 ──────────────────────────────────────
+  // 后端按「每个拖入项自己的名字」在远端重建目录树（递归到叶子、保留空目录）。
+  // 通道选择：先探测服务端能力（SFTP 子系统 / lrzsz，按 session 缓存），
+  // SFTP 可用走 SFTP（含同名目录弹窗），否则 lrzsz 可用走 ZMODEM（向 PTY
+  // 发 rz，远端 rz 自己按相对路径重建目录树），两者皆无给安装指引。
+  // 背景：SSH 连得上不等于 SFTP 用得了（restricted shell / chroot / 只开
+  // exec 的跳板机），此前无条件走 SFTP 的结果是「SFTP session init failed:
+  // Timeout」且没有任何下一步提示。
+  async function startDropUpload(rawPaths: string[]): Promise<void> {
+    if (rawPaths.length === 0) return;
+    dropPreparing.value = true;
+    try {
+      await startDropUploadInner(rawPaths);
+    } finally {
+      dropPreparing.value = false;
+    }
+  }
+
+  async function startDropUploadInner(rawPaths: string[]): Promise<void> {
+    let caps: UploadCapabilities;
+    try {
+      caps = await probeUploadCapabilities(sid);
+    } catch (e) {
+      toast(`无法探测服务端上传能力：${e}`, { type: "error", duration: 6000 });
+      return;
+    }
+
+    const cwd = await probeRemoteCwd();
+
+    // 探测没跑完（exec 也不可用/超时）→ 能力未知，按旧逻辑试 SFTP，
+    // 失败只能如实报错——此时不能建议装 lrzsz（可能装不上）。
+    if (caps.sftpAvailable || !caps.probeCompleted) {
+      await startDropUploadSftp(rawPaths, cwd, caps.zmodemAvailable && cwd !== null);
+      return;
+    }
+
+    if (caps.zmodemAvailable) {
+      // ZMODEM 在 PTY 的当前目录执行 rz；cwd 未知时不猜目录，直接取消
+      // （此时往 PTY 发命令可能落进用户正开着的全屏程序里）。
+      if (cwd === null) {
+        toast("未能确定终端当前目录，已取消上传；请回到 shell 提示符后重试", {
+          type: "warning",
+          duration: 6000,
+        });
+        return;
+      }
+      startDropUploadZmodem(rawPaths);
+      return;
+    }
+
+    // 两条路都没有：给可操作的安装指引，而不是一句无法执行的错误。
+    capsUnavailable.value = {
+      message: caps.message ?? "服务端既不支持 SFTP 子系统，也没有 lrzsz",
+      hint: caps.installHint,
+    };
+  }
+
+  /** SFTP 通道（含目标目录预检、重名剔除、同名目录弹窗）。zmodemFallback
+   *  为 true 时，预检因 SFTP 不可用而失败会自动改走 ZMODEM。 */
+  async function startDropUploadSftp(
+    rawPaths: string[],
+    cwd: string | null,
+    zmodemFallback: boolean,
+  ): Promise<void> {
+    if (cwd === null) {
+      toast("未能获取终端当前目录，将上传到主目录", { type: "warning", duration: 5000 });
+    }
+    let dest = cwd ?? "~";
+
+    let report: SftpDirConflictReport;
+    try {
+      report = await sftpCheckDirConflicts(sid, rawPaths, dest);
+    } catch (e) {
+      if (zmodemFallback) {
+        // SFTP 探测说可用但预检失败（探测与使用之间服务端拒绝/挂起）——
+        // 有 lrzsz 就别让用户白等，直接换通道。
+        toast("SFTP 子系统不可用，改用 ZMODEM 通道上传", { type: "info", duration: 4000 });
+        startDropUploadZmodem(rawPaths);
+        return;
+      }
+      toast(`无法检查远端目标目录，已取消上传：${e}`, { type: "error", duration: 6000 });
+      return;
+    }
+
+    // 目标目录在拖入后、上传前被删掉（或探针拿到的是个已消失的路径）：
+    // 回退主目录再检一次，避免后面每一步 create_dir 都失败。
+    if (!report.destExists) {
+      if (dest !== "~") {
+        toast(`目标目录不存在或不可访问，已改用主目录：${dest}`, {
+          type: "warning",
+          duration: 6000,
+        });
+        dest = "~";
+        try {
+          report = await sftpCheckDirConflicts(sid, rawPaths, dest);
+        } catch (e) {
+          toast(`无法检查远端主目录，已取消上传：${e}`, { type: "error", duration: 6000 });
+          return;
+        }
+      }
+      if (!report.destExists) {
+        toast(`远端目录不可用，已取消上传：${report.resolvedDest}`, {
+          type: "error",
+          duration: 6000,
+        });
+        return;
+      }
+    }
+
+    // 批次内同名目录：两棵不同的本地树会落到同一个远端路径并静默混合，
+    // 任何自动选择（先到先得/合并/改名）都是替用户猜。剔除并明确告知。
+    let paths = rawPaths;
+    const dupPaths = new Set(report.duplicatePaths);
+    if (dupPaths.size > 0) {
+      paths = rawPaths.filter((p) => !dupPaths.has(p));
+      toast(
+        `以下目录本次拖入重名，已跳过：${report.duplicateDirs.join("、")}（请分开拖入）`,
+        { type: "warning", duration: 7000 },
+      );
+      if (paths.length === 0) return;
+    }
+
+    // 远端已存在同名目录 → 让用户决定合并还是跳过，不默认覆盖。
+    if (report.existingDirs.length > 0) {
+      pendingDrop.value = {
+        dest: report.resolvedDest,
+        paths,
+        conflictNames: report.existingDirs,
+      };
+      return;
+    }
+    await beginDropUpload(paths, report.resolvedDest);
+  }
+
+  /** ZMODEM 通道：向 PTY 发 rz，等 zmodem_start 后把拖入的路径交给
+   *  zmodemStartUpload（远端 rz 按 offer 的相对路径自动重建目录树）。
+   *  这条路上没有同名目录弹窗——目录创建语义归远端 rz，客户端无法预检。 */
+  function startDropUploadZmodem(paths: string[]): void {
+    if (autoUploadPaths.value !== null) return; // 已有一轮在等 rz 启动
+    autoUploadPaths.value = paths;
+    dragZmodemActive.value = true;
+    // rz 12s 内没起会话就收场。command not found 时 shell 早已回到提示符，
+    // 不用补发任何按键；若恰好赶上启动，迟到的 zmodem_start 走正常选择器。
+    rzWatchdog = setTimeout(() => {
+      rzWatchdog = null;
+      dragZmodemActive.value = false;
+      if (autoUploadPaths.value !== null) {
+        autoUploadPaths.value = null;
+        toast("远端 rz 未在 12 秒内启动，已取消上传（安装 lrzsz 后重试）", {
+          type: "error",
+          duration: 6000,
+        });
+      }
+    }, 12000);
+    // `-y` = 覆盖已存在的同名文件。裸 rz 对已存在文件回 ZSKIP 直接拒收，
+    // 用户看到的只是「传输失败」——实测 lrzsz 的默认行为就是跳过。
+    sendTo(sid, "rz -y\n").catch(() => {
+      if (rzWatchdog !== null) {
+        clearTimeout(rzWatchdog);
+        rzWatchdog = null;
+      }
+      autoUploadPaths.value = null;
+      dragZmodemActive.value = false;
+      toast("发送 rz 失败，已取消上传", { type: "error", duration: 5000 });
+    });
+  }
+
+  // 落点判定。Tauri 的 drag-drop 载荷带的是 **PhysicalPosition（物理像素）**
+  // —— wry 在 WebView2 上把 ScreenToClient 的结果原样传出，经 tauri-runtime-wry
+  // 包成 PhysicalPosition 交给前端；而 getBoundingClientRect() 返回的是
+  // **CSS 像素**。DPR ≠ 1 的屏幕（125%/150%/200% 缩放）上两者不等，
+  // 直接比会让整个落点区域按 DPR 缩放后偏移：150% 缩放下拖到面板左上角
+  // 会被判成落在面板外，拖到窗口右下角反而命中。
+  // 用 devicePixelRatio 把物理坐标换成 CSS 坐标再比。
+  function hitSelf(physX: number, physY: number): boolean {
+    const el = panelEl.value;
+    if (!el) return false;
+    const dpr = window.devicePixelRatio || 1;
+    const x = physX / dpr;
+    const y = physY / dpr;
+    const r = el.getBoundingClientRect();
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  }
+
+  // Tauri 2 的拖放是窗口级原生事件（tauri://drag-enter/over/drop/leave），
+  // 由 wry 在 WebView2 上注册 IDropTarget 后经 manager 转发成前端事件。
+  // 注意：注册了原生拖放后 WebView2 的 HTML5 拖放被完全接管，DOM 的
+  // dragover/drop 不会再触发，所以只能走这条通道。
+  // 四个事件共用同一套判空 + 落点判定；只有 enter/over 需要维护高亮态。
+  const dragPos = (e: { payload: { position: { x: number; y: number } } }) =>
+    hitSelf(e.payload.position.x, e.payload.position.y);
+  const onDragEnter = (e: { payload?: { paths?: string[] } }) => {
+    const paths = e.payload?.paths;
+    if (!paths || paths.length === 0) return;
+    fileDropActive.value = dragPos(e as never);
+  };
+  const onDragOver = (e: { payload: { position: { x: number; y: number } } }) => {
+    fileDropActive.value = dragPos(e);
+  };
+  const onDragLeave = () => {
+    fileDropActive.value = false;
+  };
+  const onDrop = (e: { payload: { paths?: string[]; position: { x: number; y: number } } }) => {
+    fileDropActive.value = false;
+    const paths = e.payload?.paths;
+    if (!paths || paths.length === 0) return;
+    if (!dragPos(e)) return;
+    // 本地终端没有 SSH 会话，sftp_upload 无从打开子系统；本地 tab
+    // 拖入文件没有意义（用户要传的是远端），直接忽略而不是报错。
+    if (props.connType === "local") return;
+    // ZMODEM 会话期间终端输入被吞以保护协议流，探针的 echo 会直接打进
+    // 字节流污染传输 —— 宁可拒绝本次拖拽。
+    if (isZmodem) {
+      toast("ZMODEM 传输进行中，请等待结束再拖拽上传", { type: "warning", duration: 4000 });
+      return;
+    }
+    if (dropTransfer.value || pendingDrop.value || dropPreparing.value || autoUploadPaths.value) {
+      toast("已有上传任务在进行中", { type: "warning", duration: 3000 });
+      return;
+    }
+    void startDropUpload(paths);
+  };
 
   emit("terminal-ready", sid, t);
 
@@ -975,10 +1546,55 @@ function setupTerminal(): void {
   };
   window.addEventListener("focus", onWindowFocus);
 
+  // ── 窗口级拖放事件订阅（拖拽上传）──
+  // 用 Tauri 的 event.listen 而不是 getCurrentWindow().onDragDropEvent：
+  // 后者内部同样转发 tauri://drag-drop，但 enter/over 的载荷形状在不同
+  // 版本有差异；直接监听原始事件、按 payload 字段判空更稳。订阅放进本轮
+  // 生命周期，dispose 时一并取消。
+  void (async () => {
+    const { listen } = await import("@tauri-apps/api/event");
+    const dragEvents: Array<[string, (e: never) => void]> = [
+      ["tauri://drag-enter", onDragEnter as (e: never) => void],
+      ["tauri://drag-over", onDragOver as (e: never) => void],
+      ["tauri://drag-leave", onDragLeave as (e: never) => void],
+      ["tauri://drag-drop", onDrop as (e: never) => void],
+    ];
+    const unlisteners = await Promise.all(
+      dragEvents.map(([name, fn]) => listen(name, fn as (e: unknown) => void)),
+    );
+    if (closed) {
+      unlisteners.forEach((u) => u());
+      return;
+    }
+    dragEventUnlisten.push(...unlisteners);
+  })();
+
   disposeFn = () => {
     closed = true;
     clearTimeout(focusRetry);
     clearZmodemIntentHint();
+    dragEventUnlisten.forEach((u) => u());
+    dragEventUnlisten = [];
+    // 未完成的 cwd 探针不能挂着：dispose 之后 PTY 输出不会再进来，
+    // 等待者会一直挂到 3s 超时。直接以 null 收场。
+    cwdWaiters.splice(0).forEach((w) => w(null));
+    cwdProbe = null;
+    // 进行中的拖拽上传随本次终端一起收场。底层 sftp_upload 仍会在 Rust 侧
+    // 跑完（或随旧 SSH 会话断开而失败），它 emit 的 progress/done 已无人
+    // 监听、被丢弃 —— 重连后从零开始符合用户预期，不跨会话继承半截传输。
+    closeDropTransfer();
+    // 挂起的冲突对话框也必须一起作废：它记录的是这一次拖入的 dest 与路径，
+    // 若用户在 dispose 前最后一点击到「合并覆盖」，beginDropUpload 会拿
+    // 旧 sid 发起上传，而那个会话已经不在 ssh_sessions 里。
+    pendingDrop.value = null;
+    // ZMODEM 自动上传同样作废：挂起的路径属于旧会话，迟到的 zmodem_start
+    // 会把文件发给已断开的连接。看门狗一并停掉。
+    if (rzWatchdog !== null) {
+      clearTimeout(rzWatchdog);
+      rzWatchdog = null;
+    }
+    autoUploadPaths.value = null;
+    dragZmodemActive.value = false;
     window.removeEventListener("focus", onWindowFocus);
     unlistenOutput?.();
     unlistenClosed?.();
@@ -989,6 +1605,7 @@ function setupTerminal(): void {
     unlistenZmodemOffer?.();
     unlistenZmodemProgress?.();
     unlistenZmodemFileComplete?.();
+    unlistenZmodemFileSkipped?.();
     unsubscribeStatus();
     resizeObserver.disconnect();
     t.dispose();
@@ -1013,6 +1630,57 @@ function teardownTerminal(): void {
   term = null;
   fitAddon = null;
   bridge = null;
+}
+
+// ── 拖拽上传浮层的派生量（对齐 SftpPanel 的 pctDone/speed/remaining）──
+const dropPct = computed(() => {
+  const t = dropTransfer.value;
+  if (!t || t.bytesTotal <= 0) return 0;
+  return Math.min(100, Math.round((t.bytesDone / t.bytesTotal) * 100));
+});
+const dropElapsed = computed(() => {
+  const t = dropTransfer.value;
+  if (!t || t.startTime <= 0) return 0;
+  return (dropTickNow.value - t.startTime) / 1000;
+});
+const dropSpeed = computed(() =>
+  dropElapsed.value > 1 ? (dropTransfer.value?.bytesDone ?? 0) / dropElapsed.value : 0,
+);
+const dropRemaining = computed(() => {
+  const t = dropTransfer.value;
+  const sp = dropSpeed.value;
+  return sp > 0 && t !== null && t.bytesTotal > 0 ? (t.bytesTotal - t.bytesDone) / sp : Infinity;
+});
+
+function dropFormatSize(bytes: number): string {
+  if (bytes === 0) return "-";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  let size = bytes;
+  while (size >= 1024 && i < units.length - 1) {
+    size /= 1024;
+    i++;
+  }
+  return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+function dropFormatClock(epochMs: number): string {
+  if (!epochMs) return "—";
+  const d = new Date(epochMs);
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map((n) => String(n).padStart(2, "0"))
+    .join(":");
+}
+function dropFormatDuration(seconds: number): string {
+  if (!isFinite(seconds) || seconds <= 0) return "—";
+  if (seconds < 60) return `${Math.ceil(seconds)}秒`;
+  if (seconds < 3600) {
+    const m = Math.floor(seconds / 60);
+    const s = Math.ceil(seconds % 60);
+    return `${m}分${s}秒`;
+  }
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}小时${m}分`;
 }
 
 /** 字体设置后的重排。xterm re-measures the cell width when fontFamily changes
@@ -1084,7 +1752,7 @@ watch(terminalFontSize, (px) => {
 // (applyTheme 会改 html[data-theme] 并重跑 applyColorPreset），update the
 // existing terminal theme without losing scrollback.
 // xterm.js 5.x supports live `term.options.theme` mutation.
-watch([() => activePalette.value.id, () => ui.isDark, terminalSeeThrough], () => {
+watch([() => activePalette.value.id, () => ui.isDark], () => {
   const t = term;
   if (!t) return;
 
@@ -1092,15 +1760,14 @@ watch([() => activePalette.value.id, () => ui.isDark, terminalSeeThrough], () =>
   // WebGL renderer can't parse "transparent" (canvas could), and falls back
   // to an opaque black clearColor, hiding the background image.
   const theme = terminalTheme.value;
-  const currentBg = terminalSeeThrough.value ? "rgba(0, 0, 0, 0)" : theme.background;
   t.options.theme = {
     ...theme,
     ...forceVisibleCursor(theme),
-    background: currentBg,
+    // 恒透明：底色由 .terminal-wrap 的玻璃承载（见样式段注释）。
+    background: "rgba(0, 0, 0, 0)",
     selectionBackground: visibleSelection(theme.selectionBackground),
   };
-  t.options.allowTransparency = terminalSeeThrough.value;
-  // 容器背景由模板的 :style 绑定（wrapBg computed）自动跟随，无需手动同步。
+  t.options.allowTransparency = true;
 });
 
 // Active-tab transitions: refit on show (the last fit ran against a
@@ -1137,16 +1804,23 @@ function handleActiveChange(): void {
       return;
     }
 
-    resizeTo(props.sessionId, t.cols, t.rows).catch(() => {});
-    // Sync the freshly-refit cols to broadcast members so their shells
-    // output in the same width — covers the case where this tab was
-    // inactive through a window resize and the others had stale dims.
-    for (const targetSid of props.broadcastTargets) {
-      if (targetSid !== props.sessionId) {
-        resizeTo(targetSid, t.cols, t.rows).catch(() => {});
+    // 分屏：焦点从一个叶子切到另一个时，新焦点叶子在这里补一次 fit 并把
+    // 尺寸推给远端；旧叶子走 else 分支 blur。非焦点叶子不推尺寸（见
+    // ResizeObserver 里同样的门禁），否则两个叶子的 cols 互相覆盖。
+    if (props.resizeEnabled !== false) {
+      resizeTo(props.sessionId, t.cols, t.rows).catch(() => {});
+      // Sync the freshly-refit cols to broadcast members so their shells
+      // output in the same width — covers the case where this tab was
+      // inactive through a window resize and the others had stale dims.
+      for (const targetSid of props.broadcastTargets) {
+        if (targetSid !== props.sessionId) {
+          resizeTo(targetSid, t.cols, t.rows).catch(() => {});
+        }
       }
     }
-    t.focus();
+    if (props.inputEnabled !== false) {
+      t.focus();
+    }
   } else {
     t.blur();
   }
@@ -1182,24 +1856,16 @@ function syncBroadcastDims(): void {
 
 watch(() => [props.broadcastTargets.join(","), props.active] as const, syncBroadcastDims);
 
-// commandBar 是可选布尔 prop，不传时为 undefined（falsy）。用 !== false 表达
-// 「默认开启、显式关闭」—— 多窗口网格不传它（每个格子自带命令栏），主标签区传
-// false（改用壳层底部行那一条）。不改成 withDefaults 是为了避免为一个默认值把
-// 上面整块 props 声明重排缩进。
-const showCommandBar = computed(() => props.commandBar !== false);
+// commandBar 默认 true（由 props 的 withDefaults 声明），主标签区显式传
+// false 改用壳层底部行那条；多窗口网格不传 → 每格自带一条。
+const showCommandBar = computed(() => props.commandBar);
 
 function onZmodemCancel(): void {
   bridge?.abort();
-  // Safety net: zmodem_finish normally triggers zmodem_end within
-  // one IPC round-trip. If it somehow doesn't arrive (session dead,
-  // IPC failure), force-reset after 2s so the terminal is usable.
-  if (abortTimeout) clearTimeout(abortTimeout);
-  abortTimeout = setTimeout(() => {
-    bridge?.reset();
-    isZmodem = false;
-    term?.write("\r\n\x1b[33m[abort 超时 — 强制重置]\x1b[0m\r\n");
-    abortTimeout = null;
-  }, 2000);
+  // bridge?.abort() 只作用于 JS 版 zmodem 桥；上传/下载走 Rust 原生通道，
+  // 统一出口负责发 abort、本地复位与 2s 兜底（见 abortZmodemSession）。
+  bridge?.reset();
+  abortZmodemSession();
 }
 
 onMounted(() => {
@@ -1227,19 +1893,17 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="terminal-panel">
+  <div class="terminal-panel" ref="panelEl">
     <!-- xterm 容器 —— flex:1 占据 CommandBar 之上全部空间。padding 放在
          wrapper 上，NOT on the xterm container below. See the comment on
-         xterm-container for why. The wrapper also takes the terminal
-         background so the 4px inset stays seamless (no gap to the app
-         chrome behind it) in the non-background-image case. -->
-    <div
-      class="terminal-wrap"
-      :class="{ 'terminal-bg-transparent': terminalSeeThrough }"
-      :style="{ background: wrapBg }"
-    >
-      <!-- 背景图由 body 级壁纸层统一渲染（app.css 的 body::before，全窗透出），
-           此处只保持容器透明让图片透出 —— 避免双层叠加重影 -->
+         xterm-container for why.
+         底色不在这里内联：.terminal-wrap 是否铺玻璃取决于工作区有没有铺
+         （见样式段注释），用 CSS 条件比在这里算更准确。 -->
+    <div class="terminal-wrap">
+      <!-- 底色由这一层承担，与侧栏/顶栏/命令栏同源（var(--glass-bg)：
+           颜色随主题色、alpha 随界面实心度）；xterm 自身背景恒透明，
+           只负责画字。壁纸由 body 级壁纸层统一渲染（app.css 的
+           body::before），透过玻璃自然显现。 -->
       <!-- xterm 挂载容器。NO padding here — the 4px visual inset lives on the
            wrapper above. xterm's .xterm element fills this container's content
            box, and FitAddon reads getComputedStyle(thisContainer).width as
@@ -1253,25 +1917,10 @@ onUnmounted(() => {
            spilling out and the background shifted left ("字符跳出界面 /
            背景左移", worst on the local PowerShell/ConPTY path). Keeping
            the inset on the wrapper leaves the column math exact. -->
-      <div ref="containerRef" class="xterm-container" :style="{ background: wrapBg }" />
+      <div ref="containerRef" class="xterm-container" />
       <ZmodemProgressOverlay :status="zmodemStatus" @cancel="onZmodemCancel" />
-      <!-- rz upload chooser — files vs folder. Shown while the remote rz
-           waits; dismissed on pick, cancel, or zmodem_end. -->
-      <div v-if="uploadChooserOpen" class="upload-chooser">
-        <span class="chooser-title">↑ ZMODEM 上传</span>
-        <span class="chooser-hint">远端 rz 已就绪，选择要发送的内容：</span>
-        <MyButton variant="secondary" size="small" class="chooser-btn" @click="pickUploadFiles">
-          <MyIcon :size="13" name="Document" />
-          选择文件
-        </MyButton>
-        <MyButton variant="secondary" size="small" class="chooser-btn" @click="pickUploadFolder">
-          <MyIcon :size="13" name="FolderOpened" />
-          选择文件夹（递归上传）
-        </MyButton>
-        <MyButton variant="ghost" size="small" class="chooser-btn chooser-cancel" @click="cancelNativeUpload">
-          取消
-        </MyButton>
-      </div>
+      <!-- 手动 rz 的文件选择直接弹系统对话框（onZmodemStart → pickUploadFiles），
+           关闭不选即取消；不再有内嵌的「文件/文件夹」二选一浮层。 -->
     </div>
 
     <!-- 命令栏。多窗口网格里每个格子自带一条（commandBar 默认开启）；主标签区
@@ -1300,6 +1949,114 @@ onUnmounted(() => {
       </span>
       <span>正在截取终端...</span>
     </div>
+
+    <!-- 拖拽上传：拖入时的落点提示（覆盖终端区，不吃点击）。 -->
+    <div v-if="fileDropActive" class="drop-hint">
+      <MyIcon :size="22" name="Upload" />
+      <span>松开上传到当前目录（支持文件夹）</span>
+    </div>
+
+    <!-- 松手后的「准备中」遮罩：能力探测（SFTP 子系统探测 + exec 脚本各
+         最多 8s）与 cwd 探针期间不能没有任何反馈——此前这段静默十几秒，
+         用户以为拖拽没生效。 -->
+    <div v-else-if="dropPreparing" class="drop-hint">
+      <span class="spinner">
+        <MyIcon :size="16" name="Loading" spin />
+      </span>
+      <span>正在准备上传（检测服务器传输能力）…</span>
+    </div>
+
+    <!-- 两条上传通道都不可用：给出可执行的安装指引而不是一句死路错误。 -->
+    <MyDialog
+      :model-value="capsUnavailable !== null"
+      title="无法上传：服务器缺少传输组件"
+      size="sm"
+      @update:model-value="(v: boolean) => { if (!v) capsUnavailable = null; }"
+    >
+      <div v-if="capsUnavailable" class="caps-body">
+        <p class="caps-msg">{{ capsUnavailable.message }}</p>
+        <template v-if="capsUnavailable.hint">
+          <p class="caps-step">在服务器上安装 lrzsz：</p>
+          <div class="caps-cmd-row">
+            <code class="caps-cmd">{{ capsUnavailable.hint }}</code>
+            <MyButton variant="secondary" size="small" @click="copyInstallHint">复制</MyButton>
+          </div>
+        </template>
+        <p class="caps-alt">
+          或者让服务端启用 SFTP 子系统：确认 /etc/ssh/sshd_config 中保留
+          <code>Subsystem sftp internal-sftp</code> 后重载 sshd。
+        </p>
+      </div>
+      <template #footer>
+        <MyButton variant="primary" size="small" @click="capsUnavailable = null">知道了</MyButton>
+      </template>
+    </MyDialog>
+
+    <!-- 远端已存在同名目录：默认不覆盖，由用户决定合并还是跳过。 -->
+    <!-- 不传 hide-footer：myui 的 hideFooter 会把自定义 #footer 一起丢掉
+         （源码 `hideFooter ? void 0 : { name: "footer" }`），三个出口按钮
+         会全部不渲染。提供 #footer 插槽即覆盖默认的确认/取消按钮。 -->
+    <MyDialog
+      :model-value="pendingDrop !== null"
+      title="远端已存在同名目录"
+      size="sm"
+      @update:model-value="(v: boolean) => { if (!v) resolveDropConflict('cancel'); }"
+    >
+      <div v-if="pendingDrop" class="conflict-body">
+        <p>以下目录在目标位置已存在：</p>
+        <ul class="conflict-list">
+          <li v-for="name in pendingDrop.conflictNames" :key="name">{{ name }}</li>
+        </ul>
+        <p class="conflict-note">
+          「合并覆盖」会把新文件写进已有目录，同名文件被覆盖；「跳过这些」只上传其余内容。
+        </p>
+      </div>
+      <template #footer>
+        <div class="conflict-actions">
+          <MyButton variant="ghost" size="small" @click="resolveDropConflict('cancel')">取消</MyButton>
+          <MyButton variant="ghost" size="small" @click="resolveDropConflict('skip')">跳过这些</MyButton>
+          <MyButton variant="primary" size="small" @click="resolveDropConflict('merge')">合并覆盖</MyButton>
+        </div>
+      </template>
+    </MyDialog>
+
+    <!-- 拖拽上传进度浮层（SFTP，非 ZMODEM）—— 版式对齐 ZmodemProgressOverlay
+         与 SftpPanel 的 transfer-overlay：四行 + 错误列表。 -->
+    <div v-if="dropTransfer" class="transfer-overlay">
+      <div class="tx-row1">
+        <div class="tx-left">
+          <span class="tx-arrow">↑</span>
+          <span class="tx-label">
+            {{ dropTransfer.done ? "上传完成" : "上传中" }}
+          </span>
+          <span v-if="dropTransfer.fileCount > 1" class="tx-count">
+            {{ Math.min(dropTransfer.fileIndex + (dropTransfer.done ? 0 : 1), dropTransfer.fileCount) }}/{{ dropTransfer.fileCount }}
+          </span>
+          <span class="tx-file">{{ dropTransfer.currentFile || "准备中…" }}</span>
+        </div>
+        <MyButton v-if="dropTransfer.done" variant="primary" size="small" @click="closeDropTransfer">
+          关闭
+        </MyButton>
+        <MyButton v-else variant="danger" size="small" @click="onCancelDropTransfer">取消</MyButton>
+      </div>
+      <MyProgress class="tx-bar" :percentage="dropPct" :stroke-width="8" :show-text="false" />
+      <div class="tx-row3">
+        <span>
+          {{ dropFormatSize(dropTransfer.bytesDone) }} / {{ dropFormatSize(dropTransfer.bytesTotal) }}
+          <template v-if="dropTransfer.bytesTotal > 0">({{ dropPct }}%)</template>
+        </span>
+        <span>{{ dropSpeed >= 1 ? dropFormatSize(dropSpeed) + "/s" : "—" }}</span>
+      </div>
+      <div class="tx-row4">
+        <span>开始 {{ dropFormatClock(dropTransfer.startTime) }}</span>
+        <span>已用 {{ dropFormatDuration(dropElapsed) }}</span>
+        <span>剩余 {{ dropTransfer.done ? "—" : dropFormatDuration(dropRemaining) }}</span>
+      </div>
+      <div v-if="dropTransfer.done && dropTransfer.errors.length > 0" class="tx-errors">
+        <div v-for="(er, i) in dropTransfer.errors.slice(0, 3)" :key="i">• {{ er }}</div>
+        <div v-if="dropTransfer.errors.length > 3">…等 {{ dropTransfer.errors.length }} 个错误</div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1318,18 +2075,16 @@ onUnmounted(() => {
   min-height: 0;
 }
 
-/* When a background image is active, force xterm.js internal DOM
-    layers (.xterm-viewport, .xterm-screen, canvas) transparent so the
-    image shows through. xterm.css ships with solid background-color
-    rules that must be overridden.（xterm 运行时生成的 DOM 不带 scoped
-    标记，须用 :deep() 穿透） */
-.terminal-bg-transparent :deep(.xterm-viewport),
-.terminal-bg-transparent :deep(.xterm-screen),
-.terminal-bg-transparent :deep(.xterm) {
+/* xterm 内部层常驻透明：底色由 .terminal-wrap 的玻璃承担，xterm 只画字。
+   xterm.css 自带实底 background-color 规则，必须覆盖掉，否则玻璃被挡住。
+   （xterm 运行时生成的 DOM 不带 scoped 标记，须用 :deep() 穿透） */
+:deep(.xterm-viewport),
+:deep(.xterm-screen),
+:deep(.xterm) {
   background: transparent !important;
 }
 
-.terminal-bg-transparent :deep(.xterm-viewport::-webkit-scrollbar-track) {
+:deep(.xterm-viewport::-webkit-scrollbar-track) {
   background: transparent !important;
 }
 
@@ -1338,6 +2093,26 @@ onUnmounted(() => {
   min-height: 0;
   position: relative;
   padding: 4px;
+  /* ── 终端底色：与侧栏/顶栏/命令栏同一套玻璃 ──
+     但要避免**双层叠加**：.shell-work 本身在「无壁纸」模式下已经铺了
+     一层 var(--glass-bg)（alpha 0.38 起），终端若再铺一层同值玻璃，
+     叠加后 1-(1-0.38)² ≈ 0.62 —— 终端区会比侧栏明显更实，正是「不
+     一致」的来源。所以这里默认透明，让工作区那层玻璃透出来；只有
+     透出模式（工作区改为完全透明、壁纸直出）才由终端自己铺。
+     两条路径最终都是「一层 --glass-bg」，与菜单同源同值。 */
+  background: transparent;
+}
+
+/* 透出模式下工作区已透明（app.css 的 html[data-translucent="1"]
+   .shell-work），终端必须自己铺这一层，否则文字直接压在壁纸上。
+   整条选择器包进 :global()：Vue 对 `:global(A) B` 的编译会丢掉 B
+   （实测输出变成 `html[data-translucent="1"] { background: … }`，
+   直接作用到 html 上，终端一条没铺）；包成 :global(A B) 才按原样输出。
+   `.terminal-wrap` 全仓只有本组件使用，不担心误伤。 */
+:global(html[data-translucent="1"] .terminal-wrap) {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
 }
 
 .xterm-container {
@@ -1345,6 +2120,7 @@ onUnmounted(() => {
   height: 100%;
   position: relative;
   z-index: 1;
+  background: transparent;
 }
 
 .bg-layer {
@@ -1357,53 +2133,7 @@ onUnmounted(() => {
   z-index: 0;
 }
 
-/* rz 上传选择条（文件 vs 文件夹） */
-.upload-chooser {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: var(--glass-bg);
-  border-top: 1px solid var(--border-emphasis);
-  padding: 10px 16px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  font-family: "Cascadia Code", Consolas, monospace;
-  font-size: var(--fs-xs);
-  color: var(--text-primary);
-  z-index: 10;
-}
-
-.chooser-title {
-  color: var(--success);
-  font-weight: 600;
-}
-
-.chooser-hint {
-  color: var(--text-secondary);
-}
-
-.chooser-btn {
-  background: transparent;
-  border: 1px solid var(--accent-primary);
-  color: var(--accent-primary);
-  padding: 3px 12px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  font-size: var(--fs-xs);
-  font-family: inherit;
-  white-space: nowrap;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.chooser-cancel {
-  color: var(--error);
-  border-color: var(--error);
-}
+/* rz 上传的内嵌「文件/文件夹」选择条已删除（直接弹系统对话框）。 */
 
 /* 截图状态横幅 */
 .screenshot-banner {
@@ -1422,6 +2152,175 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/* 拖拽上传落点提示（虚线框居中，不吃点击） */
+.drop-hint {
+  position: absolute;
+  inset: 8px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 2px dashed var(--accent-primary);
+  border-radius: var(--radius-md);
+  background: var(--accent-primary-muted);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  pointer-events: none;
+}
+
+/* 冲突确认：列出远端已存在的目录名，三个出口（取消 / 跳过 / 合并）。 */
+.conflict-body p {
+  margin: 0 0 8px;
+  color: var(--text-secondary);
+}
+
+.conflict-list {
+  margin: 0 0 10px;
+  padding-left: 18px;
+  max-height: 160px;
+  overflow-y: auto;
+  color: var(--text-primary);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+}
+
+.conflict-note {
+  color: var(--text-tertiary);
+  font-size: var(--fs-xs);
+}
+
+.conflict-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+/* 安装指引对话框：结论 + 可复制的安装命令 + SFTP 替代方案。 */
+.caps-body p {
+  margin: 0 0 10px;
+  color: var(--text-secondary);
+}
+
+.caps-msg {
+  color: var(--text-primary);
+}
+
+.caps-step {
+  font-weight: 600;
+}
+
+.caps-cmd-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.caps-cmd {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: var(--fs-xs);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.caps-alt {
+  color: var(--text-tertiary);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+/* 拖拽上传进度浮层：版式与 ZmodemProgressOverlay / SftpPanel.transfer-overlay
+   一致（同一套 CSS 变量与行结构），只改类名前缀避免与 scoped 规则串味。 */
+.transfer-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--glass-bg);
+  border-top: 1px solid var(--border-emphasis);
+  padding: 8px 16px 10px;
+  font-size: var(--fs-xs);
+  font-family: "Cascadia Code", Consolas, monospace;
+  color: var(--text-primary);
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tx-row1 {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.tx-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tx-arrow {
+  color: var(--accent-primary);
+  font-size: var(--fs-lg);
+  line-height: 1;
+}
+
+.tx-label {
+  color: var(--success);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.tx-count {
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.tx-file {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tx-bar :deep(.el-progress-bar__outer) {
+  background: var(--bg-surface-active);
+  border-radius: 4px;
+}
+
+.tx-row3 {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-secondary);
+}
+
+.tx-row4 {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-tertiary);
+  font-size: var(--fs-2xs);
+}
+
+.tx-errors {
+  color: var(--error);
+  max-height: 42px;
+  overflow-y: auto;
+  line-height: 1.4;
 }
 
 .spinner {

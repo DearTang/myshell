@@ -81,6 +81,28 @@ enum Commands {
         #[command(subcommand)]
         action: VaultAction,
     },
+
+    /// SSH port forwarding (tunnel) management
+    Forward {
+        #[command(subcommand)]
+        action: ForwardAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ForwardAction {
+    /// List stored forwarding rules and their live state
+    List,
+    /// Start a tunnel by rule id (runs until this process exits)
+    Start {
+        /// Rule id (see `forward list`)
+        id: String,
+    },
+    /// Stop a tunnel by rule id
+    Stop {
+        /// Rule id
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -349,6 +371,8 @@ async fn main() {
         zmodem_files: Arc::new(Mutex::new(std::collections::HashMap::new())),
         dek: Arc::new(Mutex::new(None)),
         transfer_cancels: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        port_forwards: Arc::new(forward::ForwardManager::new()),
+        upload_caps: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     // Unlock the vault for every command that actually needs credentials.
@@ -398,6 +422,7 @@ async fn main() {
                 Ok(())
             }
         },
+        Commands::Forward { action } => cmd_forward(&state, action, cli.json).await,
     };
 
     if let Err(e) = result {
@@ -407,6 +432,191 @@ async fn main() {
 }
 
 // ============ Command implementations ============
+
+/// Port-forwarding subcommands. `list` is read-only; `start` blocks until the
+/// process is interrupted (a CLI tunnel has no other lifetime — there is no
+/// daemon to hand it to); `stop` releases both the local listener and the
+/// server-side forward request.
+async fn cmd_forward(state: &AppState, action: ForwardAction, json: bool) -> Result<(), String> {
+    match action {
+        ForwardAction::List => {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            let rows = db::list_port_forwards(&db).map_err(|e| e.to_string())?;
+            if json {
+                let items: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "name": r.name,
+                            "connection_id": r.connection_id,
+                            "direction": r.direction,
+                            "bind_host": r.bind_host,
+                            "bind_port": r.bind_port,
+                            "target_host": r.target_host,
+                            "target_port": r.target_port,
+                            "enabled": r.enabled,
+                            "active": state.port_forwards.is_active(&r.id),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?
+                );
+            } else {
+                if rows.is_empty() {
+                    println!("（无端口转发规则，请在 MyShell 设置中创建）");
+                    return Ok(());
+                }
+                println!("{:<36} {:<12} {:<22} {}", "ID", "方向", "监听", "目标");
+                println!("{}", "─".repeat(90));
+                for r in &rows {
+                    let active = state.port_forwards.is_active(&r.id);
+                    println!(
+                        "{:<36} {:<12} {:<22} {}:{}",
+                        r.id,
+                        r.direction,
+                        format!("{}:{}", r.bind_host, r.bind_port),
+                        r.target_host,
+                        r.target_port,
+                    );
+                    if active {
+                        println!("{:<36} └─ 运行中", "");
+                    }
+                }
+            }
+            Ok(())
+        }
+        ForwardAction::Start { id } => {
+            let row = {
+                let db = state.db.lock().map_err(|e| e.to_string())?;
+                db::get_port_forward(&db, &id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("规则不存在: {id}"))?
+            };
+            let key = require_dek(state)?;
+            let mut config = {
+                let db = state.db.lock().map_err(|e| e.to_string())?;
+                db::get_connection(&db, &key, &row.connection_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "该规则引用的连接已不存在".to_string())?
+            };
+            if config.conn_type != "local" && config.password.is_none() {
+                config.password = secrets::get_password(&config.id, &key)?.map(|p| p.to_string());
+            }
+            if config.conn_type != "local"
+                && config.proxy_type != "none"
+                && config.proxy_password.is_none()
+            {
+                config.proxy_password =
+                    secrets::get_proxy_password(&config.id, &key)?.map(|p| p.to_string());
+            }
+            drop(key);
+
+            let handle = Arc::new(ssh::dial_and_authenticate(state, &config, false).await?);
+            let session_id = uuid::Uuid::new_v4().to_string();
+            {
+                let mut sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+                sessions.insert(
+                    session_id.clone(),
+                    ssh::SshSession {
+                        handle: Arc::clone(&handle),
+                        config: Arc::new(config),
+                        command_tx: {
+                            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                            tx
+                        },
+                    },
+                );
+            }
+
+            let rule = forward::ForwardRule {
+                id: row.id.clone(),
+                name: row.name,
+                connection_id: row.connection_id,
+                direction: row.direction.clone(),
+                bind_host: row.bind_host.clone(),
+                bind_port: row.bind_port,
+                target_host: row.target_host.clone(),
+                target_port: row.target_port,
+                enabled: row.enabled,
+                created_at: row.created_at,
+            };
+            let port = match row.direction.as_str() {
+                "remote" => state
+                    .port_forwards
+                    .start_remote(&rule, &handle, &session_id)
+                    .await?,
+                _ => state
+                    .port_forwards
+                    .start_local(&rule, &handle, &session_id)
+                    .await?,
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "id": rule.id,
+                        "direction": rule.direction,
+                        "bind_host": rule.bind_host,
+                        "bind_port": port,
+                        "target_host": rule.target_host,
+                        "target_port": rule.target_port,
+                        "state": "up",
+                    })
+                );
+            } else {
+                println!(
+                    "隧道已建立：{} {}:{} → {}:{}（按 Ctrl+C 停止）",
+                    if row.direction == "remote" { "远程" } else { "本地" },
+                    row.bind_host,
+                    port,
+                    row.target_host,
+                    row.target_port
+                );
+            }
+            // A CLI tunnel lives exactly as long as this process. Park until
+            // interrupted, then tear down both ends.
+            tokio::signal::ctrl_c().await.ok();
+            let sids: Vec<String> = state
+                .port_forwards
+                .session_owner_snapshot()
+                .into_iter()
+                .filter(|(rid, _)| rid == &id)
+                .map(|(_, sid)| sid)
+                .collect();
+            state.port_forwards.stop(&id);
+            for sid in sids {
+                let _ = ssh::disconnect(state, &sid).await;
+            }
+            println!("隧道已停止");
+            Ok(())
+        }
+        ForwardAction::Stop { id } => {
+            // `ssh::disconnect` releases the server-side listener and stops any
+            // remaining tunnels bound to the session (same path the GUI uses),
+            // then drops the SSH connection the tunnel dialled.
+            let sids: Vec<String> = state
+                .port_forwards
+                .session_owner_snapshot()
+                .into_iter()
+                .filter(|(rid, _)| rid == &id)
+                .map(|(_, sid)| sid)
+                .collect();
+            state.port_forwards.stop(&id);
+            for sid in sids {
+                let _ = ssh::disconnect(state, &sid).await;
+            }
+            if json {
+                println!("{}", serde_json::json!({ "id": id, "state": "stopped" }));
+            } else {
+                println!("已停止规则 {id} 的隧道");
+            }
+            Ok(())
+        }
+    }
+}
 
 async fn cmd_list(state: &AppState, json: bool) -> Result<(), String> {
     let key = require_dek(state)?;
@@ -564,6 +774,10 @@ async fn cmd_exec(
                 serde_json::json!({
                     "error": "远端未返回退出码：连接中断或进程被信号终止，结果未知（不能视为成功）",
                     "exit_code": serde_json::Value::Null,
+                    // 能走到这里说明 exec 请求已写入通道（上面两步失败都会提前
+                    // 返回），所以是「可能已执行」而非「没执行」——非幂等命令
+                    // 重试前必须先确认。与 MCP 侧同一语义（阶段 220）。
+                    "delivered": true,
                     "stdout": stdout_str,
                     "stderr": stderr_str,
                 })
@@ -587,6 +801,9 @@ async fn cmd_exec(
             "{}",
             serde_json::json!({
                 "exit_code": code,
+                // 128+信号形态（Ctrl-C=130）与 MCP 侧同口径：空输出 + 130 不是
+                // 「干净地没有输出」，调用方要能区分「被中断」与「成功无输出」。
+                "interrupted": (128..=159).contains(&code),
                 "stdout": stdout_str,
                 "stderr": stderr_str,
             })

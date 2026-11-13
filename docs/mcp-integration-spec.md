@@ -67,6 +67,31 @@ args = {"connection": "prod-db",
 
 要读文件内容，用 **`ssh_read_text`**：路径作为普通 JSON 参数传入，由 MyShell 内部处理转义（优先 SFTP，无 SFTP 时回退 shell 并对路径做单引号转义）。**不要**再手拼 `cat` / `echo` / heredoc。
 
+反过来要**写**文件内容（凭据、API key、配置值、脚本），用 **`ssh_write_text`**：内容用 `content_b64` 传，字节经 SFTP 通道直达文件，远端 shell 完全不解析它。**不要**用 `ssh_exec` + heredoc / `echo` 写凭据——那会把每个字节过一遍交互式 shell 的行编辑器，字符污染就发生在这里。
+
+```python
+args = {"connection": "prod-db",
+        "remote_path": "/opt/app/.env",
+        "content_b64": base64.b64encode(b"MINIMAX_API_KEY=sk-cp-...\n").decode()}
+```
+
+`mode` 默认 `overwrite`，传 `"append"` 则追加到文件末尾。目标路径命中敏感路径（与 `ssh_read_text` 共用同一份路径清单）时同样弹人工确认。
+
+---
+
+## 一之二、选对执行通道：`exec_channel`
+
+`ssh_exec` 的 `exec_channel` 有两个值：
+
+| 值 | 语义 | 适用 |
+|---|---|---|
+| `gui`（默认） | 在可见的 MyShell 终端标签页里执行，**每个 MCP 客户端进程复用各自的一条持久 shell**（多客户端互不串台），退出码取 shell 的 `$?` | 用户想旁观；短命令；只读探查 |
+| `pipe` | 直连 SSH exec 通道（等价 `ssh host 'cmd'`），无 PTY、无 shell 状态、退出码来自远端进程本身 | 写凭据、长命令、含 `|` `;` `2>&1` / heredoc、上一次 `gui` 结果疑似被污染 |
+
+默认值没有变，仍是 `gui`；只有显式传 `"pipe"` 才走直连通道。两边的命令规则与确认弹窗完全一致。
+
+`gui` 通道**不是**每次调用的独立会话：同一 MCP 客户端进程内，cwd、环境变量、未闭合的引号都会带到下一次调用（不同客户端进程各自一条 shell，互不可见）。所以要么用绝对路径 + `&&` 串起来，要么直接要 `pipe`。若上一条命令把 shell 留在了续行（`>`）状态，工具现在会直接报错并自动补 Ctrl-C，不会再让后续每条命令都静默失效。注意：MCP 进程重启（新开一轮对话）会拿到新标签，shell 状态不跨重启延续。
+
 ---
 
 ## 二、适配层应当传递结构化参数，而不是字符串
@@ -134,6 +159,9 @@ content = {"connection":"prod-db","command":"..."}     // ← 要这样
 
 - **返回值已剥离终端控制序列**（CSI 颜色、OSC 标题/超链接），无需自行清洗；中文与制表/换行保留。
 - `ssh_exec` 结果含 `duration_ms`、`timed_out`、`truncated`、`command`（回显）、`exit_code_source`；`exit_code` 是远端进程退出码，管道命令给出的是最后一段的状态。
+- `delivered: true`（出现在失败结果上）表示命令**已经写进 SSH 通道**，远端可能已经执行了它或它的一部分。非幂等命令（`rm`、`kill`、写文件）重试前必须先确认，不要盲目重发。
+- `interrupted: true` 表示退出码呈 `128+信号` 形态（Ctrl-C = 130）。它不是「干净地没有输出」，别当成成功。
+- `completed: false`（仅 `gui` 通道）表示 shell 的完成标记始终没回来——命令可能还在跑，此时 `exit_code` 为 `null`，是「未知」而不是 0。
 - `truncated: true` 表示输出被 `MCP_SSH_MAX_OUTPUT_BYTES`（默认 4 MiB）截断，请改为重定向到文件再取。
 - **确认门不可绕过**：`ssh_exec` / `ssh_run` 按白名单/黑名单决定是否弹确认框；文件类工具（`sftp_upload` / `sftp_remove` / `sftp_rename` / `upload_project` / `download_project` / `zmodem_upload`）**一律**弹框。不要设计「让 agent 声明已获授权从而跳过」的参数——那是设计前提，不是缺陷。
 - 日志：基础轨 `mcp-<日期>.log`，错误轨 `mcp-error-<日期>.log`（同目录，保留 7 天）。报障只需后者。
@@ -146,8 +174,12 @@ content = {"connection":"prod-db","command":"..."}     // ← 要这样
 - [ ] 含引号/反斜杠/`$`/反引号/花括号/管道的命令走 `command_b64`
 - [ ] schema 校验按 `anyOf` 接受 `command` 或 `command_b64`
 - [ ] 读文件用 `ssh_read_text`，不手拼 `cat`
+- [ ] **写**文件内容用 `ssh_write_text` + `content_b64`，不用 heredoc/echo
+- [ ] 写凭据或上一次结果疑似被污染时，`ssh_exec` 传 `exec_channel: "pipe"`
 - [ ] 客户端接收超时 > 传入的 `timeout`
 - [ ] 失败分支读 `error_kind`，不匹配中文文案
+- [ ] 失败结果上的 `delivered: true` 触发「先确认再重试」，非幂等命令不自动重发
+- [ ] `completed: false` 时把 `exit_code: null` 当未知，不当 0
 - [ ] `busy` 时按 `hint` 的秒数等待，或改 `ssh_run`，不做紧密重试
 - [ ] `user_denied` 视为硬性停止
 

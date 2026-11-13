@@ -187,8 +187,12 @@ function onOpenQuickCommandsManage(connectionId: string): void {
   align-items: center;
   justify-content: space-between;
   padding: 0 12px;
-  border-bottom: 1px solid var(--border-subtle);
-  background: var(--bg-surface);
+  border-bottom: 1px solid var(--glass-border);
+  /* 与壳层同档玻璃：此前用 --bg-surface 实色，壁纸/主题色光晕完全透不出来，
+     与单窗口工作区（--glass-bg）观感割裂。 */
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
 }
 
 .toolbar-title {
@@ -219,15 +223,22 @@ function onOpenQuickCommandsManage(connectionId: string): void {
   grid-auto-rows: 1fr;
   gap: 6px;
   padding: 6px;
-  background: var(--bg-darker, var(--bg-base));
+  /* 透明：让 .shell-work 的玻璃与壁纸透出。此前是 --bg-base 实色，
+     多窗口模式整块糊成一张实底色面板，与单窗口完全两个世界。 */
+  background: transparent;
 }
 
 .cell {
   display: flex;
   flex-direction: column;
-  background: var(--bg-base);
-  border: 1px solid var(--border-default);
+  /* strong 档玻璃：格子是浮在工作区之上的卡片，比壳层实一档才压得住终端内容，
+     又不必像弹层那么实。 */
+  background: var(--glass-bg-strong);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
+  border: 1px solid var(--glass-border);
   border-radius: var(--radius-md);
+  box-shadow: var(--glass-highlight);
   overflow: hidden;
   min-width: 320px;
   min-height: 160px;
@@ -240,8 +251,11 @@ function onOpenQuickCommandsManage(connectionId: string): void {
   align-items: center;
   justify-content: space-between;
   padding: 0 8px;
-  background: var(--bg-surface);
-  border-bottom: 1px solid var(--border-subtle);
+  /* 与格子同档玻璃的一层薄面：标题条自身不铺底就会露出 .grid 的透明，
+     文字直接压在终端画布上。 */
+  background: var(--glass-bg-strong);
+  border-bottom: 1px solid var(--glass-border);
+  color: var(--text-tertiary);
 }
 
 .cell-title {
@@ -255,7 +269,8 @@ function onOpenQuickCommandsManage(connectionId: string): void {
 .cell-remove {
   background: transparent;
   border: none;
-  color: var(--text-muted);
+  /* --text-muted 在玻璃面上只有 ~2:1，几乎看不见；提到 tertiary（~3.8:1）。 */
+  color: var(--text-tertiary);
   cursor: pointer;
   font-size: var(--fs-md);
   padding: 0 4px;

@@ -432,6 +432,70 @@ export async function deleteQuickCommand(id: number): Promise<void> {
   await invoke("delete_quick_command", { id });
 }
 
+// ============ Port Forwarding API ============
+//
+// SSH tunnels (local -L / remote -R). Rules are plaintext in SQLite (host
+// names and ports expose topology, same class as the connection's host) so
+// this API works with the vault still locked. Credentials never live here —
+// each rule references a connection whose password/key stay in the keyring.
+
+export type ForwardDirection = "local" | "remote";
+
+/** Live tunnel snapshot; absent while the rule is stopped. */
+export interface TunnelStatus {
+  ruleId: string;
+  /** "listening" | "forwarding" | "error" */
+  state: string;
+  bytesIn: number;
+  bytesOut: number;
+  connections: number;
+  /** Non-empty when the tunnel failed after starting. */
+  error: string;
+}
+
+export interface ForwardRule {
+  id: string;
+  name: string;
+  connectionId: string;
+  direction: ForwardDirection;
+  bindHost: string;
+  bindPort: number;
+  targetHost: string;
+  targetPort: number;
+  enabled: boolean;
+  createdAt: string;
+  tunnel: TunnelStatus | null;
+}
+
+/** List every rule with its live tunnel state. Empty `id` on save = new. */
+export async function forwardListRules(): Promise<ForwardRule[]> {
+  return await invoke("forward_list_rules");
+}
+
+export async function forwardSaveRule(rule: ForwardRule): Promise<string> {
+  return await invoke("forward_save_rule", { rule });
+}
+
+export async function forwardDeleteRule(id: string): Promise<void> {
+  await invoke("forward_delete_rule", { id });
+}
+
+export async function forwardSetEnabled(
+  id: string,
+  enabled: boolean
+): Promise<void> {
+  await invoke("forward_set_enabled", { id, enabled });
+}
+
+/** Start a tunnel. Resolves the rule's connection credentials server-side. */
+export async function forwardStart(id: string): Promise<number> {
+  return await invoke("forward_start", { id });
+}
+
+export async function forwardStop(id: string): Promise<void> {
+  await invoke("forward_stop", { id });
+}
+
 // ============ Server Info API ============
 
 export interface ServerInfo {
@@ -450,6 +514,16 @@ export interface ServerInfo {
   diskMaxSize: string;
   diskMaxUsed: string;
   diskMaxPct: number;
+  /** 硬件块设备聚合读写速率（字节/秒）。分区与 dm-/md- 等堆叠设备不计入，
+      避免同一份 I/O 被数两遍。 */
+  diskReadBps: number;
+  diskWriteBps: number;
+  /** 物理网卡聚合收发速率（字节/秒）。lo 与 veth/docker/br-/tun 等虚拟设备
+      不计入。 */
+  netRxBps: number;
+  netTxBps: number;
+  /** 到本机 loopback 的 TCP 连接耗时（毫秒）。0 = 测量失败（如无 /dev/tcp）。 */
+  latencyMs: number;
   stale: boolean;
 }
 
@@ -604,6 +678,8 @@ export interface SftpTransferProgressPayload {
 export interface SftpTransferDonePayload {
   requestId: string;
   errors: string[];
+  /** 本次上传在远端新建的目录数（文件夹拖拽上传）；其它传输恒为 0。 */
+  createdDirs: number;
 }
 
 export async function sftpUpload(
@@ -646,14 +722,68 @@ export function onSftpTransferProgress(
   });
 }
 
-/** Transfer finished — handler receives the list of per-file errors (empty if all OK). */
+/** Transfer finished — handler receives the list of per-file errors (empty if all OK).
+ * `createdDirs` 是本次上传在远端新建的目录数（文件夹拖拽上传），其它传输恒为 0。 */
 export function onSftpTransferDone(
   requestId: string,
-  handler: (errors: string[]) => void
+  handler: (errors: string[], createdDirs: number) => void
 ): Promise<UnlistenFn> {
   return listen<SftpTransferDonePayload>("sftp_transfer_done", (event) => {
-    if (event.payload.requestId === requestId) handler(event.payload.errors);
+    if (event.payload.requestId === requestId) {
+      handler(event.payload.errors, event.payload.createdDirs);
+    }
   });
+}
+
+/** 拖拽上传前的冲突预检结果（Rust `sftp::ConflictReport`）。 */
+export interface SftpDirConflictReport {
+  /** 解析后的远端目标绝对路径（`~` 已展开），上传直接用这个。 */
+  resolvedDest: string;
+  /** 目标目录是否存在且确实是目录；false 时前端应回退主目录。 */
+  destExists: boolean;
+  /** 批次内重名的目录名（提示用）。 */
+  duplicateDirs: string[];
+  /** 批次内重名、需要从本次上传中剔除的本地路径（精确到项）。 */
+  duplicatePaths: string[];
+  /** 远端已存在的同名目录名。 */
+  existingDirs: string[];
+}
+
+/**
+ * 只读预检：目标目录是否可用、批次内有无重名目录、远端有无同名目录。
+ * 不做任何写入。失败（断连/权限）时调用方应中止上传，而不是继续覆盖。
+ */
+export async function sftpCheckDirConflicts(
+  sessionId: string,
+  localPaths: string[],
+  remoteDestDir: string
+): Promise<SftpDirConflictReport> {
+  return await invoke("sftp_check_dir_conflicts", { sessionId, localPaths, remoteDestDir });
+}
+/**
+ * 服务端上传能力（Rust `ssh::UploadCapabilities`）。拖拽上传据此选通道：
+ * SFTP 可用走 SFTP（含冲突预检），否则 lrzsz 可用走 ZMODEM，两者皆无给安装指引。
+ */
+export interface UploadCapabilities {
+  /** SFTP 子系统是否可用（真实开过一次并完成 INIT 握手）。 */
+  sftpAvailable: boolean;
+  /** 远端是否同时有 rz 与 sz（lrzsz）。 */
+  zmodemAvailable: boolean;
+  /** 探测是否跑完。false = exec 通道也不可用/超时，两条路径都未确认。 */
+  probeCompleted: boolean;
+  /** 探测到的包管理器（apt-get / dnf / yum / apk / zypper / pacman）。 */
+  packageManager: string | null;
+  /** 安装 lrzsz 的具体命令；探测到包管理器时才有。 */
+  installHint: string | null;
+  /** 探测结论或失败原因，直接展示给用户。 */
+  message: string | null;
+}
+
+/** 探测服务端上传能力（结果按 session 缓存，正常只跑一次）。 */
+export async function probeUploadCapabilities(
+  sessionId: string
+): Promise<UploadCapabilities> {
+  return await invoke("probe_upload_capabilities", { sessionId });
 }
 
 /** Cancel an in-flight SFTP transfer. The backend breaks at the next 32 KB chunk boundary. */
@@ -1160,6 +1290,18 @@ export async function readTextFile(path: string): Promise<string> {
   return await invoke("read_text_file", { path });
 }
 
+/** 导入本地图片为壁纸：复制进应用自管目录（`<LOCALAPPDATA>/…/wallpapers/`），
+ *  返回绝对路径。前端用 `convertFileSrc` 转 asset URL —— 落在 tauri.conf.json
+ *  的 assetProtocol scope 内，重启后依然放行。扩展名白名单 + 16MB 上限。 */
+export async function importWallpaper(path: string): Promise<string> {
+  return await invoke("import_wallpaper", { path });
+}
+
+/** 旧版壁纸（base64 data URL）迁入自管目录，返回绝对路径。 */
+export async function importWallpaperData(dataUrl: string): Promise<string> {
+  return await invoke("import_wallpaper_data", { dataUrl });
+}
+
 // ============ Feedback / Diagnostics ============
 
 /** Log info returned by `get_feedback_log` for the feedback dialog. */
@@ -1308,6 +1450,11 @@ export interface ZmodemFileCompletePayload {
   bytesWritten: number;
 }
 
+export interface ZmodemFileSkippedPayload {
+  sessionId: string;
+  fileName: string;
+}
+
 /** A file is being offered by the remote `sz` — prompt the user for a dir. */
 export function onZmodemOffer(
   sessionId: string,
@@ -1334,6 +1481,17 @@ export function onZmodemFileComplete(
   handler: (p: ZmodemFileCompletePayload) => void
 ): Promise<UnlistenFn> {
   return listen<ZmodemFileCompletePayload>("zmodem_file_complete", (event) => {
+    if (event.payload.sessionId === sessionId) handler(event.payload);
+  });
+}
+
+/** The receiver declined a file we offered (ZSKIP) — it never landed.
+ *  Not fatal: the transfer continues with the remaining files. */
+export function onZmodemFileSkipped(
+  sessionId: string,
+  handler: (p: ZmodemFileSkippedPayload) => void
+): Promise<UnlistenFn> {
+  return listen<ZmodemFileSkippedPayload>("zmodem_file_skipped", (event) => {
     if (event.payload.sessionId === sessionId) handler(event.payload);
   });
 }

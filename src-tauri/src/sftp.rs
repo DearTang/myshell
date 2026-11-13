@@ -47,6 +47,19 @@ async fn get_sftp_session(
     Ok(sftp)
 }
 
+/// SFTP 子系统是否可用。真实开一次子系统并完成 INIT 握手，失败即不可用。
+///
+/// 用于拖拽上传的通道选择：SSH 连得上不等于 SFTP 用得了（restricted shell、
+/// chroot、只开 exec 的跳板机都会拒绝 `request_subsystem("sftp")`）。实测
+/// 失败信息是 `SFTP session init failed: Timeout`，没有任何下一步提示。
+/// 刻意复用 `get_sftp_session` 的同一条路径——任何间接推断都可能与服务端
+/// 的真实行为不一致。
+pub async fn probe_sftp_subsystem(state: &AppState, session_id: &str) -> Result<(), String> {
+    // 握手本身就会失败/超时；拿到 session 后立刻丢掉，不做任何真实操作。
+    let _sftp = get_sftp_session(state, session_id).await?;
+    Ok(())
+}
+
 /// Expand a leading `~` to the user's absolute home directory.
 ///
 /// The SFTP protocol (and russh-sftp) treats `~` as a **literal** directory
@@ -221,6 +234,10 @@ pub(crate) struct TransferProgressPayload {
 pub(crate) struct TransferDonePayload {
     pub(crate) request_id: String,
     pub(crate) errors: Vec<String>,
+    /// 本次上传在远端创建的目录数（SFTP 拖拽上传的文件夹展开）。
+    /// 下载与 FTP 传输恒为 0 —— 前端据此决定完成提示的措辞
+    /// （「已创建 N 个目录」/「已上传 M 个文件」）。
+    pub(crate) created_dirs: usize,
 }
 
 /// Shared with ftp.rs — FTP transfers emit the SAME event contract so the
@@ -260,10 +277,240 @@ pub(crate) fn basename(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Upload a batch of local files into `remote_dest_dir` (resolved through
-/// `resolve_path` so `~` works). Overwrites existing remote files. Returns
-/// `Err` only on fatal failures (no SFTP session); per-file failures land in
-/// the `sftp_transfer_done` errors list.
+/// 一个待上传的本地文件。
+#[derive(Clone, Debug)]
+struct UploadTask {
+    local_path: String,
+    /// 相对目标目录的 POSIX 路径（如 "sub/deep/c.bin"）。
+    /// 远端拼接只用它，绝不让本地 `Path` 的分隔符进入远端路径。
+    relative: String,
+    size: u64,
+}
+
+/// 本地拖入项的展开结果。
+#[derive(Debug, Default)]
+struct UploadPlan {
+    /// 需要创建的远端目录（相对路径，父目录一定排在子目录之前）。
+    dirs: Vec<String>,
+    files: Vec<UploadTask>,
+    errors: Vec<String>,
+}
+
+/// 本地递归的深度熔断。
+///
+/// 这不是产品层数限制：正常目录树想多深就多深。它只为挡住符号链接成环
+/// （`a -> ..` 这类软链会让 `std::fs::metadata` 每层都跟回祖先，无限递归）。
+/// 与 `ssh.rs::walk_upload_dir`、`MAX_RECURSE_DEPTH` 同值。
+const MAX_UPLOAD_DEPTH: usize = 64;
+
+/// 远端绝对目录 + 相对路径 → 绝对路径，统一用 POSIX 分隔符。
+fn join_remote(dest: &str, rel: &str) -> String {
+    if dest.ends_with('/') {
+        format!("{}{}", dest, rel)
+    } else {
+        format!("{}/{}", dest, rel)
+    }
+}
+
+/// 把拖入的本地路径展开成「要建的目录」+「要传的文件」。
+///
+/// 每个拖入项以**自己的名字**成为目标目录下的一个根（`/a/src` → `<dest>/src`），
+/// 与单文件上传、ZMODEM 上传、主流客户端一致；不做「保留上级目录」那种
+/// 随场景变化的路径规则。
+///
+/// 同步实现（`std::fs`）：调用方用 `spawn_blocking` 包住整棵树的遍历，
+/// 几十万文件的目录不该占住 tokio worker。逻辑纯本地，可单测。
+fn plan_upload(paths: &[String]) -> UploadPlan {
+    let mut plan = UploadPlan::default();
+    for p in paths {
+        match std::fs::metadata(p) {
+            Ok(md) if md.is_file() => plan.files.push(UploadTask {
+                local_path: p.clone(),
+                relative: basename(p),
+                size: md.len(),
+            }),
+            Ok(md) if md.is_dir() => {
+                let root = Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("folder")
+                    .to_string();
+                plan.dirs.push(root.clone());
+                expand_upload_dir(Path::new(p), &root, &mut plan, 0);
+            }
+            Ok(_) => plan
+                .errors
+                .push(format!("{}: 不是文件或目录（已跳过）", basename(p))),
+            Err(e) => plan
+                .errors
+                .push(format!("{}: 读取本地信息失败: {}", basename(p), e)),
+        }
+    }
+    plan
+}
+
+/// 递归遍历一个本地目录，把子目录与文件按相对路径压入 `plan`。
+///
+/// 深度守卫写在这里（真正递归的函数内），不是写在外层入口——下载侧的
+/// `expand_dir_recursive` 记过这个教训：守卫放在只进入一次的外层等于从没生效。
+fn expand_upload_dir(dir: &Path, rel_prefix: &str, plan: &mut UploadPlan, depth: usize) {
+    if depth > MAX_UPLOAD_DEPTH {
+        plan.errors.push(format!(
+            "{}: 目录层级超过 {} 层，已跳过（可能是符号链接成环）",
+            rel_prefix, MAX_UPLOAD_DEPTH
+        ));
+        return;
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            plan.errors.push(format!("{}: 读取目录失败: {}", rel_prefix, e));
+            return;
+        }
+    };
+    // 名字排序：跨平台确定性（Windows 的 read_dir 顺序不保证稳定）。
+    let mut names: Vec<std::ffi::OsString> =
+        rd.filter_map(|e| e.ok().map(|e| e.file_name())).collect();
+    names.sort();
+    for fname in names {
+        let full = dir.join(&fname);
+        let disp = fname.to_string_lossy().into_owned();
+        let rel = format!("{}/{}", rel_prefix, disp);
+        // 跟随符号链接，与 ZMODEM 的 collect_upload_files 一致；环由深度熔断兜住。
+        match std::fs::metadata(&full) {
+            Ok(md) if md.is_dir() => {
+                plan.dirs.push(rel.clone());
+                expand_upload_dir(&full, &rel, plan, depth + 1);
+            }
+            Ok(md) if md.is_file() => plan.files.push(UploadTask {
+                local_path: full.to_string_lossy().into_owned(),
+                relative: rel,
+                size: md.len(),
+            }),
+            Ok(_) => plan
+                .errors
+                .push(format!("{}: 不是文件或目录（已跳过）", rel)),
+            Err(e) => plan
+                .errors
+                .push(format!("{}: 读取本地信息失败: {}", rel, e)),
+        }
+    }
+}
+
+/// 找出批次内重名的**目录**。
+///
+/// 只判目录：同名目录会在远端合并成一棵树（静默的本地数据混合），必须拦；
+/// 同名文件是既有的覆盖语义（Q8 已确认保持），单文件/多文件都照旧。
+/// 返回名字（用于提示），调用方另有 `duplicate_paths` 做精确剔除。
+fn find_duplicate_dirs(entries: &[(String, bool)]) -> Vec<String> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (name, is_dir) in entries {
+        if *is_dir {
+            *counts.entry(name.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut out: Vec<String> = counts
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// 拖拽上传前的冲突预检结果（序列化给前端）。
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictReport {
+    /// 解析后的远端目标绝对路径（`~` 已展开），上传直接用这个。
+    pub resolved_dest: String,
+    /// 目标目录是否存在且确实是目录。false 时前端应回退主目录。
+    pub dest_exists: bool,
+    /// 批次内重名的目录名（提示用）。
+    pub duplicate_dirs: Vec<String>,
+    /// 批次内重名、需要从本次上传中剔除的本地路径（精确到项）。
+    pub duplicate_paths: Vec<String>,
+    /// 远端已存在的同名目录名。
+    pub existing_dirs: Vec<String>,
+}
+
+/// 预检：目标目录是否可用、批次内有无重名目录、远端有无同名目录。
+///
+/// 纯只读：不建目录、不写文件、不碰 transfer 取消表。任一远端查询失败都
+/// 会在 `dest_exists` / 空列表上体现或直接返回 `Err`——调用方据此中止，
+/// 而不是在「不知道会不会覆盖」的情况下继续写。
+pub async fn check_dir_conflicts(
+    state: &AppState,
+    session_id: &str,
+    local_paths: &[String],
+    remote_dest_dir: &str,
+) -> Result<ConflictReport, String> {
+    let sftp = get_sftp_session(state, session_id).await?;
+    let dest = resolve_path(&sftp, remote_dest_dir).await?;
+
+    // 目标目录必须存在且是目录，否则后面每个 create_dir 都会失败。
+    // stat 失败（不存在 / 无权限）一律视为不可用，由调用方回退并提示。
+    let dest_exists = matches!(sftp.metadata(dest.as_str()).await, Ok(md) if md.is_dir());
+
+    // 本地类型分类。stat 失败的项在这里不报错——plan_upload 稍后会把它
+    // 变成一条 per-path error，不重复打扰。
+    // (完整路径, basename, 是否目录)
+    let mut entries: Vec<(String, String, bool)> = Vec::new();
+    for p in local_paths {
+        if let Ok(md) = tokio::fs::metadata(p).await {
+            entries.push((p.clone(), basename(p), md.is_dir()));
+        }
+    }
+
+    let dir_flags: Vec<(String, bool)> = entries
+        .iter()
+        .map(|(_, name, is_dir)| (name.clone(), *is_dir))
+        .collect();
+    let duplicate_dirs = find_duplicate_dirs(&dir_flags);
+    // 只剔除重名**目录**：同名文件是既有的覆盖语义，不能连带删掉。
+    let duplicate_paths: Vec<String> = entries
+        .iter()
+        .filter(|(_, name, is_dir)| *is_dir && duplicate_dirs.contains(name))
+        .map(|(path, _, _)| path.clone())
+        .collect();
+
+    // 冲突 = 远端已经有同名**目录**。用 stat（跟随符号链接）：指向目录的
+    // 软链在用户眼里就是个目录，提示与合并都该按这个事实工作。
+    // 同名但类型是文件的远端项不在这里报，交给 create_dir 失败的 per-path 错误。
+    let mut existing_dirs: Vec<String> = Vec::new();
+    if dest_exists {
+        for (_, name, is_dir) in &entries {
+            if !*is_dir || duplicate_dirs.contains(name) {
+                continue;
+            }
+            let remote = join_remote(&dest, name);
+            if matches!(sftp.metadata(remote).await, Ok(md) if md.is_dir()) {
+                existing_dirs.push(name.clone());
+            }
+        }
+    }
+    existing_dirs.sort();
+
+    Ok(ConflictReport {
+        resolved_dest: dest,
+        dest_exists,
+        duplicate_dirs,
+        duplicate_paths,
+        existing_dirs,
+    })
+}
+
+/// Upload a batch of local files and/or directories into `remote_dest_dir`
+/// (resolved through `resolve_path` so `~` works).
+///
+/// Directories are expanded locally into the tree they should recreate on the
+/// remote side: each dropped item becomes `<dest>/<its own name>` and is walked
+/// to the leaves. Existing remote directories are treated as already-created
+/// (merge semantics); same-named files overwrite, matching the single-file
+/// behavior that predates this function.
+///
+/// Returns `Err` only on fatal failures (no SFTP session); per-path failures
+/// land in the `sftp_transfer_done` errors list.
 pub async fn upload(
     state: &AppState,
     session_id: &str,
@@ -276,60 +523,129 @@ pub async fn upload(
     let sftp = get_sftp_session(state, session_id).await?;
     let dest = resolve_path(&sftp, remote_dest_dir).await?;
 
-    // Pre-stat: total files + bytes so the overlay shows a real progress bar.
-    // Non-files (dirs) violate the files-only contract — skip + record.
-    let mut errors: Vec<String> = Vec::new();
-    let mut tasks: Vec<String> = Vec::new();
-    let mut bytes_total: u64 = 0;
-    for lp in &local_paths {
-        match tokio::fs::metadata(lp).await {
-            Ok(md) if md.is_file() => {
-                bytes_total = bytes_total.saturating_add(md.len());
-                tasks.push(lp.clone());
+    // 本地展开放到 blocking 线程：整棵树遍历可能很久，不能占住 tokio worker。
+    let UploadPlan {
+        dirs,
+        files,
+        mut errors,
+    } = tokio::task::spawn_blocking(move || plan_upload(&local_paths))
+        .await
+        .map_err(|e| format!("本地目录展开失败: {}", e))?;
+
+    let file_total = files.len();
+    let bytes_total: u64 = files.iter().map(|t| t.size).sum();
+    let dir_total = dirs.len();
+
+    // ── 建目录阶段 ──────────────────────────────────────────────────
+    // `dirs` 是深度优先前序（父目录一定在子目录之前），而 SFTP 的
+    // create_dir 不递归——这个顺序是硬约束，不能改成并行。
+    //
+    // 父目录失败后，它的所有子目录与文件都必然失败。短路整棵子树，
+    // 否则一个 3 层目录会刷出几十条重复错误。
+    let mut failed_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut created_dirs = 0usize;
+    let mut cancelled_in_dirs = false;
+    for (i, rel) in dirs.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            errors.push("已取消".to_string());
+            cancelled_in_dirs = true;
+            break;
+        }
+        if let Some((parent, _)) = rel.rsplit_once('/') {
+            if failed_dirs.contains(parent) {
+                failed_dirs.insert(rel.clone());
+                continue;
             }
-            Ok(_) => errors.push(format!("{}: 不是文件（已跳过）", basename(lp))),
-            Err(e) => errors.push(format!("{}: 读取本地信息失败: {}", basename(lp), e)),
+        }
+        // 目录阶段也发进度：几千个目录时浮层不能一直停在「准备中…」。
+        emit_transfer_progress(
+            sink,
+            request_id,
+            "upload",
+            &format!("创建目录 {}/{}", i + 1, dir_total),
+            i,
+            dir_total,
+            0,
+            0,
+        );
+        let remote = join_remote(&dest, rel);
+        match sftp.create_dir(remote.as_str()).await {
+            Ok(()) => created_dirs += 1,
+            Err(e) => {
+                // 已存在的同名目录是正常情况（重新上传 / 用户选了「合并」）。
+                // create_dir 对它一定失败，所以失败后必须 stat 确认，否则
+                // 合并路径整棵树都建不起来。
+                if matches!(sftp.metadata(remote.as_str()).await, Ok(md) if md.is_dir()) {
+                    // 已存在，不算错误也不算新建。
+                } else {
+                    log::warn!("[sftp] create dir {} failed: {}", rel, e);
+                    errors.push(format!("{}: 创建目录失败: {}", rel, e));
+                    failed_dirs.insert(rel.clone());
+                }
+            }
         }
     }
-    let file_count = tasks.len();
 
+    // ── 传文件阶段 ──────────────────────────────────────────────────
+    // 建目录阶段已经取消过就不再进这个循环：否则会再推一条「已取消」。
     let mut bytes_done: u64 = 0;
-    for (i, lp) in tasks.iter().enumerate() {
+    let mut skipped_by_failed_dir = 0usize;
+    for (i, task) in files.iter().enumerate() {
+        if cancelled_in_dirs {
+            break;
+        }
         if cancel.load(Ordering::Relaxed) {
             errors.push("已取消".to_string());
             break;
         }
-        let name = basename(lp);
-        let remote_path = if dest.ends_with('/') {
-            format!("{}{}", dest, name)
-        } else {
-            format!("{}/{}", dest, name)
-        };
-
+        if let Some((parent, _)) = task.relative.rsplit_once('/') {
+            if failed_dirs.contains(parent) {
+                skipped_by_failed_dir += 1;
+                continue;
+            }
+        }
+        let name = basename(&task.local_path);
+        let remote = join_remote(&dest, &task.relative);
         let mut last_emit = Instant::now();
         emit_transfer_progress(
-            sink, request_id, "upload", &name, i, file_count, bytes_done, bytes_total,
+            sink, request_id, "upload", &name, i, file_total, bytes_done, bytes_total,
         );
         if let Err(e) = upload_one(
-            &sftp, sink, request_id, lp, &remote_path, i, file_count, bytes_total,
+            &sftp, sink, request_id, &task.local_path, &remote, i, file_total, bytes_total,
             &mut bytes_done, &mut last_emit, &cancel,
         )
         .await
         {
             errors.push(e);
-            if cancel.load(Ordering::Relaxed) { break; }
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
         }
+    }
+    if skipped_by_failed_dir > 0 {
+        errors.push(format!(
+            "{} 个文件因父目录创建失败而跳过",
+            skipped_by_failed_dir
+        ));
     }
 
     // Final tick so the overlay completes cleanly at 100%.
     emit_transfer_progress(
-        sink, request_id, "upload", "", file_count, file_count, bytes_done, bytes_total,
+        sink,
+        request_id,
+        "upload",
+        "",
+        file_total,
+        file_total,
+        bytes_done,
+        bytes_total,
     );
     sink.emit(
         "sftp_transfer_done",
         &TransferDonePayload {
             request_id: request_id.to_string(),
             errors,
+            created_dirs,
         },
     );
     Ok(())
@@ -711,6 +1027,8 @@ pub async fn download(
         &TransferDonePayload {
             request_id: request_id.to_string(),
             errors,
+            // 下载不建远端目录。
+            created_dirs: 0,
         },
     );
     Ok(())
@@ -793,4 +1111,211 @@ async fn download_one(
     // `remote` (SFTP read handle) is closed by its Drop impl on scope exit —
     // a read-only handle has no pending writes to drain.
     Ok(())
+}
+
+#[cfg(test)]
+mod upload_plan_tests {
+    use super::{find_duplicate_dirs, plan_upload};
+
+    /// 每个用例独立的临时根目录（按 tag 区分，跑完清理）。
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "myshell_upload_plan_{}_{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cleanup(root: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_tree_keeps_relative_paths_and_empty_dirs() {
+        let root = temp_root("nested");
+        std::fs::write(root.join("a.txt"), b"aaa").unwrap();
+        std::fs::create_dir_all(root.join("sub").join("deep")).unwrap();
+        std::fs::write(root.join("sub").join("b.txt"), b"bb").unwrap();
+        std::fs::write(root.join("sub").join("deep").join("c.bin"), b"cccc").unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        // 三层全空的目录链：三层都必须在 dirs 里，否则远端会缺层。
+        std::fs::create_dir_all(root.join("e1").join("e2").join("e3")).unwrap();
+
+        let plan = plan_upload(&[root.to_string_lossy().to_string()]);
+        assert!(plan.errors.is_empty(), "不应有错误: {:?}", plan.errors);
+
+        let name = root.file_name().unwrap().to_string_lossy().to_string();
+
+        // 文件的相对路径一律 POSIX 分隔，且保留层级。
+        let files: Vec<String> = plan.files.iter().map(|f| f.relative.clone()).collect();
+        assert_eq!(
+            files,
+            vec![
+                format!("{}/a.txt", name),
+                format!("{}/sub/b.txt", name),
+                format!("{}/sub/deep/c.bin", name),
+            ]
+        );
+        // bytes_total 由调用方求和，这里核对单文件尺寸来源正确。
+        let total: u64 = plan.files.iter().map(|f| f.size).sum();
+        assert_eq!(total, 3 + 2 + 4);
+
+        // 父目录一定排在子目录之前（create_dir 不递归，这是硬约束）。
+        for (i, rel) in plan.dirs.iter().enumerate() {
+            if let Some((parent, _)) = rel.rsplit_once('/') {
+                let parent_pos = plan
+                    .dirs
+                    .iter()
+                    .position(|d| d == parent)
+                    .unwrap_or_else(|| panic!("目录 {} 的父目录 {} 不在 dirs 里", rel, parent));
+                assert!(parent_pos < i, "父目录 {} 必须排在 {} 之前", parent, rel);
+            }
+        }
+        // 空目录必须出现（否则远端重建出来会缺目录）。
+        assert!(plan.dirs.iter().any(|d| d == &format!("{}/empty", name)));
+        assert!(plan.dirs.iter().any(|d| d == &format!("{}/e1/e2/e3", name)));
+        // 根目录自身也要建。
+        assert_eq!(plan.dirs.first().map(String::as_str), Some(name.as_str()));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn top_level_file_relative_is_just_its_name() {
+        let root = temp_root("flat");
+        let file = root.join("only.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let plan = plan_upload(&[file.to_string_lossy().to_string()]);
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        assert!(plan.dirs.is_empty());
+        assert_eq!(plan.files.len(), 1);
+        // 不能把本地的上级目录泄漏进远端路径。
+        assert_eq!(plan.files[0].relative, "only.txt");
+        assert_eq!(plan.files[0].size, 1);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn missing_path_is_a_per_item_error_not_a_failure() {
+        let plan = plan_upload(&["Z:\\definitely\\not\\here.abc".to_string()]);
+        assert!(plan.files.is_empty());
+        assert!(plan.dirs.is_empty());
+        assert_eq!(plan.errors.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_dirs_detected_only_for_directories() {
+        let entries = vec![
+            ("src".to_string(), true),
+            ("src".to_string(), true),
+            ("README.md".to_string(), false),
+            ("README.md".to_string(), false),
+            ("only".to_string(), true),
+        ];
+        // 同名文件走既有覆盖语义，不拦；只报同名目录。
+        assert_eq!(find_duplicate_dirs(&entries), vec!["src".to_string()]);
+    }
+
+    #[test]
+    fn duplicate_dirs_ignores_unique_names() {
+        let entries = vec![
+            ("a".to_string(), true),
+            ("b".to_string(), true),
+            ("a.txt".to_string(), false),
+        ];
+        assert!(find_duplicate_dirs(&entries).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod upload_conflict_tests {
+    use super::{find_duplicate_dirs, plan_upload};
+
+    /// 回归守卫：同名目录 + 同名文件混合时的剔除名单。
+    ///
+    /// 修前 bug：`check_dir_conflicts` 用「basename 命中 duplicate_dirs」筛
+    /// 剔除名单，会把同名的**文件**一起删掉（`/x/README.md` 与 `/x/src`、
+    /// `/y/src` 同时拖入时 README.md 被误剔）。修后只剔目录。
+    #[test]
+    fn duplicate_pruning_keeps_same_named_files() {
+        let root = std::env::temp_dir().join("myshell_upload_conflict_prune");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("x").join("src")).unwrap();
+        std::fs::create_dir_all(root.join("y").join("src")).unwrap();
+        std::fs::write(root.join("x").join("README.md"), b"a").unwrap();
+
+        let paths: Vec<String> = [
+            root.join("x").join("src"),
+            root.join("y").join("src"),
+            root.join("x").join("README.md"),
+        ]
+        .into_iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+        // 与 check_dir_conflicts 相同的本地分类逻辑。
+        let mut entries: Vec<(String, String, bool)> = Vec::new();
+        for p in &paths {
+            if let Ok(md) = std::fs::metadata(p) {
+                let name = super::basename(p);
+                entries.push((p.clone(), name, md.is_dir()));
+            }
+        }
+        let dir_flags: Vec<(String, bool)> = entries
+            .iter()
+            .map(|(_, name, is_dir)| (name.clone(), *is_dir))
+            .collect();
+        let duplicate_dirs = find_duplicate_dirs(&dir_flags);
+        let duplicate_paths: Vec<String> = entries
+            .iter()
+            .filter(|(_, name, is_dir)| *is_dir && duplicate_dirs.contains(name))
+            .map(|(path, _, _)| path.clone())
+            .collect();
+
+        assert_eq!(duplicate_dirs, vec!["src".to_string()]);
+        // 只有两个目录被剔除，同名文件必须留下。
+        assert_eq!(duplicate_paths.len(), 2);
+        assert!(duplicate_paths.iter().all(|p| p.ends_with("src")));
+        assert!(!duplicate_paths.iter().any(|p| p.ends_with("README.md")));
+
+        // 剔除后仍应有一个文件要传。
+        let remaining: Vec<&String> = paths
+            .iter()
+            .filter(|p| !duplicate_paths.contains(p))
+            .collect();
+        assert_eq!(remaining.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 回归守卫：顶层文件与顶层目录的 relative 语义不同。
+    ///
+    /// 修前 bug 的对照面：文件用 basename（不带任何目录），目录则要建出根
+    /// 目录本身。这条锁住「别为了统一把文件的 relative 也加上父目录」。
+    #[test]
+    fn file_and_dir_roots_have_different_shapes() {
+        let root = std::env::temp_dir().join("myshell_upload_conflict_shapes");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proj")).unwrap();
+        std::fs::write(root.join("proj").join("main.rs"), b"fn main(){}").unwrap();
+        std::fs::write(root.join("top.txt"), b"t").unwrap();
+
+        let plan = plan_upload(&[
+            root.join("proj").to_string_lossy().to_string(),
+            root.join("top.txt").to_string_lossy().to_string(),
+        ]);
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+
+        // 拖入的目录项以「自己的名字」为根，不带上层路径。
+        assert_eq!(plan.dirs, vec!["proj".to_string()]);
+        let files: Vec<&str> = plan.files.iter().map(|f| f.relative.as_str()).collect();
+        assert_eq!(files, vec!["proj/main.rs", "top.txt"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

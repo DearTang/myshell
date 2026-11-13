@@ -42,6 +42,16 @@ import { useConnectionDrag } from "@/composables/useConnectionDrag";
 
 defineOptions({ name: "AppSidebar" });
 
+/** 侧栏是否处于收起态。由壳层（App.vue）传入 —— 折叠入口在顶栏与侧栏顶排
+ *  两处（侧栏隐藏时顶栏那枚才可达），状态本身仍归 ui store。 */
+const props = defineProps<{
+  collapsed?: boolean;
+}>();
+
+const emit = defineEmits<{
+  "toggle-collapse": [];
+}>();
+
 // ── 文件夹树模型 ─────────────────────────────────────────────────────────────
 interface FolderNode {
   path: string;
@@ -510,12 +520,7 @@ function rowMenuDelete(c: ConnectionConfig): void {
 }
 
 // ── 壳层入口 ────────────────────────────────────────────────────────────────
-// 侧栏的收起/展开入口只保留顶栏最左一枚 ☰（AppTopBar.vue toggleSidebar），
-// 侧栏自身不再提供 —— 隐藏态下这里整个不可见，留着也没人点得到。
-function openQuickCommands(): void {
-  ui.qcInitialConnectionId = null;
-  ui.showQuickCommands = true;
-}
+// 快捷命令入口移至顶栏专用按钮（侧栏顶排原有一枚与之重复，已删）。
 const updateAvailable = computed(() => !!updateInfo.value?.has_update);
 function openAbout(): void {
   ui.about = { open: true, mode: "about" };
@@ -533,15 +538,21 @@ const dragHintTarget = computed<string | null>(() => {
 
 <template>
   <!-- 侧栏本体。
-       此前的「折叠态」是一整块 44px 窄条模板（品牌 Logo + 一枚展开钮），
-       现在 `ui.sidebarCollapsed` 的语义改为**完全隐藏**（壳层第一列归零 +
-       display:none），窄条随之删除 —— 收起/展开只由顶栏最左的 ☰ 负责，
-       侧栏里不该再有第二个入口。
-       组件本身没有 v-if：壳层用 display:none 隐藏，组件仍留在树上，
-       连接树的展开态 / 搜索词 / 右键菜单状态在隐藏再显示后原样还在。 -->
+       折叠态（ui.sidebarCollapsed）下**不写内联宽度**，由 app.css 的
+       .app-shell.sidebar-collapsed > .shell-side 规则接管（width:0 + min-width:0
+       + overflow:hidden + visibility:hidden）—— 内联样式优先级高于任何选择器，
+       照旧写死宽度会让折叠态永远压不掉 260px。
+       顶排那枚折叠/展开钮是唯一入口：侧栏宽度归零后顶排仍留 44px 高一条可见，
+       折叠钮照常可点，不需要顶栏兜底钮或左缘 hover 热区。
+       组件本身没有 v-if：折叠只是宽度归零，组件仍留在树上，连接树的展开态 /
+       搜索词 / 右键菜单状态在收起再展开后原样还在。 -->
   <div
     class="side"
-    :style="{ width: `${ui.sidebarWidth}px`, minWidth: `${ui.sidebarWidth}px` }"
+    :style="
+      props.collapsed
+        ? undefined
+        : { width: `${ui.sidebarWidth}px`, minWidth: `${ui.sidebarWidth}px` }
+    "
     @click="closeMenu"
     @contextmenu="onBlankContext"
   >
@@ -549,6 +560,7 @@ const dragHintTarget = computed<string | null>(() => {
            拼成窗口最上面同一整排（对齐 ompDesktop 的 .wb-logo 口径）。
            兼作窗口拖拽区：deep 表示整行空白处可拖，按钮自动豁免。 -->
     <div class="side-header" data-tauri-drag-region="deep">
+      <!-- 左：常规动作钮（贴合最左缘） -->
       <div class="header-actions">
         <MyIconButton
           :title="isDark ? '切换到亮色模式' : '切换到暗色模式'"
@@ -558,14 +570,8 @@ const dragHintTarget = computed<string | null>(() => {
           :name="isDark ? 'Sunny' : 'Moon'"
           @click="toggleTheme"
         />
-        <MyIconButton
-          title="快捷命令"
-          class="icon-btn"
-          label="快捷命令"
-          size="15"
-          name="MagicStick"
-          @click="openQuickCommands"
-        />
+        <!-- 快捷命令入口只在顶栏（闪电图标）：侧栏顶排原有一枚与顶栏
+             重复（同一视觉行出现两次，用户实报），删除以换顶排宽度。 -->
         <!-- 设置入口只在顶栏（右上角），此处不再重复，避免头部一行过挤 -->
         <MyIconButton
           title="刷新"
@@ -600,9 +606,23 @@ const dragHintTarget = computed<string | null>(() => {
           @click="handleAddNew()"
         />
       </div>
+
+      <!-- 右：侧栏收起/展开（与 ompDesktop 同构：常规动作贴最左，折叠钮单独靠右）。
+           这一枚是**唯一**的折叠入口 —— 侧栏折叠态改为宽度归零而非 display:none
+           （见 app.css 的 .app-shell.sidebar-collapsed），所以折叠后它仍然可点，
+           不需要顶栏兜底钮，也不需要在壳层左缘埋 hover 热区。 -->
+      <MyIconButton
+        :title="props.collapsed ? '显示侧栏' : '隐藏侧栏'"
+        class="icon-btn"
+        :label="props.collapsed ? '显示侧栏' : '隐藏侧栏'"
+        size="15"
+        :name="props.collapsed ? 'Expand' : 'Fold'"
+        :aria-expanded="!props.collapsed"
+        @click="emit('toggle-collapse')"
+      />
     </div>
 
-    <!-- 搜索框（MyInput：small + 前缀图标 + 内建清除） -->
+    <!-- 搜索框（MyInput：small + 前缀图标 + 内建清除）。 -->
     <div class="search-box">
       <MyInput
         v-model="searchQuery"
@@ -617,7 +637,9 @@ const dragHintTarget = computed<string | null>(() => {
       <div v-if="searchQuery" class="search-count">找到 {{ filteredConnections.length }} 个连接</div>
     </div>
 
-    <!-- 连接树列表 -->
+    <!-- 连接列表：树形（分组层级 + 徽标 + 拖拽）。列表/网格两种平铺视图已移除
+         —— 用户要求侧栏只走树形；平铺在连接量大时丢掉分组语义，且树形本身
+         已支持折叠/展开，覆盖了那两种视图的使用场景。 -->
     <div class="list" @contextmenu="onBlankContext">
       <!-- 拖拽横幅：说明手势语义 + 当前落点，用户永远不必猜 -->
       <div v-if="isDragging" class="drag-hint">
@@ -627,6 +649,7 @@ const dragHintTarget = computed<string | null>(() => {
         <span v-else class="drag-hint-none">当前目标：移到文件夹上以选择</span>
       </div>
 
+      <!-- 树形视图：扁平化 rows（文件夹层级 + 徽标 + 拖拽全保留） -->
       <template v-for="row in rows" :key="row.key">
         <!-- 文件夹行：data-folder-path 供拖拽 elementFromPoint 命中测试 -->
         <div
@@ -825,6 +848,9 @@ const dragHintTarget = computed<string | null>(() => {
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation, 180%));
   border-right: 1px solid var(--glass-border);
+  /* 与顶栏同款顶部高光：整排由「侧栏顶排 + 顶栏」拼成，缺一侧会让接缝处
+     出现半条亮边。 */
+  box-shadow: var(--glass-highlight);
   display: flex;
   flex-direction: column;
 }
@@ -835,8 +861,10 @@ const dragHintTarget = computed<string | null>(() => {
   flex-shrink: 0;
   height: var(--chrome-top-height);
   box-sizing: border-box;
-  padding: 0 8px;
-  border-bottom: 1px solid var(--border-subtle);
+  padding: 0 6px;
+  /* 与顶栏（.app-topbar）同款 --glass-border：此前这里是 --border-subtle，
+     两者在整排接缝处一深一浅，拼不成一条连续线。 */
+  border-bottom: 1px solid var(--glass-border);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -851,19 +879,35 @@ const dragHintTarget = computed<string | null>(() => {
 }
 .header-actions {
   display: flex;
-  gap: 2px;
+  gap: 1px;
   align-items: center;
-  /* 兜底：更窄时在头部内换行，而不是借 .side 的
-     overflow:visible 溢出面板（骑跨按钮需要 visible） */
-  flex-wrap: wrap;
+  /* 不换行（用户实报：拉宽 30px 后顶排仍折成两行）。放不下时靠按钮
+     压缩吸收；min-width:0 + flex:1 让本容器优先吃掉全部收缩，右侧
+     折叠钮（flex-shrink:0）因此永不被挤裁。 */
+  flex-wrap: nowrap;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 /* 头部动作钮：外观（悬停/按下/禁用/焦点环）由 MyIconButton 承担，
-   这里只把尺寸压到侧栏密度，并保留静止态的次级文字色——
-   tertiary 在 --bg-elevated 上仅 ~3.8:1，暗色下整排图标会糊成一团灰。 */
+   这里只把尺寸压到侧栏密度，并规定静止态的文字色。
+   用 --text-primary 而非 --text-secondary：浅色模式下 secondary
+   （oklch 0.45）压在 0.985 的玻璃上约 4.3:1，图标视觉发虚（用户实报
+   「浅色模式图标对比度不够」）；primary 浅色 0.2（约 9.6:1）、
+   暗色 0.92，两档都清晰。 */
 .icon-btn {
-  width: 28px;
+  /* flex-basis 28px 默认尺寸、min-width 24px 压缩下限：侧栏 200px 最窄时
+     5 钮 + 间隙 + 折叠钮 + 内边距 ≈ 165px 仍单行；再窄由图标微缩吸收
+     而不是换行。折叠钮（.side-header 直接子项）另见 .side-header 里的
+     flex-shrink:0 —— 它永不压缩，压缩全由 .header-actions 吸收。 */
+  flex: 0 1 28px;
+  min-width: 24px;
   height: 28px;
-  color: var(--text-secondary);
+  color: var(--text-primary);
+}
+.side-header > .icon-btn {
+  /* 折叠/展开钮：整行唯一入口，被裁掉用户就出不来了（用户实报「展开
+     收起没有展示完整」）。永不收缩，也不允许被动作钮挤偏。 */
+  flex-shrink: 0;
 }
 /* 悬停/按下改用强调色系（库的默认是中性 bg-elevated）：
    「悬停变主色」是本项目一贯的可用性反馈，标题栏与命令栏一致。 */

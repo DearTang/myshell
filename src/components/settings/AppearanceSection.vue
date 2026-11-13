@@ -1,10 +1,10 @@
-<!-- 外观 — 配色方案 / 背景图片 / 终端字体 / 终端渲染（旧 appearance 分区） -->
+<!-- 外观 — 界面（深浅/主题色/字号/实心度/动效）/ 终端配色 / 背景（四模式）/ 终端字体 / 终端渲染 -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { MyButton, MyIcon, MySection, MySegmented, MySlider, MyToggle } from "myui";
-import { readFileBase64 } from "@/api";
-import { compressImageDataUrl } from "@/utils/image";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { MyButton, MyIcon, MyIconButton, MySection, MySegmented, MySlider, MyToggle } from "myui";
+import { importWallpaper } from "@/api";
 import {
   appearance,
   setPaletteId,
@@ -12,6 +12,7 @@ import {
   clearCustomPalette,
   setBgImage,
   setSolidity,
+  setAccentHue,
 } from "@/store/appearance";
 import {
   ui,
@@ -31,34 +32,67 @@ import {
   readGpuDisabled,
   type RendererBackend,
 } from "@/composables/useRendererPref";
-import { PRESETS, type ColorPalette } from "@/themes";
+import { PRESETS, type BackgroundMode, type ColorPalette } from "@/themes";
 import FontField from "@/components/FontField.vue";
 import CustomPaletteDialog from "./CustomPaletteDialog.vue";
+import {
+  APPEARANCE_THEMES_MAX,
+  applyAppearanceValues,
+  appearanceThemeNameTaken,
+  appearanceThemesWithinBudget,
+  appearanceValuesEqual,
+  newAppearanceThemeId,
+  readAppearanceValues,
+  validAppearanceThemeName,
+  type AppearanceTheme,
+} from "@/utils/appearanceThemes";
+import { getAppearanceThemes, setAppearanceThemes } from "@/store/appearance";
+import { confirmDialog, promptDialog, toast } from "myui";
 
 defineOptions({ name: "AppearanceSection" });
 
-// 背景透明度滑杆范围。与下方 MySlider 的 min/max 保持同步。
-const BG_OPACITY_MIN = 10;
-const BG_OPACITY_MAX = 100;
-
 // ── 界面通用设置（字号 / 实心度 / 动效 / 深浅）──
 
-/** 实心度滑杆的百分比区间：下限 = 设计基线的玻璃质感，上限 = 完全不透明。
- *  与 ompDesktop 同一套口径。**不能**直接把 solidity×100 当显示值：
- *  solidity 0 会显示成 0%（被 el-slider 的 min=40 夹住），而真正的基线
- *  玻璃 alpha 是 0.55 —— 滑杆位置与实际透明度脱节（实测默认值 0.25 显示成
- *  40%，但玻璃 alpha 是 0.6625）。 */
+/** 界面实心度滑杆：40–100，压缩映射到 solidity 0–1（**ompDesktop 同口径**）。
+ *
+ *  40% = 最透档（solidity 0，壳层 alpha 取 app.css 的 --glass-alpha 基线），
+ *  100% = 完全不透明。omp 把下限夹在 40 是刻意的：最低位仍保留一层可见的
+ *  玻璃底，不会出现「滑杆拉到头、壳层变成一层几乎不存在的薄膜」。
+ *
+ *  曾改成一比一的 0–100%（2026-11-10，理由「读数即真实不透明度」），但用户
+ *  比对 ompDesktop 后要求外观配置方式与它一致，故改回压缩区间。
+ *  副作用是 40% 的读数不等于真实 alpha（真实值由各档基线公式算出），这与
+ *  omp 完全一致 —— 用户已按 omp 的口径接受这个读数语义。 */
 const OPACITY_MIN_PERCENT = 40;
 const OPACITY_MAX_PERCENT = 100;
+/** 弹窗实心度滑杆的下限：浮层压在文字上，不允许比这更透。 */
+const POPUP_MIN_PERCENT = 40;
+
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, value));
+}
 
 function solidityToPercent(solidity: number): number {
-  const ratio = Math.min(1, Math.max(0, solidity));
-  return Math.round(OPACITY_MIN_PERCENT + ratio * (OPACITY_MAX_PERCENT - OPACITY_MIN_PERCENT));
+  return Math.round(
+    OPACITY_MIN_PERCENT + clamp01(solidity) * (OPACITY_MAX_PERCENT - OPACITY_MIN_PERCENT),
+  );
 }
 
 function percentToSolidity(percent: number): number {
   const bounded = Math.min(OPACITY_MAX_PERCENT, Math.max(OPACITY_MIN_PERCENT, percent));
   return (bounded - OPACITY_MIN_PERCENT) / (OPACITY_MAX_PERCENT - OPACITY_MIN_PERCENT);
+}
+
+/** 弹窗档：40–100 压缩映射（40 → solidity 0，100 → solidity 1）。 */
+function popupSolidityToPercent(solidity: number): number {
+  return Math.round(
+    POPUP_MIN_PERCENT + clamp01(solidity) * (OPACITY_MAX_PERCENT - POPUP_MIN_PERCENT),
+  );
+}
+
+function percentToPopupSolidity(percent: number): number {
+  const bounded = Math.min(OPACITY_MAX_PERCENT, Math.max(POPUP_MIN_PERCENT, percent));
+  return (bounded - POPUP_MIN_PERCENT) / (OPACITY_MAX_PERCENT - POPUP_MIN_PERCENT);
 }
 
 const uiOpacityPercent = computed({
@@ -67,8 +101,8 @@ const uiOpacityPercent = computed({
 });
 
 const popupOpacityPercent = computed({
-  get: () => solidityToPercent(appearance.popupSolidity),
-  set: (v: number) => setSolidity({ popup: percentToSolidity(v) }),
+  get: () => popupSolidityToPercent(appearance.popupSolidity),
+  set: (v: number) => setSolidity({ popup: percentToPopupSolidity(v) }),
 });
 
 function onDarkToggle(v: string | number | boolean): void {
@@ -91,18 +125,14 @@ function onMotionToggle(v: string | number | boolean): void {
   setMotionEnabled(Boolean(v));
 }
 
-// ── 配色方案 ──
+// ── 配色方案（预设只管终端 16 色；界面颜色由主题色滑杆 + 深浅决定）──
 const showCustomDialog = ref(false);
-const customAccent = ref(
-  appearance.customPalette?.dark.ui?.["--accent-primary"]?.toString() || "#6366f1",
-);
 const customBg = ref(appearance.customPalette?.dark.terminal?.background || "#1e1e2e");
 
 const HEX_3_RE = /^#[0-9a-fA-F]{3}$/;
 const HEX_6_RE = /^#[0-9a-fA-F]{6}/;
 const HEX_VALID_RE = /^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/;
 
-const accentValid = computed(() => HEX_VALID_RE.test(customAccent.value.trim()));
 const bgValid = computed(() => HEX_VALID_RE.test(customBg.value.trim()));
 
 function presetVariant(preset: ColorPalette): ColorPalette["dark"] {
@@ -115,9 +145,8 @@ function choosePreset(id: string): void {
 }
 
 function saveCustomPalette(): void {
-  // 先规范化为 7 位 #RRGGBB 再追加 alpha 后缀（"cc"、"26"...）。
-  // "#RGB" 缩写或 "#RRGGBBAA" 之类的自由文本若不处理，会拼出非法 CSS
-  // 颜色（如 "#fffcc"），被浏览器静默丢弃。
+  // 规范化为 7 位 #RRGGBB："#RGB" 缩写或自由文本若不处理，会拼出非法
+  // CSS 颜色，被 xterm 静默丢弃。
   const normHex = (hex: string): string => {
     const h = hex.trim();
     if (HEX_3_RE.test(h)) {
@@ -132,80 +161,184 @@ function saveCustomPalette(): void {
     }
     return HEX_6_RE.test(h) ? h.slice(0, 7) : h;
   };
-  const accent = normHex(customAccent.value);
   const bg = normHex(customBg.value);
   const id = `custom-${Date.now()}`;
+  // 自定义预设只覆盖终端背景色，其余 16 色沿用 Carbon 基线 ——
+  // UI 颜色已不由预设携带（主题色滑杆管强调色族）。
   const palette: ColorPalette = {
     id,
     name: "自定义主题",
-    dark: {
-      terminal: { ...PRESETS[0].dark.terminal, background: bg },
-      ui: {
-        ...PRESETS[0].dark.ui,
-        "--accent-primary": accent,
-        "--accent-primary-hover": accent + "cc",
-        "--accent-primary-muted": accent + "26",
-        "--border-accent": accent + "66",
-        "--shadow-glow": `0 0 20px ${accent}40`,
-        "--bg-base": bg,
-      },
-    },
-    light: {
-      terminal: { ...PRESETS[0].light.terminal, background: bg },
-      ui: {
-        ...PRESETS[0].light.ui,
-        "--accent-primary": accent,
-        "--accent-primary-hover": accent + "cc",
-        "--accent-primary-muted": accent + "1a",
-        "--border-accent": accent + "66",
-        "--shadow-glow": `0 0 20px ${accent}33`,
-      },
-    },
+    dark: { terminal: { ...PRESETS[0].dark.terminal, background: bg } },
+    light: { terminal: { ...PRESETS[0].light.terminal, background: bg } },
   };
   setCustomPalette(palette);
   setPaletteId(id);
   showCustomDialog.value = false;
 }
 
-// ── 背景图片（先预览后应用的本地状态） ──
-const bgOpacity = ref(appearance.bgImage.opacity * 100);
-const bgImageBusy = ref(false);
+// ── 主题色（--accent-hue，0-360 色相）──
+/** 色相轨道渐变：与 oklch 色相环一致（0° 红 → 120° 绿 → 240° 蓝 → 360° 红），
+ *  滑杆下方常驻展示，用户不必猜「210 是什么颜色」。 */
+const HUE_TRACK_GRADIENT =
+  "linear-gradient(to right, oklch(0.72 0.15 0), oklch(0.72 0.15 60), oklch(0.72 0.15 120), oklch(0.72 0.15 180), oklch(0.72 0.15 240), oklch(0.72 0.15 300), oklch(0.72 0.15 360))";
 
+function onAccentHueChange(v: number | number[]): void {
+  setAccentHue(Array.isArray(v) ? v[0] : v);
+}
+
+// ── 背景（四模式：glow / grid / image / none）──
+const BG_MODE_OPTIONS = [
+  { label: "光晕", value: "glow" },
+  { label: "网格", value: "grid" },
+  { label: "壁纸", value: "image" },
+  { label: "无", value: "none" },
+];
+
+const BG_MODE_HINTS: Record<string, string> = {
+  glow: "主题色环境光晕（默认）：顶部两团柔和渐变，跟随「主题色」滑杆变色。",
+  grid: "细网格纹理：1px 线按 32px 间距平铺，工程图纸气质。",
+  image: "本地壁纸：导入时收进应用自管目录（不放 localStorage），设壁纸后壳层自动进入透出模式。",
+  none: "纯底色：不加任何背景图形。",
+};
+
+/** 强度（0.05-0.8）。滑杆显示为百分比（5-80）。 */
+const bgOpacity = computed(() => appearance.bgImage.opacity);
+const bgImageBusy = ref(false);
+/** 导入按钮文案：三态（导入中/已有壁纸换图/无壁纸选图），替代模板里的链式三元。 */
+const bgImportLabel = computed(() => {
+  if (bgImageBusy.value) return "导入中...";
+  return appearance.bgImage.image ? "更换壁纸" : "选择壁纸";
+});
+function onBgModeChange(v: string | number | boolean): void {
+  if (typeof v !== "string") return;
+  setBgImage({ ...appearance.bgImage, mode: v as BackgroundMode });
+}
+
+function onOpacityChange(v: number | number[]): void {
+  const percent = Array.isArray(v) ? v[0] : v;
+  setBgImage({ ...appearance.bgImage, opacity: Math.min(0.8, Math.max(0.05, percent / 100)) });
+}
+
+/** 选图 → Rust 导入自管目录 → convertFileSrc 生成 asset URL。
+ *  导入而非直读的原因（asset scope / URL 缓存 / 原图被移）见 wallpaper.rs。 */
 async function pickBgImage(): Promise<void> {
   bgImageBusy.value = true;
   try {
     const selected = await open({
       multiple: false,
-      filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"] }],
+      filters: [
+        { name: "图片", extensions: ["png", "jpg", "jpeg", "webp", "gif", "bmp", "avif"] },
+      ],
     });
     if (selected && !Array.isArray(selected)) {
-      const raw = await readFileBase64(selected);
-      // 存储前先压缩：多 MB 照片的原始 base64 会撑爆 localStorage 的
-      // ~5 MB 配额（setItem 抛错被静默吞掉，图片永远不落盘）。
-      // 降采样到 ≤1920px + JPEG 可稳定控制在配额以内。
-      const dataUrl = await compressImageDataUrl(raw);
-      // 立即自动应用
-      setBgImage({ dataUrl: dataUrl, opacity: bgOpacity.value / 100 });
+      const stored = await importWallpaper(selected);
+      setBgImage({
+        mode: "image",
+        image: convertFileSrc(stored),
+        opacity: appearance.bgImage.opacity,
+      });
     }
   } catch (e) {
-    console.error("Failed to read image:", e);
+    console.error("壁纸导入失败:", e);
   } finally {
     bgImageBusy.value = false;
   }
 }
 
-function onOpacityChange(v: number | number[]): void {
-  const val = Array.isArray(v) ? v[0] : v;
-  bgOpacity.value = val;
-  // 已有背景图时实时更新透明度
-  if (appearance.bgImage.dataUrl) {
-    setBgImage({ dataUrl: appearance.bgImage.dataUrl, opacity: val / 100 });
-  }
+function clearBgImage(): void {
+  setBgImage({ mode: "image", image: "", opacity: appearance.bgImage.opacity });
 }
 
-function clearBgImage(): void {
-  setBgImage({ dataUrl: null, opacity: 1 });
-  bgOpacity.value = 85;
+// ── 外观主题快照（当前全套外观固化成命名主题，一键切换）──
+const themes = ref<AppearanceTheme[]>(getAppearanceThemes());
+const currentValues = computed(() =>
+  readAppearanceValues({ appearance, ui: { themeChoice: ui.themeChoice, uiFontPx: ui.uiFontPx, motionEnabled: ui.motionEnabled } }),
+);
+/** 当前外观与哪套主题完全一致；不一致为 null（调乱后无高亮）。 */
+const activeThemeId = computed(
+  () => themes.value.find((t) => appearanceValuesEqual(t.values, currentValues.value))?.id ?? null,
+);
+const atThemeLimit = computed(() => themes.value.length >= APPEARANCE_THEMES_MAX);
+
+function persistThemes(next: AppearanceTheme[]): void {
+  themes.value = next;
+  setAppearanceThemes(next);
+}
+
+function applyTheme(theme: AppearanceTheme): void {
+  applyAppearanceValues(
+    {
+      setThemeChoice,
+      setPaletteId,
+      setAccentHue,
+      setSolidity,
+      setUiFontPx,
+      setMotionEnabled,
+      setBgImage,
+    },
+    theme.values,
+  );
+  toast(`已切换到「${theme.label}」`, { type: "success" });
+}
+
+async function saveTheme(): Promise<void> {
+  if (atThemeLimit.value) {
+    toast(`最多保存 ${APPEARANCE_THEMES_MAX} 套主题`, { type: "warning" });
+    return;
+  }
+  const name = await promptDialog({
+    title: "保存当前外观为主题",
+    message: "把当前全部外观设置（深浅/主题色/实心度/字号/背景/终端配色）存为命名主题",
+    inputPlaceholder: "例如：白天工作台",
+    inputValidator: (value: string) => {
+      if (!validAppearanceThemeName(value)) return "名称不能为空（40 字以内）";
+      if (appearanceThemeNameTaken(value, themes.value)) return "已有同名主题";
+      return true;
+    },
+  });
+  if (name === null) return;
+  const label = name.trim();
+  if (!validAppearanceThemeName(label)) {
+    toast("名称不能为空（40 字以内）", { type: "warning" });
+    return;
+  }
+  const theme: AppearanceTheme = { id: newAppearanceThemeId(), label, values: currentValues.value };
+  // 壁纸若是历史遗留的 data URL，单条就可能上百 KB —— 落库前先挡一道
+  if (!appearanceThemesWithinBudget(themes.value, theme)) {
+    toast("主题存储超预算（壁纸过大），请先在「背景」里重选壁纸", { type: "warning" });
+    return;
+  }
+  persistThemes([...themes.value, theme]);
+  toast("主题已保存", { type: "success" });
+}
+
+/** 把当前外观写回某套主题（调乱之后的「保存修改」）。 */
+function updateTheme(theme: AppearanceTheme): void {
+  const next = themes.value.map((t) =>
+    t.id === theme.id ? { ...t, values: currentValues.value } : t,
+  );
+  if (
+    !appearanceThemesWithinBudget(
+      themes.value.filter((t) => t.id !== theme.id),
+      { ...theme, values: currentValues.value },
+    )
+  ) {
+    toast("主题存储超预算（壁纸过大），请先在「背景」里重选壁纸", { type: "warning" });
+    return;
+  }
+  persistThemes(next);
+  toast(`已更新「${theme.label}」`, { type: "success" });
+}
+
+async function removeTheme(theme: AppearanceTheme): Promise<void> {
+  const confirmed = await confirmDialog({
+    title: "删除主题",
+    message: `删除「${theme.label}」？界面当前外观不会变，只是少了一套可一键切换的快照。`,
+    type: "warning",
+  });
+  if (!confirmed) return;
+  persistThemes(themes.value.filter((t) => t.id !== theme.id));
+  toast("主题已删除", { type: "success" });
 }
 
 // ── 终端渲染：渲染后端 + GPU 开关。 ──
@@ -232,7 +365,7 @@ function onGpuToggle(v: string | number | boolean): void {
 }
 
 const RENDERER_OPTIONS: { id: RendererBackend; label: string; desc: string }[] = [
-  { id: "auto", label: "自动（推荐）", desc: "默认 Canvas，透明背景时用 WebGL" },
+  { id: "auto", label: "自动（推荐）", desc: "WebGL（终端背景透明，需 GPU 合成；不可用时自动回退 Canvas）" },
   { id: "canvas", label: "Canvas", desc: "最稳定，光标/选区直接画在画布上" },
   { id: "webgl", label: "WebGL", desc: "性能最佳，依赖 GPU 合成" },
   { id: "dom", label: "DOM", desc: "最轻量，仅聚焦时显示光标" },
@@ -268,9 +401,42 @@ function onRendererChange(v: string | number | boolean): void {
     <div class="setting-row">
       <div class="setting-text">
         <div class="setting-title">暗色模式</div>
-        <div class="setting-desc">切换深浅主题，33 套配色各自带深浅两套变体。</div>
+        <div class="setting-desc">切换深浅主题。终端配色预设各自带深浅两套变体。</div>
       </div>
       <MyToggle :model-value="ui.isDark" @update:model-value="onDarkToggle" />
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-text">
+        <div class="setting-title">主题色</div>
+        <div class="setting-desc">
+          界面强调色族（按钮 / 选中态 / 光晕 / 玻璃底色）的色相，深浅两档自动适配。
+        </div>
+      </div>
+      <div class="setting-control hue-control">
+        <div class="slider-slot">
+          <MySlider
+            :model-value="appearance.accentHue"
+            :min="0"
+            :max="360"
+            :step="5"
+            unit="°"
+            aria-label="主题色色相"
+            @update:model-value="onAccentHueChange"
+          />
+        </div>
+        <button
+          type="button"
+          class="reset-link"
+          title="恢复默认（青绿 180°）"
+          @click="onAccentHueChange(180)"
+        >
+          复位
+        </button>
+      </div>
+      <!-- 色相轨道渐变条：滑杆本体的轨道是主题色画不出来的（每个位置颜色
+           都不同），常驻一条参考带，用户看到 210 ≈ 蓝就不用试错。 -->
+      <div class="hue-track" :style="{ background: HUE_TRACK_GRADIENT }" aria-hidden="true" />
     </div>
 
     <div class="setting-row">
@@ -303,7 +469,8 @@ function onRendererChange(v: string | number | boolean): void {
       <div class="setting-text">
         <div class="setting-title">界面实心度</div>
         <div class="setting-desc">
-          越低越透（壁纸/底色透出顶栏、侧栏与 AI 栏），拉满为完全不透明。
+          顶栏 / 侧栏 / 底栏 / AI 栏的实心度。40% 为最透档（仍保留一层薄玻璃，
+          保证终端文字压在壁纸上可读），拉满为完全不透明。
         </div>
       </div>
       <div class="setting-control">
@@ -352,8 +519,39 @@ function onRendererChange(v: string | number | boolean): void {
     </div>
   </MySection>
 
+  <!-- 外观主题（命名快照）：把上面的全部外观控件固化成一套，一键切换 -->
+  <MySection
+    title="外观主题"
+    description="保存当前全套外观为命名主题（深浅/主题色/实心度/字号/背景/终端配色），跨场景一键切换。"
+  >
+    <div v-if="themes.length === 0" class="theme-empty">还没有保存过主题 —— 调好上面各项后点「保存当前为主题」。</div>
+    <ul v-else class="theme-list">
+      <li v-for="theme in themes" :key="theme.id" class="theme-row">
+        <span class="theme-name" :title="theme.label">{{ theme.label }}</span>
+        <span v-if="activeThemeId === theme.id" class="theme-active">当前</span>
+        <span class="theme-flex" />
+        <MyButton size="small" variant="primary" @click="applyTheme(theme)">切换</MyButton>
+        <MyButton size="small" variant="secondary" title="用当前外观覆盖这套主题" @click="updateTheme(theme)">更新</MyButton>
+        <MyIconButton
+          title="删除主题"
+          label="删除主题"
+          size="14"
+          name="Delete"
+          @click="removeTheme(theme)"
+        />
+      </li>
+    </ul>
+    <div class="theme-actions">
+      <span class="theme-count">{{ themes.length }} / {{ APPEARANCE_THEMES_MAX }}</span>
+      <MyButton size="small" variant="primary" :disabled="atThemeLimit" @click="saveTheme">
+        <MyIcon :size="13" name="Plus" />
+        保存当前为主题
+      </MyButton>
+    </div>
+  </MySection>
+
   <!-- 配色方案 -->
-  <MySection title="配色方案" description="选择预设配色方案，同步更新终端和界面颜色">
+  <MySection title="终端配色" description="预设只管终端 16 色；界面颜色由上方「主题色」与深浅模式决定">
     <div class="preset-grid">
       <MyButton
         v-for="preset in PRESETS"
@@ -369,14 +567,11 @@ function onRendererChange(v: string | number | boolean): void {
             class="preset-dot"
             :style="{ background: presetVariant(preset).terminal.background }"
           >
-            <!-- 色板底部的强调色条 -->
+            <!-- 色板底部的光标色条：预设不再携带 UI 变量后，用终端光标色
+                 （各套预设的强调色）做视觉区分。 -->
             <span
               class="preset-dot-bar"
-              :style="{
-                background:
-                  presetVariant(preset).ui?.['--accent-primary'] ||
-                  (ui.isDark ? '#6366f1' : '#4f46e5'),
-              }"
+              :style="{ background: presetVariant(preset).terminal.cursor }"
             />
           </span>
           <span class="preset-name">{{ preset.name }}</span>
@@ -394,84 +589,78 @@ function onRendererChange(v: string | number | boolean): void {
       <span class="custom-entry-icon">
         <MyIcon :size="14" name="Brush" />
       </span>
-      {{ appearance.customPalette ? "管理自定义主题" : "自定义主题..." }}
+      {{ appearance.customPalette ? "管理自定义主题" : "自定义终端配色..." }}
     </MyButton>
 
     <!-- 自定义主题对话框 -->
     <CustomPaletteDialog
       v-if="showCustomDialog"
-      v-model:accent="customAccent"
       v-model:bg="customBg"
-      :accent-valid="accentValid"
       :bg-valid="bgValid"
       @save="saveCustomPalette"
       @close="showCustomDialog = false"
     />
   </MySection>
 
-  <!-- 背景图片 -->
-  <MySection
-    title="背景图片"
-    description="作为整窗壁纸铺在最底层，顶栏 / 侧栏 / AI 栏按「界面实心度」透出它。图片会压缩后存进本地存储。"
-  >
-    <MyButton
-      variant="secondary"
-      class="block-btn"
-      :disabled="bgImageBusy"
-      @click="pickBgImage"
-    >
-      <MyIcon :size="14" name="Picture" />
-      {{ bgImageBusy ? "选择中..." : appearance.bgImage.dataUrl ? "更换图片" : "选择图片" }}
-    </MyButton>
 
-    <!-- 图片预览缩略图 -->
-    <div
-      v-if="appearance.bgImage.dataUrl"
-      class="bg-preview"
-      :style="{
-        backgroundImage: `url(${appearance.bgImage.dataUrl})`,
-        opacity: bgOpacity / 100,
-      }"
+  <!-- 背景（四模式：glow 光晕 / grid 网格 / image 壁纸 / none） -->
+  <MySection
+    title="背景"
+    description="整窗背景层的绘制方式；壁纸之外还有光晕与网格两种程序化背景，不占存储。"
+  >
+    <MySegmented
+      :model-value="appearance.bgImage.mode"
+      :options="BG_MODE_OPTIONS"
+      size="small"
+      @update:model-value="onBgModeChange"
     />
 
-    <!-- 状态 -->
-    <div class="bg-status" :class="{ ok: !!appearance.bgImage.dataUrl }">
-      <span class="bg-status-icon">
-        <MyIcon :size="13" :icon="appearance.bgImage.dataUrl ? 'CircleCheck' : 'Picture'" />
-      </span>
-      <span>
-        {{
-          appearance.bgImage.dataUrl
-            ? `已设置背景 (透明度: ${Math.round(bgOpacity)}%)`
-            : "未设置背景图片"
-        }}
-      </span>
-    </div>
+    <div class="bg-mode-hint">{{ BG_MODE_HINTS[appearance.bgImage.mode] }}</div>
 
-    <!-- 透明度滑杆 — 实时应用 -->
+    <!-- 壁纸导入（仅 image 模式）：经 Rust 命令收进自管目录，localStorage
+         只存 asset 路径 —— 旧版把 base64 塞 localStorage，大图直接撑爆配额。 -->
+    <template v-if="appearance.bgImage.mode === 'image'">
+      <div class="bg-image-row">
+        <MyButton variant="secondary" :disabled="bgImageBusy" @click="pickBgImage">
+          <MyIcon :size="14" name="Picture" />
+          {{ bgImportLabel }}
+        </MyButton>
+        <MyButton
+          v-if="appearance.bgImage.image"
+          variant="ghost"
+          class="clear-btn"
+          @click="clearBgImage"
+        >
+          移除壁纸
+        </MyButton>
+      </div>
+
+      <div
+        v-if="appearance.bgImage.image"
+        class="bg-preview"
+        :style="{ backgroundImage: `url(${appearance.bgImage.image})` }"
+      />
+    </template>
+
+    <!-- 背景强度：image 模式 = 壁纸清晰度（越低越模糊）；glow/grid = 图形浓度 -->
     <div class="opacity-block">
       <div class="opacity-head">
-        <label class="opacity-label">透明度</label>
-        <span class="opacity-value">{{ Math.round(bgOpacity) }}%</span>
+        <label class="opacity-label">
+          {{ appearance.bgImage.mode === "image" ? "壁纸清晰度" : "背景强度" }}
+        </label>
+        <span class="opacity-value">{{ Math.round(bgOpacity * 100) }}%</span>
       </div>
       <MySlider
-        :model-value="bgOpacity"
-        :min="BG_OPACITY_MIN"
-        :max="BG_OPACITY_MAX"
+        :model-value="Math.round(bgOpacity * 100)"
+        :min="5"
+        :max="80"
         :step="1"
         @update:model-value="onOpacityChange"
       />
+      <div v-if="appearance.bgImage.mode === 'image'" class="opacity-note">
+        拉满清晰度会同时减薄雾层并调低壳层玻璃基线（顶栏 / 侧栏 / 工作区），壁纸更明显；再调低「界面实心度」可进一步透出。
+      </div>
     </div>
-
-    <!-- 清除按钮 -->
-    <MyButton
-      variant="ghost"
-      class="block-btn clear-btn"
-      :disabled="!appearance.bgImage.dataUrl"
-      @click="clearBgImage"
-    >
-      清除背景图片
-    </MyButton>
   </MySection>
 
   <!-- 终端字体 -->
@@ -532,6 +721,10 @@ function onRendererChange(v: string | number | boolean): void {
    标签区可换行、控件区固定宽度不挤压说明文字）。 */
 .setting-row {
   display: flex;
+  /* 允许换行：主题色行的渐变参考带要独占第二行（flex-basis:100%）；
+     单行 flex 里 100% 宽子项会参与主轴分配，把 setting-text（min-width:0）
+     挤成 0 宽 → 标题逐字竖排。普通行宽度足够时不会触发换行。 */
+  flex-wrap: wrap;
   align-items: flex-start;
   justify-content: space-between;
   gap: 24px;
@@ -580,6 +773,21 @@ function onRendererChange(v: string | number | boolean): void {
 .slider-slot {
   width: 200px;
   flex-shrink: 0;
+}
+
+/* 主题色滑杆行：控件行 + 下方全宽色相渐变参考带（渐变由脚本内联写入，
+   这里只管布局）。setting-row 是 flex 行，渐变带作为行的第三个子元素
+   占满整行宽度，与上方滑杆对齐。 */
+.hue-control {
+  flex-wrap: wrap;
+}
+.hue-track {
+  /* 换行后独占一行；不用 width:100%（单行 flex 里语义不同） */
+  flex-basis: 100%;
+  height: 6px;
+  margin-top: 6px;
+  border-radius: 3px;
+  opacity: 0.75;
 }
 
 .reset-link {
@@ -763,6 +971,31 @@ function onRendererChange(v: string | number | boolean): void {
   color: var(--error);
 }
 
+.opacity-note {
+  margin-top: 6px;
+  font-size: var(--fs-2xs);
+  color: var(--text-tertiary);
+  line-height: 1.6;
+}
+
+
+.bg-mode-hint {
+  margin-top: 8px;
+  font-size: var(--fs-2xs);
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+
+.bg-image-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+/* 行内的「移除壁纸」与选图按钮同排，不吃块级 clear-btn 的上边距。 */
+.bg-image-row .clear-btn {
+  margin-top: 0;
+}
 .clear-btn:disabled {
   color: var(--text-muted);
 }
@@ -823,5 +1056,70 @@ function onRendererChange(v: string | number | boolean): void {
   color: var(--text-muted);
   margin-top: 3px;
   line-height: 1.5;
+}
+
+/* ── 外观主题面板 ── */
+.theme-empty {
+  padding: 16px;
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+.theme-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.theme-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  font-size: var(--fs-xs);
+}
+
+.theme-name {
+  min-width: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.theme-active {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border-radius: var(--radius-full);
+  font-size: var(--fs-2xs);
+  color: var(--accent-primary);
+  background: var(--accent-primary-muted);
+}
+
+.theme-flex {
+  flex: 1;
+}
+
+.theme-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.theme-count {
+  font-size: var(--fs-2xs);
+  color: var(--text-tertiary);
 }
 </style>

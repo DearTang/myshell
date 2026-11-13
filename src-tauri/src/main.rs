@@ -3468,8 +3468,242 @@ fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-// ============ SSH Server Info ============
+// ============ Port Forwarding ============
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForwardRuleView {
+    id: String,
+    name: String,
+    connection_id: String,
+    /// "local" | "remote"
+    direction: String,
+    bind_host: String,
+    bind_port: u16,
+    target_host: String,
+    target_port: u16,
+    enabled: bool,
+    created_at: String,
+    /// Live tunnel snapshot when the rule is running; None when stopped.
+    tunnel: Option<forward::TunnelStatus>,
+}
+
+impl ForwardRuleView {
+    fn from_row(row: db::PortForwardRow, tunnel: Option<forward::TunnelStatus>) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            connection_id: row.connection_id,
+            direction: row.direction,
+            bind_host: row.bind_host,
+            bind_port: row.bind_port,
+            target_host: row.target_host,
+            target_port: row.target_port,
+            enabled: row.enabled,
+            created_at: row.created_at,
+            tunnel,
+        }
+    }
+}
+
+/// Every stored rule plus its live tunnel state. Does NOT require an unlocked
+/// vault: rules are plaintext by design (see `db::save_port_forward`), so the
+/// settings panel can list them before unlock.
+#[tauri::command]
+fn forward_list_rules(state: State<'_, AppState>) -> Result<Vec<ForwardRuleView>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let rows = db::list_port_forwards(&db).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let tunnel = state.port_forwards.status(&r.id);
+            ForwardRuleView::from_row(r, tunnel)
+        })
+        .collect())
+}
+
+/// Create or update a rule. `id` empty means "new" (a UUID is minted here);
+/// a non-empty id updates in place, which is how the edit dialog works.
+#[tauri::command]
+fn forward_save_rule(
+    state: State<'_, AppState>,
+    rule: ForwardRuleView,
+) -> Result<String, String> {
+    let id = if rule.id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        rule.id.clone()
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::save_port_forward(
+        &db,
+        &id,
+        &rule.name,
+        &rule.connection_id,
+        &rule.direction,
+        &rule.bind_host,
+        rule.bind_port,
+        &rule.target_host,
+        rule.target_port,
+        rule.enabled,
+        &now,
+    )?;
+    Ok(id)
+}
+
+#[tauri::command]
+async fn forward_delete_rule(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    // Stop first: deleting a running rule's DB row while its listener is
+    // still bound would orphan the socket with no way to stop it. Reuse the
+    // same teardown as `forward_stop` so the rule's dedicated SSH connection
+    // is dropped too.
+    teardown_tunnel(&state, &id).await;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::delete_port_forward(&db, &id)
+}
+
+#[tauri::command]
+fn forward_set_enabled(
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::set_port_forward_enabled(&db, &id, enabled)
+}
+
+/// Start a tunnel. Resolves the rule's connection, dials a dedicated SSH
+/// session for it, then binds (local) or asks the server to listen (remote).
+///
+/// The tunnel owns its own SSH connection rather than reusing a terminal
+/// tab's session: a forward must outlive the tab it was configured from, and
+/// sharing a session would make closing that tab silently kill the tunnel.
+#[tauri::command]
+async fn forward_start(state: State<'_, AppState>, id: String) -> Result<u16, String> {
+    let row = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db::get_port_forward(&db, &id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "规则不存在".to_string())?
+    };
+    let rule = forward::ForwardRule {
+        id: row.id,
+        name: row.name,
+        connection_id: row.connection_id.clone(),
+        direction: row.direction,
+        bind_host: row.bind_host,
+        bind_port: row.bind_port,
+        target_host: row.target_host,
+        target_port: row.target_port,
+        enabled: row.enabled,
+        created_at: row.created_at,
+    };
+
+    // Credentials follow the same precedence as ssh_connect: typed values win,
+    // otherwise resolve from the keyring by connection id.
+    let key = require_dek(&state)?;
+    let mut config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db::get_connection(&db, &key, &row.connection_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "该规则引用的连接已不存在".to_string())?
+    };
+    if config.conn_type != "local" && config.password.is_none() {
+        config.password = secrets::get_password(&config.id, &key)?.map(|p| p.to_string());
+    }
+    if config.conn_type != "local" && config.proxy_password.is_none() && config.proxy_type != "none" {
+        config.proxy_password =
+            secrets::get_proxy_password(&config.id, &key)?.map(|p| p.to_string());
+    }
+    drop(key);
+
+    // A dedicated dial: no PTY, no shell, no tab. `hold_startup` is irrelevant
+    // here — the session never spawns a channel reader, so nothing holds bytes.
+    //
+    // The handle is wrapped once and shared: the session registry keeps a
+    // clone so `forward_stop` / `disconnect` can reach it (to cancel a
+    // server-side listener), and the tunnel task clones the same Arc.
+    let handle = Arc::new(ssh::dial_and_authenticate(&state, &config, false).await?);
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    // Register the handle under a synthetic session id so the manager's
+    // teardown path (which keys off session ids) can find and release it.
+    {
+        let mut sessions = state.ssh_sessions.lock().map_err(|e| e.to_string())?;
+        sessions.insert(
+            session_id.clone(),
+            ssh::SshSession {
+                handle: Arc::clone(&handle),
+                config: Arc::new(config),
+                // No reader task owns this session, so the command channel is
+                // never polled. A dead sender is harmless: nothing sends.
+                command_tx: {
+                    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                    tx
+                },
+            },
+        );
+    }
+
+    let port = match rule.direction.as_str() {
+        "remote" => state
+            .port_forwards
+            .start_remote(&rule, &handle, &session_id)
+            .await?,
+        _ => state
+            .port_forwards
+            .start_local(&rule, &handle, &session_id)
+            .await?,
+    };
+    log::info!(
+        "[fwd:{}] {} tunnel up on {}:{} → {}:{}",
+        rule.id,
+        rule.direction,
+        rule.bind_host,
+        port,
+        rule.target_host,
+        rule.target_port
+    );
+    Ok(port)
+}
+
+/// Tear a tunnel down completely: drop its bookkeeping, then disconnect the
+/// SSH connection it dialled (see `forward_start`).
+///
+/// `ssh::disconnect` already releases the server-side listener and stops any
+/// remaining tunnels bound to that session, so no separate `release_remote`
+/// call is needed here.
+///
+/// Skipping the disconnect leaked one live SSH connection plus its
+/// `ssh_sessions` map entry on every start/stop cycle; the handle stayed open
+/// for the process lifetime.
+async fn teardown_tunnel(state: &AppState, id: &str) {
+    // Snapshot the tunnel's synthetic session ids BEFORE `stop()`: `stop`
+    // clears the session bindings, so they are unreachable afterwards.
+    let session_ids: Vec<String> = {
+        state
+            .port_forwards
+            .session_owner_snapshot()
+            .into_iter()
+            .filter(|(rid, _)| rid == id)
+            .map(|(_, sid)| sid)
+            .collect()
+    };
+    // Drop the tunnel's bookkeeping first so no new connection is accepted.
+    state.port_forwards.stop(id);
+    for sid in session_ids {
+        let _ = ssh::disconnect(state, &sid).await;
+    }
+}
+
+#[tauri::command]
+async fn forward_stop(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    teardown_tunnel(&state, &id).await;
+    Ok(())
+}
+
+// ============ SSH Server Info ============
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerInfo {
@@ -3506,6 +3740,20 @@ struct ServerInfo {
     /// Utilization percent (0–100) of the busiest partition — drives the
     /// usage-bar color threshold in the UI.
     disk_max_pct: f32,
+    /// Aggregate disk I/O throughput in bytes/sec across hardware-backed
+    /// block devices (partitions and stacked virtual devices excluded).
+    /// Two consecutive `/proc/diskstats` samples over the same 1s window as
+    /// the CPU samples, so the numbers are directly comparable.
+    disk_read_bps: u64,
+    disk_write_bps: u64,
+    /// Aggregate network throughput in bytes/sec across physical NICs
+    /// (`/proc/net/dev`, `lo` and virtual devices excluded).
+    net_rx_bps: u64,
+    net_tx_bps: u64,
+    /// TCP-connect round-trip to the host's own loopback in milliseconds.
+    /// A cheap liveness/latency signal that needs no extra tooling.
+    /// 0 when the measurement failed (no /dev/tcp, restricted shell).
+    latency_ms: u32,
     /// True when the last refresh timed out — the frontend should grey out
     /// the values to signal staleness.
     stale: bool,
@@ -3527,15 +3775,45 @@ struct ServerInfo {
 /// - `=DM=` keeps `df -h` human-readable strings per partition so we can
 ///   surface the busiest partition's size/used without lossy byte→unit
 ///   reformatting in Rust.
+///
+/// `=N1=` / `=N2=` and `=D1=` / `=D2=` are the two-sample pairs for network
+/// and disk throughput, taken either side of the same `sleep 1` that feeds
+/// the CPU samples — one round-trip, three rates.
+///
+/// Network filters to physical NICs: `/proc/net/dev` lists `lo` plus every
+/// virtual device (docker0, veth*, br-*, tun*). Summing them all double- or
+/// triple-counts container traffic, so the awk skips `lo`, `veth`, `docker`,
+/// `br-`, `tun`, `tap`, and `virbr` prefixes. `/proc/net/dev` has no
+/// interface-count field to filter against, so prefix matching is the
+/// pragmatic option; a missed exotic name shows up as a slightly higher
+/// rate, never a wrong connection.
+///
+/// Disk filters to whole disks: `/proc/diskstats` field 1 is the device
+/// name, and a partition is `<disk><number>` (sda1). We count a device only
+/// when its name has no trailing digit AND its name isn't in the stacked
+/// set (`dm-`, `md`, `loop`, `ram`, `sr`, `zram`) — otherwise `sda` + `sda1`
+/// both count the same bytes, and an LVM/LUKS stack counts them a third and
+/// fourth time. Sector counts are converted with `*512`.
+///
+/// Latency uses bash's `/dev/tcp` when the shell has it (bash, not dash —
+/// hence the `command -v bash` guard). One connect + immediate close to
+/// 127.0.0.1:22, timed with `date +%s%N`. 0 on any failure path: a
+/// restricted shell without /dev/tcp reports nothing rather than a bogus
+/// number.
 const SERVER_INFO_SCRIPT: &str = r#"echo "=OS="; (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -sr
 echo "=K="; uname -r
 echo "=C="; nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo
 echo "=M="; awk '/^(MemTotal|MemAvailable|MemFree|Buffers|Cached|SReclaimable):/' /proc/meminfo 2>/dev/null || LC_ALL=C free -b 2>/dev/null
 echo "=DT="; df -B1 2>/dev/null | awk 'NR>1 && $1 ~ /^\/dev\// {print $2,$3}'
 echo "=DM="; df -h 2>/dev/null | awk 'NR>1 && $1 ~ /^\/dev\// {sub(/%/,"",$5); print $1,$2,$3,$5,$6}'
+echo "=N1="; awk 'NR>2 {sub(/:/,"",$1); if ($1 !~ /^(lo|veth|docker|br-|tun|tap|virbr)/) {r+=$2; t+=$10}} END {print r+0, t+0}' /proc/net/dev 2>/dev/null
+echo "=D1="; awk '$3 !~ /[0-9]$/ && $3 !~ /^(dm-|md|loop|ram|sr|zram)/ {r+=$6; w+=$10} END {print (r+0)*512, (w+0)*512}' /proc/diskstats 2>/dev/null
 echo "=S1="; head -n1 /proc/stat
 sleep 1
-echo "=S2="; head -n1 /proc/stat"#;
+echo "=S2="; head -n1 /proc/stat
+echo "=N2="; awk 'NR>2 {sub(/:/,"",$1); if ($1 !~ /^(lo|veth|docker|br-|tun|tap|virbr)/) {r+=$2; t+=$10}} END {print r+0, t+0}' /proc/net/dev 2>/dev/null
+echo "=D2="; awk '$3 !~ /[0-9]$/ && $3 !~ /^(dm-|md|loop|ram|sr|zram)/ {r+=$6; w+=$10} END {print (r+0)*512, (w+0)*512}' /proc/diskstats 2>/dev/null
+echo "=L="; if command -v bash >/dev/null 2>&1; then s=$(date +%s%N); (exec 3<>/dev/tcp/127.0.0.1/22) 2>/dev/null && exec 3>&- 2>/dev/null; e=$(date +%s%N); echo $(( (e - s) / 1000000 )); else echo 0; fi"#;
 
 #[tauri::command]
 async fn ssh_get_server_info(
@@ -3549,7 +3827,28 @@ async fn ssh_get_server_info(
     .await
     {
         Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(e),
+        Ok(Err(e)) => {
+            // The probe runs over the same SSH connection as the terminal but
+            // on its own exec channel. When the transport is gone the raw
+            // russh string ("Open exec channel failed: Channel send error")
+            // reaches the status bar verbatim and tells the user nothing —
+            // and on a MaxSessions=1 account the channel can't be opened even
+            // after a successful reconnect. One actionable sentence, with the
+            // underlying error kept in parentheses for bug reports.
+            let e = if e.contains("Open exec channel failed")
+                || e.contains("exec failed")
+            {
+                format!(
+                    "无法读取服务器信息：当前 SSH 连接已失效，或该账号不允许额外会话通道。\n\
+                     请点击终端里的「重新连接」；若反复出现，说明该服务器限制单会话，服务器信息条将不可用。\n\
+                     （底层：{}）",
+                    e
+                )
+            } else {
+                e
+            };
+            return Err(e);
+        }
         // On timeout, return a stale snapshot so the UI can grey it out
         // instead of erroring the whole panel.
         Err(_) => {
@@ -3569,6 +3868,11 @@ async fn ssh_get_server_info(
                 disk_max_size: String::new(),
                 disk_max_used: String::new(),
                 disk_max_pct: 0.0,
+                disk_read_bps: 0,
+                disk_write_bps: 0,
+                net_rx_bps: 0,
+                net_tx_bps: 0,
+                latency_ms: 0,
                 stale: true,
             });
         }
@@ -3740,6 +4044,18 @@ fn parse_server_info(raw: &str) -> ServerInfo {
         cpu_busy_pct(s1, s2)
     };
 
+    // =N1= / =N2= and =D1= / =D2= are "rx tx" / "read written" byte pairs
+    // either side of the same 1s sleep the CPU samples straddle, so the
+    // derived rates share one denominator and one window.
+    let (net_rx_bps, net_tx_bps) = rate_pair(section(raw, "=N1="), section(raw, "=N2="));
+    let (disk_read_bps, disk_write_bps) = rate_pair(section(raw, "=D1="), section(raw, "=D2="));
+
+    let latency_ms = section(raw, "=L=")
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+
     ServerInfo {
         os_pretty,
         kernel,
@@ -3756,8 +4072,33 @@ fn parse_server_info(raw: &str) -> ServerInfo {
         disk_max_size,
         disk_max_used,
         disk_max_pct,
+        disk_read_bps,
+        disk_write_bps,
+        net_rx_bps,
+        net_tx_bps,
+        latency_ms,
         stale: false,
     }
+}
+
+/// Per-second delta between two "a b" counter lines.
+///
+/// The script's two samples are exactly 1s apart (`sleep 1`), so the delta
+/// IS the rate. Counters are monotonic per boot; a reset (interface flap,
+/// device hot-remove) makes the second sample smaller — `saturating_sub`
+/// yields 0 rather than a u64 underflow, which would surface as an absurd
+/// multi-exabyte rate.
+fn rate_pair(s1: &str, s2: &str) -> (u64, u64) {
+    let parse = |s: &str| -> Option<(u64, u64)> {
+        let v: Vec<&str> = s.split_whitespace().collect();
+        if v.len() < 2 {
+            return None;
+        }
+        Some((v[0].parse().ok()?, v[1].parse().ok()?))
+    };
+    let Some((a1, b1)) = parse(s1) else { return (0, 0) };
+    let Some((a2, b2)) = parse(s2) else { return (0, 0) };
+    (a2.saturating_sub(a1), b2.saturating_sub(b1))
 }
 
 /// Compute CPU busy % between two /proc/stat `cpu` aggregate lines. The
@@ -3886,6 +4227,53 @@ mod server_info_tests {
         assert_eq!(info.mem_total_bytes, 0);
         assert_eq!(info.mem_used_bytes, 0);
         assert_eq!(info.mem_usage_pct, 0.0);
+    }
+
+    /// 两个采样点相隔 1 秒，差值即速率。这里锁住「N1/N2、D1/D2 的
+    /// rx/tx、read/write 列没有串位」——awk 里 $2/$10、$6/$10 的列号是
+    /// /proc/net/dev 与 /proc/diskstats 的隐式契约，改错列号不会报错，
+    /// 只会让速率变成另一个计数器的差值。
+    #[test]
+    fn rate_pairs_map_rx_tx_and_read_write() {
+        // N: 第一列 rx、第二列 tx；D: 第一列 read、第二列 written。
+        let raw = "=N1=\n1000 500\n=D1=\n2000 800\n=N2=\n3000 1200\n=D2=\n20000 8000\n";
+        let info = parse_server_info(raw);
+        assert_eq!(info.net_rx_bps, 2000, "rx 差值错位");
+        assert_eq!(info.net_tx_bps, 700, "tx 差值错位");
+        assert_eq!(info.disk_read_bps, 18000, "read 差值错位");
+        assert_eq!(info.disk_write_bps, 7200, "write 差值错位");
+    }
+
+    /// 计数器归零（网卡重置 / 设备热拔）时第二个样本更小。saturating_sub
+    /// 必须把它读成 0 而不是 u64 下溢 —— 下溢会渲染出每秒数百 EB 的
+    /// 速率，比显示 0 难查得多。
+    #[test]
+    fn rate_pairs_saturate_on_counter_reset() {
+        let raw = "=N1=\n5000 9000\n=N2=\n100 200\n";
+        let info = parse_server_info(raw);
+        assert_eq!(info.net_rx_bps, 0, "计数器回绕产生了下溢速率");
+        assert_eq!(info.net_tx_bps, 0);
+    }
+
+    /// 缺段 / 垃圾段 → 0，不 panic。
+    #[test]
+    fn rate_pairs_missing_sections_are_zero() {
+        let info = parse_server_info("=N1=\ngarbage\n=N2=\nnot numbers\n");
+        assert_eq!(info.net_rx_bps, 0);
+        assert_eq!(info.net_tx_bps, 0);
+        assert_eq!(info.disk_read_bps, 0);
+        assert_eq!(info.disk_write_bps, 0);
+    }
+
+    /// 延迟：正常毫秒数透传；非数字（受限 shell 输出了空行或报错）归零。
+    #[test]
+    fn latency_parses_and_degrades_to_zero() {
+        let ok = parse_server_info("=L=\n3\n");
+        assert_eq!(ok.latency_ms, 3);
+        let bad = parse_server_info("=L=\n\n");
+        assert_eq!(bad.latency_ms, 0);
+        let garbage = parse_server_info("=L=\n/dev/tcp: not found\n");
+        assert_eq!(garbage.latency_ms, 0);
     }
 }
 
@@ -4044,6 +4432,45 @@ async fn sftp_upload(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()).remove(&request_id);
     result
+}
+
+/// 拖拽上传前的只读预检：目标目录是否可用、批次内有无重名目录、远端有无
+/// 同名目录。不做任何写入，也不登记取消表。见 `sftp::check_dir_conflicts`。
+#[tauri::command]
+async fn sftp_check_dir_conflicts(
+    session_id: String,
+    local_paths: Vec<String>,
+    remote_dest_dir: String,
+    state: State<'_, AppState>,
+) -> Result<sftp::ConflictReport, String> {
+    sftp::check_dir_conflicts(&state, &session_id, &local_paths, &remote_dest_dir).await
+}
+
+/// 探测服务端的上传能力（SFTP 子系统 / lrzsz / 包管理器），结果按 session 缓存。
+/// 拖拽上传据此选择通道；两条路都不可用时返回带安装命令的提示。
+/// 见 `ssh::probe_upload_capabilities`。
+#[tauri::command]
+async fn probe_upload_capabilities(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<ssh::UploadCapabilities, String> {
+    // 命中缓存直接返回：探测要开一次子系统 + 一次 exec 往返，不该每次拖拽都跑。
+    if let Some(cached) = state
+        .upload_caps
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&session_id)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+    let caps = ssh::probe_upload_capabilities(&state, &session_id).await;
+    state
+        .upload_caps
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session_id, caps.clone());
+    Ok(caps)
 }
 
 /// Batch-download remote files/folders into a local dir. Folders are expanded
@@ -5320,6 +5747,8 @@ pub fn run() {
         zmodem_files: Arc::new(Mutex::new(HashMap::new())),
         dek: Arc::new(Mutex::new(None)),
         transfer_cancels: Arc::new(Mutex::new(HashMap::new())),
+        port_forwards: Arc::new(forward::ForwardManager::new()),
+        upload_caps: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = tauri::Builder::default()
@@ -5396,6 +5825,14 @@ pub fn run() {
             update_quick_command,
             update_quick_command_order,
             delete_quick_command,
+            forward_list_rules,
+            forward_save_rule,
+            forward_delete_rule,
+            forward_set_enabled,
+            forward_start,
+            forward_stop,
+            wallpaper::import_wallpaper,
+            wallpaper::import_wallpaper_data,
             ssh_connect,
             ssh_send,
             ssh_resize,
@@ -5419,6 +5856,8 @@ pub fn run() {
             sftp_remove,
             sftp_rename,
             sftp_upload,
+            sftp_check_dir_conflicts,
+            probe_upload_capabilities,
             sftp_download,
             sftp_cancel_transfer,
             ftp_connect,
@@ -5855,6 +6294,10 @@ fn handle_ipc_connection(
                                     // granted "allow this session" — the frontend
                                     // skips its confirmation dialog.
                                     "session_allowed": cmd["session_allowed"].as_bool().unwrap_or(false),
+                                    // Forwarded caller identity: the frontend keys
+                                    // per-process terminal tabs by this (each MCP
+                                    // client process gets its own persistent shell).
+                                    "client_pid": cmd["client_pid"].as_u64().unwrap_or(0),
                                 });
                                 if let Err(e) = ipc_handle.emit("mcp-gui-command", payload) {
                                     // Clean up the pending entry on emit failure.

@@ -32,6 +32,8 @@ pub mod redact;
 pub mod mcp_tools;
 pub mod command_rules;
 pub mod path_safety;
+pub mod forward;
+pub mod wallpaper;
 
 // ============ Event Sink (emitter abstraction) ============
 
@@ -271,6 +273,14 @@ pub struct AppState {
     /// The frontend sets the flag via `sftp_cancel_transfer`; the download/upload
     /// loop checks it between 32 KB chunks and breaks early when true.
     pub transfer_cancels: Arc<Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// Live SSH port-forwarding tunnels, keyed by rule id. Holds the listener
+    /// accept loop (local direction) or the server-side forward request
+    /// (remote direction) plus per-tunnel byte counters for the UI.
+    pub port_forwards: Arc<forward::ForwardManager>,
+    /// 每个 SSH 会话的上传能力探测结果（SFTP / lrzsz / 包管理器）。
+    /// 按 session_id 缓存：服务端不会在会话中途装/卸软件，重连换 session
+    /// 自然失效，所以不做 TTL。`None` = 尚未探测（或探测未跑完）。
+    pub upload_caps: Arc<Mutex<HashMap<String, ssh::UploadCapabilities>>>,
 }
 
 /// Track open file handles for streaming ZMODEM file IO. Each transfer is
@@ -359,6 +369,8 @@ mod tests {
             zmodem_files: Arc::new(Mutex::new(HashMap::new())),
             dek: Arc::new(Mutex::new(None)),
             transfer_cancels: Arc::new(Mutex::new(HashMap::new())),
+            port_forwards: Arc::new(forward::ForwardManager::new()),
+            upload_caps: Arc::new(Mutex::new(HashMap::new())),
         };
         let err = require_dek(&state).expect_err("locked vault must not yield a key");
         assert_eq!(err, "Vault 未解锁");
