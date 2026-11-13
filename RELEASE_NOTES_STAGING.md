@@ -14,6 +14,4 @@
 
 ## 待发布条目
 
-baseline: v2.20.1
-- 🛠️ MCP 命令恢复可见性：instructions 与 exec_channel schema 收窄 pipe 通道引导（此前「命令长/含管道分号/heredoc 就用 pipe」导致 AI 大量命令静默执行、用户在终端窗口完全看不到），现仅在写凭据或 gui 结果损坏时才允许 pipe，gui（可见）成为强默认
-- 🛠️ 「MCP 高危已放行」会话放行指示器从顶栏迁到命令栏（用户指定位置：命令输入框右侧、快捷按钮左侧，点击撤销）
+baseline: v2.20.2
