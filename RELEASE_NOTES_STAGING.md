@@ -14,4 +14,4 @@
 
 ## 待发布条目
 
-- [BUG] 修复安装版设置壁纸后不渲染:CSP `connect-src` 漏放行 asset 域,壁纸可达性预检的 HEAD fetch 被无条件拦截,`applyBgImage` 永远判定不可用而退回光晕底;补上 `http(s)://asset.localhost` 后 dev 与安装版行为一致(dev 无 CSP 响应头故此前未暴露)
+baseline: v2.20.2
