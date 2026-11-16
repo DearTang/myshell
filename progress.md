@@ -10078,3 +10078,14 @@ html[data-translucent="1"] {
   panic 在「session 决策必须留下会话授权」这一行。
 - **注意**:instructions 变更要 AI 客户端重连 MCP(重启会话)才生效;
   已安装的旧 myshell-mcp.exe 需重新构建才带修复。
+
+### 阶段 249 -- 发布 v2.20.4（MCP 放行授权 + 降级可见性）
+
+- 2.20.4(patch,2 条 🐛):session 决策未 grant 导致重复确认;GUI 降级不再静默。
+  https://gitee.com/argustang/myshell/releases/tag/v2.20.4
+- 流水线 push 步第五次挂在凭据上(`askpass` 禁用,脚本不读 token),照例用
+  `.gitee-token` 一次性 `insteadOf` 补推 main + tag;三处 SHA 核对一致
+  (main / tag 解引用 / HEAD 均为 60e0aba)。
+- **clear 步 baseline 误写 bug 第五次复现**:节内写 v2.20.4、头部第 7 行仍留
+  v2.20.3。已手动修正头部。该 bug 已连续 5 个版本出现,建议尽快修
+  ~/.omp/agent/skills/myTools-packageTauri/ 里的 clear 逻辑(应同时更新头部那行)。
