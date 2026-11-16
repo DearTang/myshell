@@ -10031,3 +10031,23 @@ html[data-translucent="1"] {
   sidebar)全部实跑。临时探针 `dialog-probe.{html,ts}` 已删。
 - **注意**:`node_modules/.vite` 必须清一次 —— myui 换了 scopeId 族,旧预构建会让
   所有 myui 组件样式静默失效(阶段 195 踩过)。本次已清。
+
+### 阶段 247 -- 发布 v2.20.3（myui v1.9.1 集成）
+
+- 2.20.3(patch,2 条 🛠️ + 1 条 🐛):myui v1.6.1 → v1.9.1、浮层宽度修复、
+  回收站图标语义。
+  https://gitee.com/argustang/myshell/releases/tag/v2.20.3
+- **打包前审出并修掉一个会污染发布提交的问题**:`README.md` /
+  `src/components/CommandBar.vue` / `src/components/settings/DataSection.vue`
+  三个文件的工作区行尾是 CRLF,而 HEAD blob 是 LF(`core.autocrlf=true` 但文件
+  被编辑器写成了 CRLF)。`git diff` 因 autocrlf 归一化仍显示 5/0 行的干净 diff,
+  但 `commit` 工具按原始字节算 hunk,把 CommandBar 的 CSS 插入点算到了
+  `@@ -29,6 +29,11 @@`(import 之后)而不是真实的第 766 行 —— 直接提交会**破坏文件**。
+  已把这 3 个文件行尾归一为 LF,`d.diff()` 复核 hunk 位置正确后才提交。
+  教训:`git diff --numstat` 干净不等于原始字节干净,选择性提交工具看的是后者。
+- **流水线 push 步第四次挂在凭据上**(`askpass` 禁用,脚本不读 token),
+  照例用 `.gitee-token` 的一次性 `insteadOf` 环境改写补推 main + tag;
+  三处 SHA 核对一致(main / tag 解引用 / HEAD 均为 1d4b5fd)。
+- **clear 步 baseline 误写 bug 第四次复现**:节内写 v2.20.3、头部第 7 行仍留
+  v2.20.2。已手动修正头部。该 bug 已连续 4 个版本出现,脚本在
+  ~/.omp/agent/skills/myTools-packageTauri/,待修:clear 应同时更新头部那行。
