@@ -10051,3 +10051,30 @@ html[data-translucent="1"] {
 - **clear 步 baseline 误写 bug 第四次复现**:节内写 v2.20.3、头部第 7 行仍留
   v2.20.2。已手动修正头部。该 bug 已连续 4 个版本出现,脚本在
   ~/.omp/agent/skills/myTools-packageTauri/,待修:clear 应同时更新头部那行。
+
+### 阶段 248 -- 修复「已放行仍重复确认」与「不启动 tab 且无输出」
+
+- **用户实报两点**:(1) 已经放通 MCP(选过「本轮会话均允许」)后,仍需要反复允许;
+  (2) 命令不会启动 tab 页面,也没有输出。
+- **根因(1)是真 bug**:`confirm_via_gui` 把 GUI 返回的 `decision` 映射成
+  `Some("allow") | Some("session") => Some(true)` —— `session` 与 `allow` 合并成
+  一支,于是用户点「本轮会话均允许」只放行了**那一条**命令,授权从未被记住。
+  授权只在 `exec_in_gui_tab` 里根据 exec 结果的 `session_allowed` 字段 grant,
+  而 `pipe` 通道与全部文件类工具(sftp_upload/remove/rename/upload_project/
+  zmodem_upload/ssh_read_text/ssh_write_text)根本不经过那条路径 ——
+  实测日志里用户 91 次 `exec_channel:"pipe"`,每一次都走确认门但永远学不到授权。
+  修复:抽出 `apply_confirm_decision`,把 `session` 单独一支并调用
+  `grant_session_allowed()`。
+- **根因(2)是设计缺口而非崩溃**:GUI 路径失败后代码会**静默降级**到无头执行
+  (`exec_in_gui_tab` 的 Err 分支落到 headless),结果里只写
+  `executed_in:"headless"`,与「本来就走无头」完全无法区分。用户侧看到的就是
+  「没有新标签页、也没有输出」。实测 5 次降级的真实原因分别是:3 次连接超时
+  (10s 无响应)、1 次连接名找不到、1 次执行锁占用 —— 都是真实故障,但降级过程
+  对调用方完全不可见。修复:新增 `headless_fallback` 档 + `gui_fallback_reason`
+  字段,并写进 MCP instructions,要求 AI 主动告知用户「这条命令没出现在终端里」。
+- **验证**:`cargo test --bin myshell-mcp` 29 passed(新增 2 条回归);
+  `cargo test --lib` 159 passed。修前必挂已实证:把 `apply_confirm_decision`
+  临时还原成合并分支后,`session_decision_grants_and_allow_does_not` 立刻
+  panic 在「session 决策必须留下会话授权」这一行。
+- **注意**:instructions 变更要 AI 客户端重连 MCP(重启会话)才生效;
+  已安装的旧 myshell-mcp.exe 需重新构建才带修复。

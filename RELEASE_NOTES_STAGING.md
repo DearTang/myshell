@@ -15,3 +15,5 @@
 ## 待发布条目
 
 baseline: v2.20.3
+- 🐛 修复「已选『本轮会话均允许』却仍逐条弹确认」：GUI 的 `session` 决策曾被并入 `allow` 分支，授权从未被记住，而 `pipe` 通道与全部文件类工具又都绕过唯一会 grant 的 GUI 执行路径
+- 🐛 GUI 侧执行失败后静默降级到无头执行时，结果新增 `executed_in: "headless_fallback"` 与 `gui_fallback_reason`，不再与「本来就走无头」混为一谈（此前用户只看到「没有新标签页、也没有输出」）

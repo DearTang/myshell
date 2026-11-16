@@ -129,10 +129,32 @@ fn confirm_via_gui(tool: &str, detail: &str) -> Option<bool> {
     if v["ok"].as_bool() != Some(true) {
         return None;
     }
-    match v["decision"].as_str() {
-        Some("allow") | Some("session") => Some(true),
-        // Explicit deny, and the GUI's own timeout, both mean "no".
-        _ => Some(false),
+    Some(apply_confirm_decision(v["decision"].as_str()))
+}
+
+/// Map a GUI confirmation decision onto "may this operation proceed?", with
+/// the session-grant side effect.
+///
+/// Split out of `confirm_via_gui` so the mapping is testable without a live
+/// IPC socket. The bug this exists to prevent: `"session"` used to be folded
+/// into the same arm as `"allow"`, so the user's 「本轮会话均允许」 click
+/// released exactly ONE operation and then every subsequent dangerous command
+/// popped the dialog again. Only `exec_in_gui_tab` ever called
+/// `grant_session_allowed()` (from the exec result's `session_allowed`
+/// field), and the `pipe` channel plus every file tool bypass that path
+/// entirely — so for those callers the grant was never learned.
+///
+/// A missing / unrecognized decision reads as DENY: for irreversible
+/// operations "the user did not say yes" must mean "no", and the GUI's own
+/// 180s timeout arrives here as an unrecognized value.
+fn apply_confirm_decision(decision: Option<&str>) -> bool {
+    match decision {
+        Some("session") => {
+            grant_session_allowed();
+            true
+        }
+        Some("allow") => true,
+        _ => false,
     }
 }
 
@@ -374,7 +396,7 @@ VAULT GATE (applies to EVERY tool except ssh_status/ssh_cancel/zmodem_status): M
 ZMODEM IS ASYNC: `zmodem_upload`/`zmodem_download` return IMMEDIATELY with a `task_id` (status=`running`); the transfer (including GUI launch, vault-unlock wait, and the confirmation dialog) runs in the background. You MUST then poll `zmodem_status` with the `task_id` every 5-10 seconds until `status` is `done` or `failed`. Do not report success until you see `done`.\n\
 \n\
 EVERY tool failure carries a machine-readable `error_kind` (`permission_denied` | `user_denied` | `timeout` | `busy` | `connection_lost` | `connect_failed` | `vault_locked` | `bad_request` | `not_found` | `internal`) plus a `hint` naming the next action. Branch on `error_kind`, not on the Chinese prose.\n\
-RESULT FIELDS: `delivered: true` on a failure means the command WAS written to the SSH channel — the remote may have run it (or part of it), so do NOT blind-retry a non-idempotent command (rm, kill, write); confirm first. `interrupted: true` means the exit code has the 128+signal shape (130 = Ctrl-C) — it is NOT a clean no-output success. `completed: false` (gui channel only) means the shell's completion marker was never confirmed — the command may still be running, so treat `exit_code: null` as unknown, never as 0.\n\
+RESULT FIELDS: `delivered: true` on a failure means the command WAS written to the SSH channel — the remote may have run it (or part of it), so do NOT blind-retry a non-idempotent command (rm, kill, write); confirm first. `interrupted: true` means the exit code has the 128+signal shape (130 = Ctrl-C) — it is NOT a clean no-output success. `completed: false` (gui channel only) means the shell's completion marker was never confirmed — the command may still be running, so treat `exit_code: null` as unknown, never as 0. `executed_in: \"headless_fallback\"` means you asked for `gui` but the GUI side failed and the command was run over the direct channel instead — the user saw NOTHING in any terminal tab; the reason is in `gui_fallback_reason`. Tell the user that this command did not appear in a tab, and fix the underlying cause (a stuck confirmation dialog, a dead session, or the per-connection exec lock) before assuming the visible-terminal experience works.\\n\\
 \n\
 SERIALIZATION: a connection's terminal runs one command at a time. A second `ssh_exec` on the same connection while the first is still running returns `error_kind: \"busy\"` with how long it has been running and the longest remaining wait — do NOT blind-retry; wait that long, or switch to `ssh_run` (asynchronous, exempt from this lock). Different connections run fully in parallel.\n\
 \n\
@@ -1113,6 +1135,26 @@ fn resolve_exec_channel(args: &Value) -> ExecChannel {
     }
 }
 
+/// Which channel actually ran this command, as a machine-readable string.
+///
+/// Three outcomes must stay distinguishable, because "why didn't I see this in
+/// a terminal tab?" is otherwise unanswerable:
+///   - `exec_channel`     — the caller explicitly asked for `pipe`.
+///   - `headless_fallback`— the caller asked for `gui`, the GUI side failed,
+///                          and we silently ran it headless. The user saw
+///                          nothing; this is the case that used to be reported
+///                          as a plain `headless` run.
+///   - `headless`         — no GUI path was applicable at all.
+fn executed_in_label(channel: ExecChannel, gui_fell_back: bool) -> &'static str {
+    if channel == ExecChannel::Pipe {
+        "exec_channel"
+    } else if gui_fell_back {
+        "headless_fallback"
+    } else {
+        "headless"
+    }
+}
+
 /// Whether an exit code means "terminated by a signal" rather than "ran to
 /// completion". POSIX shells report `128 + signum`; Ctrl-C is 128+SIGINT(2)=130.
 ///
@@ -1435,10 +1477,18 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // exec_channel=pipe skips this block entirely: the caller asked for
             // the direct channel, so neither the rules' show_in_gui default nor
             // a GUI failure may pull the command back into the PTY.
+            //
+            // 降级留痕：GUI 路径失败后本函数会落到无头执行（用户看不到任何
+            // 东西）。这个变量把失败原因带到最终结果里，让调用方知道「这条
+            // 命令其实没在终端里跑」。此前降级只写日志，结果里只有一句
+            // executed_in:"headless"，与「本来就要无头」完全无法区分 —— 用户
+            // 看到的就是「没有新标签页、也没有输出」。
+            let mut gui_fallback_reason: Option<String> = None;
             if exec_channel == ExecChannel::Gui && rules.show_in_gui {
                 match exec_in_gui_tab(conn_name, command, timeout, &state).await {
                     Ok(result_json) => return Ok(result_json),
                     Err(e) => {
+                        gui_fallback_reason = Some(e.message.clone());
                         // A session grant means NO dialog is shown on either path
                         // (GUI skips it, headless short-circuits), so the
                         // double-popup concern below does not apply — treat the
@@ -1587,6 +1637,8 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                         "duration_ms": started.elapsed().as_millis() as u64,
                         "timeout_secs": timeout,
                         "exit_code": serde_json::Value::Null,
+                        "executed_in": executed_in_label(exec_channel, gui_fallback_reason.is_some()),
+                        "gui_fallback_reason": gui_fallback_reason,
                     });
                     return Ok(json!({
                         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&payload).unwrap_or_default() }],
@@ -1628,6 +1680,10 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                     "truncated": truncated,
                     "stdout": stdout,
                     "stderr": stderr,
+                    // 与成功路径同口径：降级到无头执行时如实标注，调用方才知道
+                    // 这条命令没有出现在终端里。
+                    "executed_in": executed_in_label(exec_channel, gui_fallback_reason.is_some()),
+                    "gui_fallback_reason": gui_fallback_reason,
                 });
                 return Ok(json!({
                     "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
@@ -1649,7 +1705,14 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 // flag an empty stdout + 130 is indistinguishable from a clean
                 // no-output success (P2-4).
                 "interrupted": interrupted_json(code),
-                "executed_in": if exec_channel == ExecChannel::Pipe { "exec_channel" } else { "headless" },
+                // 三个来源必须能区分，否则「为什么没在终端里看到这条命令」无从
+                // 判断：exec_channel = 调用方显式要求 pipe；headless_fallback =
+                // 调用方要 gui、但 GUI 侧失败后降级（用户看不到任何东西）；
+                // headless = 本来就没有可用的 GUI 路径。
+                "executed_in": executed_in_label(exec_channel, gui_fallback_reason.is_some()),
+                // 仅在降级时出现：告诉调用方「这条命令没有出现在终端里」以及
+                // 为什么。AI 需要据此提醒用户，而不是让用户对着空白终端困惑。
+                "gui_fallback_reason": gui_fallback_reason,
                 "command": command,
                 "duration_ms": duration_ms,
                 "timed_out": false,
@@ -3888,6 +3951,61 @@ mod tests {
         assert!(GuiLaunchError::NoPortFile.gui_reachable());
         // 普通字符串错误全部发生在 GUI 就绪之后
         assert!(GuiExecError::from("whatever".to_string()).gui_reachable);
+    }
+
+    /// 用户在确认框点「本轮会话均允许」后，后续高危命令不得再弹窗。
+    ///
+    /// 回归的是实测 bug：`"session"` 曾被和 `"allow"` 并进同一个 match 分支，
+    /// 于是那次点击只放行**一条**命令，下一条继续弹。原因是授权只在
+    /// `exec_in_gui_tab` 里根据 exec 结果的 `session_allowed` 字段 grant，
+    /// 而 `pipe` 通道与全部文件类工具根本不走那条路径 —— 用户看到的正是
+    /// 「明明放通了，还是每条都问」。
+    ///
+    /// SESSION_ALLOWED 是进程级静态，测试之间会串，故进出都显式重置。
+    #[test]
+    fn session_decision_grants_and_allow_does_not() {
+        use super::{apply_confirm_decision, revoke_session_allowed, session_allowed};
+
+        revoke_session_allowed();
+        assert!(!session_allowed(), "前置：授权应已清空");
+
+        // 「本轮会话均允许」→ 放行本次 **且** 记住授权
+        assert!(apply_confirm_decision(Some("session")));
+        assert!(
+            session_allowed(),
+            "session 决策必须留下会话授权，否则后续每条高危命令都会重复弹窗"
+        );
+
+        revoke_session_allowed();
+        assert!(!session_allowed(), "撤销后应回到未授权");
+
+        // 「允许」→ 只放行本次，不产生会话授权
+        assert!(apply_confirm_decision(Some("allow")));
+        assert!(!session_allowed(), "allow 决策不得产生会话授权");
+
+        // 拒绝 / 超时（未知值）/ 字段缺失 → 一律按拒绝处理
+        for d in [Some("deny"), Some(""), Some("timeout"), None] {
+            assert!(!apply_confirm_decision(d), "{d:?} 必须读作拒绝");
+        }
+        assert!(!session_allowed(), "拒绝不得产生会话授权");
+    }
+
+    /// 「这条命令到底在哪儿跑的」必须能区分三种来源。
+    ///
+    /// 回归的是实测症状：调用方要 `gui`（默认），GUI 侧失败后代码静默改走
+    /// 无头执行，结果里只写 `executed_in:"headless"` —— 与「本来就没走 GUI」
+    /// 一模一样。用户侧看到的就是「没有新标签页、也没有输出」，而 AI 完全
+    /// 无从解释。现在降级单独成一档，并附带 `gui_fallback_reason`。
+    #[test]
+    fn executed_in_distinguishes_headless_fallback_from_plain_headless() {
+        use super::{executed_in_label, ExecChannel};
+
+        assert_eq!(executed_in_label(ExecChannel::Pipe, false), "exec_channel");
+        // pipe 通道不会「降级」，标志位不该影响它
+        assert_eq!(executed_in_label(ExecChannel::Pipe, true), "exec_channel");
+
+        assert_eq!(executed_in_label(ExecChannel::Gui, true), "headless_fallback");
+        assert_eq!(executed_in_label(ExecChannel::Gui, false), "headless");
     }
 
     /// 端口文件丢失时必须能通过进程表发现「GUI 还活着」——否则
