@@ -766,6 +766,11 @@ function firstLine(cmd: string): string {
   background: transparent;
   box-shadow: none;
   overflow: visible;
+  /* myui 的 `:where(html .el-popper){max-width:min(360px,…)}` 兜住长提示不撑满
+     视口，但 max-width 永远压过 width（含内联），下面 popper-style 给的 420/480px
+     实测被砍到 360px。v1.6.1 把该规则降权到 :where() 正是为了让消费方类选择器
+     能覆盖，这里就是那个出口。 */
+  max-width: none;
 }
 
 /* 面板宽度改由 MyPopover 的 :popper-style 给到 popper 外壳（见模板注释），

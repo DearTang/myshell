@@ -586,7 +586,7 @@ const dragHintTarget = computed<string | null>(() => {
           class="icon-btn"
           label="回收站"
           size="15"
-          name="Delete"
+          name="TrashRecycle"
           @click="ui.showRecycle = true"
         />
         <MyIconButton

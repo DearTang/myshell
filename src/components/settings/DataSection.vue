@@ -329,7 +329,7 @@ async function handleRollback(version: string): Promise<void> {
 
     <!-- 回收站入口 — 恢复或彻底清除软删除的连接。 -->
     <MyButton variant="secondary" class="recycle-btn" @click="ui.showRecycle = true">
-      <MyIcon :size="14" name="Delete" />
+      <MyIcon :size="14" name="TrashRecycle" />
       找回连接 / 回收站
     </MyButton>
   </MySection>

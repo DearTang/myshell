@@ -133,7 +133,7 @@ function relativeTime(iso: string): string {
     <template #header>
       <div class="dlg-header">
         <span class="header-icon">
-          <MyIcon :size="18" name="Delete" />
+          <MyIcon :size="18" name="TrashRecycle" />
         </span>
         <div class="header-text">
           <div class="header-title">找回连接</div>

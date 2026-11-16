@@ -9982,3 +9982,52 @@ html[data-translucent="1"] {
   https://gitee.com/argustang/myshell/releases/tag/v2.20.2
 - 流水线 push 步依旧挂起(无凭据 tty),照例杀掉后 token 一次性 URL 手动推
   main+tag;clear 的 baseline 误写 bug 第三次出现(v2.20.3→已修正 v2.20.2)。
+
+### 阶段 246 -- myui v1.6.1 → v1.9.1 升级与集成
+
+- **动机**:用户指定 `pnpm add myui@git+...#v1.9.1` 并「集成」。
+- **安装通道**:直接跑失败 —— git 对 gitee 的 https 无凭据(`askpass` 禁用),
+  仓库 `.gitee-token` 又不能写进 URL(会进 lockfile/提交)。用
+  `GIT_CONFIG_COUNT=1 url.https://argustang:<token>@gitee.com/.insteadOf=https://gitee.com/`
+  做一次性环境级改写,安装命令与记录的 specifier 都保持原样;
+  事后核对 `pnpm-lock.yaml` 与 `package.json` 中 token 出现次数 = 0。
+- **兼容性核对**(不是「装完能编译就完事」):拉 v1.6.1 产物到 `/f/tmp/myui-161`,
+  与本机 1.9.1 逐条 diff。在用 21 个组件的 `.d.ts` 只有 5 个有差异,且全部是
+  新增可选能力(MyDialog `size:xl`、MyButton `block`/`round`、MyPopover trigger 类型、
+  两个 emit 顺序),无破坏性变更。CSS 侧差异 35 条,全部是新增组件/新增规则。
+- **实测回归**(CDP + 真实组件,不是推算):
+  - 对话框:`MyDialog` 新增 `.my-dialog .el-dialog__body{max-height:calc(100vh-220px);
+    overflow-y:auto}`。1280×768 与最小窗 800×600 下量 ConnectionDialog / AboutDialog,
+    body 实测 548px / 380px,均 ≤ 上限,自定义 `body-class` 的 flex 布局没被截断,
+    changelog 内部滚动层仍独立工作。
+  - 字号滑杆:`--fs-scale` 1.0→1.15 后 `.el-input__inner` 14→16.1px、
+    `.el-slider__runway` 同步;`.my-button` 仍是 12px,因为该档本来就是 12px 基准
+    (与升级前逐像素一致)。
+  - 主题色相:`--accent-hue` 改 300 后 `--accent` 变 `oklch(0.72 0.15 300)`,
+    EP 主按钮底色跟着变 —— 令牌桥仍压得住 myui 的 `:root, html.dark`。
+  - 图标:运行时查注册表,`TrashRecycle`/`Grip`/`Broom`/`MeasureCup` 均存在,
+    真实挂载渲染出 7/0/6 条 path,无 Unknown 回落。
+- **顺手修的两处真问题**:
+  1. 浮层宽度:`popper-style` 给的 480px 实测只有 360px。根因是 myui
+     `:where(html .el-popper){max-width:min(360px,…)}` —— `max-width` 永远压过
+     `width`(含内联)。v1.6.1 把该规则降权到 `:where()` 正是为了留出口,于是
+     在 `.cb-popper.el-popover` 上补 `max-width:none`,实测 360→480px,
+     `.history-panel` 同步 358→478px,右缘仍贴视口内。探针里的 CSS 拷贝一并同步,
+     否则探针会量出「已修好」的假象。
+  2. 动效开关(审后回退):曾把 `html.motion-off *` 改成
+     `:not(.my-spinner, .my-icon.is-spinning)` 让加载指示继续转,理由是「停掉等于
+     谎报没有在加载」。review 阶段否掉了这个改动:开关文案是「一次性停掉全部过渡
+     与动画(低配设备更跟手)」,用户关它买的就是动画开销;而 myui 自己的
+     `html[data-motion=off]` 也把 `.my-spinner` 与 `.my-status-dot__dot.is-pulse`
+     一起停掉 —— 原注释「myui 也刻意排除了」只对 `.my-icon.is-spinning` 成立,
+     是选择性引用。且例外只放行 spinner 与 spin 图标、漏了同为「进行中」的
+     `MyStatusDot pulse`(顶栏连接中状态),自身不自洽。已回退为 `*` 并把真实
+     口径写进注释。静态圆环/圆点仍表达「进行中」,不靠旋转传达。
+- **回收站图标语义**:`Delete` 与 EP `Delete` 是同一副垃圾桶剪影,「可还原的暂存」
+  被读成「不可逆删除」。切到 myui v1.3.0 新增的 `TrashRecycle`(桶内三箭头循环),
+  侧栏钮 / 回收站对话框头部 / 数据管理入口三处统一。
+- **验证**:`npm run test:ts` 通过、`npm run build` 通过、`audit-myui-imports` 通过
+  (76 个导出 / 41 个 .vue)、四个既有探针页(debug-shell / drawer / popover / preset /
+  sidebar)全部实跑。临时探针 `dialog-probe.{html,ts}` 已删。
+- **注意**:`node_modules/.vite` 必须清一次 —— myui 换了 scopeId 族,旧预构建会让
+  所有 myui 组件样式静默失效(阶段 195 踩过)。本次已清。

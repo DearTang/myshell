@@ -38,6 +38,7 @@ const PROBE_CSS = `
   background: transparent;
   box-shadow: none;
   overflow: visible;
+  max-width: none;
 }
 .history-panel {
   width: 100%;

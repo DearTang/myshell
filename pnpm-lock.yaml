@@ -42,8 +42,8 @@ importers:
         specifier: ^14.1.0
         version: 14.3.1
       myui:
-        specifier: git+https://gitee.com/argustang/my-ui.git#v1.6.1
-        version: git+https://gitee.com/argustang/my-ui.git#216731567638e76ffe9c06c0f1419838ad95fe2c(@element-plus/icons-vue@2.3.2(vue@3.5.42(typescript@5.6.3)))(element-plus@2.14.5(vue@3.5.42(typescript@5.6.3)))(vue-i18n@11.4.10(vue@3.5.42(typescript@5.6.3)))(vue@3.5.42(typescript@5.6.3))
+        specifier: git+https://gitee.com/argustang/my-ui.git#v1.9.1
+        version: git+https://gitee.com/argustang/my-ui.git#7d29addcf9774458501324ae6e01bd44338ee64e(@element-plus/icons-vue@2.3.2(vue@3.5.42(typescript@5.6.3)))(element-plus@2.14.5(vue@3.5.42(typescript@5.6.3)))(vue-i18n@11.4.10(vue@3.5.42(typescript@5.6.3)))(vue@3.5.42(typescript@5.6.3))
       vue:
         specifier: ^3.5.32
         version: 3.5.42(typescript@5.6.3)
@@ -868,9 +868,9 @@ packages:
   muggle-string@0.4.1:
     resolution: {integrity: sha512-VNTrAak/KhO2i8dqqnqnAHOa3cYBwXEZe9h+D5h/1ZqFSTEFHdM65lR7RoIqq3tBBYavsOXV84NoHXZ0AkPyqQ==}
 
-  myui@git+https://gitee.com/argustang/my-ui.git#216731567638e76ffe9c06c0f1419838ad95fe2c:
-    resolution: {commit: 216731567638e76ffe9c06c0f1419838ad95fe2c, repo: https://gitee.com/argustang/my-ui.git, type: git}
-    version: 1.6.1
+  myui@git+https://gitee.com/argustang/my-ui.git#7d29addcf9774458501324ae6e01bd44338ee64e:
+    resolution: {commit: 7d29addcf9774458501324ae6e01bd44338ee64e, repo: https://gitee.com/argustang/my-ui.git, type: git}
+    version: 1.9.1
     engines: {node: '>=22.12.0', pnpm: '>=9'}
     peerDependencies:
       '@element-plus/icons-vue': ^2.3.0
@@ -1738,7 +1738,7 @@ snapshots:
 
   muggle-string@0.4.1: {}
 
-  myui@git+https://gitee.com/argustang/my-ui.git#216731567638e76ffe9c06c0f1419838ad95fe2c(@element-plus/icons-vue@2.3.2(vue@3.5.42(typescript@5.6.3)))(element-plus@2.14.5(vue@3.5.42(typescript@5.6.3)))(vue-i18n@11.4.10(vue@3.5.42(typescript@5.6.3)))(vue@3.5.42(typescript@5.6.3)):
+  myui@git+https://gitee.com/argustang/my-ui.git#7d29addcf9774458501324ae6e01bd44338ee64e(@element-plus/icons-vue@2.3.2(vue@3.5.42(typescript@5.6.3)))(element-plus@2.14.5(vue@3.5.42(typescript@5.6.3)))(vue-i18n@11.4.10(vue@3.5.42(typescript@5.6.3)))(vue@3.5.42(typescript@5.6.3)):
     dependencies:
       '@element-plus/icons-vue': 2.3.2(vue@3.5.42(typescript@5.6.3))
       element-plus: 2.14.5(vue@3.5.42(typescript@5.6.3))

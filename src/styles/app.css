@@ -6,7 +6,11 @@
 
 
 /* ─── 界面字号阶梯（对齐 ompDesktop 的 myui --fs-* 体系）──
-   本机 myui 是 v1.1.1，包内没有 --fs-* 令牌，故由应用侧声明。
+   本机 myui 自 v1.2.0 起包内已声明 --fs-scale 与 --fs-xs…--fs-3xl 七级，
+   但**没有 --fs-2xs**（11px 档是 MyShell 自加的一档），且应用侧要保证
+   「不依赖库也能渲染」，故这里仍整组声明一遍。选择器 `:root` (0,1,0) 低于
+   myui 的 `:root, html.dark` (0,1,1)，深色下共有七档由 myui 的值生效
+   （逐档相等，观感无差异），而 --fs-2xs 只此一处来源、始终由本文件提供。
    唯一旋钮是 --fs-scale：App.vue 把它写进 html 内联样式（内联优先级高于
    任何选择器），七级阶梯整体缩放。此处只声明「默认值 + fallback」，
    真正的运行时倍率一律走内联样式，不在这里重复定义。
@@ -537,7 +541,13 @@ html.motion-off {
 }
 
 /* 关键帧动画不吃 CSS 变量，用 animation-duration 覆盖。
-   WebView2 上无限动画是「有或没有」的阶跃，逐个组件优化没有意义。 */
+   WebView2 上无限动画是「有或没有」的阶跃，逐个组件优化没有意义。
+   **加载指示也一并停**（`.my-spinner` / `.my-icon.is-spinning` /
+   `.my-status-dot__dot.is-pulse`）：设置里这一项的文案就是「一次性停掉全部
+   过渡与动画（低配设备更跟手）」，用户关它换的就是动画开销。myui 自己的
+   `html[data-motion=off]` 同样把 spinner 与状态点脉冲一起停掉，只留
+   `.my-icon.is-spinning`——那点不一致不影响结论：关动效 = 全部静止。
+   残留的静态圆环/圆点仍表达「进行中」，不靠旋转传达。 */
 html.motion-off *,
 html.motion-off *::before,
 html.motion-off *::after {
