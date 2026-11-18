@@ -10130,3 +10130,48 @@ color-text 214 / textarea 754，均正确撑满无溢出）、弹窗 `size=md` �
 
 **遗留**：myui v1.9.8 的 tag 已推送但产物不完整（缺 `files` 白名单），1.9.9 已修。
 MyShell 的 lockfile 指向 1.9.9，1.9.8 可视为废弃。
+
+### 阶段 251 — myui 升级 v1.9.9 → v1.9.15
+
+**升级**：`myui` 从 v1.9.9 升到 v1.9.15。这 6 个版本里有 3 个是上轮反馈的直接落地。
+
+**1.9.12 的非 bare 字段宽度修复（本次主要影响面）**：`MyFieldShell` 把
+`:where(&) { width: 100% }` 从 `&--bare` 提到 `.my-field` 根块，此前只有 bare 态
+占满容器，带 label 的常规写法仍按内容算宽（实测 486px 容器里 Input/Select/TextArea
+分别是 214/203/166）。MyShell 有 57 处非 bare 字段，全部落在这次修复路径上。
+
+用无头 Chromium 逐类实测，结论是**纯改进、零补偿**：
+- `ConnectionDialog` 的 `.conn-field`（包在 `.form-field` 列里）：739px 撑满父容器
+- 双列行 `.col-2` / `.col-1`：484.7 / 242.3，保持 2:1 比例
+- `AppSidebar` 搜索框：224px（父 240，因 padding）
+- 设置页 `.field`：739px 撑满
+- `inline-row` 两个字段：各 339px，总宽 723 < 容器 739，未溢出
+- `MultiWindowSection` 的 `.grid-prefs`（flex 行 + `max-width:240px` 收窄下拉）：
+  两个字段各 199px，正常收缩
+
+关键验证：`select-narrow` 的 `max-width` 写在内层 `.el-select` 上（class 经
+`inheritAttrs:false` 透传到那里），外层 `.my-field` 仍占满——但因为它本身在 flex
+容器里，`flex-shrink` 会让它按内容收缩，视觉无异常。
+
+**1.9.14 的 `check:publish` 门禁**：上轮反馈的 `dist/utils` 缺失已被固化成门禁
+（跑 `npm pack --dry-run` 取真实 tarball 清单 + 断言三处白名单逐项对应 +
+断言文档里的 `#vX.Y.Z` 等于 package.json 版本）。1.9.15 的产物实测零断链。
+
+**1.9.15 的 `MyTooltip` `enterable` 默认改 `false`**：MyShell 未使用 `MyTooltip`，无影响。
+
+**MyShell 侧改动**：
+- `DataSection` 的「加密导出」「解密导入」两个弹窗：`:width="400"` → `size="sm"`（420）。
+- `CustomPaletteDialog`（自定义终端配色）：`:width="400"` → `size="sm"`。
+- 这三处都是单字段表单弹窗，按 docs/04「表单弹窗用档位、不手写中间值」收敛。
+
+**刻意未改**：`AboutDialog`（480，关于框）、`StatsConsentDialog`（460，统计授权）、
+`McpConfirmDialog`（400，高危命令确认）、`DataSection` 的外部导入预览（640，含
+列表与勾选）——都不是表单弹窗，规范不约束，改档位反而可能挤坏内容。
+
+**未接入的新 API**：`setOverlayLabels`（项目单语言，12 处确认框文案全是场景化的
+「彻底删除」「清空回收站」，接入会把它们压成统一文案）；`DEFAULT_PAGE_SIZES`、
+`MyForm`、`MyFormItem`、`MyPagination`、`MyDataTable`、`MyTooltip`（项目均未使用）。
+
+**验证**：`npm run test:ts` 零错误；`npm run build` 通过；无头 Chromium 实测
+非 bare 字段宽度（6 类容器全部正确）、`size="sm"` 弹窗实测 420px 且字段撑满
+body、footer 正常、零控制台错误。

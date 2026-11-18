@@ -397,11 +397,12 @@ async function handleRollback(version: string): Promise<void> {
     <div v-if="backups.length === 0" class="backup-empty">暂无备份记录</div>
   </MySection>
 
-  <!-- 导出密码对话框 -->
+  <!-- 导出密码对话框。宽度走 myui v1.9.7 的档位契约：单字段表单弹窗用
+       size="sm"（420），不再手写 400 这类中间值。 -->
   <MyDialog
     v-model="showExportDialog"
     title="加密导出"
-    :width="400"
+    size="sm"
     :dismissable="false"
     @cancel="closeExportDialog"
     hide-footer
@@ -465,11 +466,11 @@ async function handleRollback(version: string): Promise<void> {
     </div>
   </MyDialog>
 
-  <!-- 导入密码对话框 -->
+  <!-- 导入密码对话框：同样是单字段表单弹窗，用 size="sm"（420）。 -->
   <MyDialog
     v-model="showImportDialog"
     title="解密导入"
-    :width="400"
+    size="sm"
     :dismissable="false"
     hide-footer
     @cancel="closeImportDialog"

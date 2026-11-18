@@ -26,7 +26,7 @@ const canSave = computed(() => props.bgValid);
   <MyDialog
     :model-value="true"
     title="自定义终端配色"
-    :width="400"
+    size="sm"
     :dismissable="false"
     hide-footer
     @cancel="emit('close')"

@@ -28,7 +28,7 @@
     "fflate": "^0.8.3",
     "html2canvas": "^1.4.1",
     "markdown-it": "^14.1.0",
-    "myui": "git+https://gitee.com/argustang/my-ui.git#v1.9.9",
+    "myui": "git+https://gitee.com/argustang/my-ui.git#v1.9.15",
     "vue": "^3.5.32",
     "vue-i18n": "^11.4.0",
     "zmodem.js": "^0.1.10"
