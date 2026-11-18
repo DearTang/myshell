@@ -52,6 +52,24 @@ const MCP_LOCK_STALE_MS = 60_000;
 //（断开≠退出，不自动关）。
 const mcpProcessTabs = new Map<string, string>();
 
+/**
+ * 把 MCP 正在使用的标签带到前台——但只在用户没有别的活动标签时。
+ *
+ * 早期实现无条件写 `sessions.activeTabId = tab.id`，本意是「让用户看见 AI
+ * 在哪个终端跑命令」。实际后果是每次 MCP 调用（含 5s 一次的探活）都把用户
+ * 正在看的标签切走：底栏 ServerInfoPanel 跟着 activeTab 跳，于是两台机器的
+ * CPU/内存/磁盘数据来回闪，用户看到的就是「系统信息不停切换会话」。
+ *
+ * MCP 执行本身不依赖活动态——输出采集走 `onSshOutput(sessionId, …)` 事件，
+ * runExec 拿的也是 sessionId。所以切页只是可见性提示，不该抢用户的操作焦点。
+ *
+ * 规则：当前没有活动标签（首帧、刚关完标签）时才聚焦；用户已经在看某个
+ * 标签时不打扰。若将来需要「AI 操作提示」，应做标签条上的角标而不是抢焦点。
+ */
+function focusTabIfIdle(tabId: string): void {
+  if (sessions.activeTabId === null) sessions.activeTabId = tabId;
+}
+
 export async function startMcpBridge(): Promise<UnlistenFn> {
   const unlisten = await listen<McpGuiCommand>("mcp-gui-command", (event) => {
     const { action, connection_id } = event.payload;
@@ -464,13 +482,13 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
 
       if (existingTab && existingTab.status === "connected" && existingTab.sessionId) {
         // 快路径：tab 已连接，直接执行
-        sessions.activeTabId = existingTab.id;
+        focusTabIfIdle(existingTab.id);
         runExec(existingTab.sessionId).catch((e) => {
           finishExec({ ok: false, error: `执行失败: ${e}` });
         });
       } else if (existingTab && (existingTab.status === "disconnected" || existingTab.status === "error")) {
         // 重连路径：原地重连（保留 scrollback）后执行
-        sessions.activeTabId = existingTab.id;
+        focusTabIfIdle(existingTab.id);
         reconnectOne(existingTab.id).then(async (ok) => {
           if (!ok) {
             finishExec({
@@ -515,7 +533,7 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
           if (tab && tab.sessionId && tab.status === "connected") {
             clearInterval(checkInterval);
             mcpProcessTabs.set(processKey, tab.id);
-            sessions.activeTabId = tab.id;
+            focusTabIfIdle(tab.id);
             runExec(tab.sessionId).catch((e) => {
               finishExec({ ok: false, error: `执行失败: ${e}` });
             });
@@ -544,6 +562,8 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
         return true;
       });
       if (existing) {
+        // open_connection 的语义就是「打开并聚焦」——这里保留切页，它是
+        // MCP 客户端显式请求的（如 open_in_gui 工具），不是每次 exec 的副作用。
         sessions.activeTabId = existing.id;
         return;
       }

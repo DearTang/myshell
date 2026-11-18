@@ -21,10 +21,15 @@ const info = ref<ServerInfo | null>(null);
 const error = ref<string | null>(null);
 
 // 轮询语义与旧版 useEffect 一致：仅 active 时启动；立即刷一次，之后每 5s 一次；
-// 依赖变化时取消在途请求的落库并清理定时器；info/error 不因切换而提前清空。
+// 依赖变化时取消在途请求的落库并清理定时器。
+// 切换会话必须清空 info/error：旧机器（如 16 核/62G 内存）的数据若留着，
+// 新会话首个响应回来前会一直显示上一台机器的值，看起来就是「信息在不同
+// 会话间跳动」。清空后立即显示「加载中…」，语义正确且不误导。
 watch(
   () => [props.sessionId, props.active] as const,
   ([sessionId, active]) => {
+    info.value = null;
+    error.value = null;
     if (!active) return;
     let cancelled = false;
     let tid: ReturnType<typeof setInterval> | undefined;
@@ -35,13 +40,16 @@ watch(
     const refresh = async (): Promise<void> => {
       try {
         const v = await sshGetServerInfo(sessionId);
-        if (!cancelled) {
+        // 双重保险：cancelled 覆盖「watch 已重建」，这里再比对 sessionId
+        // 覆盖「同一 watch 内 sessionId 又变了」的极端时序（Vue 的 watch
+        // 清理是同步的，但 await 之后的值仍可能来自旧请求）。
+        if (!cancelled && sessionId === props.sessionId) {
           info.value = v;
           error.value = null;
           fails = 0;
         }
       } catch (e) {
-        if (!cancelled) {
+        if (!cancelled && sessionId === props.sessionId) {
           error.value = String(e);
           if (++fails >= 2 && tid !== undefined) {
             clearInterval(tid);

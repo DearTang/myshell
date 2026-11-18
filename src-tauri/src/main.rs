@@ -3815,6 +3815,35 @@ echo "=N2="; awk 'NR>2 {sub(/:/,"",$1); if ($1 !~ /^(lo|veth|docker|br-|tun|tap|
 echo "=D2="; awk '$3 !~ /[0-9]$/ && $3 !~ /^(dm-|md|loop|ram|sr|zram)/ {r+=$6; w+=$10} END {print (r+0)*512, (w+0)*512}' /proc/diskstats 2>/dev/null
 echo "=L="; if command -v bash >/dev/null 2>&1; then s=$(date +%s%N); (exec 3<>/dev/tcp/127.0.0.1/22) 2>/dev/null && exec 3>&- 2>/dev/null; e=$(date +%s%N); echo $(( (e - s) / 1000000 )); else echo 0; fi"#;
 
+/// 把 exec 探针的原始错误翻译成用户能照做的文案。
+///
+/// 两类失败必须分开，否则用户会按错的方向修：
+/// - **`Session not found`**：`open_exec_channel` 里 `sessions.get(id)` 返回
+///   `None`——前端持有的 session_id 已不在后端 map 里（`disconnect` 是唯一
+///   移除点：标签被关、重连换了新 id、或连接彻底断开）。重连也无用
+///   （`reconnect_session` 同样取不到 config），正确动作是重开终端。
+/// - **通道打不开**：`exec_once` 在传输层已死时会重连一次，仍失败说明该账号
+///   不允许额外会话通道（`MaxSessions=1` 之类）。这句提示原来也套在
+///   `Session not found` 上，用户点了「重新连接」永远好不了。
+///
+/// 其余错误原样返回，不编造解释。
+fn format_server_info_error(raw: &str) -> String {
+    if raw.contains("Session not found") {
+        return "该会话已关闭，服务器信息条已停止刷新。请关闭此标签页并重新连接；\
+                若终端本身仍在正常使用，说明信息条拿到的会话 id 已失效，重新打开终端即可恢复。"
+            .to_string();
+    }
+    if raw.contains("Open exec channel failed") || raw.contains("exec failed") {
+        return format!(
+            "无法读取服务器信息：当前 SSH 连接已失效，或该账号不允许额外会话通道。\n\
+             请点击终端里的「重新连接」；若反复出现，说明该服务器限制单会话，服务器信息条将不可用。\n\
+             （底层：{}）",
+            raw
+        );
+    }
+    raw.to_string()
+}
+
 #[tauri::command]
 async fn ssh_get_server_info(
     state: State<'_, AppState>,
@@ -3827,28 +3856,7 @@ async fn ssh_get_server_info(
     .await
     {
         Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            // The probe runs over the same SSH connection as the terminal but
-            // on its own exec channel. When the transport is gone the raw
-            // russh string ("Open exec channel failed: Channel send error")
-            // reaches the status bar verbatim and tells the user nothing —
-            // and on a MaxSessions=1 account the channel can't be opened even
-            // after a successful reconnect. One actionable sentence, with the
-            // underlying error kept in parentheses for bug reports.
-            let e = if e.contains("Open exec channel failed")
-                || e.contains("exec failed")
-            {
-                format!(
-                    "无法读取服务器信息：当前 SSH 连接已失效，或该账号不允许额外会话通道。\n\
-                     请点击终端里的「重新连接」；若反复出现，说明该服务器限制单会话，服务器信息条将不可用。\n\
-                     （底层：{}）",
-                    e
-                )
-            } else {
-                e
-            };
-            return Err(e);
-        }
+        Ok(Err(e)) => return Err(format_server_info_error(&e)),
         // On timeout, return a stale snapshot so the UI can grey it out
         // instead of erroring the whole panel.
         Err(_) => {
@@ -4274,6 +4282,39 @@ mod server_info_tests {
         assert_eq!(bad.latency_ms, 0);
         let garbage = parse_server_info("=L=\n/dev/tcp: not found\n");
         assert_eq!(garbage.latency_ms, 0);
+    }
+
+    /// `Session not found` 必须走「会话已关闭」分支，不能落到「通道打不开」
+    /// 那句——后者会让用户去点「重新连接」，而这个错误重连永远好不了。
+    /// 注意 exec_once 会给错误加 `Open exec channel failed: ` 前缀，所以
+    /// 真实到达的字符串两者同时含，分流顺序（先判 Session not found）是
+    /// 这条测试真正锁住的东西。
+    #[test]
+    fn session_not_found_takes_the_session_closed_branch() {
+        let msg = format_server_info_error("Open exec channel failed: Session not found");
+        assert!(
+            msg.contains("会话已关闭"),
+            "Session not found 应归为会话已关闭，实际: {msg}"
+        );
+        assert!(
+            !msg.contains("不允许额外会话通道"),
+            "不得误判为通道限制，实际: {msg}"
+        );
+    }
+
+    /// 通道打不开（传输层已死 / MaxSessions=1）保留原文案与底层错误。
+    #[test]
+    fn channel_open_failure_keeps_the_channel_hint() {
+        let msg = format_server_info_error("Open exec channel failed: Channel send error");
+        assert!(msg.contains("不允许额外会话通道"), "实际: {msg}");
+        assert!(msg.contains("Channel send error"), "应保留底层错误: {msg}");
+    }
+
+    /// 其他错误原样透出，不编造解释。
+    #[test]
+    fn unrelated_errors_pass_through_unchanged() {
+        let raw = "some unexpected failure";
+        assert_eq!(format_server_info_error(raw), raw);
     }
 }
 

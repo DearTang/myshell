@@ -10175,3 +10175,49 @@ MyShell 的 lockfile 指向 1.9.9，1.9.8 可视为废弃。
 **验证**：`npm run test:ts` 零错误；`npm run build` 通过；无头 Chromium 实测
 非 bare 字段宽度（6 类容器全部正确）、`size="sm"` 弹窗实测 420px 且字段撑满
 body、footer 正常、零控制台错误。
+
+### 阶段 252 — 修复服务器信息条跨会话跳动 + Session not found 误报
+
+**现象**：同一会话下底栏系统信息（CPU/内存/磁盘）在两台机器间不停切换；
+另一台机器偶尔报「当前 SSH 连接已失效，或该账号不允许额外会话通道」。
+
+**根因一（跳动主因）：MCP 桥强抢活动标签页。**
+`useMcpBridge.ts` 的 exec 路径无条件写 `sessions.activeTabId = <MCP 自己的
+标签>`。MCP 执行本身不依赖活动态——输出采集走 `onSshOutput(sessionId, …)`
+事件，`runExec` 拿的也是 sessionId。切页的本意是「让用户看见 AI 在哪个终端
+跑命令」（AGENTS.md 的透明性要求），但副作用是每次 MCP 调用都把用户正在看
+的标签切走。AI 探活频率是 5s 一次，于是 `bottomServerInfoTab` 跟着
+`activeTab` 跳，信息条在两台机器的数据间来回闪。
+
+修复：新增 `focusTabIfIdle(tabId)`，只在 `sessions.activeTabId === null`
+（首帧、刚关完标签）时聚焦。三处 exec 路径（快路径 / 重连路径 / 新开标签
+路径）改用它；`open_connection` 保留无条件切页——那是 MCP 客户端显式请求
+的语义（`open_in_gui` 工具），不是每次 exec 的副作用。
+
+**根因二（放大因素）：信息条切换时不清空旧数据。**
+`ServerInfoPanel` 的注释明写「info/error 不因切换而提前清空」，于是旧机器
+（16 核/62G）的数据会一直显示到新会话首个响应回来。现在 watch 回调开头
+清空，切换立即显示「加载中…」；`refresh` 里再加一层
+`sessionId === props.sessionId` 比对，挡住旧会话的迟到响应覆盖新数据
+（`cancelled` 只覆盖 watch 重建，挡不住同一 watch 内的极端时序）。
+
+**根因三：`Session not found` 被错误分类。**
+该错误来自 `open_exec_channel` 里 `sessions.get(id)` 返回 None——前端持有的
+session_id 已不在后端 map 里（`disconnect` 是唯一移除点）。它被
+`exec_once` 加上 `Open exec channel failed: ` 前缀后，命中 main.rs 里
+`contains("exec failed")` 的分支，于是用户看到「限制单会话」并去点「重新
+连接」——而重连对这个错误永远无效（`reconnect_session` 同样取不到 config）。
+
+修复：把错误分类提取成 `format_server_info_error()`，先判
+`Session not found` 走「会话已关闭，请重开终端」，再判通道失败走原文案。
+顺序是关键——真实字符串两者同时含。
+
+**验证**：
+- `npm run test:ts` 零错误；`npm run build` 通过。
+- `cargo check --bin myshell` 通过（仅既有 Win32 命名警告）。
+- `cargo test --lib session_not_found` 通过；新增 3 个 `format_server_info_error`
+  分流测试全绿（12 passed）。
+- 无头 Chromium 实测信息条：切会话后立即不含旧数据、显示「加载中…」、
+  迟到的旧响应不覆盖、新数据正确落位。
+- 无头 Chromium 实测焦点：用户在看 A 时 MCP 连续 5 次调用不切换；
+  无活动标签时正常聚焦。
