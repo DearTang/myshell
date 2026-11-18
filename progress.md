@@ -10089,3 +10089,44 @@ html[data-translucent="1"] {
 - **clear 步 baseline 误写 bug 第五次复现**:节内写 v2.20.4、头部第 7 行仍留
   v2.20.3。已手动修正头部。该 bug 已连续 5 个版本出现,建议尽快修
   ~/.omp/agent/skills/myTools-packageTauri/ 里的 clear 逻辑(应同时更新头部那行)。
+
+### 阶段 250 — myui 升级 v1.9.1 → v1.9.9（并修上游发布缺陷）
+
+**升级**：`myui` 从 v1.9.1 升到 v1.9.9。跨 8 个版本，实际影响 MyShell 的只有三处：
+v1.9.5 的 `isImeKeyEvent` 导出与 `--danger-fg` 令牌、v1.9.6 的 `MyFieldShell` bare
+宽度修复、v1.9.7 的表单排版契约。v1.9.2/3/4 全是应用模板（AppShell/MyNavBar/脚手架）
+的修复，MyShell 只消费组件库、不复制模板，无影响。
+
+**上游发布缺陷（两处白名单，连修两版）**：v1.9.5 起 `MyCascadeMenu` 引用
+`@/utils/external-url`，但该模块的产物从未进过任何发布包——`dist/` 是入库产物，
+`.gitignore` 的入库白名单列了 `!dist/{components,composables,icons,_virtual}/`
+却漏了 `!dist/utils/`。消费方 Rollup 解析 `myui-lib.js` 的 re-export 链时报
+`Could not resolve "../../utils/external-url.ts.js"`，即使没用到该组件也失败
+（根入口静态 re-export 全部 76 个组件，必须先解析完 import 图才能判定摇除）。
+
+1.9.8 补了 `.gitignore` 的 `!dist/utils/` 并把产物入库，**仍然不行**：`package.json`
+的 `files` 白名单同样漏了 `dist/utils`，而 pnpm/npm 安装 git 依赖时按 `files` 打包。
+`.gitignore` 管「产物能否进 git」，`files` 管「进 git 的产物能否进 tarball」，两处
+必须同时维护。1.9.9 两处齐备后 `dist/utils` 才真正到达消费方。
+
+**MyShell 侧改动**：
+- `AiPanel.vue` 的 `onKeyDown` 此前**完全没有 IME 判据**——中文输入法按回车确认
+  候选词会直接把半截拼音当消息发出去并清空输入框。本次唯一的真实功能缺陷。
+- `CommandBar.vue` 手写的 `e.isComposing || e.keyCode === 229` 换成库谓词（语义等价）。
+- `AiSupplierList.vue`（重命名）与 `CommandRulesEditor.vue`（加规则）补判据。
+- `ConnectionDialog.vue` 宽度 `:width="480"` → `size="md"`（520），按 docs/04 的档位契约。
+- `WindowControls.vue` 关闭钮前景 `#fff` → `var(--danger-fg, #fff)`。
+- `CommandBar.vue` 更新了「bare 靠内容收缩」的过时注释（v1.9.6 起 bare 强制 width:100%）。
+
+**`--danger-fg` 刻意不桥接**：myui 在双主题里都声明 `oklch(0.99 0 0)`（恒白），而
+MyShell 的 `--text-inverse` 在浅色主题下是深色（`oklch(0.15 ...)`）。桥过去会让
+红底变深字、不可读。MyShell 自绘的关闭钮规则特异性 (0,5,0) 本就压过库的 (0,3,1)，
+保持现状即正确。
+
+**验证**：`npm run test:ts` 零错误；`npm run build` 通过（901 模块，产物
+1670KB/gzip 545KB）；无头 Chromium 实测 bare 宽度（cmd-slot 365 / path-input 182 /
+color-text 214 / textarea 754，均正确撑满无溢出）、弹窗 `size=md` 实测 520px、
+双列布局无溢出；`isImeKeyEvent` 6 条语义用例全通过。
+
+**遗留**：myui v1.9.8 的 tag 已推送但产物不完整（缺 `files` 白名单），1.9.9 已修。
+MyShell 的 lockfile 指向 1.9.9，1.9.8 可视为废弃。

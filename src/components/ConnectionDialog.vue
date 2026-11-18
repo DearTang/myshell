@@ -598,10 +598,12 @@ function onKeepaliveInput(v: string): void {
 
 <template>
   <!-- MyDialog 壳：dismissable 默认 false（遮罩/Esc/X 全禁用，表单防误关，与旧版一致）；
-       header/footer 均为自定义插槽（标题动态：编辑连接/新建连接）。壳层 v-if 挂载，恒为打开态。 -->
+       header/footer 均为自定义插槽（标题动态：编辑连接/新建连接）。壳层 v-if 挂载，恒为打开态。
+       宽度走 myui v1.9.7 的档位契约：字段数远超 6 个（SSH/FTP/代理/终端/高级各成一组），
+       按 docs/04「≥6 字段用 md」取 520，不再手写 480 这类中间值。 -->
   <MyDialog
     :model-value="true"
-    :width="480"
+    size="md"
     align-center
     class="conn-dialog"
     body-class="conn-dialog-body"

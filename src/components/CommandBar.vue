@@ -14,7 +14,7 @@
      TerminalPanel 构成父子关系，原来那条 emit 直连已失效。 -->
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { MyButton, MyIcon, MyIconButton, MyInput, MyPopover } from "myui";
+import { MyButton, MyIcon, MyIconButton, MyInput, MyPopover, isImeKeyEvent } from "myui";
 import {
   addCommandHistory,
   clearCommandHistory,
@@ -231,12 +231,10 @@ async function handleExecute(cmd: string): Promise<void> {
 }
 
 function onInputKeyDown(e: KeyboardEvent): void {
-  // IME composition: pressing Enter to CONFIRM a Chinese/Japanese/Korean
-  // candidate also dispatches keydown with key === "Enter" and isComposing
-  // true. Treating that as a submit sent the raw pinyin to the host and then
-  // wiped the input, losing the text the user just composed. keyCode 229 is
-  // the legacy signal some IMEs emit instead.
-  if (e.isComposing || e.keyCode === 229) return;
+  // IME 组合态：中文/日文/韩文按 Enter 确认候选词时也会派发 keydown。
+  // 当成提交会把原始拼音发给远端并清空输入框，用户刚组合的字全丢。
+  // 判据收敛到库导出的 isImeKeyEvent（含 keyCode 229 兜底），不再手写。
+  if (isImeKeyEvent(e)) return;
   if (e.key === "Enter" && input.value.trim()) {
     void handleExecute(input.value);
   }
@@ -424,9 +422,11 @@ function firstLine(cmd: string): string {
          **显式转给了内层 ElInput**，所以 class 落在 ElInput 的根上，而不是
          .command-bar 的直接 flex 子项（div.my-field.my-field--bare）。把
          flex:0 1 50% 直接挂在 MyInput 上，等于写在非 flex 子元素上 —— 完全不
-         生效，输入框退回内容自适应宽度（实测约占本栏 15%）。
-         宽度改由这层**块级**包裹 div 控制：.my-field--bare / .my-field__control /
-         .el-input 在块上下文里逐级撑满，无需 :deep() 就能打穿到控件宽度。 -->
+         生效。
+         宽度改由这层**块级**包裹 div 控制。myui v1.9.6 起 .my-field--bare 自身
+         已强制 width:100%（:where 降权，消费方显式宽度仍可覆盖），所以内层
+         不再需要逐级撑满的 hack；包裹层现在的唯一职责就是承接 flex 尺寸，
+         让「占本栏左半」这条布局语义有落点。 -->
     <div class="cmd-slot">
       <MyInput
         ref="cmdInputRef"
@@ -680,9 +680,8 @@ function firstLine(cmd: string): string {
 
    必须挂在 .cmd-slot（包裹层）而不是 MyInput 上，理由见模板处注释：MyInput 的
    class 会被转给内层 ElInput，而 flex 属性只对 .command-bar 的直接子元素生效。
-   .cmd-slot 保持块级（不要改成 display:flex —— 那样 .my-field 又会退回按内容
-   收缩），内部的 my-field--bare / my-field__control / .el-input 在块上下文里
-   逐级撑满，无需 :deep()。 */
+   .cmd-slot 保持块级即可（myui v1.9.6 起 .my-field--bare 自身 width:100%，
+   块上下文里会自动撑满，不再依赖「逐级撑满」的隐式行为）。 */
 .cmd-slot {
   flex: 0 1 50%;
   min-width: 0;

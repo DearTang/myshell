@@ -16,6 +16,7 @@
     "test:compile": "npm run test:ts && npm run test:rust"
   },
   "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@xterm/addon-canvas": "^0.7.0",
@@ -27,7 +28,7 @@
     "fflate": "^0.8.3",
     "html2canvas": "^1.4.1",
     "markdown-it": "^14.1.0",
-    "myui": "git+https://gitee.com/argustang/my-ui.git#v1.9.1",
+    "myui": "git+https://gitee.com/argustang/my-ui.git#v1.9.9",
     "vue": "^3.5.32",
     "vue-i18n": "^11.4.0",
     "zmodem.js": "^0.1.10"

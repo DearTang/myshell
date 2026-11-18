@@ -125,14 +125,17 @@ onUnmounted(() => {
   -webkit-user-select: none;
 }
 
+/* 关闭钮的红底是 Windows 系统语义色（#e81123 是 Win11 关闭按钮的实测值），
+   不随主题色走；前景用 myui v1.9.5 起的 --danger-fg（双主题恒白），与库内
+   MyWindowControls 的默认值同源，避免两处各写一份 #fff。 */
 .window-controls :deep(.my-window-controls__btn.is-close:hover) {
   background: #e81123;
-  color: #fff;
+  color: var(--danger-fg, #fff);
 }
 
 .window-controls :deep(.my-window-controls__btn.is-close:active) {
   background: #f1707a;
-  color: #fff;
+  color: var(--danger-fg, #fff);
 }
 
 /* 浮层（门禁页 / 启动页）形态：按钮贴在覆盖层右上角，底色是深色渐变而非

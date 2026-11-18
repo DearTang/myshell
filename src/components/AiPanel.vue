@@ -4,7 +4,7 @@
      - markdown 由 react-markdown+remark-gfm 换为 markdown-it（html:false 保持防 XSS 语义）；
      - 宽度拖拽 emit width-change，由壳层（ui.aiPanelWidth）持久化。 -->
 <script setup lang="ts">
-import { MyButton, MyIcon, MyIconButton, MyPopover, MyTextArea } from "myui";
+import { MyButton, MyIcon, MyIconButton, MyPopover, MyTextArea, isImeKeyEvent } from "myui";
 import { computed, onUnmounted, ref, watch } from "vue";
 import type { Terminal } from "@xterm/xterm";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -365,6 +365,9 @@ function attachSelection(): void {
 }
 
 function onKeyDown(e: KeyboardEvent): void {
+  // 中文/日文候选态下按 Enter 是「确认候选词」，不是发送。缺这道判据时
+  // 拼音会被当成消息发出去，输入框随即清空——用户刚打的字全丢。
+  if (isImeKeyEvent(e)) return;
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     send();

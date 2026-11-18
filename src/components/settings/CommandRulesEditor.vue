@@ -2,7 +2,7 @@
      （从旧 mcp 分区拆出）。active 语义沿用旧版：每次切入 MCP 类目重新拉取。 -->
 <script setup lang="ts">
 import { onMounted, ref, watch } from "vue";
-import { MyButton, MyCheckbox, MyIcon, MyIconButton, MyInput } from "myui";
+import { MyButton, MyCheckbox, MyIcon, MyIconButton, MyInput, isImeKeyEvent } from "myui";
 import { getCommandRules, setCommandRules, type CommandRules } from "@/api";
 
 defineOptions({ name: "CommandRulesEditor" });
@@ -128,6 +128,8 @@ function addRule(key: RuleListVM["key"]): void {
 }
 
 function addRuleOnEnter(key: RuleListVM["key"], e: KeyboardEvent): void {
+  // 规则是正则文本，常含中文注释；组合期回车是确认候选词，不该直接加规则。
+  if (isImeKeyEvent(e)) return;
   if (e.key === "Enter" && inputOf(key).trim()) addRule(key);
 }
 

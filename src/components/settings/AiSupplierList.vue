@@ -1,7 +1,7 @@
 <!-- AI 供应商左列表 — 选择 / 双击重命名 / 启用开关（从旧 AiSection 拆出）。 -->
 <script setup lang="ts">
 import { ref } from "vue";
-import { MyButton, MyInput, MyToggle } from "myui";
+import { MyButton, MyInput, MyToggle, isImeKeyEvent } from "myui";
 import type { AiModel } from "@/api";
 
 defineOptions({ name: "AiSupplierList" });
@@ -36,6 +36,9 @@ async function onRenameBlur(m: AiModel): Promise<void> {
 }
 
 function onRenameKeydown(e: KeyboardEvent): void {
+  // 重命名输入框里按 Enter 确认候选词 ≠ 提交新名字；Escape 同理（组合期
+  // 按 Esc 是取消候选词，不该顺带退出重命名）。
+  if (isImeKeyEvent(e)) return;
   if (e.key === "Enter") (e.target as HTMLInputElement).blur();
   if (e.key === "Escape") renamingId.value = null;
 }
