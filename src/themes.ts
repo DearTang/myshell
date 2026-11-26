@@ -72,6 +72,8 @@ export const STORAGE_KEY_TERMINAL_FONT_SIZE = "myshell-terminal-font-size";
 /** 界面/弹窗实心度（0-1）。外观设置的两个滑杆写入。 */
 export const STORAGE_KEY_SOLIDITY = "myshell-ui-solidity";
 export const STORAGE_KEY_POPUP_SOLIDITY = "myshell-ui-popup-solidity";
+/** 截图样式（PuTTY / 跟随终端）。与终端配色分开存 —— 两者服务不同场景。 */
+export const STORAGE_KEY_SCREENSHOT_STYLE = "myshell-screenshot-style";
 
 export const TERMINAL_FONT_SIZE_DEFAULT = 14;
 export const TERMINAL_FONT_SIZE_MIN = 10;
@@ -573,6 +575,96 @@ export const PRESETS: ColorPalette[] = [
   { id: "tokyo-night",       name: "Tokyo Night",       dark: c8Dark,  light: c8Light },
   { id: "everforest",        name: "Everforest",        dark: c9Dark,  light: c9Light },
 ];
+
+// ===========================================================================
+// SCREENSHOT COLOR STYLES — palette used when re-rendering the terminal
+// buffer into a PNG (src/utils/screenshot.ts)
+// ===========================================================================
+//
+// Deliberately SEPARATE from the terminal presets above: a screenshot is an
+// export artifact that people paste into docs / tickets, while the live
+// terminal follows whatever palette the user picked for their own eyes. A user
+// who likes Tokyo Night on screen still wants PuTTY-style PNGs when reporting
+// a bug, so the two domains get their own switch (settings → 截图样式).
+//
+// Colors are the terminal theme as xterm sees it: 16 ANSI slots + foreground,
+// cursor and selection. The PNG renderer also uses `fontFamily` as its
+// last-resort font fallback when the live terminal's own font can't be read.
+export interface ScreenshotStyle {
+  id: string;
+  name: string;
+  terminal: TerminalTheme;
+  /** Font family used when the live terminal's own font can't be measured. */
+  fontFamily: string;
+}
+
+// ── PuTTY default (the classic 16-color scheme) ──
+// Values transcribed from PuTTY's own source so this isn't "close enough":
+//   settings.c  load_open_settings() — the Colour0..Colour21 default table
+//     (Colour0 fg / Colour1 bold fg / Colour2 bg / Colour5 cursor /
+//      Colour6..Colour21 = ANSI 0-7 and bright 8-15)
+//   windows/windefs.c  platform_default_fontspec() — Courier New, 10pt
+const puttyScreenshot: ScreenshotStyle = {
+  id: "putty",
+  name: "PuTTY",
+  terminal: {
+    background:        "#000000",
+    foreground:        "#bbbbbb", // 187,187,187
+    cursor:            "#00ff00", // 0,255,0 — PuTTY's bright green block
+    cursorAccent:      "#000000",
+    selectionBackground: "#000000",
+    black:             "#000000", //   0,0,0
+    red:               "#bb0000", // 187,0,0
+    green:             "#00bb00", // 0,187,0
+    yellow:            "#bbbb00", // 187,187,0
+    blue:              "#0000bb", // 0,0,187
+    magenta:           "#bb00bb", // 187,0,187
+    cyan:              "#00bbbb", // 0,187,187
+    white:             "#bbbbbb", // 187,187,187
+    brightBlack:       "#555555", //  85,85,85
+    brightRed:         "#ff5555", // 255,85,85
+    brightGreen:       "#55ff55", // 85,255,85
+    brightYellow:      "#ffff55", // 255,255,85
+    brightBlue:        "#5555ff", // 85,85,255
+    brightMagenta:     "#ff55ff", // 255,85,255
+    brightCyan:        "#55ffff", // 85,255,255
+    brightWhite:       "#ffffff", // 255,255,255
+  },
+  fontFamily: "Courier New, monospace",
+};
+
+// ── Live terminal (follow the on-screen palette) ──
+// Not a ScreenshotStyle entry: resolved from the active palette at capture
+// time (see resolveScreenshotStyle), so switching the terminal palette
+// switches the PNG colors too. BOTH `terminal` and `fontFamily` below are
+// therefore placeholders the capture path never reads — the live values come
+// from the active palette and the terminal's measured font stack.
+const liveScreenshot: ScreenshotStyle = {
+  id: "live",
+  name: "跟随终端",
+  terminal: {
+    background:        "#000000",
+    foreground:        "#cccccc",
+    cursor:            "#cccccc",
+    cursorAccent:      "#000000",
+    selectionBackground:"#000000",
+    black:             "#000000",  red: "#cc0000",  green: "#00cc00",
+    yellow:            "#cccc00",  blue: "#0000cc",  magenta: "#cc00cc",
+    cyan:              "#00cccc",  white: "#cccccc",
+    brightBlack:       "#555555",  brightRed: "#ff5555", brightGreen: "#55ff55",
+    brightYellow:      "#ffff55",  brightBlue: "#5555ff", brightMagenta: "#ff55ff",
+    brightCyan:        "#55ffff",  brightWhite: "#ffffff",
+  },
+  fontFamily: "Courier New, monospace",
+};
+
+export const SCREENSHOT_STYLES: ScreenshotStyle[] = [puttyScreenshot, liveScreenshot];
+
+export const DEFAULT_SCREENSHOT_STYLE_ID = "putty";
+
+export function getScreenshotStyle(id: string): ScreenshotStyle {
+  return SCREENSHOT_STYLES.find((s) => s.id === id) ?? puttyScreenshot;
+}
 
 // --------------- Utilities ---------------
 

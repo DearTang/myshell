@@ -1,19 +1,24 @@
-// MCP ↔ GUI 桥：监听 MCP 服务器的 open_connection / exec_in_tab 命令。
+// MCP ↔ GUI 桥：监听 MCP 服务器的 open_connection / exec_in_tab /
+// screenshot_terminal 命令。
 // 从旧 App.tsx 的 mcp-gui-command useEffect 原样移植（sentinel 三层完成策略、
 // 每连接执行互斥锁 + 陈旧锁自愈、GUI 确认对话框），语义零改动。
 import { watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { toast } from "myui";
 import {
   checkCommandConfirmation,
   checkCommandDangerReasons,
   mcpConfirmResult,
   mcpExecResult,
   onSshOutput,
+  saveScreenshot,
+  showInFolder,
   sshSend,
 } from "../api";
 import { connectionsStore } from "../store/connections";
-import { sessions, connect, reconnectOne, getTab } from "../store/sessions";
+import { sessions, connect, reconnectOne, getTab, getTerminal } from "../store/sessions";
 import { showMcpConfirm, ui } from "../store/ui";
+import { captureTerminalToDataUrl } from "../utils/screenshot";
 import { stripFromAnsiPosition } from "../utils/ansi";
 
 interface McpGuiCommand {
@@ -35,6 +40,8 @@ interface McpGuiCommand {
   connection_name?: string;
   /** `mcp_confirm`：完整详情（路径、目标对象），展示给用户判断影响面 */
   detail?: string;
+  /** `exec_task_progress`：MCP 后台任务（ssh_run）的阶段文案。null = 清除角标 */
+  label?: string | null;
 }
 
 // 每连接执行锁：连接 id → 加锁时刻。交互式 PTY 串行执行，上一条没跑完时
@@ -46,11 +53,131 @@ interface McpGuiCommand {
 const mcpExecLocks = new Map<string, number>();
 const MCP_LOCK_STALE_MS = 60_000;
 
+/**
+ * 已确认 TERM 齐备的会话集合（sessionId）。
+ *
+ * 为什么需要缓存：探针是一次远端往返（发 `echo $TERM` 等回显）。gui 通道的
+ * 每个 MCP 客户端进程复用同一条持久 shell，所以「这个会话的 TERM 已经对了」
+ * 在整条会话里都成立 —— 不缓存就等于给每次 ssh_exec 都加一次往返，而那正是
+ * 反馈里「一次调用约 6 秒就被切断」最不该花的预算。
+ */
+const termDeclaredSessions = new Set<string>();
+
+/** 探针标记：只认这一串，避免把用户自己 echo 的内容误判成探针结果。 */
+const TERM_PROBE_MARK = "__MYSHLL_TERM__";
+
+/**
+ * 确保远端 shell 的 TERM 已显式声明为 xterm-256color。
+ *
+ * 背景：gui 通道的 PTY 由 ssh.rs 以 `xterm-256color` 申请（ssh.rs request_pty），
+ * 但 TERM 变量是否真的出现在远端环境里取决于 sshd 的 `AcceptEnv` 配置 —— 多数
+ * 默认配置不收。结果是「有 PTY 但没有 TERM」的中间态：提示符正常，而依赖
+ * terminfo 的 `clear` 行为不确定，采集输出里还带着
+ * `TERM environment variable not set.`。
+ *
+ * 判据（刻意保守）：探针读到非空值就认为齐备，一律不覆盖用户自己设的 TERM
+ * （可能是 dumb、screen-256color 等有意选择）。只在缺失/为空时才导出。
+ */
+async function ensureTermDeclared(sessionId: string): Promise<void> {
+  if (termDeclaredSessions.has(sessionId)) return;
+  try {
+    const current = await probeTerm(sessionId);
+    if (current) {
+      termDeclaredSessions.add(sessionId);
+      return;
+    }
+    // 只在缺失时导出。export 对当前 shell 生效，且该 shell 被同一 MCP 客户端
+    // 进程复用，所以后续命令都看得到。
+    await sshSend(sessionId, "export TERM=xterm-256color\n");
+    termDeclaredSessions.add(sessionId);
+  } catch {
+    // 探针失败不阻断执行：TERM 缺失只是让部分命令行为不确定，不是致命错误。
+    // 标记为已处理，避免每条命令都重试一次注定失败的探针。
+    termDeclaredSessions.add(sessionId);
+  }
+}
+
+/** 发一次 `echo <mark>:$TERM` 并用一次性监听取回该行的值。 */
+//
+// 刻意用 new Promise 而非 Promise.withResolvers：本项目 tsconfig 的 lib 是
+// ES2021（见 tsconfig.json），没有 withResolvers 类型；为它抬 lib 会波及其
+// 其他文件的类型解析，不值的当。
+//
+// 取值的两个坑（探针脚本 F:/tmp/term-probe-check.mjs 实测抓到）：
+//   1. 命令**回显行**（`echo __MYSHLL_TERM__:$TERM`）也含标记，且排在结果行
+//      之前。只按「标记:」匹配会先命中回显、把字面量 `$TERM` 当成已设值，
+//      于是永远跳过导出 —— TERM 缺失恰恰静默延续。判据加一条：值不得以 `$`
+//      开头（那是未展开的变量名，不是值）。
+//   2. 结果行尾常带 readline 的 ANSI（`\x1b[m\x1b[K`），原样返回会把
+//      `xterm-256color` 判成非空但脏的值。先剥 ANSI 再取。
+function probeTerm(sessionId: string): Promise<string> {
+  return new Promise<string>((resolve) => {
+    let settled = false;
+    let stop: UnlistenFn | null = null;
+    const finish = (v: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      stop?.();
+      resolve(v);
+    };
+    // 探针有自己的预算：3 秒拿不到就当作「读不到」，与命令超时无关。
+    const timer = setTimeout(() => finish(""), 3000);
+    void (async () => {
+      try {
+        stop = await onSshOutput(sessionId, (data) => {
+          const chunk = new TextDecoder("utf-8", { fatal: false }).decode(data, {
+            stream: true,
+          });
+          const value = parseTermProbeValue(chunk);
+          if (value !== null) finish(value);
+        });
+        await sshSend(sessionId, `echo ${TERM_PROBE_MARK}:$TERM\n`);
+      } catch {
+        finish("");
+      }
+    })();
+  });
+}
+
+/**
+ * 从一段 PTY 输出里解析 TERM 探针的值。
+ *
+ * 返回 null = 还没看到结果行（调用方继续等）；返回空串 = 结果行在、TERM 未
+ * 设置（需要导出）；返回非空 = 远端已有 TERM（一律不覆盖）。
+ */
+function parseTermProbeValue(chunk: string): string | null {
+  const re = new RegExp(`${TERM_PROBE_MARK}:([^\\r\\n]*)`);
+  let m: RegExpExecArray | null;
+  let rest = chunk;
+  // 逐个候选扫过去：第一个可能是命令回显（值是 `$TERM`），结果行排在它后面。
+  while ((m = re.exec(rest)) !== null) {
+    const raw = stripAnsiTail(m[1]);
+    // 未展开的变量名不是值 —— 那是回显行，继续找结果行
+    if (!raw.startsWith("$")) return raw;
+    rest = rest.slice(m.index + m[0].length);
+  }
+  return null;
+}
+
+/// 剥掉行尾的 CSI 序列（readline 重绘留下的 `\x1b[m` / `\x1b[K` 等）。
+/// 只处理行尾：值本身不可能含合法 ANSI，这样不必引入完整的状态机。
+function stripAnsiTail(s: string): string {
+  return s.replace(/(?:\x1b\[[0-9;]*[a-zA-Z])+$/, "");
+}
+
 // 进程级终端标签注册表："连接id:客户端pid" → tabId。exec_in_tab 据此复用
 // 本进程自己的标签；标签被用户关掉后从这里清除（startMcpBridge 内 watch）。
 // MCP 进程重启换 pid → 自然落新键、开新标签，旧标签留作孤儿由用户手关
 //（断开≠退出，不自动关）。
 const mcpProcessTabs = new Map<string, string>();
+
+// 截图新建标签轮询的活动句柄。三条正常出口（连上 / 连接失败 / 轮询超时）
+// 各自 clearInterval 并 delete；桥卸载（MCP 客户端断开）这条路径只有这里
+// 能覆盖 —— 不清的话 interval 会带着 sessions.tabs 引用转到应用结束。
+// 本项目 tsconfig 走 DOM lib，setInterval 返回 number（NodeJS.Timeout 不在
+// 这个工程的环境里），直接用具名类型，不用 ReturnType<typeof setInterval>。
+const activeScreenshotPolls = new Set<number>();
 
 /**
  * 把 MCP 正在使用的标签带到前台——但只在用户没有别的活动标签时。
@@ -102,12 +229,135 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
 
     if (!connection_id) return;
 
+    // ── exec_task_progress：MCP 后台任务（ssh_run）的阶段角标 ──
+    //
+    // 为什么值得做：ssh_run 的存在理由就是「客户端单次调用预算 ~30s，而任务本身
+    // 要跑几分钟」。AI 侧轮询 ssh_status 能看到进度，用户侧却只看到一台安静的
+    // MyShell —— 完全看不出有个 5 分钟的安装在跑。角标把阶段写到该连接的标签
+    // 标题上，是成本最低的诚实答案（不伪造终端流，也不抢焦点）。
+    //
+    // label 为 null 表示清除（任务跑完 / 失败 / 被 ssh_cancel）。空串等同 null：
+    // 一个空角标在标题上只是噪音。
+    if (action === "exec_task_progress") {
+      const label = event.payload.label;
+      const text = typeof label === "string" ? label.trim() : "";
+      if (text) {
+        sessions.taskBadges[connection_id] = text;
+      } else {
+        delete sessions.taskBadges[connection_id];
+      }
+      return;
+    }
+
     const config = connectionsStore.connections.find((c) => c.id === connection_id);
     if (!config) {
       console.warn(`[mcp-gui] connection not found: ${connection_id}`);
       if (action === "exec_in_tab" && event.payload.request_id) {
         mcpExecResult(event.payload.request_id, { ok: false, error: "未找到连接" });
       }
+      if (action === "screenshot_terminal" && event.payload.request_id) {
+        mcpExecResult(event.payload.request_id, { ok: false, error: "未找到连接" });
+      }
+      return;
+    }
+
+    // ── screenshot_terminal：截取该连接终端标签页的当前画面并保存 ──
+    //
+    // 与 exec_in_tab 的分工：exec 要往 PTY 写命令，screenshot 只读画面，
+    // 所以它没有每连接执行锁，也没有确认门（截图不是危险操作）。捕获直接
+    // 走 terminalRegistry 里的 xterm 实例（getTerminal(sessionId)），复用
+    // 📷 按钮同一条 captureTerminalToDataUrl + saveScreenshot 管线，产出
+    // 与手动截图逐字节一致 —— 不绕 sessionActions 是因为那条注册表是
+    // fire-and-forget 的，拿不到保存路径，而路径是这次改动的核心交付。
+    //
+    // 不抢焦点：截的是该连接标签页的缓冲区内容，与用户当前在看哪个标签
+    // 无关；exec_in_tab 曾因无条件 set_focus 被用户投诉，截图这条路径
+    // 更不该重蹈。已有标签时直接复用，没有才开新标签（新标签会置为活动
+    // 态，这是「打开标签」语义自带的，无法避免也不需要避免）。
+    if (action === "screenshot_terminal" && event.payload.request_id) {
+      const requestId = event.payload.request_id;
+      // 调用方可选的文件名标签（P1：跳转采集时表达「这是哪台目标机的画面」）。
+      // 连接身份仍会进入文件名 —— 丢了它就答不出「这张图本来是在哪台上截的」。
+      const shotLabel = typeof event.payload.label === "string" ? event.payload.label : undefined;
+      const fail = (error: string) => mcpExecResult(requestId, { ok: false, error });
+
+      const captureTab = (tabId: string) => {
+        const tab = getTab(tabId);
+        if (!tab?.sessionId || tab.status !== "connected") {
+          fail("该连接的终端标签页尚未连接，无法截图。请先在 GUI 中打开并连上该连接。");
+          return;
+        }
+        const term = getTerminal(tab.sessionId);
+        if (!term) {
+          fail("终端实例未就绪（面板可能仍在挂载中），请稍候重试。");
+          return;
+        }
+        // 与 TerminalPanel.handleScreenshot 同管线；保存路径在这里回传给
+        // MCP 调用方，toast 也照旧给用户一个可「打开」的成功反馈。
+        void (async () => {
+          try {
+            const dataUrl = await captureTerminalToDataUrl(term);
+            if (!dataUrl) {
+              fail("截图失败：无法捕获终端画面");
+              return;
+            }
+            const path = await saveScreenshot(
+              dataUrl,
+              tab.name || tab.sessionId!,
+              shotLabel
+            );
+            toast(`已保存：${path}`, {
+              type: "success",
+              duration: 8000,
+              action: { label: "打开", onClick: () => showInFolder(path) },
+            });
+            mcpExecResult(requestId, { ok: true, path });
+          } catch (e: unknown) {
+            const msg = e instanceof Error && e.message ? String(e.message) : String(e);
+            fail(msg.includes("附件目录") ? msg : `保存失败: ${msg}`);
+          }
+        })();
+      };
+
+      const existing = sessions.tabs.find(
+        (t) => t.connectionId === connection_id && t.type === "terminal" && t.status === "connected",
+      );
+      if (existing?.sessionId) {
+        captureTab(existing.id);
+        return;
+      }
+
+      // 没有已连接的终端标签页：开一个新标签并等它连上后截图。
+      // 复用 exec_in_tab 的新建 tab 路径语义（快照 id 识别本次新建的那个）。
+      const idsBefore = new Set(sessions.tabs.map((t) => t.id));
+      connect(config);
+      let attempts = 0;
+      // 30s 轮询上限（60 × 500ms），与三端超时预算对齐：GUI 侧 IPC 等 45s、
+      // MCP 侧读 50s，都比这里大 —— 宁可 GUI 先超时回一条结构化错误，
+      // 也不要前端还没连上 GUI 就已经答完了（那会变成假成功）。
+      const maxAttempts = 60;
+      const checkInterval = setInterval(() => {
+        attempts++;
+        const tab = sessions.tabs.find(
+          (t) => !idsBefore.has(t.id) && t.connectionId === connection_id && t.type === "terminal",
+        );
+        if (tab?.status === "error") {
+          clearInterval(checkInterval);
+          activeScreenshotPolls.delete(checkInterval);
+          fail(`连接失败：${tab.errorMessage || "请检查保险库是否已解锁"}`);
+          return;
+        }
+        if (tab?.sessionId && tab.status === "connected") {
+          clearInterval(checkInterval);
+          activeScreenshotPolls.delete(checkInterval);
+          captureTab(tab.id);
+        } else if (attempts >= maxAttempts) {
+          clearInterval(checkInterval);
+          activeScreenshotPolls.delete(checkInterval);
+          fail("连接超时，无法建立终端会话，截图未发起。");
+        }
+      }, 500);
+      activeScreenshotPolls.add(checkInterval);
       return;
     }
 
@@ -453,6 +703,17 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
         }, timeoutMs);
 
         try {
+          // TERM 显式声明（P0-3）：gui 通道的 PTY 由 ssh.rs 以
+          // `xterm-256color` 申请，但 TERM 变量是否真的到远端取决于 sshd 的
+          // AcceptEnv —— 没声明时远端 shell 报
+          // `TERM environment variable not set.`，`clear` 之类依赖 terminfo
+          // 的命令行为不确定（这正是「像终端又不是终端」的中间态）。
+          //
+          // 每会话只探针一次：探针本身是一次往返，且它的输出会进入
+          // outputBuf —— 必须先于 sentinel 订阅之前发完并等待其回显归位，
+          // 否则探针输出会被算进命令 stdout。做法：探针在订阅输出前发送，
+          // 用一个独立的一次性监听只吞这一行。
+          await ensureTermDeclared(sessionId);
           // 监听挂好后再发命令（先订阅后发送，避免快命令输出丢失）
           await sshSend(sessionId, command + "\n");
           // 从这一刻起命令已经在远端跑了——后续任何失败（硬超时、sentinel 丢失、
@@ -589,5 +850,9 @@ export async function startMcpBridge(): Promise<UnlistenFn> {
   return () => {
     unlisten();
     stopWatch();
+    // 截图轮询的卸载清理：桥断开时还有轮询在跑（前端正在等新标签连上），
+    // 这里必须停 —— 否则 interval 会带着 sessions.tabs 引用转到应用结束。
+    for (const handle of activeScreenshotPolls) clearInterval(handle);
+    activeScreenshotPolls.clear();
   };
 }

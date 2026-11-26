@@ -10,12 +10,18 @@
 //! 看起来合法的 URL，壁纸却一次都不渲染。收进自管目录同时根治「原图被
 //! 移动/删除后壁纸失效」。
 //!
-//! ## 为什么文件名不能固定
+//! ## 文件名固定，缓存由前端查询串兜住
 //!
 //! **同一个 background-image URL 浏览器不会重新取图**（Chromium 实测：CSS
-//! 里重复设置同一 URL，请求计数不增加），换同格式图片时前端拿到同一个
-//! URL，watch 不触发、页面继续显示旧图。文件名带单调后缀，保证每次导入
-//! 都产生新 URL。
+//! 里重复设置同一 URL，请求计数不增加）。早期版本用「时间戳文件名」保证
+//! 每次导入都是新 URL，代价是 localStorage 里的旧 URL 会指向被清理的文件：
+//! 启动预检 404 → 壁纸静默丢失（实测每次启动一条
+//! `File does not exist at path`，用户报「设完当时生效、重启就不见了」）。
+//!
+//! 现在文件名固定为 `wallpaper.<ext>`：URL 与磁盘路径永久一一对应，换图是
+//! 覆盖写，旧 URL 永远有效。缓存问题改由前端拼 `?v=<时间戳>` 查询串解决
+//! （见 `appearance.ts` 的 `wallpaperUrl`）—— 查询串不参与 asset scope 的
+//! 路径判定。
 //!
 //! ## 安全边界
 //!
@@ -28,7 +34,6 @@
 //! （设计对齐 omp-desktop 的 wallpaper.rs，按 MyShell 的目录约定适配。）
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 /// 单张壁纸体积上限。4K 壁纸通常 3–8MB，16MB 与截图读取同口径。
@@ -44,22 +49,12 @@ const WALLPAPER_DIR: &str = "wallpapers";
 
 const WALLPAPER_STEM: &str = "wallpaper";
 
-/// 生成本次导入的文件名：固定前缀 + 毫秒时间戳 + 白名单扩展名。
+/// 本次导入的文件名：固定 `wallpaper.<ext>`。
 ///
-/// 后缀只有一个作用：让每次导入落在不同路径上（= 不同 asset URL =
-/// 浏览器重新取图）。只含数字，无任何用户输入；时间戳撞车时顺延。
-fn wallpaper_file_name(dir: &Path, ext: &str) -> PathBuf {
-    let mut millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or(0);
-    loop {
-        let candidate = dir.join(format!("{WALLPAPER_STEM}-{millis}.{ext}"));
-        if !candidate.exists() {
-            return candidate;
-        }
-        millis += 1;
-    }
+/// 路径稳定 = asset URL 稳定（换图靠覆盖写，前端用 `?v=` 查询串绕过缓存）。
+/// 只含固定前缀与白名单扩展名，无任何用户输入。
+fn wallpaper_file_name(ext: &str) -> PathBuf {
+    PathBuf::from(format!("{WALLPAPER_STEM}.{ext}"))
 }
 
 /// 扩展名 → 白名单内的小写形式；不在表内返回 None。
@@ -138,7 +133,7 @@ fn import_into_dir(dir: &Path, source_text: &str) -> Result<PathBuf, String> {
     }
 
     std::fs::create_dir_all(dir).map_err(|err| format!("创建壁纸目录失败：{err}"))?;
-    let target = wallpaper_file_name(dir, &ext);
+    let target = dir.join(wallpaper_file_name(&ext));
     std::fs::copy(source, &target).map_err(|err| format!("复制壁纸失败：{err}"))?;
     clear_other_wallpapers(dir, &target);
     Ok(target)
@@ -179,7 +174,7 @@ fn parse_data_url(data_url: &str) -> Result<(String, Vec<u8>), String> {
 fn import_data_into_dir(dir: &Path, data_url: &str) -> Result<PathBuf, String> {
     let (ext, bytes) = parse_data_url(data_url)?;
     std::fs::create_dir_all(dir).map_err(|err| format!("创建壁纸目录失败：{err}"))?;
-    let target = wallpaper_file_name(dir, &ext);
+    let target = dir.join(wallpaper_file_name(&ext));
     std::fs::write(&target, &bytes).map_err(|err| format!("写入壁纸失败：{err}"))?;
     clear_other_wallpapers(dir, &target);
     Ok(target)
@@ -195,6 +190,50 @@ fn import_wallpaper_data_impl(app: &tauri::AppHandle, data_url: String) -> Resul
     let dir = wallpaper_dir(app)?;
     let stored = import_data_into_dir(&dir, data_url.trim())?;
     Ok(stored.to_string_lossy().into_owned())
+}
+
+/// 当前壁纸的绝对路径：优先固定文件名（新逻辑导入的那张），没有则退回
+/// 目录里修改时间最新的白名单图片（兼容升级前的时间戳命名）。
+///
+/// 前端启动时若 `localStorage` 里的壁纸 URL 不可达，用它自愈 —— 壁纸配置
+/// 只存在 WebView 的 localStorage 里，而进程退出不保证 Chromium 把最后一批
+/// 写入刷进 LevelDB（实测：设置后重启读回旧值）。磁盘文件才是可靠来源。
+fn pick_current_wallpaper(dir: &Path) -> Option<PathBuf> {
+    for ext in WALLPAPER_EXTENSIONS {
+        let candidate = dir.join(wallpaper_file_name(ext));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_file() || extension_of(&path).is_none() {
+            continue;
+        }
+        let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(best, _)| modified > *best) {
+            newest = Some((modified, path));
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+fn current_wallpaper_impl(app: &tauri::AppHandle) -> Result<Option<String>, String> {
+    let dir = wallpaper_dir(app)?;
+    Ok(pick_current_wallpaper(&dir).map(|path| path.to_string_lossy().into_owned()))
+}
+
+/// 读取当前壁纸路径（无壁纸时返回 null）。供前端在 localStorage 里的
+/// 壁纸 URL 失效时自愈。
+#[tauri::command]
+pub async fn current_wallpaper(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || current_wallpaper_impl(&app))
+        .await
+        .map_err(|err| format!("读取壁纸路径失败：{err}"))?
 }
 
 /// 导入本地图片为壁纸。前端拿返回的绝对路径调 `convertFileSrc` 生成
@@ -243,37 +282,30 @@ mod tests {
         assert_eq!(extension_of(Path::new("noext")), None);
     }
 
-    /// 同一毫秒内两次导入也必须落不同路径：路径不变 = asset URL 不变 =
-    /// 浏览器不重新取图，换图表现为「点了没反应」。
+    /// 文件名必须固定：换图走覆盖写，URL 才不会指向被清理的旧文件。
     #[test]
-    fn wallpaper_file_name_is_unique_per_import() {
-        let dir = temp_root("name");
-        let first = wallpaper_file_name(&dir, "png");
-        std::fs::write(&first, b"x").expect("touch first");
-        let second = wallpaper_file_name(&dir, "png");
-        assert_ne!(first, second, "two imports must produce different paths");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 文件名只由固定前缀 + 数字 + 白名单扩展名组成，无路径穿越面。
-    #[test]
-    fn wallpaper_file_name_has_no_user_input() {
-        let name = wallpaper_file_name(Path::new("C:\\base"), "png");
-        let name = name.file_name().unwrap().to_str().unwrap();
-        assert!(name.starts_with("wallpaper-"), "got {name}");
-        assert!(name.ends_with(".png"), "got {name}");
-        assert!(
-            name.trim_start_matches("wallpaper-")
-                .trim_end_matches(".png")
-                .chars()
-                .all(|c| c.is_ascii_digit()),
-            "got {name}"
+    fn wallpaper_file_name_is_stable_per_extension() {
+        assert_eq!(wallpaper_file_name("png"), wallpaper_file_name("png"));
+        assert_ne!(wallpaper_file_name("png"), wallpaper_file_name("jpg"));
+        assert_eq!(
+            wallpaper_file_name("png"),
+            PathBuf::from("wallpaper.png"),
+            "文件名只由固定前缀与扩展名组成"
         );
     }
 
-    /// 端到端：连续导入两张图必须返回不同路径，且旧图被清理。
+    /// 文件名只由固定前缀 + 白名单扩展名组成，无路径穿越面。
     #[test]
-    fn consecutive_imports_produce_distinct_paths() {
+    fn wallpaper_file_name_has_no_user_input() {
+        let name = wallpaper_file_name("png");
+        let name = name.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name, "wallpaper.png");
+    }
+
+    /// 端到端：连续导入两张图落到同一路径（覆盖写），内容为第二张，
+    /// 目录里只留一份壁纸。
+    #[test]
+    fn consecutive_imports_overwrite_same_path() {
         let root = temp_root("import");
         let src_dir = root.join("src");
         let dst_dir = root.join("dst");
@@ -288,9 +320,14 @@ mod tests {
         let first = import_into_dir(&dst_dir, a.to_str().unwrap()).expect("import a");
         let second = import_into_dir(&dst_dir, b.to_str().unwrap()).expect("import b");
 
-        assert_ne!(first, second, "两次导入必须落到不同路径");
+        assert_eq!(first, second, "换图必须是同一路径的覆盖写");
         assert_eq!(std::fs::read(&second).unwrap(), b"second-image");
-        assert!(!first.exists(), "旧壁纸应被清理，磁盘只留一份");
+        let left: Vec<_> = std::fs::read_dir(&dst_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("wallpaper.jpg")]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -298,7 +335,7 @@ mod tests {
     #[test]
     fn reimport_inside_wallpaper_dir_keeps_path() {
         let root = temp_root("idempotent");
-        let existing = root.join("wallpaper-1000.jpg");
+        let existing = root.join("wallpaper.jpg");
         std::fs::write(&existing, b"x").expect("write");
 
         let stored = import_into_dir(&root, existing.to_str().unwrap()).expect("import");
@@ -307,22 +344,54 @@ mod tests {
     }
 
     #[test]
-    fn legacy_and_new_names_are_both_cleaned() {
+    fn legacy_and_fixed_names_are_cleaned() {
         let dir = temp_root("clean");
-        let keep = dir.join("wallpaper-2000.jpg");
-        let legacy = dir.join("wallpaper.jpg");
-        let stale = dir.join("wallpaper-1000.png");
+        let keep = dir.join("wallpaper.jpg");
+        let legacy = dir.join("wallpaper-2000.png");
+        let other_ext = dir.join("wallpaper.jpeg");
         let foreign = dir.join("notes.txt");
-        for path in [&keep, &legacy, &stale, &foreign] {
+        for path in [&keep, &legacy, &other_ext, &foreign] {
             std::fs::write(path, b"x").expect("touch");
         }
 
         clear_other_wallpapers(&dir, &keep);
 
         assert!(keep.exists());
-        assert!(!legacy.exists(), "旧命名壁纸应被清理");
-        assert!(!stale.exists(), "换下的壁纸应被清理");
+        assert!(!legacy.exists(), "旧时间戳命名的壁纸应被清理");
+        assert!(!other_ext.exists(), "换扩展名后的旧壁纸应被清理");
         assert!(foreign.exists(), "非壁纸文件不动");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 固定名优先于更新的时间戳文件：新逻辑导入的那张就是当前壁纸。
+    #[test]
+    fn pick_current_wallpaper_prefers_fixed_name() {
+        let dir = temp_root("pick-fixed");
+        let fixed = dir.join("wallpaper.png");
+        let legacy = dir.join("wallpaper-9999.jpg");
+        std::fs::write(&fixed, b"x").expect("touch fixed");
+        std::fs::write(&legacy, b"x").expect("touch legacy");
+        assert_eq!(pick_current_wallpaper(&dir), Some(fixed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没有固定名时退回扫描：时间戳命名的旧壁纸仍能被找回（升级兼容）。
+    #[test]
+    fn pick_current_wallpaper_falls_back_to_legacy_name() {
+        let dir = temp_root("pick-legacy");
+        let legacy = dir.join("wallpaper-1000.jpg");
+        std::fs::write(&legacy, b"x").expect("touch");
+        assert_eq!(pick_current_wallpaper(&dir), Some(legacy));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 目录不存在 / 只有非图片文件 → None（前端据此保持无壁纸态）。
+    #[test]
+    fn pick_current_wallpaper_none_without_images() {
+        let dir = temp_root("pick-none");
+        std::fs::write(dir.join("notes.txt"), b"x").expect("touch");
+        assert_eq!(pick_current_wallpaper(&dir), None);
+        assert_eq!(pick_current_wallpaper(&dir.join("missing")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

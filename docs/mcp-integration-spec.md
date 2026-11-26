@@ -151,7 +151,69 @@ content = {"connection":"prod-db","command":"..."}     // ← 要这样
 
 - 同一连接的终端**一次只能跑一条命令**；第二条 `ssh_exec` 返回 `busy`（含等待时间），**命令未发出，可安全重试**。
 - **不同连接完全并行**；`ssh_status` / `ssh_cancel` 等状态查询不受阻塞影响（阶段 185 起服务端并发处理工具调用）。
-- 需要批量在多台机器上跑同一命令：直接并发发多个 `ssh_exec`（各自不同连接）即可。
+- **多台机器同一条命令用 `ssh_exec_many`**，不要循环发多个 `ssh_exec`——循环的每一次迭代都要花掉一次工具调用，而调用方的单次预算是有限的（实测约 6 秒即被切断的客户端，跑 52 台要 150 次往返）。
+
+---
+
+## 五之二、动手前先预检：`mcp_health`
+
+多步骤任务（一批调用、一次传输、一张截图）开始前，先调一次 `mcp_health`。它是只读探针，**不接触任何连接**，也不暴露连接名/主机/凭据：
+
+| 字段 | 含义 |
+|---|---|
+| `gui_running` | MyShell GUI 进程是否活着 |
+| `ipc_responsive` | GUI 是否应答 localhost IPC 桥（活着但挂起的 GUI 为 false） |
+| `vault_state` | `unlocked` / `locked` / `not_initialized` / `gui_unavailable` / `ipc_unresponsive` |
+| `attachment_dir_configured` / `attachment_dir` | 截图与批量结果的落地目录；未配置时这两个工具会失败 |
+| `mcp_version` / `mcp_log_dir` | 版本号与日志目录（报障时给 `mcp-error-<日期>.log`） |
+| `ready` / `next_action` | 一句话结论与下一步 |
+
+**不要**在收到 `vault_locked` 后把它当第一反应——门禁的调用内 20 秒等待已经覆盖了短场景，先重试**同一个**工具；只有重试仍以同样方式失败时，才转 `vault_status` 轮询。
+
+`mcp_health` 与 `vault_status` 一样豁免登录门禁：锁定时恰恰最需要它，把它也门禁起来会自相矛盾。
+
+---
+
+## 五之三、批量执行：`ssh_exec_many`
+
+同一命令跑多台，一次调用：
+
+```jsonc
+{ "name": "ssh_exec_many",
+  "arguments": { "connections": ["/production/node-01", "node-02", "node-03"],
+                 "command_b64": "<base64 命令>" } }
+```
+
+- **每台一个独立 SSH exec 通道**（等价 `ssh host 'cmd'`），全部并行——没有共享 shell，没有跨主机状态，也不保证顺序。
+- **一次确认覆盖整批**，对话框列出全部目标主机。52 个对话框会让这个工具不可用；代价是用户必须读那串主机列表。
+- `timeout` 是**每台**的秒数，不是整批的——各台并行，整批耗时约等于最慢那台。
+- 每台的完整输出写入 `<附件目录>/myshell-batch/<批次id>/<连接名>.log`（含表头：连接、命令、stdout、stderr）。**读这些文件**，不要只信内联摘要。
+- `summary` = `{total, ok, failed, duration_ms}`，每个连接一条 `{connection, ok, exit_code, bytes, error_kind, log}`。
+
+**部分失败是正常结果**：一台连不上不会中止其他主机。上报成功前先看 `summary.failed` 与每台的 `error_kind`。
+
+`ok` 的语义是「命令跑完且退出码为 0」——非零退出是**执行成功但命令失败**，与「根本没连到主机」必须分开看。
+
+未配置附件目录时这个工具**直接报错**，不静默落到临时目录：结果落在随时可能被清理的目录里，正是跳板机重启丢掉的 52 份明细的原因。
+
+---
+
+## 五之四、SFTP 不可用时怎么办
+
+`sftp_*` 与 `ssh_write_text` 每次调用都新开 SFTP 子系统通道，并对**超时形态**的握手失败自动重试一次。判据只看超时：权限拒绝、子系统不存在这类确定性失败不重试（重试只会把同样的答案晚一倍时间送回）。
+
+仍失败时错误信息会指名下一步：
+
+- 传输类：改用 `zmodem_upload` / `zmodem_download`（文档里的首选通道）。
+- `ssh_write_text`：**刻意不做 shell 降级**。它的全部意义就是「凭据字节绝不经过远端 shell 的行编辑器」，降级会让这个承诺变成假话。可用 `zmodem_upload`，或 `ssh_exec` + `exec_channel: "pipe"` 的 base64/printf 写法。
+
+---
+
+## 五之五、GUI 崩溃与 TERM
+
+**IPC 连接被拒绝**时，错误是「MyShell GUI 已退出或崩溃」+ `error_kind: connect_failed`，不再是裸的 `os error 10061`。端口文件陈旧时工具会自动重启 GUI；持续失败才让用户手动打开。活着但不应答的 GUI 报 `ipc_unresponsive`，**绝不**启动第二个实例（会撞单实例守卫）。
+
+**TERM**：`gui` 通道在远端 shell 没有 TERM 时会声明 `TERM=xterm-256color`（用户自设的值一律不覆盖），因此 `clear` 等依赖 terminfo 的命令行为可预期。`pipe` 通道没有 PTY，不作此承诺。
 
 ---
 
@@ -177,6 +239,9 @@ content = {"connection":"prod-db","command":"..."}     // ← 要这样
 - [ ] **写**文件内容用 `ssh_write_text` + `content_b64`，不用 heredoc/echo
 - [ ] 写凭据或上一次结果疑似被污染时，`ssh_exec` 传 `exec_channel: "pipe"`
 - [ ] 客户端接收超时 > 传入的 `timeout`
+- [ ] 多台同一条命令用 `ssh_exec_many`，不循环 `ssh_exec`；把它的 `timeout` 当**每台**理解
+- [ ] 多步骤任务开始前调一次 `mcp_health` 预检（附件目录是否配置、GUI 是否可达）
+- [ ] `ssh_exec_many` 的 `summary.failed > 0` 时逐台看 `error_kind`，不当成整批失败重跑
 - [ ] 失败分支读 `error_kind`，不匹配中文文案
 - [ ] 失败结果上的 `delivered: true` 触发「先确认再重试」，非幂等命令不自动重发
 - [ ] `completed: false` 时把 `exit_code: null` 当未知，不当 0

@@ -1302,6 +1302,12 @@ export async function importWallpaperData(dataUrl: string): Promise<string> {
   return await invoke("import_wallpaper_data", { dataUrl });
 }
 
+/** 当前壁纸的绝对路径（自管目录里的固定文件名；无壁纸时 null）。
+ *  供前端在 localStorage 里的壁纸 URL 失效时自愈。 */
+export async function currentWallpaper(): Promise<string | null> {
+  return await invoke("current_wallpaper");
+}
+
 // ============ Feedback / Diagnostics ============
 
 /** Log info returned by `get_feedback_log` for the feedback dialog. */
@@ -1646,10 +1652,17 @@ export async function setAttachmentDir(dir: string): Promise<string> {
  *
  * @param dataUrl  `data:image/png;base64,...` URL from canvas.toDataURL("image/png")
  * @param connectionName  Used to build a human-friendly filename
+ * @param label  Optional tag that leads the filename. The MCP `screenshot_terminal`
+ *   tool uses it so a jump-host capture can name the TARGET machine while the
+ *   connection identity is still kept in the filename.
  * @returns Absolute path of the saved file
  */
-export async function saveScreenshot(dataUrl: string, connectionName: string): Promise<string> {
-  return invoke<string>("save_screenshot", { dataUrl, connectionName });
+export async function saveScreenshot(
+  dataUrl: string,
+  connectionName: string,
+  label?: string
+): Promise<string> {
+  return invoke<string>("save_screenshot", { dataUrl, connectionName, label: label ?? null });
 }
 
 /**

@@ -95,7 +95,18 @@ function tabHost(tab: Tab): string {
  * 完整信息也不丢失。 */
 function tabTitle(tab: Tab): string {
   const id = tabHost(tab);
-  return id ? `${tab.name} — ${id}` : tab.name;
+  const base = id ? `${tab.name} — ${id}` : tab.name;
+  const badge = taskBadge(tab);
+  // 角标也进 title：条上被截断时，悬停仍能看到阶段。
+  return badge ? `${base} — MCP 任务：${badge}` : base;
+}
+
+/** 该标签对应的 MCP 后台任务角标文案（无则空串）。
+ *
+ * 键是 connectionId（跨重连稳定），不是 tab.id —— 同一台机器的多个标签页
+ * 共享同一个任务状态，任务本来就是按连接跑的。 */
+function taskBadge(tab: Tab): string {
+  return (tab.connectionId && sessions.taskBadges[tab.connectionId]) || "";
 }
 
 // ── 下拉面板开关 ──
@@ -264,10 +275,14 @@ function openQuickCommands(): void {
                图标/状态点与 title 区分，这是「信息密度让位可用宽度」的取舍。 -->
           <span
             class="tab-name"
-            :class="{ 'is-error': (tab.status || 'connected') === 'error', 'in-broadcast': sessions.broadcastIds.has(tab.id) }"
+            :class="{ 'is-error': (tab.status || 'connected') === 'error', 'in-broadcast': sessions.broadcastIds.has(tab.id), 'has-task': !!taskBadge(tab) }"
             :title="tabTitle(tab)"
           >
             {{ tab.name }}
+            <!-- MCP 后台任务角标：ssh_run 在该连接上跑着（阶段由 MCP 经 IPC 推送）。
+                 只读展示，不抢焦点、不改终端内容 —— 让用户知道「有活儿在跑」，
+                 而不冒充一个真的终端流。 -->
+            <span v-if="taskBadge(tab)" class="tab-task-badge">{{ taskBadge(tab) }}</span>
           </span>
 
           <!-- 状态指示（始终显示） -->
@@ -556,6 +571,26 @@ function openQuickCommands(): void {
 
 .tab-name.in-broadcast {
   color: var(--success);
+}
+
+/* MCP 后台任务角标：紧贴名称的小胶囊。用 --info 色系与「错误/广播」区分开，
+   且不加动画 —— 阶段变化本身已经是信息，呼吸动画会让整条标签条显得忙。 */
+.tab-task-badge {
+  display: inline-block;
+  margin-left: 0.4em;
+  padding: 0 0.4em;
+  border-radius: var(--radius-sm, 4px);
+  background: color-mix(in srgb, var(--info, #3b82f6) 22%, transparent);
+  color: var(--info, #3b82f6);
+  font-size: 0.85em;
+  line-height: 1.4;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
+.tab-name.has-task {
+  /* 有任务时允许名称让出空间给角标，但保持省略号行为 */
+  min-width: 3em;
 }
 
 /* 状态点：尺寸与呼吸动画由 MyStatusDot 承担，这里只收紧密度。 */

@@ -22,12 +22,17 @@ interface SessionsState {
   activeTabId: string | null;
   /** 广播组：组内 SSH 终端 tab 的键击互相镜像 */
   broadcastIds: Set<string>;
+  /** MCP 后台任务角标：connectionId → 阶段文案（"连接中"/"执行中"…）。
+   *  由 useMcpBridge 的 exec_task_progress 事件写入/清除；标签标题渲染时拼接，
+   *  因此不改 Tab 结构（那是持久化形状，角标是纯会话态）。 */
+  taskBadges: Record<string, string>;
 }
 
 export const sessions = reactive<SessionsState>({
   tabs: [],
   activeTabId: null,
   broadcastIds: new Set(),
+  taskBadges: {},
 });
 
 // ── 广播重复连接提醒（会话级，不持久化） ──

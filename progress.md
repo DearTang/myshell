@@ -10221,3 +10221,429 @@ session_id 已不在后端 map 里（`disconnect` 是唯一移除点）。它被
   迟到的旧响应不覆盖、新数据正确落位。
 - 无头 Chromium 实测焦点：用户在看 A 时 MCP 连续 5 次调用不切换；
   无活动标签时正常聚焦。
+
+---
+
+### 阶段 253 — MCP `screenshot_terminal` 真正发起截图（不再只回文字指令）
+
+**现象**：AI 调用 `screenshot_terminal`（如对 135.32.64.34）只收到一段
+「请用户去 GUI 点 📷」的中文指引，没有任何截图产生，也没有成功提示。
+
+**根因**：阶段 63 落地时采用「诚实告知」方案——MCP server 是独立进程，
+访问不到 GUI 的 xterm DOM，于是工具只回文字让用户自己点。但 GUI 侧的
+IPC action `screenshot_terminal`（main.rs：emit 事件 → 等前端
+`mcp_exec_result` → 20s 超时）**早已实现**，前端 `useMcpBridge` 却从未
+接过这个 action，MCP 工具也从未发过这个 IPC 命令。整条链路断在两端：
+请求方不发，接收方不接。
+
+**修复（三处接线 + 一处收敛）**：
+
+1. **MCP 侧**（`src-tauri/src/bin/myshell-mcp.rs`）：
+   `screenshot_terminal` 分支从「回文字指令」改为
+   `find_connection_id` → 新增 `send_gui_screenshot_command()`（仿
+   `send_gui_open_command`：一行 JSON 命令，读超时 30s > GUI 侧 20s，
+   保证永远读到真实响应而不是 socket 超时）→ 成功回传 `{ok, path}`。
+   工具 description 同步重写（去掉「Ask the user to click 📷」，改为
+   说明「已有标签页直接截、没有则开新标签等连上再截、不抢焦点、不返回
+   图片字节」）。顺手删掉随之失去调用者的 `secrets_attachment_dir()`。
+
+2. **GUI IPC 侧**（`src-tauri/src/main.rs`）：删掉 `screenshot_terminal`
+   分支里的 `window.show() + set_focus()`。截图是只读捕获，不需要用户
+   的眼睛盯着窗口；exec_in_tab 早就因为同样原因去掉了抢焦点（阶段 252
+   的用户投诉同源）。
+
+3. **前端桥**（`src/composables/useMcpBridge.ts`）：新增
+   `screenshot_terminal` 分支。找到该连接已连接的 terminal 标签页 →
+   `getTerminal(sessionId)` 拿 xterm → 走 `captureTerminalToDataUrl` +
+   `saveScreenshot`（与 📷 按钮**同一条管线**，PNG 逐字节一致）→
+   `mcpExecResult(requestId, {ok:true, path})` 回传路径 + 给用户一个带
+   「打开」动作的 toast。没有已连接标签页时 `connect(config)` 开新标签，
+   500ms 轮询等连上（上限 60 次 = 30s，刻意大于 GUI 的 20s IPC 超时：
+   宁可 GUI 先超时回结构化错误，也不要前端还没连上 GUI 就答完变成假成功）。
+   失败路径如实回错：连接失败 / 终端实例未就绪 / 未配附件目录
+   （Rust 侧原样文案）。
+
+**为什么不像 exec_in_tab 那样复用 sessionActions 注册表**：那条表是
+fire-and-forget 的（`() => void`），拿不到保存路径，而路径正是本次交付的
+核心（「没有任何返回」的抱怨就是没有结果可回）。直接走
+`terminalRegistry` 更短，也不需要给注册表加返回通道。
+
+**取舍记录**：
+- 不切页/不抢焦点（与 exec 的 `focusTabIfIdle` 一致）。截图是读操作，
+  用户在看别的标签时把窗口拽到前面没有收益，只有打扰。
+- 不做确认门：截图非危险操作，与六类不可逆文件工具的确认前提无关。
+- 工具仍不返回图片字节（文本通道），只回路径；用户可自行打开或拖进对话。
+
+**验证**：
+- `cargo check` 通过（GUI + MCP 两个二进制）。
+- `npm run test:ts` 零错误。
+- 新增 Rust 契约测试 `screenshot_tool_is_ipc_backed_not_instructional`：
+  锁住工具描述不含「Ask the user to click」这类旧语义，防止回归成
+  「只回文字」的假实现。
+
+**超时预算修正（写代码时漏算的一环，验证时发现）**：
+前端新标签路径最多轮询 30s，而 GUI IPC 侧原先只等 20s —— 「没有已打开
+标签页」这个最常见场景必然在 GUI 侧先超时，MCP 拿到的是
+`screenshot timeout (20s)` 而不是前端的真实结果。三端重新对齐：
+前端 ≤30s（连接轮询）→ GUI IPC 45s（覆盖 30s + 截图 + IPC 往返）→
+MCP 读超时 50s（最外层，保证永远读到真实响应而非 socket 超时）。
+顺序上 vault 门禁先跑（解锁时 <1s），只有锁定时才耗 20s 且那种情况
+直接返回 `vault_locked`，不会走到截图。
+
+**验证（实际跑过的）**：
+- `cargo check --bin myshell --bin myshell-mcp` 零 error；
+  `cargo build` 两个 debug 二进制成功。
+- `npm run test:ts`（vue-tsc）零错误；`npm run build` 通过。
+- `cargo test --bin myshell-mcp` 30 passed，含新增契约测试
+  `screenshot_tool_is_ipc_backed_not_instructional`（锁住工具描述不含
+  旧指令式措辞，防止回归成「只回文字」）。
+- **IPC 协议层端到端**：写最小 IPC 客户端以 MCP 身份向运行中的 GUI 发
+  `{"action":"screenshot_terminal","connection_id":<135.32.64.34 的 id>,
+  "token":<端口文件令牌>}`，GUI 返回
+  `{"ok":false,"error":"screenshot timeout (20s)"}` —— 证明 action 名、
+  token 认证、connection_id、结构化错误返回全部正确，且错误如实而非假成功。
+  连接 id 经 SQLite 只读副本取得（`abbcc318-a97e-42f6-8479-3c72bc5e8332`）。
+- **未做**：新前端分支的真实运行验证。运行中的 GUI/MCP 均来自安装版
+  `E:\Program Files\MyShell\`，启动 debug 版 GUI 会触发单实例机制
+  `kill_other_myshell_processes()` **强制结束用户正在使用的 GUI**（断开
+  全部终端会话）。已把这个抉择交给用户，未擅自执行。
+
+---
+
+### 阶段 254 — open-code-review delegate 模式工作区审查 + 问题修复
+
+用 `ocr delegate preview -f json` 取得未提交改动清单（13 文件、+751/−104，
+11 个可审查），按 `ocr delegate rule` 的 Rust / 前端 / 默认三组规则逐文件审
+diff，发现问题 6 项，修复 4 项、驳回 2 项。
+
+**修复的 4 项**：
+1. `src/store/sessions.ts:78` 注释 typo「那一个」→「那个」（本次改动引入）。
+2. 三处超时注释与代码不符（改预算时漏改注释）：`main.rs` 的「MCP client's
+   read timeout is 30s」→ 50s；`myshell-mcp.rs` 的「GUI-side timeout 20s,
+   ours 30s」→ 45s/50s；`useMcpBridge.ts` 的「GUI 侧 IPC 20s 超时」→ 45s。
+   过期注释比没有注释更坏——它会让后续维护者按错误的预算继续推导。
+3. `useMcpBridge.ts` 截图轮询 `setInterval` 无卸载清理：三条正常出口各自
+   clearInterval，但桥卸载（MCP 客户端断开）这条路径没有任何清理，interval
+   会带着 `sessions.tabs` 引用转到应用结束。改为模块级
+   `activeScreenshotPolls: Set<number>` 登记句柄，三条出口 clear + delete，
+   `startMcpBridge` 返回的清理函数遍历 clear + 清空。
+   过程中按内置样式规则回退了两版写法：先写的 `stopPolling` 单表达式包装
+   （ts-no-tiny-functions，无调用点）删掉；`ReturnType<typeof setInterval>`
+   （ts-no-return-type）改用具名类型 `number`（本项目 tsconfig 走 DOM lib）。
+4. 探针文件 `screenshot-probe.html` + `src/screenshot-probe.ts` 移到仓库外
+   （`F:/tmp/screenshot-probe/`）——违反 AGENTS.md「只服务当次任务的探针脚本
+   留在 F:/tmp，不进库」。
+
+**驳回的 2 项**：
+- `src/utils/screenshot.ts` 的 `(term as any).options`：HEAD 版本已存在两处
+  （该文件 257/267 行），本次 diff 未触碰这些行。非本次引入，顺手改会扩大
+  diff 范围。
+- `main.rs:984` 的「Network timeout is 30s」：update-check 的既有注释，
+  与本次截图链路无关，措辞与代码一致，非问题。
+
+**回归验证**：
+- `npm run test:ts` 零错误；`cargo test --lib` 159 passed；
+  `cargo test --bin myshell-mcp` 30 passed（含阶段 253 新增的截图契约测试）。
+- #6 的自检断言（fake timer 等价实现）：卸载后无残留 interval、
+  对照组「无清理逻辑时确实泄漏」——证明断言能抓住该 bug 而非永真式。
+  项目无 vitest 设施（无 test 脚本 / 无测试文件 / 无 vitest 依赖），
+  为一条 interval 清理引入整套框架违反最小改动原则，故用一次性探针 +
+  跑完即弃，不落仓库。
+
+### 阶段 255 — 截图样式（PuTTY 默认）+ 修复截图丢失全部 ANSI 颜色
+
+用户需求：「myshell 截图的背景和字体、颜色都按 putty 的样式来修改」，
+并要求「支持在设置中配置截图样式，当前样式设置为 putty」。需求随后收窄为
+**只影响截图输出的图片，不影响真实看到的终端** —— 因此本阶段不触碰
+TerminalPanel 的实时主题与字体，只改 PNG 导出链路。
+
+**PuTTY 出厂默认值的来源（不是「接近就好」）**：
+- 配色：官方源码 `settings.c` `load_open_settings()` 里的 `Colour0..Colour21`
+  默认表。前景（Colour0）= 187,187,187；背景（Colour2）= 0,0,0；
+  光标（Colour5）= 0,255,0；Colour6..Colour21 即 ANSI 0-7 与亮色 8-15
+  （黑 0,0,0 / 亮黑 85,85,85 / 红 187,0,0 / 亮红 255,85,85 / … / 亮白 255,255,255）。
+- 字体：`windows/windefs.c` `platform_default_fontspec()` → Courier New 10pt。
+
+**改动**：
+1. `src/themes.ts`：新增 `ScreenshotStyle` 与 `SCREENSHOT_STYLES`（PuTTY /
+   跟随终端两个选项），`STORAGE_KEY_SCREENSHOT_STYLE` 持久化键，
+   `getScreenshotStyle()` 归一化（未知 id 回落 PuTTY）。与终端预设
+   （`PRESETS`）**刻意分成两套**：截图是给别人看的导出物，终端是给自己看的，
+   用户可能终端用 Tokyo Night、截图要 PuTTY，两个域各自切换。
+2. `src/store/appearance.ts`：`appearance.screenshotStyleId`（默认 putty，
+   localStorage 不可信输入经 `getScreenshotStyle` 夹紧）、`setScreenshotStyleId()`、
+   `resolveScreenshotStyle()`。**不纳入外观主题快照**（`appearanceThemes.ts`
+   未动）—— 与 `customPalette` 同理，模块注释明确「自定义配色是用户资产，
+   不随快照走」；截图样式同属这类「导出偏好」，删一套主题不该连带改掉它。
+3. `src/components/settings/AppearanceSection.vue`：「终端配色」与「背景」之间
+   新增「截图样式」分区，复用 `.preset-grid` / `.preset-card` 卡片样式，
+   零新增 CSS。
+4. `src/utils/screenshot.ts`：取色链路改为「截图样式 → DOM 上溯 → 兜底」。
+   样式背景不透明时直接采用（PuTTY 纯黑），不再被 `.terminal-wrap` 的玻璃层
+   解析结果盖掉；`readMetrics` 字体兜底改为 Courier New；`PALETTE_16` 兜底表
+   与 `DEFAULT_BG` / `DEFAULT_FG` 同步为 PuTTY 值。
+
+**顺带修掉的既存缺陷（截图丢失全部 ANSI 颜色）**：
+`resolveColor()` 还在用 xterm 4.x 的 color-mode 常量（0=default / 1=palette /
+2=RGB），而 xterm.js 5.5 的常量是 `CM_DEFAULT=0`、`CM_P16=0x1000000`、
+`CM_P256=0x2000000`、`CM_RGB=0x3000000`（`common/buffer/Constants.ts`）。
+后果：调色板单元格的 mode 报 16777216 而非 1，`mode === 1` 永不命中，
+所有带色单元格都落到默认前景分支 —— 截图里 `ls` 的蓝色目录、`top` 的
+绿色状态行全部退化成同一个灰色。已改为按 `mode & 0x3000000` 判定，
+与 xterm 5.x 的 `AttributeData.getFgColorMode()` 同源。
+
+**回归验证（真实浏览器 + 真实 xterm + 像素断言）**：
+项目无 vitest 设施，且断言对象是 PNG 像素（必须跑 canvas 才能拿到），
+故用一次性 Playwright 脚本 + Edge 打开探针页，跑完即弃、不落仓库
+（沿用阶段 254 的约定：探针留在 `F:/tmp`）。探针挂真实
+`AppearanceSection` + 起真实 xterm（Canvas 渲染器、透明背景，与
+TerminalPanel 一致），写一行含默认色/红/绿/亮白的文本，跑真实
+`captureTerminalToDataUrl`，再逐像素判定：
+
+```
+names            = [... "PuTTY","跟随终端"]   ← UI 渲染出两个选项
+active class     = true                        ← 默认选中 PuTTY
+row0 cells       = 5:'R'fg=1/16777216 8:'G'fg=2/16777216 11:'W'fg=15/16777216
+                                                  ← ANSI 被 xterm 正确解析
+red pixels         = 31   -> red    #bb0000 PASS
+green pixels       = 21   -> green  #00bb00 PASS
+brightWhite pixels = 23   -> bwhite #ffffff PASS
+fg pixels          = 47   -> fg     #bbbbbb PASS
+corner(2,2)       = [0,0,0,255]  -> bg #000000 PASS   ← 不再是被玻璃层解析出的 #1e1e2e
+=> PUTTY PNG PASS
+[live] corner(2,2) = [13,17,23,255]  -> bg #0d1117 PASS
+[live] red #f85149 px = 31  PASS
+[live] green #3fb950 px = 21  PASS
+=> LIVE PNG PASS
+```
+
+「跟随终端」一组同时证明样式选择真实生效（切到 live 后输出的是 Carbon 暗色的
+`#0d1117` / `#f85149` / `#3fb950`，而非硬编码的 PuTTY 值）。
+`npm run test:ts`（vue-tsc --noEmit）零错误。
+
+**取舍**：
+- 光标只改颜色不改形状：本阶段不碰真实终端（需求明确收窄），截图链路也不画
+  光标，故未涉及 PuTTY 的块状光标。
+- 「跟随终端」不带自己的字体：截图沿用终端的字体栈，只换颜色 —— 否则用户在
+  「跟随终端」下会莫名得到 Courier New，与屏幕上看到的字形不一致。
+- 默认值设为 putty：需求原文「当前样式设置为 putty」。
+- 字体不回写终端默认栈：`TERMINAL_FONT_DEFAULT_STACK` 首位仍是 Nerd Font
+  （Powerline 图标依赖它），PuTTY 的 Courier New 只作用于 PNG。
+
+
+---
+
+### 阶段 255 — 第二轮工作区审查（ocr delegate）
+
+对阶段 254 修复后的工作区重跑 `ocr delegate preview` + `rule` 同一套流程。
+清单 11 文件、+788/−113（9 个可审查）。
+
+**发现并修复 1 项**：`src/store/appearance.ts` 的 `resolveScreenshotStyle()`
+在 `live`（跟随终端）分支返回 `style.fontFamily`（恒为非空的
+"Courier New, monospace"），而 `captureTerminalToDataUrl` 里
+`shotStyle.fontFamily || fontFamily` 因左操作数非空而短路 —— 于是
+「跟随终端」样式的截图字体被写死成 Courier New，与注释承诺的「截图沿用
+终端的字体栈，只换颜色」相反。改为返回空串让 `||` 回落到终端实测字体。
+`themes.ts` 的 `liveScreenshot` 补注释说明其 `terminal` 与 `fontFamily`
+都是 capture 路径不会读的占位值。
+
+**复审发现并回退 1 次误操作**：把 `src/preset-probe.ts` 移出仓库时误判它为
+未跟踪文件，实际它**已被 git 跟踪**（HEAD 里有 `preset-probe.ts`）。删除
+会让工作区比 HEAD 少一个文件，属于改动仓库既有内容，超出「审未提交改动」
+的范围。已恢复为 HEAD 版本（78 行排版探针）。注意 HEAD 里还有
+`drawer-probe` / `popover-probe` / `preset-probe` / `sidebar-probe` 四对
+共 8 个探针文件 —— 与 AGENTS.md「探针不进库」相悖的历史积累，本轮未动，
+留给用户决定是否单独清理。
+
+**驳回项**：
+- `screenshot.ts` 的 `(term as any).options`：HEAD 已有两处，本次未触碰。
+- `themes.ts` / `appearance.ts` 里 grep 命中的 `===` / `!==`：规则要求的
+  严格相等，非 `==`/`!=` 违规。
+- `myshell-mcp.rs` 测试模块里的 `unwrap()` / `unwrap_or_else(panic!)`：
+  位于 `#[cfg(test)]`，Rust 规则只禁 production/library 路径。
+
+**验证**：
+- `npm run test:ts` 零错误；`cargo test --lib` 159 passed；
+  `cargo test --bin myshell-mcp` 30 passed。
+- live 字体修复的自检断言 6 项全过（含「修前 ≠ 修后」「PuTTY 未被波及」
+  两条非永真式对照）。
+
+---
+
+### 阶段 256 — MCP 工具面加固：健康预检 / 批量执行 / SFTP 重试 / GUI 崩溃契约 / TERM / 截图标签
+
+**背景**：用户拿 52 台采集任务跑了一整天，回来一份分级清单。其中两条在当前
+代码里已经不是缺陷（截图已由阶段 253 接通 IPC 并回传路径；`executed_in` 已区分
+`gui_terminal` / `exec_channel` / `headless` / `headless_fallback` 并带
+`gui_fallback_reason`），其余六项本轮落地。
+
+**1. 新增 `mcp_health`（P0，调用方可预检）**
+`tool_definitions` 里紧跟 `vault_status`，`call_tool` 里实现，并加入门禁豁免
+名单（与 `vault_status` 同级）。返回 `gui_running` / `ipc_responsive` /
+`vault_state` / `attachment_dir_configured` / `attachment_dir` / `mcp_version` /
+`mcp_log_dir` / `ready` / `next_action`。
+- 复用 `ensure_gui_running()` + `query_gui_vault_status()`，与 `vault_status` 同
+  一套「GUI 算不算活着」判据，两个工具不会互相矛盾。
+- 附件目录直接读 `<config_dir>/myshell/attachment-dir`（与 `main.rs`
+  `attachment_dir_setting_path` 同源），不新增 Tauri 命令 —— 那是纯本地磁盘
+  事实，不该要求 GUI 醒着。
+- `ipc_responsive=false` 但 `gui_running=true`：活着但挂起，明确告诉调用方不要
+  启动第二个实例。
+
+**2. 新增 `ssh_exec_many`（P1，批量原语）**
+`connections` 数组 + 一条命令，每台一个独立 SSH exec 通道，全并行。
+- **一次确认覆盖整批**，对话框列出全部目标主机。取舍：52 个对话框会让工具不可
+  用；代价是用户必须读那串列表。拒绝即整批不执行（硬性停止）。
+- `timeout` 语义是**每台**（各台并行，整批约等于最慢那台），schema 描述里写明
+  `PER HOST` —— 按整批理解会把一台慢主机的预算错配成整组的预算。
+- 每台完整输出落盘到 `<附件目录>/myshell-batch/<批次id>/<连接名>.log`，含表头
+  （连接、命令、stdout、stderr）。**附件目录未配置时直接报错**，不静默落临时
+  目录 —— 结果落在可能被清理的目录里，正是这次跳板机重启丢掉 52 份明细的原因。
+- 部分失败是正常结果：一台连不上只出它自己的 `error_kind`，其余照常完成。
+- `ok` = 命令跑完且退出码 0；非零退出是「执行成功但命令失败」，与「没连到主机」
+  分开表达。
+- 凭据解析顺序做（不塞进并行扇出）：否则 N 个解密请求同时砸 GUI 的 IPC 桥，
+  每个都可能在门禁上等待。
+
+**3. SFTP 握手重试 + 结构化降级指引（P1）**
+`open_sftp` 拆出 `open_sftp_once`，对**超时形态**失败重试一次。判据
+`sftp_open_failure_is_retryable` 只认 timeout/timed out/超时 —— 权限拒绝、子系统
+不存在这类确定性失败不重试（重试只会把同样的答案晚一倍时间送回）。
+九个 sftp 调用点改走 `open_sftp_or_zmodem_hint`，失败信息指名下一步（ZMODEM 通道）。
+`ssh_write_text` **刻意不做 shell 降级**：它的全部意义就是「凭据字节绝不经过远端
+shell 的行编辑器」，降级会让这个承诺变成假话。
+
+**4. GUI 崩溃错误契约（P0）**
+新增 `gui_ipc_connect_error` / `gui_ipc_connect_error_kind`，四个直连 IPC 的点
+（open_in_gui / screenshot / get_connection_secrets / exec_in_gui_tab）统一改走。
+- 拒绝 → 「MyShell GUI 已退出或崩溃（IPC 连接被拒绝，os error 10061）」+
+  `connect_failed`；超时 → 「进程可能已挂起」；其它 → 通用提示 + `internal`。
+- 分类来自 `ErrorKind` 而非文案，与 `GuiLaunchError::gui_reachable()` 同一条不变量
+  （改措辞不会静默改变安全判定）。10061 作为用户可自查的锚点**保留**，但不再
+  是唯一信息 —— 修复前它确实只是唯一信息。
+
+**5. gui 通道 TERM 显式声明（P0）**
+`useMcpBridge.ts` 新增 `ensureTermDeclared` / `probeTerm`：命令发送前探一次
+`echo __MYSHLL_TERM__:$TERM`，缺失才 `export TERM=xterm-256color`。
+- 每会话只探一次（`termDeclaredSessions` 缓存）：gui 通道的每个 MCP 客户端进程
+  复用同一条持久 shell，「这个会话 TERM 已对」整条会话都成立。不缓存就等于给
+  每次 ssh_exec 加一次往返，而那正是调用方最缺的预算。
+- 用户自设的 TERM 一律不覆盖（dumb / screen-256color 可能是有意选择）。
+- 探针失败不阻断执行：TERM 缺失只是让部分命令行为不确定，不是致命错误。
+
+**探针脚本抓到的两个真 bug**（`F:/tmp/term-probe-check.mjs`，12 项断言）：
+- 命令**回显行**（`echo __MYSHLL_TERM__:$TERM`）也含标记且排在结果行之前。只按
+  「标记:」匹配会先命中回显、把字面量 `$TERM` 当成已设值，于是永远跳过导出 ——
+  TERM 缺失恰恰静默延续。判据加「值不得以 `$` 开头」并继续向后找。
+- 结果行尾带 readline 的 ANSI（`\x1b[m\x1b[K`），原样返回会判成脏值。先剥行尾
+  CSI 再取。
+
+**6. 截图命名支持 `label`（P1）**
+`save_screenshot` 增第三参 `label: Option<String>`，文件名
+`截图_<label>_<conn>_<ts>.png`。连接身份**仍然保留**——丢了它就答不出「这张图
+本来是在哪台上截的」。跳转采集时传 `label`（如目标 IP）即可。空串视为未提供。
+`label` 是可选参数，不进 `required`（严格校验的客户端会拒掉不带它的合法调用）。
+
+**7. `ssh_run` 进度在 GUI 标签可见（P1）**
+MCP 侧 `send_gui_task_progress`（新 IPC action `exec_task_progress`）→ GUI 转
+Tauri 事件 → 前端写 `sessions.taskBadges[connectionId]`，标签标题旁渲染小胶囊。
+- `TransferTask` 新增 `conn_id` 字段（`with_conn_id` 构造）。**刻意不从
+  `description` 反解析连接名**：那会把展示字符串变成控制流，改一下描述格式
+  `ssh_cancel` 就清不掉角标了。测试锁住这点。
+- 角标时机：过了确认门才亮（确认中被拒的任务不该留痕迹），跑完/取消/无退出码
+  三种终点都清；`ssh_cancel` 立即清（不等 bg 任务注意到取消）—— 用户刚叫停，
+  标签还写着「执行中」就是撒谎。
+- fire-and-forget：角标是 nicety，绝不成为任务失败的原因。payload 只带阶段文案，
+  不带命令文本/主机/凭据。
+- zmodem 任务本轮不上角标（`TransferTask::new` 保持 `conn_id=None`）。
+
+**取舍汇总**：
+- `mcp_health` 做成新工具而非扩 `vault_status`：后者只有三个布尔的契约，往里塞
+  附件目录/版本会让「vault_status」这个名字说谎。
+- 批量输出落附件目录而非临时目录：见第 2 条。
+- 批量确认门一次覆盖整批：见第 2 条。
+- `probeTerm` 用 `new Promise` 而非 `Promise.withResolvers`：项目 tsconfig 的 lib
+  是 ES2021，没有该类型；为它抬 lib 会波及其他文件的类型解析。
+
+**验证**：
+- `cargo test --bin myshell-mcp` 37 passed（新增 7 个：mcp_health schema 与豁免、
+  附件目录读取契约、SFTP 重试判据、GUI IPC 错误分类、截图 label 契约、conn_id
+  独立于 description、exec_many schema 与文件名清洗）。
+- `npm run test:ts`（vue-tsc --noEmit）零错误。
+- `cargo check --bin myshell` / `--bin myshell-mcp` 均通过。
+- TERM 探针判据自检 12 项全过（`F:/tmp/term-probe-check.mjs`），其中 2 项是修
+  复前会失败的真 bug 复现。
+
+### 阶段 257 — myui v1.48.4 升级 + 壁纸「重启后不生效」根因修复
+
+**需求（用户原话）**：「更新myui版本，然后修复，背景图设置后，当时生效，重启后不生效问题」。
+
+**1. 壁纸重启失效：四条叠加的成因**
+
+日志先给了铁证：11-20 / 11-23 / 11-24 / 11-25 每次 release 启动都恰好一条
+`ERROR tauri::protocol::asset: File does not exist at path: ...wallpaper-1794301820474.jpg`
+——启动预检 404，壁纸静默退回无壁纸。逐层查下来是四个问题叠在一起：
+
+1. **文件名带毫秒时间戳**（每次导入生成新 URL），导入时 `clear_other_wallpapers`
+   删掉上一张。localStorage 里保存的旧 URL 于是指向一个已不存在的文件。
+2. **`verifyWallpaperReachable()` 预检失败时静默放弃**：`applyBgImage` 直接
+   `removeProperty("--app-bg-image")`，不提示、不自愈。用户看到的就是「设置
+   时好好的，重启没了」。
+3. **dev 与生产双 origin 共享同一壁纸目录**：`http://localhost:1420` 与
+   `http://tauri.localhost` 各存一份 `myshell-bg-image`，却都写
+   `%LOCALAPPDATA%/com.myshell.client/wallpapers/`。任一侧导入都会删掉另一侧
+   正在引用的文件（本地 LevelDB 里可查到两份指向不同文件的值）。
+4. **localStorage 写入在进程退出时不保证落盘**：CDP 实测 —— 写入壁纸配置、
+   reload 页面能读到新值；强杀进程再启动，读回的是旧值（LevelDB 的 WAL 里
+   有新记录，但读取侧仍是旧值）。所以「设置成功」不等于「重启还在」。
+
+**修法（让 URL 结构上稳定 + 启动自愈）**：
+- `wallpaper_file_name()` 改为固定 `wallpaper.<ext>`，换图是**覆盖写**：URL 与
+  磁盘路径永久一一对应，不再有「旧 URL 指向被删文件」这一类问题。
+- 前端新增 `wallpaperUrl()`：`convertFileSrc(path)?v=<毫秒>`。固定文件名后必须
+  靠查询串绕过 Chromium「同一 URL 不重取图」的缓存（查询串不参与 asset scope
+  的路径判定）。导入与旧壁纸迁移都走它。
+- 新命令 `current_wallpaper` + `applyBgImage` 自愈：localStorage 里的 image
+  非空但不可达时，从后端目录取当前壁纸（固定名优先，否则 mtime 最新的白名单
+  图片），verify 通过就写回 localStorage 并应用。`image` 为空表示用户主动
+  清除壁纸，此时**不恢复**——否则清除操作会在下次启动自己撤销。
+- `pick_current_wallpaper()` 保留旧时间戳命名的回退：升级用户不重新设置也能
+  找回 11-20 导入的那张图。
+
+**2. myui v1.9.15 → v1.48.4**
+
+- 新增必需 peer `reka-ui@^2.11.0`：myui 1.42.0 起库组件改用 reka-ui 原语，
+  Element Plus 降为可选 peer（`myui/element-theme` 兼容层保留，服务本仓仅剩
+  的 3 处 `<el-*>`）。
+- 图标体系换 lucide 描边（名字仍是 EP 标准名，消费方零改动）；本仓在用的
+  35 个导出全部存在。
+- 升级后 `vue-tsc`、`npm run build`、`scripts/audit-myui-imports.mjs` 均零改动
+  通过——没有 props 破坏需要适配。
+
+**验证**：
+- `cargo test --lib wallpaper::` 11 passed（改写：连续导入同路径覆盖、清理旧
+  时间戳/换扩展名文件；新增：固定名优先、旧名回退、无图返回 None）。
+- `npm run test:ts` 零错误；`npm run build` 通过（CSS 683.89 kB / JS 1731.62 kB）。
+- CDP 实测（dev）：导入测试图返回
+  `...\wallpapers\wallpaper.png`；reload 后 `data-background-mode="image"`、
+  `data-wallpaper="1"`、`--app-bg-image` 为固定名 URL（带 `?v=`）。
+- 自愈实测：把 localStorage 指回已删除的文件、目录只留时间戳旧图，重启后
+  `current_wallpaper` 找回旧图并重新应用（`data-wallpaper="1"`），无需用户
+  重新设置。
+
+**取舍汇总**：
+- 不自愈「image 为空」的情况：用户点了「清除壁纸」后重启不该自己冒回来。
+- dev/prod 双 origin 共享壁纸目录的隔离本轮不做：Rust 侧拿不到请求 origin，
+  影响已从「丢壁纸」降为「显示最后一次设置的图」。
+- 保留 element-plus 与 `myui/element-theme`：本仓还有 3 处 `<el-*>`，不在本次
+  升级范围内顺手迁移。
+
+**五问重启检查（阶段 257）**：
+
+| 问题 | 回答 |
+|---|---|
+| 我刚刚做了什么？ | 把壁纸文件名固定化并加启动自愈，修掉「设置后重启失效」；myui 从 v1.9.15 升到 v1.48.4。 |
+| 我想去哪里？ | 壁纸设置一次后永久有效（含升级用户），myui 与上游最新版对齐。 |
+| 我要去哪里？ | 真机确认壁纸重启存留与 myui 控件观感；发布前跑完整 `cargo test`。 |
+| 什么可能导致偏离？ | myui 跨 39 个次版本的行为修复只在类型层验证过，交互细节可能变化。 |
+| 下一步最小可验证动作？ | 装包 → 设置壁纸 → 关闭 → 重启 → 壁纸仍在；设置 → 外观 → 各控件逐个操作一遍。 |

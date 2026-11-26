@@ -12,9 +12,12 @@ import {
   resolvePalette,
   DEFAULT_PALETTE_ID,
   DEFAULT_BG_IMAGE,
+  DEFAULT_SCREENSHOT_STYLE_ID,
+  getScreenshotStyle,
   STORAGE_KEY_COLOR,
   STORAGE_KEY_CUSTOM,
   STORAGE_KEY_BG,
+  STORAGE_KEY_SCREENSHOT_STYLE,
   STORAGE_KEY_SOLIDITY,
   STORAGE_KEY_POPUP_SOLIDITY,
 } from "../themes";
@@ -23,6 +26,7 @@ import {
   normalizeAppearanceValues,
   type AppearanceTheme,
 } from "../utils/appearanceThemes";
+import { currentWallpaper } from "../api";
 import { ui } from "./ui";
 
 /** 主题色相的持久化键（0-360 整数）。 */
@@ -58,6 +62,8 @@ interface AppearanceState {
   popupSolidity: number;
   /** 主题色相 0-360（默认青绿 180）。强调色族 / 光晕 / 玻璃色度由它派生。 */
   accentHue: number;
+  /** 截图样式 id（默认 putty）。只管 📷 截图产出的 PNG，不影响真实终端。 */
+  screenshotStyleId: string;
 }
 
 function migrateStoredPalette(stored: string): string {
@@ -112,6 +118,10 @@ export const appearance = reactive<AppearanceState>({
   uiSolidity: clampSolidity(readStored<number>(STORAGE_KEY_SOLIDITY, 0), 0),
   popupSolidity: clampSolidity(readStored<number>(STORAGE_KEY_POPUP_SOLIDITY, 0.55), 0.55),
   accentHue: clampHue(readStored<number>(STORAGE_KEY_ACCENT_HUE, DEFAULT_ACCENT_HUE)),
+  // 截图样式：非法 id 回落默认（localStorage 是不可信输入，同色相/实心度两侧夹紧）
+  screenshotStyleId: getScreenshotStyle(
+    readStored<string>(STORAGE_KEY_SCREENSHOT_STYLE, DEFAULT_SCREENSHOT_STYLE_ID),
+  ).id,
 });
 
 /** 旧版预设把 UI 变量写成 html 内联覆盖；升级到 hue 派生模型后，启动时
@@ -194,6 +204,15 @@ function sanitizeBackgroundImage(value: string): string {
   }
 }
 
+/** 壁纸文件 → 可直接放进 CSS 的 asset URL。
+ *
+ *  文件名在 Rust 侧固定为 `wallpaper.<ext>`（换图是覆盖写），所以 URL 必须
+ *  带 `?v=` 版本戳：同一个 URL 浏览器不会重新取图（Chromium 实测），不带戳
+ *  换图后页面继续显示旧图。查询串不参与 asset 协议 scope 的路径判定。 */
+export function wallpaperUrl(path: string): string {
+  return `${convertFileSrc(path)}?v=${Date.now()}`;
+}
+
 /** asset 协议的壁纸文件可能已被替换/删除（实测：导入新壁纸后旧文件删掉，
  *  localStorage 里的旧文件名仍在，每次启动 WebView 请求一次 404，
  *  Tauri 侧报 `File does not exist at path`）。这里用 fetch 预检：
@@ -234,11 +253,30 @@ export async function applyBgImage(): Promise<void> {
   root.setProperty("--wallpaper-blur", `${((0.8 - clarity) * 4).toFixed(2)}px`);
   // 文件已被删/替换时（localStorage 里的旧文件名）不发请求：
   // 否则每次启动 WebView 请求一次 404，Tauri 侧刷一条 ERROR。
-  const usable = safeUrl ? await verifyWallpaperReachable(safeUrl) : false;
-  if (usable) {
+  let usableUrl = safeUrl && (await verifyWallpaperReachable(safeUrl)) ? safeUrl : "";
+  // 自愈：localStorage 里的 URL 指向已不存在的文件时，从后端目录取当前壁纸。
+  // 两种成因都实测过：旧版时间戳命名被清理；进程退出时 Chromium 没把最后
+  // 一次写入刷进 LevelDB，重启读回旧值。image 为空 = 用户主动清除壁纸，
+  // 此时不恢复（否则清除操作会在下次启动自己撤销）。
+  if (!usableUrl && safeUrl) {
+    try {
+      const stored = await currentWallpaper();
+      if (stored) {
+        const fresh = wallpaperUrl(stored);
+        if (await verifyWallpaperReachable(fresh)) {
+          usableUrl = fresh;
+          appearance.bgImage.image = fresh;
+          writeStored(STORAGE_KEY_BG, appearance.bgImage);
+        }
+      }
+    } catch {
+      /* 自愈失败按无壁纸处理，不影响其它外观设置 */
+    }
+  }
+  if (usableUrl) {
     // JSON.stringify 包引号：URL 里的 `#`/`)`/空白会让裸 url(...) 非法，
     // setProperty 静默失败（实测 --app-bg-image 丢失而 opacity 成功）。
-    root.setProperty("--app-bg-image", `url(${JSON.stringify(safeUrl)})`);
+    root.setProperty("--app-bg-image", `url(${JSON.stringify(usableUrl)})`);
     html.dataset.wallpaper = "1";
     html.dataset.translucent = "1";
   } else {
@@ -302,6 +340,32 @@ export function getActivePalette(): ColorPalette {
   return resolvePalette(appearance.paletteId, appearance.customPalette);
 }
 
+export function setScreenshotStyleId(id: string): void {
+  // 归一化在 getScreenshotStyle 里（未知 id → putty），写进去的永远是合法值
+  appearance.screenshotStyleId = getScreenshotStyle(id).id;
+  writeStored(STORAGE_KEY_SCREENSHOT_STYLE, appearance.screenshotStyleId);
+}
+
+/** 截图实际使用的配色：PuTTY 样式直接返回；「跟随终端」按当前深浅主题取
+ *  当前终端预设的对应变体（自定义预设同样覆盖，因为它就是当前预设）。
+ *
+ * `fontFamily` 为空串表示「不带自己的字体」：captureTerminalToDataUrl 里
+ * `shotStyle.fontFamily || fontFamily` 会回落到终端实测的字体栈。返回非空值
+ * （哪怕是 Courier New）会让 `||` 短路，把「跟随终端」的截图字体写死成
+ * Courier New —— 而这个样式的语义就是只换颜色、字体沿用终端。 */
+export function resolveScreenshotStyle(): {
+  terminal: ColorPalette["dark"]["terminal"];
+  fontFamily: string;
+} {
+  const style = getScreenshotStyle(appearance.screenshotStyleId);
+  if (style.id !== "live") return { terminal: style.terminal, fontFamily: style.fontFamily };
+  const active = getActivePalette();
+  return {
+    terminal: (ui.isDark ? active.dark : active.light).terminal,
+    fontFamily: "",
+  };
+}
+
 // 深浅主题切换时清一次旧覆盖（终端配色由 TerminalPanel 自取，无需重应用）
 watch(
   () => ui.isDark,
@@ -331,7 +395,7 @@ export async function migrateLegacyWallpaper(): Promise<void> {
     const stored = await invoke<string>("import_wallpaper_data", { dataUrl: image });
     setBgImage({
       mode: "image",
-      image: convertFileSrc(stored),
+      image: wallpaperUrl(stored),
       opacity: appearance.bgImage.opacity,
     });
   } catch (e) {

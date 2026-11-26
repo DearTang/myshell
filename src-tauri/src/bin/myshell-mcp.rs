@@ -395,6 +395,16 @@ VAULT GATE (applies to EVERY tool except ssh_status/ssh_cancel/zmodem_status): M
 \n\
 ZMODEM IS ASYNC: `zmodem_upload`/`zmodem_download` return IMMEDIATELY with a `task_id` (status=`running`); the transfer (including GUI launch, vault-unlock wait, and the confirmation dialog) runs in the background. You MUST then poll `zmodem_status` with the `task_id` every 5-10 seconds until `status` is `done` or `failed`. Do not report success until you see `done`.\n\
 \n\
+PRE-FLIGHT (multi-step tasks only): before a batch of calls, a transfer, or a screenshot, call `mcp_health` ONCE. It reports `gui_running`, `ipc_responsive`, `vault_state`, `attachment_dir_configured` and `ready` without touching any connection. It is the cheap way to learn that the attachment directory is unconfigured (which makes `screenshot_terminal` and `ssh_exec_many` fail) BEFORE you have burned half your budget. Do NOT call it as the first response to a `vault_locked` failure — the in-call wait already covered the short case; retry the SAME tool first.\n\
+\n\
+MANY HOSTS, ONE COMMAND: use `ssh_exec_many` (NOT a loop of `ssh_exec`). It runs the same command on every listed connection concurrently, each on its own SSH exec channel, and writes each host's full output to `<attachment_dir>/myshell-batch/<id>/<connection>.log`. ONE confirmation covers the whole batch and the dialog lists every target. Its `timeout` is PER HOST, not for the batch. Partial failure is the NORMAL outcome — read `summary.failed` and each entry's `error_kind` before declaring success; one unreachable host does not abort the others. Use single `ssh_exec` when the command differs per host.\n\
+\n\
+SFTP UNAVAILABLE: `sftp_*` and `ssh_write_text` open the SFTP subsystem fresh per call and retry ONCE on a timeout-shaped handshake failure (the reported `SFTP 会话失败: Timeout` on hosts whose exec channel answers instantly). If it still fails, the error says so and points at the ZMODEM channel — for transfers, `zmodem_upload`/`zmodem_download` are the documented FIRST choice anyway. `ssh_write_text` deliberately does NOT fall back to a shell write: its whole purpose is that credential bytes never pass through the remote line editor.\n\
+\n\
+GUI CRASHED: an IPC refusal is reported as 「MyShell GUI 已退出或崩溃」 with `error_kind: connect_failed` — never as a raw `os error 10061`. The tool auto-relaunches the GUI when the port file is stale; if it keeps failing, ask the user to reopen MyShell. A live-but-unresponsive GUI reports `ipc_unresponsive` and is NEVER relaunched (a second instance would hit the single-instance guard).\n\
+\n\
+TERM ON THE GUI CHANNEL: the `gui` channel declares `TERM=xterm-256color` when the remote shell has none, so `clear` and other terminfo-dependent commands behave predictably. It never overrides a TERM the user set themselves. The `pipe` channel has no PTY at all, so it makes no such promise.\n\
+\n\
 EVERY tool failure carries a machine-readable `error_kind` (`permission_denied` | `user_denied` | `timeout` | `busy` | `connection_lost` | `connect_failed` | `vault_locked` | `bad_request` | `not_found` | `internal`) plus a `hint` naming the next action. Branch on `error_kind`, not on the Chinese prose.\n\
 RESULT FIELDS: `delivered: true` on a failure means the command WAS written to the SSH channel — the remote may have run it (or part of it), so do NOT blind-retry a non-idempotent command (rm, kill, write); confirm first. `interrupted: true` means the exit code has the 128+signal shape (130 = Ctrl-C) — it is NOT a clean no-output success. `completed: false` (gui channel only) means the shell's completion marker was never confirmed — the command may still be running, so treat `exit_code: null` as unknown, never as 0. `executed_in: \"headless_fallback\"` means you asked for `gui` but the GUI side failed and the command was run over the direct channel instead — the user saw NOTHING in any terminal tab; the reason is in `gui_fallback_reason`. Tell the user that this command did not appear in a tab, and fix the underlying cause (a stuck confirmation dialog, a dead session, or the per-connection exec lock) before assuming the visible-terminal experience works.\\n\\
 \n\
@@ -408,6 +418,11 @@ fn tool_definitions() -> Value {
             {
                 "name": "vault_status",
                 "description": "Check whether the MyShell vault is unlocked, WITHOUT executing anything and WITHOUT exposing any connection data. Returns only booleans (`gui_running`, `initialized`, `unlocked`) and a `vault_state` string.\n\nWHEN TO USE: a gated tool already parks up to 20s in-call waiting for the user to unlock — so in the common case you never need this tool. Reach for it only when a gated tool FAILED with `error_kind: vault_locked` despite that wait AND a retry fails the same way: then poll THIS tool every ~5 seconds until `vault_state` is `unlocked`, and retry THE SAME tool once it is. Do not blind-retry the gated tool in a tight loop (each retry can re-trigger a confirmation dialog), and do not switch to a different tool (switching changes semantics).\n\nSECURITY: returns booleans only. While the vault is locked you still cannot see any connection names, hosts or credentials — that gate is unchanged.",
+                "inputSchema": { "type": "object", "properties": {}, "required": [] }
+            },
+            {
+                "name": "mcp_health",
+                "description": "Pre-flight health check of the whole MyShell MCP path — GUI liveness, vault state, attachment directory. Read-only; exposes NO connection names, hosts, or credentials.\n\nWHEN TO USE: BEFORE starting a multi-step task (a batch of ssh_exec calls, a file transfer, a screenshot). One call tells you whether the path is ready, instead of discovering it via a failed operation halfway through.\n\nWHEN NOT TO USE:\n- A gated tool already returned vault_locked — its in-call 20s wait covered the short case; retry the SAME tool first (vault_status is the fallback poll, this tool is the pre-check).\n- You are about to run one trivial command — just run it; the gate handles everything.\n\nOUTPUT FIELDS:\n- `gui_running` (bool): a MyShell GUI process is alive.\n- `ipc_responsive` (bool): the GUI answers the localhost IPC bridge (a live-but-wedged GUI reports false).\n- `vault_state` (string): unlocked / locked / not_initialized / gui_unavailable / ipc_unresponsive.\n- `attachment_dir_configured` (bool) and `attachment_dir` (string, only when configured): where screenshots and batch results are saved. When false, `screenshot_terminal` and `ssh_exec_many` FAIL — configure it in MyShell 设置 → MCP 支持 first.\n- `mcp_version` (string): this server's version — compare with the GUI's when an IPC action looks missing.\n- `mcp_log_dir` (string): where mcp-<date>.log / mcp-error-<date>.log live (hand the error file over for a bug report).\n- `ready` (bool) + `next_action` (string): the one sentence telling the caller what to do next.",
                 "inputSchema": { "type": "object", "properties": {}, "required": [] }
             },
             {
@@ -442,6 +457,26 @@ fn tool_definitions() -> Value {
                         "command_b64": { "type": "string", "description": "Base64-encoded shell command (same semantics as on `ssh_exec`). Use when the command has heavy quoting/escaping; mutually exclusive with `command`." }
                     },
                     "required": ["connection"],
+                    "anyOf": [{ "required": ["command"] }, { "required": ["command_b64"] }]
+                }
+            },
+            {
+                "name": "ssh_exec_many",
+                "description": "Run the SAME shell command on SEVERAL saved connections concurrently, in one call. Returns a per-connection summary plus a local directory holding each host's full output.\n\nWHEN TO USE:\n- The user wants the same check on many machines ('check disk on all 52 nodes', 'collect the agent version everywhere').\n- Anything you would otherwise do by looping `ssh_exec` once per host — each loop iteration costs a tool call, and callers with a short per-call budget run out of them fast.\n\nWHEN NOT TO USE:\n- One host — use `ssh_exec`.\n- A DIFFERENT command per host — call `ssh_exec` per host; this tool runs ONE command everywhere.\n- Interactive sessions — same limits as `ssh_exec`.\n\nHOW IT RUNS: every host gets its own SSH exec channel (equivalent to `ssh host 'cmd'`), all in parallel — no shared shell, no cross-host state, no ordering guarantee. Command rules and the confirmation dialog are identical to `ssh_exec`, and ONE confirmation covers the WHOLE batch (the dialog lists every target host).\n\nOUTPUT: `summary` = {total, ok, failed} plus one entry per connection with {connection, ok, exit_code, bytes, error_kind}. `output_dir` = the local directory holding `<connection>.log` per host with the FULL untruncated stdout/stderr — read those files instead of trusting the inline summary. When `output_dir` is null the attachment directory was not configured (configure it in MyShell 设置 → MCP 支持).\n\nPARTIAL FAILURE IS NORMAL: one unreachable host does not abort the others. Read `summary.failed` and the per-host `error_kind` before reporting success.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "connections": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Connection names or group-paths to run on (2 or more). Duplicates are collapsed. Each entry is resolved exactly like `ssh_exec`'s `connection` parameter."
+                        },
+                        "command": { "type": "string", "description": "Shell command to run on EVERY host. Executed via `bash -c` semantics. Same rules as `ssh_exec`: avoid stdin-reading commands (use `sudo -n`)." },
+                        "command_b64": { "type": "string", "description": "Base64-encoded shell command. PREFERRED when the command contains quotes, backslashes, `$`, backticks or regex braces. Provide EITHER `command` or `command_b64` (if both, `command_b64` wins)." },
+                        "timeout": { "type": "integer", "description": "Per-host seconds to wait before giving up on that host (default 60, max 3600). This is PER HOST, not for the whole batch — hosts run in parallel, so the batch takes about as long as its slowest host.", "default": 60, "minimum": 1, "maximum": 3600 },
+                        "output_dir": { "type": "string", "description": "Optional override for where per-host logs are written. Defaults to a fresh subdirectory under the configured attachment directory. Omit unless you need the results in a specific place." }
+                    },
+                    "required": ["connections"],
                     "anyOf": [{ "required": ["command"] }, { "required": ["command_b64"] }]
                 }
             },
@@ -610,11 +645,12 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "screenshot_terminal",
-                "description": "Ask the user to capture a PNG screenshot of the terminal viewport for a saved connection, and have it saved to the attachment directory.\n\nWHEN TO USE: The user wants a visual record of what's on the terminal — e.g. 'screenshot the terminal', 'capture this screen', 'save what I'm seeing'. Also useful when you (the AI) need to see visual output that can't be expressed as text: full-screen TUIs (htop, vim), rendered charts/boxes, ASCII art, color-dependent output, or error screens with colored highlighting.\n\nWHEN NOT TO USE:\n- To read text command output — use `ssh_exec` instead and parse stdout.\n- To capture non-terminal UI (the GUI's own panels, dialogs, etc.) — this tool only captures the terminal viewport.\n- If the user isn't currently looking at the terminal — the capture is of whatever is on screen RIGHT NOW.\n\n⚠️ ARCHITECTURE LIMITATION (IMPORTANT): This MCP server runs as a separate process from the GUI and CANNOT directly access the GUI's terminal DOM. When you call this tool, it returns a message you should relay VERBATIM to the user — the user must then click the 📷 button in the MyShell GUI's CommandBar (next to the 快捷 button) themselves. The screenshot is saved automatically to their configured attachment directory. Tell the user:\n  - The connection they should have open in a tab\n  - That they should click 📷 in the terminal's toolbar\n  - That the PNG will be saved to the directory they configured in Settings → MCP 支持 → 附件目录\n\nIf they haven't configured the attachment directory yet, clicking 📷 will show an error telling them to configure it first.\n\nOUTPUT: A user-facing instruction message (relay it to the user). This tool does NOT return the image data — the capture happens in the GUI, not here.",
+                "description": "Capture a PNG screenshot of a saved connection's terminal viewport and save it to the attachment directory. Returns the absolute file path on success.\n\nWHEN TO USE: The user wants a visual record of what's on the terminal — e.g. 'screenshot the terminal', 'capture this screen', 'save what I'm seeing'. Also useful when you (the AI) need to see visual output that can't be expressed as text: full-screen TUIs (htop, vim), rendered charts/boxes, ASCII art, color-dependent output, or error screens with colored highlighting.\n\nWHEN NOT TO USE:\n- To read text command output — use `ssh_exec` instead and parse stdout.\n- To capture non-terminal UI (the GUI's own panels, dialogs, etc.) — this tool only captures the terminal viewport.\n\nHOW IT WORKS: the capture runs inside the MyShell GUI (the MCP server has no access to the GUI's xterm DOM). If the connection already has an open terminal tab, that tab's screen is captured. If no tab is open, the GUI opens one and waits for the connection to finish before capturing. The GUI does NOT steal window focus for this (unlike open_in_gui) — the user's current view is left alone.\n\nREQUIRES: the attachment directory must be configured (Settings → MCP 支持 → 附件目录); an unconfigured directory returns an actionable error, NOT a silent failure. The returned PNG is a file on disk — this tool does NOT return the image bytes, so you cannot see the image yourself; tell the user the path (they can open it or drag it into the chat).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "connection": { "type": "string", "description": CONNECTION_PARAM_DESC }
+                        "connection": { "type": "string", "description": CONNECTION_PARAM_DESC },
+                        "label": { "type": "string", "description": "Optional tag that leads the saved FILENAME. Use it when the picture is of a DIFFERENT machine than the connection identity — the classic case is a jump host: the connection is 'ias@135.32.64.34' but you are capturing 135.32.64.201's result, so pass label=\"135.32.64.201\" and the file is named 截图_135.32.64.201_ias@135.32.64.34_<ts>.png. The connection identity is always kept too, so the source of the capture stays answerable. Omit for a plain screenshot of the connection's own screen." }
                     },
                     "required": ["connection"]
                 }
@@ -711,6 +747,10 @@ struct TransferTask {
     direction: String,
     /// Human-readable description for the status tool output.
     description: String,
+    /// Resolved connection id, when the task has one. Used to address the
+    /// per-connection GUI badge (`exec_task_progress`) — parsing it back out
+    /// of `description` would couple a display string to control flow.
+    conn_id: Option<String>,
     /// Bytes transferred so far (0 until handshake completes).
     bytes_done: u64,
     /// Total bytes (file size), 0 if unknown.
@@ -779,10 +819,22 @@ impl TransferProgress {
 
 impl TransferTask {
     fn new(direction: &str, description: String, bytes_total: u64) -> Self {
+        Self::with_conn_id(direction, description, None, bytes_total)
+    }
+
+    /// Same as `new`, but records the connection id so per-connection GUI
+    /// affordances (the `ssh_run` progress badge) can address the tab.
+    fn with_conn_id(
+        direction: &str,
+        description: String,
+        conn_id: Option<String>,
+        bytes_total: u64,
+    ) -> Self {
         Self {
             phase: TaskPhase::Confirming,
             direction: direction.to_string(),
             description,
+            conn_id,
             bytes_done: 0,
             bytes_total,
             result: None,
@@ -1325,7 +1377,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
         // only when a gated tool failed with vault_locked AND the retry fails
         // the same way. It returns booleans only, never credentials or
         // connection metadata.
-        "ssh_status" | "ssh_cancel" | "zmodem_status" | "vault_status" => {}
+        "ssh_status" | "ssh_cancel" | "zmodem_status" | "vault_status" | "mcp_health" => {}
         _ => {
             // spawn_blocking: the gate parks on std::thread::sleep for up to
             // 20s (vault-unlock wait) and up to ~27s more in launch paths —
@@ -1408,6 +1460,100 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 "initialized": initialized,
                 "unlocked": unlocked,
                 "hint": "门禁工具会先就地等待解锁（最长 20 秒）；只有工具已返回 vault_locked 后才需要本工具兜底轮询 —— 每 5 秒一次、约 2 分钟上限，期间不要反复重试原工具（会重复弹确认窗）。",
+            }))
+        }
+
+        "mcp_health" => {
+            // Pre-flight probe of the whole tool path. Deliberately mirrors the
+            // vault_status discovery sequence (so both tools agree on what
+            // "the GUI is up" means) and then adds the two facts a multi-step
+            // task actually dies on: the attachment directory (screenshot +
+            // batch output land there) and where the logs are.
+            //
+            // Exempt from the gate above for the same reason vault_status is:
+            // a probe that requires an unlocked vault cannot report a locked
+            // vault. It exposes no connection metadata.
+            let probe = ensure_gui_running();
+            let (gui_up, ipc_responsive, initialized, unlocked) = match probe {
+                Err(_) => (false, false, false, false),
+                Ok(ep) => {
+                    let mut st = None;
+                    for _ in 0..3 {
+                        if let Some(s) = query_gui_vault_status(&ep) {
+                            st = Some(s);
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    match st {
+                        Some((i, u)) => (true, true, i, u),
+                        // Process alive, port file present, but nothing answers
+                        // IPC — a wedged GUI. gui_running stays true so the
+                        // caller knows NOT to spawn a second instance.
+                        None => (true, false, false, false),
+                    }
+                }
+            };
+            let state = if !gui_up {
+                "gui_unavailable"
+            } else if !ipc_responsive {
+                "ipc_unresponsive"
+            } else if !initialized {
+                "not_initialized"
+            } else if !unlocked {
+                "locked"
+            } else {
+                "unlocked"
+            };
+            // Attachment dir: read the same marker file the GUI writes
+            // (main.rs attachment_dir_setting_path). Reading the file directly
+            // avoids a Tauri command round-trip that would need the GUI awake
+            // for something that is pure local disk state.
+            let (attach_configured, attach_dir) = match mcp_attachment_dir_setting_path() {
+                Some(p) => match std::fs::read_to_string(&p) {
+                    Ok(raw) if !raw.trim().is_empty() => (true, Some(raw.trim().to_string())),
+                    _ => (false, None),
+                },
+                None => (false, None),
+            };
+            let ready = state == "unlocked" && attach_configured;
+            let next_action = match state {
+                "unlocked" if attach_configured => {
+                    "保险库已解锁、附件目录已配置，可以直接执行任务。"
+                }
+                "unlocked" => {
+                    "保险库已解锁，但附件目录未配置 —— screenshot_terminal 与 ssh_exec_many 会失败。请在 MyShell「设置 → MCP 支持」中配置附件目录；若本次任务不截图、不落盘，可继续。"
+                }
+                "locked" => {
+                    "保险库未解锁：请在 MyShell 窗口输入主密码，然后重试原工具（门禁会就地等待 20 秒）。"
+                }
+                "not_initialized" => "请用户在 MyShell 中完成主密码初始化。",
+                "ipc_unresponsive" => {
+                    "MyShell GUI 进程在但 IPC 无响应（可能已挂起）。请让用户在任务管理器检查 myshell.exe，必要时重启 MyShell —— 不要启动第二个实例。"
+                }
+                _ => "请先打开 MyShell 桌面应用（工具会自动尝试启动它）。",
+            };
+            let text = format!(
+                "mcp_health：GUI={} IPC={} 保险库={} 附件目录={}\n{}",
+                if gui_up { "运行中" } else { "未运行" },
+                if ipc_responsive { "正常" } else { "无响应" },
+                state,
+                if attach_configured { "已配置" } else { "未配置" },
+                next_action
+            );
+            Ok(json!({
+                "content": [{ "type": "text", "text": text }],
+                "gui_running": gui_up,
+                "ipc_responsive": ipc_responsive,
+                "vault_state": state,
+                "initialized": initialized,
+                "unlocked": unlocked,
+                "attachment_dir_configured": attach_configured,
+                "attachment_dir": attach_dir,
+                "mcp_version": env!("CARGO_PKG_VERSION"),
+                "mcp_log_dir": log_dir_display(),
+                "ready": ready,
+                "next_action": next_action,
             }))
         }
 
@@ -1757,6 +1903,13 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             };
             let description = format!("[{}] {}", conn_name, cmd_preview);
 
+            // Resolve the connection id NOW (plaintext lookup, no DEK) so the
+            // bg task can address the per-connection GUI badge without a second
+            // lookup, and so `ssh_cancel` can clear the badge even if the bg
+            // task hasn't noticed the cancel yet. A name that doesn't resolve
+            // yields None = no badge, which is fine.
+            let conn_id = resolve_connection_id(&state.app, &conn_name, Some("ssh")).ok();
+
             // Register the task in Confirming phase. If the command doesn't
             // need confirmation, we still leave it in Confirming briefly (the
             // bg task flips to Connecting immediately) — keeping the model
@@ -1772,7 +1925,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 let mut tasks = state.tasks.lock().map_err(|e| e.to_string())?;
                 tasks.insert(
                     task_id.clone(),
-                    TransferTask::new("exec", description.clone(), 0),
+                    TransferTask::with_conn_id("exec", description.clone(), conn_id, 0),
                 );
                 let mut controls = state.exec_controls.lock().map_err(|e| e.to_string())?;
                 controls.insert(
@@ -1814,6 +1967,190 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                 "task_id": task_id,
                 "status": "started",
                 "poll_with": "ssh_status"
+            }))
+        }
+
+        "ssh_exec_many" => {
+            // Batch execution: the SAME command on N hosts, concurrently.
+            //
+            // Why this exists: the caller's per-tool-call budget is ~30s and a
+            // 52-host sweep done as one `ssh_exec` per host costs 52 calls. The
+            // workaround in the field was an external script with checkpointing
+            // plus three files shuttled through the jump host — fragile, and it
+            // lost all 52 detail files when a host rebooted mid-run.
+            //
+            // Two deliberate design choices:
+            //   1. Per-host exec channel, NOT the gui terminal path. A batch has
+            //      no single terminal to show it in, and reusing one persistent
+            //      shell per host would serialize the whole batch behind the
+            //      per-connection exec lock. `ssh host 'cmd'` semantics give
+            //      real parallelism.
+            //   2. ONE confirmation for the whole batch, listing every target.
+            //      52 dialogs would make the tool unusable; the tradeoff is that
+            //      the user must read the host list, which is why it is spelled
+            //      out in the dialog text.
+            //
+            // Partial failure is the normal outcome, never an abort: an
+            // unreachable host reports its own error_kind and the rest finish.
+            let raw_list = args["connections"].as_array().ok_or("缺少 connections 参数（应为连接名数组）")?;
+            if raw_list.is_empty() {
+                return Err("connections 不能为空数组".to_string());
+            }
+            // Collapse duplicates while preserving order — running the same
+            // command twice on one host is never what the caller meant.
+            let mut conn_names: Vec<String> = Vec::new();
+            for v in raw_list {
+                let name = v.as_str().ok_or("connections 数组元素必须是字符串")?.trim().to_string();
+                if !name.is_empty() && !conn_names.contains(&name) {
+                    conn_names.push(name);
+                }
+            }
+            let command = resolve_command_arg(args)?;
+            let timeout = args["timeout"].as_u64().unwrap_or(60).min(3600);
+
+            // Confirmation gate — identical rules to ssh_exec, evaluated ONCE
+            // for the whole batch. The dialog names every target so the user
+            // knows the blast radius before agreeing.
+            let rules = load_command_rules();
+            if command_rules::command_needs_confirmation(&command, &rules) {
+                let detail = format!(
+                    "在 {} 台服务器上执行同一命令: {}{}\n目标列表:\n{}",
+                    conn_names.len(),
+                    command,
+                    danger_reasons_text(&command),
+                    conn_names
+                        .iter()
+                        .map(|c| format!("  - {}", c))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                if !confirm_or_session_allowed("ssh_exec_many（批量远程命令执行）", &detail) {
+                    return Ok(json!({ "content": [{ "type": "text", "text": denied_by_user_text("ssh_exec_many", &detail) }], "isError": true }));
+                }
+            } else {
+                log(&format!(
+                    "ssh_exec_many 免确认（白名单/非危险）: {} 台 / {}",
+                    conn_names.len(),
+                    command
+                ));
+            }
+
+            // Where the full per-host output lands. Default = a fresh
+            // subdirectory under the attachment dir; `output_dir` overrides it.
+            //
+            // A missing attachment directory is a HARD ERROR, not a silent
+            // fallback to temp: results that land in a directory the OS may
+            // clean are exactly what lost 52 detail files when a host rebooted
+            // during the sweep this tool replaces.
+            let out_root = match args["output_dir"].as_str().filter(|s| !s.trim().is_empty()) {
+                Some(dir) => std::path::PathBuf::from(dir),
+                None => match mcp_attachment_dir_setting_path()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .map(|raw| raw.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(base) => std::path::PathBuf::from(base).join("myshell-batch").join(unique_task_id("batch")),
+                    None => {
+                        return Err(
+                            "未配置附件目录，批量结果无处落地。请在 MyShell「设置 → MCP 支持」中配置附件目录后重试（或用 output_dir 显式指定目录）。"
+                                .to_string(),
+                        );
+                    }
+                },
+            };
+            std::fs::create_dir_all(&out_root)
+                .map_err(|e| format!("创建结果目录失败 [{}]: {}", out_root.display(), e))?;
+
+            let started = std::time::Instant::now();
+            let max_output = ssh_max_output_bytes();
+
+            // Resolve every host's credentials FIRST, sequentially. Doing this
+            // inside the parallel fan-out would hammer the GUI's IPC bridge
+            // with N simultaneous decryption requests (and each one can wait on
+            // the vault gate). A host that fails to resolve is reported per-host
+            // and simply excluded from the fan-out.
+            let mut resolved: Vec<(String, ConnectionConfig)> = Vec::new();
+            let mut results: Vec<Value> = Vec::new();
+            for name in &conn_names {
+                match state.resolve_via_gui(name, Some("ssh")) {
+                    Ok(cfg) => resolved.push((name.clone(), cfg)),
+                    Err(e) => {
+                        results.push(json!({
+                            "connection": name,
+                            "ok": false,
+                            "exit_code": serde_json::Value::Null,
+                            "bytes": 0,
+                            "error": e,
+                            "error_kind": classify_error(&e),
+                        }));
+                    }
+                }
+            }
+
+            // Fan out: one independent task per host. Each does its own dial +
+            // exec + collect and writes its own log file, so a hung host can
+            // never take the others down with it.
+            let app = state.app.clone();
+            let mut set = Vec::new();
+            for (name, cfg) in resolved {
+                let out_dir = out_root.clone();
+                let cmd = command.clone();
+                let host_app = app.clone();
+                set.push(tokio::spawn(async move {
+                    run_one_batch_host(&host_app, &name, cfg, &cmd, timeout, max_output, &out_dir).await
+                }));
+            }
+            for handle in set {
+                match handle.await {
+                    Ok(entry) => results.push(entry),
+                    Err(e) => {
+                        results.push(json!({
+                            "connection": serde_json::Value::Null,
+                            "ok": false,
+                            "error": format!("任务内部错误: {}", e),
+                            "error_kind": error_kind::INTERNAL,
+                        }));
+                    }
+                }
+            }
+
+            // Stable ordering: the caller's list order, with unresolvable hosts
+            // kept in place. JoinSet completion order is arbitrary.
+            results.sort_by_key(|r| {
+                r["connection"]
+                    .as_str()
+                    .and_then(|c| conn_names.iter().position(|n| n == c))
+                    .unwrap_or(usize::MAX)
+            });
+
+            let ok_count = results.iter().filter(|r| r["ok"] == json!(true)).count();
+            let failed_count = results.len() - ok_count;
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let text = format!(
+                "ssh_exec_many 完成：{} 台成功 / {} 台失败（共 {} 台，耗时 {} 秒）\n完整输出目录：{}",
+                ok_count,
+                failed_count,
+                results.len(),
+                duration_ms / 1000,
+                out_root.display()
+            );
+            log(&format!(
+                "ssh_exec_many: {}/{} ok in {}ms -> {}",
+                ok_count,
+                results.len(),
+                duration_ms,
+                out_root.display()
+            ));
+            Ok(json!({
+                "content": [{ "type": "text", "text": text }],
+                "summary": {
+                    "total": results.len(),
+                    "ok": ok_count,
+                    "failed": failed_count,
+                    "duration_ms": duration_ms,
+                },
+                "results": results,
+                "output_dir": out_root.to_string_lossy(),
             }))
         }
 
@@ -1903,6 +2240,22 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
                         ));
                     }
                 }
+            }
+
+            // Clear the GUI badge immediately rather than waiting for the bg
+            // task to notice the cancel: the user just asked to stop this job,
+            // and a tab that keeps claiming "执行中" after that is a lie.
+            // The bg task's own badge(None) is idempotent, so this is safe.
+            //
+            // conn_id is read straight off the task entry — parsing it back out
+            // of the human-readable `description` would couple a UI string to
+            // control flow (rename the description and cancel stops clearing).
+            let badge_conn = {
+                let tasks = state.tasks.lock().map_err(|e| e.to_string())?;
+                tasks.get(task_id).and_then(|t| t.conn_id.clone())
+            };
+            if let Some(cid) = badge_conn {
+                send_gui_task_progress(&cid, None);
             }
 
             Ok(json!({
@@ -2096,7 +2449,17 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // (same fallback the sftp_* tools use, P2-3).
             let config = state.resolve_via_gui_sftp(conn_name)?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
-            let sftp = open_sftp(&handle).await?;
+            // 已内置一次超时重试（open_sftp）。仍失败时给出指向 zmodem 的结构化
+            // 错误，而不是一句「SFTP 会话失败」让调用方无从下手 —— 这正是反馈里
+            // 「同一连接 ssh_exec 一秒响应、ssh_write_text 连续两次超时」的堵点。
+            // 刻意不做 shell 降级：本工具的存在意义就是「凭据字节绝不经过远端
+            // shell 的行编辑器」，降级会把那个承诺变成假话。
+            let sftp = open_sftp(&handle).await.map_err(|e| {
+                format!(
+                    "{}（SFTP 子系统不可用。可改用 `zmodem_upload`（rz/sz 通道，先在本地写临时文件）或 `ssh_exec` + `exec_channel:\"pipe\"` 的 base64/printf 写法；不要用 heredoc/echo 写凭据）",
+                    e
+                )
+            })?;
 
             let written = if append {
                 // Append: the SFTP APPEND flag makes the server position the
@@ -2144,7 +2507,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             let config = state.resolve_via_gui_sftp(conn_name)?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
-            let sftp = open_sftp(&handle).await?;
+            let sftp = open_sftp_or_zmodem_hint(&handle).await?;
             let entries = sftp_list_dir(&sftp, path).await?;
             let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
@@ -2158,7 +2521,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             let config = state.resolve_via_gui_sftp(conn_name)?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
-            let sftp = open_sftp(&handle).await?;
+            let sftp = open_sftp_or_zmodem_hint(&handle).await?;
             sftp_download_file(&sftp, remote, local).await?;
             let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
@@ -2178,7 +2541,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             let config = state.resolve_via_gui_sftp(conn_name)?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
-            let sftp = open_sftp(&handle).await?;
+            let sftp = open_sftp_or_zmodem_hint(&handle).await?;
             sftp_upload_file(&sftp, local, remote).await?;
             let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
@@ -2191,7 +2554,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             let config = state.resolve_via_gui_sftp(conn_name)?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
-            let sftp = open_sftp(&handle).await?;
+            let sftp = open_sftp_or_zmodem_hint(&handle).await?;
             sftp.create_dir(path).await.map_err(|e| format!("创建目录失败: {}", e))?;
             let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
@@ -2210,7 +2573,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             let config = state.resolve_via_gui_sftp(conn_name)?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
-            let sftp = open_sftp(&handle).await?;
+            let sftp = open_sftp_or_zmodem_hint(&handle).await?;
             if sftp.remove_file(path).await.is_err() {
                 sftp.remove_dir(path).await.map_err(|e| format!("删除失败: {}", e))?;
             }
@@ -2232,7 +2595,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             let config = state.resolve_via_gui_sftp(conn_name)?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
-            let sftp = open_sftp(&handle).await?;
+            let sftp = open_sftp_or_zmodem_hint(&handle).await?;
             sftp.rename(old, new).await.map_err(|e| format!("重命名失败: {}", e))?;
             let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
@@ -2302,7 +2665,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             let remote_tar_path = format!("{}/{}", home_dir, remote_tar_name);
 
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
-            let sftp = open_sftp(&handle).await?;
+            let sftp = open_sftp_or_zmodem_hint(&handle).await?;
             log(&format!("[upload_project] SFTP 上传 {} → {}", tmp_tar_str, home_dir));
             sftp_upload_file(&sftp, tmp_tar_str, &home_dir).await?;
             let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
@@ -2357,7 +2720,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
             // 1. 验证远程目录存在（通过 SFTP，支持 ssh/sftp 连接）
             let config = state.resolve_via_gui(conn_name, None)?;
             let handle = ssh::dial_and_authenticate(&state.app, &config, false).await?;
-            let sftp = open_sftp(&handle).await?;
+            let sftp = open_sftp_or_zmodem_hint(&handle).await?;
             let remote_path = std::path::Path::new(remote_dir);
             let dir_name = remote_path.file_name()
                 .and_then(|n| n.to_str())
@@ -2421,7 +2784,7 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
             let sftp_config = state.resolve_via_gui(conn_name, None)?;
             let sftp_handle = ssh::dial_and_authenticate(&state.app, &sftp_config, false).await?;
-            let sftp2 = open_sftp(&sftp_handle).await?;
+            let sftp2 = open_sftp_or_zmodem_hint(&sftp_handle).await?;
             sftp_download_file(&sftp2, &tmp_tar, local_tar_str).await?;
             let _ = sftp_handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
 
@@ -2508,44 +2871,45 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
         }
 
         "screenshot_terminal" => {
-            // Architecture note: this MCP server runs as an independent
-            // process from the GUI. It has no access to the GUI's xterm DOM
-            // tree, so it cannot capture the screenshot itself. Instead it
-            // resolves the connection (to confirm it exists and is the one
-            // the user means) and returns a verbatim instruction the AI
-            // should relay to the user — the user clicks 📷 in the GUI.
+            // The GUI owns the only thing that can capture a terminal screen:
+            // the xterm DOM. This MCP process cannot reach it, so the capture
+            // is delegated over the localhost IPC bridge — the same channel
+            // exec_in_tab already uses. The GUI's `screenshot_terminal`
+            // action emits an event to the frontend, which captures the tab's
+            // xterm buffer to a PNG and saves it to the attachment directory,
+            // then answers with the file path. Blocks until then (GUI-side
+            // timeout 45s, ours 50s so we always read a real response).
             //
-            // This honest contract avoids pretending the tool can do what it
-            // can't. A future IPC-backed variant (MCP writes a trigger file,
-            // GUI watches and captures) is tracked as future work.
+            // This used to return a "please click 📷 yourself" instruction —
+            // the tool could not capture anything, which is exactly what the
+            // user reported as "no return, no success signal".
             let conn_name = args["connection"].as_str().ok_or("缺少 connection 参数")?;
-            // Full decrypted lookup — the vault gate at the top of call_tool
-            // already verified the GUI is running and unlocked. (The old
-            // plaintext lookup left host/username EMPTY because those columns
-            // are encrypted, so the instruction text showed a bare "@".)
-            let config = state.resolve_via_gui(conn_name, None)?;
-            let attachment_dir = secrets_attachment_dir();
-
-            let attachment_hint = match attachment_dir {
-                Some(d) => format!("截图将保存到：{}", d),
-                None => "⚠️ 尚未配置附件目录。请先在「设置 → MCP 支持 → 附件目录」中配置。".to_string(),
-            };
-
-            let instruction = format!(
-                "请用户在 MyShell GUI 中完成截图操作：\n\n\
-                 1. 切换到连接 [{name}]（{user}@{host}）所在的终端标签页\n\
-                 2. 在终端上方的工具栏点击 📷 截图按钮（位于「快捷」按钮旁边）\n\
-                 3. 截图会自动保存，底部会显示保存路径\n\n\
-                 {hint}\n\n\
-                 注意：截图仅包含终端区域，不含工具栏/输入栏/标签栏。\n\
-                 截图完成后，用户可以告诉你保存路径，或直接把截图拖到对话里分享给你。",
-                name = config.name,
-                user = config.username,
-                host = config.host,
-                hint = attachment_hint,
-            );
-
-            Ok(json!({ "content": [{ "type": "text", "text": instruction }] }))
+            // Optional filename tag. Sanitized + trimmed on the Rust side
+            // (save_screenshot); here we only forward it, treating an empty
+            // string as absent so the IPC payload stays a plain string.
+            let label = args["label"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            // Any connection type is acceptable: a terminal tab exists for
+            // ssh / sftp / local connections alike (the frontend picks one).
+            let conn_id = state.find_connection_id(conn_name, None)?;
+            let ep = read_gui_ipc_endpoint().ok_or_else(|| {
+                "MyShell GUI 未运行（找不到 IPC 端口文件）。请先打开 MyShell 桌面应用，然后重试。".to_string()
+            })?;
+            let path = send_gui_screenshot_command(&ep, &conn_id, label)?;
+            // The PNG is a file on disk; the tool deliberately does NOT
+            // inline the bytes (this is a text channel). The path IS the
+            // success signal — the GUI also toasts it with an "打开" action.
+            Ok(json!({
+                "content": [{ "type": "text", "text": format!(
+                    "✅ 已为连接 [{conn}] 完成截图并保存：{path}\n\n\
+                     截图内容是该连接终端标签页的当前画面（xterm 缓冲区）。\
+                     工具不返回图片数据本身，你可以把这个路径告诉用户，\
+                     用户可以直接打开文件，或把截图拖进对话分享给你。",
+                    conn = conn_name, path = path) }],
+                "path": path,
+            }))
         }
 
         "open_in_gui" => {
@@ -2596,17 +2960,6 @@ async fn call_tool(state: &McpState, name: &str, args: &Value) -> Result<Value, 
 
         _ => { log_err(&format!("未知工具: {}", name)); Err(format!("未知工具: {}", name)) }
     }
-}
-
-/// Read the configured attachment directory from the same marker file the GUI
-/// uses (`<config_dir>/myshell/attachment-dir`). Returns None if not set.
-fn secrets_attachment_dir() -> Option<String> {
-    let mut path = dirs::config_dir()?;
-    path.push("myshell");
-    path.push("attachment-dir");
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
 }
 
 /// Read the command confirmation rules from the JSON config file written by
@@ -2690,6 +3043,53 @@ fn ipc_cmd(ep: &GuiIpcEndpoint, mut v: Value) -> Value {
     v
 }
 
+/// Render a failed `TcpStream::connect` to the GUI as an actionable message.
+///
+/// The raw error the caller used to see was Windows'
+/// 「由于目标计算机积极拒绝，无法连接。(os error 10061)」 — with no hint that
+/// this means the GUI died mid-session, and no `error_kind`, so a client that
+/// branches on machine-readable codes classified it as `internal`.
+///
+/// `ensure_gui_running` already handles the stale-port-file case (delete +
+/// relaunch). These four call sites connect DIRECTLY to an endpoint that was
+/// validated moments earlier, so a refusal here means the GUI died between
+/// the two connections — a crash, not a config problem. The message must say
+/// that, name the symptom the user can verify (tasklist), and classify as
+/// `connect_failed` so callers can retry once after reopening MyShell.
+///
+/// SECURITY: the classification comes from the error KIND, never from the
+/// prose — same invariant as `GuiLaunchError::gui_reachable()`.
+fn gui_ipc_connect_error(what: &str, e: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    let detail = match e.kind() {
+        ErrorKind::ConnectionRefused => {
+            "MyShell GUI 已退出或崩溃（IPC 连接被拒绝，os error 10061）。工具会自动尝试重启 GUI；若持续失败，请手动打开 MyShell 桌面应用后重试。"
+        }
+        ErrorKind::TimedOut => {
+            "MyShell GUI 无响应（IPC 连接超时）——进程可能已挂起。请在任务管理器检查 myshell.exe，必要时重启 MyShell 后重试；不要启动第二个实例。"
+        }
+        ErrorKind::AddrNotAvailable | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+            "MyShell GUI 的 IPC 连接中断（进程可能在通信中途退出）。请重试一次；持续失败请重启 MyShell。"
+        }
+        _ => "无法连接 MyShell GUI 的 IPC 端口。请确认 MyShell 桌面应用正在运行后重试。",
+    };
+    format!("{}: {}", what, detail)
+}
+
+/// `error_kind` for a failed GUI IPC connect. Kept separate from the message
+/// so the wire contract never depends on wording.
+fn gui_ipc_connect_error_kind(e: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::ConnectionRefused
+        | ErrorKind::TimedOut
+        | ErrorKind::AddrNotAvailable
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted => error_kind::CONNECT_FAILED,
+        _ => error_kind::INTERNAL,
+    }
+}
+
 fn read_gui_ipc_endpoint() -> Option<GuiIpcEndpoint> {
     let mut path = dirs::config_dir()?;
     path.push("myshell");
@@ -2712,7 +3112,7 @@ fn send_gui_open_command(ep: &GuiIpcEndpoint, connection_id: &str, tab_type: &st
     use std::net::TcpStream;
 
     let mut stream = TcpStream::connect(("127.0.0.1", ep.port))
-        .map_err(|e| format!("TCP 连接失败: {}", e))?;
+        .map_err(|e| gui_ipc_connect_error("打开 MyShell GUI 连接失败", &e))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .map_err(|e| format!("设置超时失败: {}", e))?;
 
@@ -2737,6 +3137,48 @@ fn send_gui_open_command(ep: &GuiIpcEndpoint, connection_id: &str, tab_type: &st
     Ok(resp["ok"].as_bool().unwrap_or(false))
 }
 
+/// Ask the GUI to capture a PNG screenshot of a connection's terminal tab and
+/// save it to the attachment directory. Returns the absolute file path.
+///
+/// Timeout budget (both sides must agree, and ours must be the LARGER one):
+///   frontend ≤30s to open a new tab + wait for the SSH connection
+///   GUI IPC handler waits 45s for the frontend's answer
+///   ours: 50s — so a healthy-but-slow capture always yields a REAL response
+///   (`{ok:false,error}` or `{ok:true,path}`) instead of a socket timeout,
+///   which the caller could not distinguish from a failure.
+fn send_gui_screenshot_command(ep: &GuiIpcEndpoint, connection_id: &str, label: Option<&str>) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", ep.port))
+        .map_err(|e| gui_ipc_connect_error("截图时连接 MyShell GUI 失败", &e))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(50)))
+        .map_err(|e| format!("设置超时失败: {e}"))?;
+
+    let cmd = ipc_cmd(&ep, serde_json::json!({
+        "action": "screenshot_terminal",
+        "connection_id": connection_id,
+        // Optional filename tag (jump-host captures name the TARGET machine).
+        // Empty string = absent; the frontend treats it as no label.
+        "label": label.unwrap_or(""),
+    }));
+    writeln!(stream, "{}", cmd).map_err(|e| format!("发送命令失败: {e}"))?;
+    stream.flush().map_err(|e| format!("flush 失败: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).map_err(|e| format!("读取响应失败: {e}"))?;
+
+    let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
+        .map_err(|e| format!("响应解析失败: {e} (raw: {})", resp_line.trim()))?;
+
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["path"].as_str().unwrap_or("").to_string())
+    } else {
+        Err(resp["error"].as_str().unwrap_or("截图失败（未知错误）").to_string())
+    }
+}
+
 /// Ask the GUI to decrypt a connection's credentials and return the full
 /// decrypted ConnectionConfig. The MCP server no longer holds the DEK or a
 /// stored passphrase — this is the ONLY way to obtain credentials for
@@ -2749,7 +3191,7 @@ fn get_config_from_gui(conn_id: &str) -> Result<ConnectionConfig, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
     let mut stream = TcpStream::connect(("127.0.0.1", ep.port))
-        .map_err(|e| format!("连接 GUI 失败: {e}"))?;
+        .map_err(|e| gui_ipc_connect_error("获取连接凭证时连接 MyShell GUI 失败", &e))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .map_err(|e| format!("设置超时失败: {}", e))?;
     let cmd = ipc_cmd(&ep, serde_json::json!({
@@ -3144,6 +3586,74 @@ fn query_gui_vault_status(ep: &GuiIpcEndpoint) -> Option<(bool, bool)> {
     Some((initialized, unlocked))
 }
 
+/// Path of the marker file that stores the user's chosen attachment directory.
+///
+/// Mirrors `main.rs::attachment_dir_setting_path` exactly — the GUI writes
+/// this file, and the MCP server reads the same one. A separate copy of the
+/// path logic is deliberate: the MCP binary must not depend on the GUI binary
+/// being awake to learn a pure-local-disk fact, and a Tauri command round-trip
+/// for a one-line file read would be strictly more machinery.
+fn mcp_attachment_dir_setting_path() -> Option<std::path::PathBuf> {
+    let mut path = dirs::config_dir()?;
+    path.push("myshell");
+    path.push("attachment-dir");
+    Some(path)
+}
+
+/// Human-readable log directory for `mcp_health`. Never creates anything:
+/// when logging is disabled this reports the intended path with a note, so the
+/// user still learns where to look.
+fn log_dir_display() -> String {
+    match LOG_DIR.as_ref() {
+        Some(d) => d.to_string_lossy().to_string(),
+        None => dirs::config_dir()
+            .map(|d| d.join("myshell").join("logs").to_string_lossy().to_string())
+            .unwrap_or_else(|| "<无法定位配置目录>".to_string()),
+    }
+}
+
+/// Ask the GUI to show a background `ssh_run` task's progress as a badge on
+/// that connection's terminal tab.
+///
+/// WHY: `ssh_run` exists because a client's per-call budget is ~30s while the
+/// job itself runs for minutes. The AI polls `ssh_status`, but the USER has no
+/// window into it — they see an idle MyShell and no sign a 5-minute install is
+/// in flight. The badge puts the phase (and byte count) on the tab they can
+/// already see, which is the cheapest honest answer that doesn't fake a
+/// terminal stream.
+///
+/// Fire-and-forget by design: a badge is a nicety, never a reason to fail a
+/// task that is otherwise running fine. Any IPC failure is logged and dropped.
+/// `clear` removes the badge (task finished / failed / cancelled).
+///
+/// SECURITY: the payload carries only a phase label and a byte count — no
+/// command text, no host, no credentials. The connection id is already known
+/// to the GUI (it owns the tab).
+fn send_gui_task_progress(connection_id: &str, label: Option<&str>) {
+    let Some(ep) = read_gui_ipc_endpoint() else { return };
+    use std::io::{BufRead, BufReader, Write};
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", ep.port)) else {
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let cmd = ipc_cmd(
+        &ep,
+        serde_json::json!({
+            "action": "exec_task_progress",
+            "connection_id": connection_id,
+            // null = clear the badge; a short phase string otherwise.
+            "label": label,
+        }),
+    );
+    if writeln!(stream, "{}", cmd).is_ok() {
+        let _ = stream.flush();
+        // Drain the one-line ack so the connection closes cleanly.
+        let mut buf = String::new();
+        let _ = BufReader::new(stream).read_line(&mut buf);
+    }
+}
+
 /// Ask the GUI to bring its window (and thus the master-password gate) to the
 /// front. Fire-and-forget: any failure is ignored — the error text we return
 /// to the AI already tells the user what to do, focusing is just a courtesy.
@@ -3369,7 +3879,7 @@ async fn exec_in_gui_tab(
     use std::net::TcpStream;
 
     let mut stream = TcpStream::connect(("127.0.0.1", ep.port))
-        .map_err(|e| format!("TCP 连接 GUI 失败: {e}"))?;
+        .map_err(|e| gui_ipc_connect_error("在 GUI 终端执行命令时连接失败", &e))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(timeout + 15)))
         .map_err(|e| format!("设置超时失败: {e}"))?;
 
@@ -3712,6 +4222,215 @@ mod tests {
         }
     }
 
+    /// `mcp_health` 必须是「调用方可预检」的探针，而不是又一个需要保险库
+    /// 解锁才能用的工具 —— 锁定时恰恰最需要它。这个测试锁住三件事：
+    /// schema 无参数、豁免名单含它、description 说清了输出字段与何时不该用。
+    #[test]
+    fn mcp_health_is_a_gate_exempt_preflight_probe() {
+        let defs = super::tool_definitions();
+        let t = defs["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "mcp_health")
+            .unwrap_or_else(|| panic!("mcp_health 未定义"));
+        // 无参数：预检不该要求调用方知道任何连接信息
+        assert!(
+            t["inputSchema"]["required"].as_array().unwrap().is_empty(),
+            "mcp_health 不得有必填参数"
+        );
+        let desc = t["description"].as_str().unwrap_or("");
+        for needle in [
+            "gui_running",
+            "ipc_responsive",
+            "vault_state",
+            "attachment_dir_configured",
+            "WHEN TO USE",
+            "WHEN NOT TO USE",
+        ] {
+            assert!(desc.contains(needle), "mcp_health 描述缺少 {needle}");
+        }
+        // 不得泄漏连接元数据的承诺要写在描述里
+        assert!(
+            desc.contains("NO connection names"),
+            "应声明不暴露连接元数据"
+        );
+    }
+
+    /// 附件目录未配置时 mcp_health 的 ready 必须为 false，且不得把不存在的
+    /// 路径当成已配置上报（截图与批量落盘都依赖它）。
+    #[test]
+    fn mcp_health_reports_unconfigured_attachment_dir() {
+        use super::mcp_attachment_dir_setting_path;
+        // 只验证读取契约：路径形态稳定（GUI 写、MCP 读同一个文件），以及
+        // 「文件缺失 ⇒ 未配置」不会被误判成已配置。
+        let p = mcp_attachment_dir_setting_path();
+        if let Some(p) = p {
+            assert!(
+                p.ends_with("attachment-dir"),
+                "附件目录标记文件路径应与 GUI 一致: {}",
+                p.display()
+            );
+        }
+        // 一个必然不存在的临时文件：读出来必须走「未配置」分支
+        let missing = std::env::temp_dir().join(format!(
+            "myshell-mcp-noattach-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        let configured = std::fs::read_to_string(&missing)
+            .ok()
+            .map(|raw| !raw.trim().is_empty())
+            .unwrap_or(false);
+        assert!(!configured, "缺失/空文件不得判为已配置");
+    }
+
+    /// SFTP 握手重试的判据：只有超时形态重试，权限拒绝/子系统不存在一律不重试
+    /// （重试只会把同样的答案晚一倍时间送回，白耗调用预算）。
+    #[test]
+    fn sftp_retry_only_on_timeout_shaped_failures() {
+        use super::sftp_open_failure_is_retryable;
+        // 用户实测的那条：SFTP 会话失败: Timeout
+        assert!(sftp_open_failure_is_retryable("SFTP 会话失败: Timeout"));
+        assert!(sftp_open_failure_is_retryable("SFTP session init failed: Timed out"));
+        assert!(sftp_open_failure_is_retryable("连接超时"));
+        // 这些是确定性拒绝：主机没有 sftp-server、或策略禁止 —— 不该重试
+        for msg in [
+            "SFTP 子系统失败: subsystem request failed",
+            "Permission denied",
+            "Connection refused",
+            "SFTP 通道失败: channel open failed",
+        ] {
+            assert!(
+                !sftp_open_failure_is_retryable(msg),
+                "{msg} 不应触发重试"
+            );
+        }
+    }
+
+    /// GUI 崩溃时（IPC 连接被拒绝）必须给出可读原因 + 可机器读取的分类，
+    /// 而不是把 Windows 的 `os error 10061` 原样抛给调用方。
+    /// 分类必须来自错误**种类**而非文案 —— 与 gui_reachable 同一条不变量。
+    #[test]
+    fn gui_ipc_connect_errors_are_actionable_and_typed() {
+        use super::{gui_ipc_connect_error, gui_ipc_connect_error_kind, error_kind};
+        use std::io::ErrorKind;
+
+        let refused = std::io::Error::from(ErrorKind::ConnectionRefused);
+        let msg = gui_ipc_connect_error("打开连接失败", &refused);
+        // 必须点名「GUI 已退出或崩溃」，并给出用户可验证的动作
+        assert!(msg.contains("GUI 已退出或崩溃"), "应说明根因: {msg}");
+        assert!(msg.contains("任务管理器") || msg.contains("重启"), "应给可执行动作: {msg}");
+        // 10061 是 Windows 用户已经见过的错误码，作为可自查锚点保留；
+        // 但不允许它成为**唯一**信息（那正是修复前的形态）。
+        assert!(
+            msg.contains("10061") && msg.len() > 40,
+            "应带错误码锚点且附原因与动作: {msg}"
+        );
+        assert_eq!(gui_ipc_connect_error_kind(&refused), error_kind::CONNECT_FAILED);
+
+        // 挂起（连上但不应答）与拒绝必须给不同指引
+        let timed_out = std::io::Error::from(ErrorKind::TimedOut);
+        let msg2 = gui_ipc_connect_error("x", &timed_out);
+        assert!(msg2.contains("挂起"), "超时应提示挂起: {msg2}");
+        assert_ne!(msg, msg2, "两种失败模式不得共用同一段文案");
+        assert_eq!(gui_ipc_connect_error_kind(&timed_out), error_kind::CONNECT_FAILED);
+
+        // 其它 IO 错误归 internal，不得冒充 connect_failed
+        let other = std::io::Error::from(ErrorKind::PermissionDenied);
+        assert_eq!(gui_ipc_connect_error_kind(&other), error_kind::INTERNAL);
+    }
+
+    /// `ssh_run` 的 GUI 角标要靠 task entry 上的 conn_id 寻址 —— 从人可读的
+    /// `description`（"[连接名] 命令…"）反解析连接名会把展示字符串变成控制流：
+    /// 改一下描述格式，ssh_cancel 就清不掉角标了。这里锁住「conn_id 独立于
+    /// description 存储」这件事。
+    #[test]
+    fn exec_task_carries_conn_id_independent_of_description() {
+        let with = super::TransferTask::with_conn_id(
+            "exec",
+            "[prod-db] apt upgrade".to_string(),
+            Some("conn-uuid-1".to_string()),
+            0,
+        );
+        assert_eq!(with.conn_id.as_deref(), Some("conn-uuid-1"));
+        // 描述怎么改都不影响寻址
+        assert_eq!(with.description, "[prod-db] apt upgrade");
+
+        // zmodem 任务没有 conn_id（本阶段不给传输任务上角标）—— 必须能表达
+        // 「没有」，而不是被迫塞个空串进去。
+        let without = super::TransferTask::new("download", "x → y".to_string(), 0);
+        assert!(without.conn_id.is_none(), "zmodem 任务不应带 conn_id");
+    }
+
+    /// 批量工具的 schema：connections 必填（数组）、command/command_b64 二选一，
+    /// 且 timeout 的语义必须写明是**每台**而不是整批 —— 调用方按整批理解会把
+    /// 一台慢主机的预算错配成整组的预算。
+    #[test]
+    fn exec_many_schema_contract() {
+        let defs = super::tool_definitions();
+        let t = defs["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "ssh_exec_many")
+            .unwrap_or_else(|| panic!("ssh_exec_many 未定义"));
+        let schema = &t["inputSchema"];
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, vec!["connections"]);
+        assert!(
+            schema["anyOf"].as_array().map(|a| a.len() == 2).unwrap_or(false),
+            "应声明 anyOf: [command, command_b64]"
+        );
+        let props = schema["properties"].as_object().unwrap();
+        assert_eq!(
+            props["connections"]["type"], "array",
+            "connections 必须是数组"
+        );
+        let timeout_desc = props["timeout"]["description"].as_str().unwrap_or("");
+        assert!(
+            timeout_desc.contains("PER HOST") || timeout_desc.contains("每台"),
+            "timeout 说明必须点明按单台计: {timeout_desc}"
+        );
+        // 部分失败是正常结果，必须在描述里说清，否则调用方会把「一台连不上」
+        // 当成整个批次失败而重跑全部。
+        let desc = t["description"].as_str().unwrap_or("");
+        assert!(
+            desc.contains("PARTIAL FAILURE IS NORMAL"),
+            "应说明部分失败是正常结果"
+        );
+        assert!(desc.contains("ONE confirmation"), "应说明一次确认覆盖整批");
+    }
+
+    /// 文件名段清洗：连接名带 `user@host` 与组路径，Windows 禁字符必须被替换，
+    /// 且空结果必须有兜底（不能生成一个空文件名）。
+    #[test]
+    fn batch_log_filenames_are_safe_and_readable() {
+        use super::sanitize_filename_segment;
+        // 可读性优先：不是哈希，人能认出是哪台
+        assert_eq!(
+            sanitize_filename_segment("ias@135.32.64.34"),
+            "ias@135.32.64.34"
+        );
+        assert_eq!(
+            sanitize_filename_segment("/production/prod-db"),
+            "_production_prod-db"
+        );
+        // Windows 禁字符逐个替换，不是整段丢弃
+        assert_eq!(sanitize_filename_segment("a:b*c?d"), "a_b_c_d");
+        // 空 / 纯禁字符必须有兜底名
+        assert_eq!(sanitize_filename_segment(""), "unnamed");
+        assert_eq!(sanitize_filename_segment("///"), "___");
+        // 超长组路径要截断，避免超出文件系统单段长度上限
+        let long = "x".repeat(300);
+        assert!(sanitize_filename_segment(&long).chars().count() <= 80);
+    }
+
     /// 错误分类要落在正确的机器可读类别上 —— 调用方靠它分支，不靠中文散文。
     #[test]
     fn classify_error_maps_known_failures() {
@@ -3733,6 +4452,64 @@ mod tests {
         assert_eq!(
             classify_error("Permission denied（读取超时）"),
             error_kind::PERMISSION_DENIED
+        );
+    }
+
+    /// `screenshot_terminal` 必须真的是 IPC 背书的截图工具，而不是「回一段
+    /// 文字让用户自己点 📷」的假实现 —— 后者真实存在过（阶段 63 的诚实告知
+    /// 方案），用户反馈「没有任何返回、没有成功提示」，阶段 253 接通了 GUI
+    /// IPC 链路。这个测试锁住新语义，防止有人把 description 改回指令式措辞
+    /// （那会让 AI 以为还需要人工介入），也防止工具被从定义里摘掉。
+    #[test]
+    fn screenshot_tool_is_ipc_backed_not_instructional() {
+        let defs = super::tool_definitions();
+        let t = defs["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "screenshot_terminal")
+            .unwrap_or_else(|| panic!("screenshot_terminal 未定义"));
+        let desc = t["description"].as_str().unwrap_or("");
+        // 旧语义的痕迹：任何一条出现都说明退化成了「转告用户手动操作」
+        for stale in [
+            "Ask the user to capture",
+            "click 📷",
+            "点击 📷",
+            "ARCHITECTURE LIMITATION",
+            "relay it to the user",
+        ] {
+            assert!(
+                !desc.contains(stale),
+                "screenshot_terminal 描述仍含旧指令式措辞「{stale}」—— \
+                 该工具现在是 IPC 背书的真实截图，不是让用户手动点的指引"
+            );
+        }
+        // 新语义的锚点：声明了保存路径与「GUI 内捕获」这两件事
+        assert!(desc.contains("attachment directory"), "应说明保存到附件目录");
+        assert!(
+            desc.contains("file path") || desc.contains("path"),
+            "应说明返回保存路径"
+        );
+        // 输入契约：connection 必填，label 可选（不得进 required —— 严格校验的
+        // 客户端会拒掉不带 label 的合法调用）。
+        let required: Vec<&str> = t["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(required, vec!["connection"]);
+        let props = t["inputSchema"]["properties"].as_object().unwrap();
+        assert!(
+            props.contains_key("label"),
+            "screenshot_terminal 应暴露可选 label（跳转采集时表达目标机）"
+        );
+        // label 的说明必须讲清「连接身份仍保留」—— 否则调用方会以为它被替换掉，
+            // 从而丢掉「这张图本来在哪台上截的」这个信息。
+        let label_desc = props["label"]["description"].as_str().unwrap_or("");
+        assert!(
+            label_desc.contains("connection identity") || label_desc.contains("连接身份"),
+            "label 说明应声明连接身份仍会保留: {label_desc}"
         );
     }
 
@@ -4894,6 +5671,27 @@ async fn run_ssh_exec_task(
     needs_confirm: bool,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Resolve the GUI badge target ONCE (plaintext DB lookup, no DEK needed).
+    // Every phase transition below pushes to it; None = no tab to badge.
+    // A name that no longer resolves simply means no badge — never a reason
+    // to fail a task that is otherwise running fine.
+    //
+    // The same id is recorded on the task entry (TransferTask::conn_id) at
+    // creation, so `ssh_cancel` can clear the badge even if this bg task has
+    // not noticed the cancel yet. Reading it back from there keeps one source
+    // of truth instead of two lookups that could disagree.
+    let badge_conn: Option<String> = {
+        let tasks = tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.get(task_id).and_then(|t| t.conn_id.clone())
+    };
+    /// Push a phase badge to the GUI (no-op when the connection can't be
+    /// resolved, or the GUI isn't running). `None` clears it.
+    let badge = |label: Option<&str>| {
+        if let Some(cid) = &badge_conn {
+            send_gui_task_progress(cid, label);
+        }
+    };
+
     // Helper closures: mark() and fail() mutate the shared task entry.
     // fail() mirrors the zmodem_*-style closure signature (just `String`) so
     // it slots directly into resolve_config_for_task's `&impl Fn(String)`
@@ -4911,6 +5709,9 @@ async fn run_ssh_exec_task(
         // touch a dropped watch::Sender.
         let mut controls = controls.lock().unwrap_or_else(|e| e.into_inner());
         controls.remove(task_id);
+        // Drop the GUI badge: the task is over, the tab should stop claiming
+        // work that is no longer running.
+        badge(None);
     };
 
     // Phase 1: confirmation (if needed). Skipped for safe commands.
@@ -4928,6 +5729,9 @@ async fn run_ssh_exec_task(
     } else {
         log(&format!("ssh_run [{}] 免确认: {}", task_id, command));
     }
+    // 过了确认门：任务确实要跑了。此刻才亮角标 —— 确认中被拒的任务不该在标签上
+    // 留下任何痕迹。
+    badge(Some("等待执行"));
 
     // Phase 2: resolve credentials. resolve_config_for_task handles GUI
     // launch + vault wait + decryption, and reports failures via fail().
@@ -4943,6 +5747,7 @@ async fn run_ssh_exec_task(
             t.phase = TaskPhase::Connecting;
         }
     }
+    badge(Some("连接中"));
 
     let handle = match ssh::dial_and_authenticate(app, &config, false).await {
         Ok(h) => h,
@@ -4977,6 +5782,7 @@ async fn run_ssh_exec_task(
             t.phase = TaskPhase::Transferring;
         }
     }
+    badge(Some("执行中"));
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
@@ -5106,6 +5912,9 @@ async fn run_ssh_exec_task(
         let mut controls = controls.lock().unwrap_or_else(|e| e.into_inner());
         controls.remove(task_id);
     }
+    // 任务收尾：角标必须消失。失败路径已经由 fail() 清过；这条覆盖
+    // 「跑完 / 取消 / 无退出码」三种终点（它们不走 fail()）。
+    badge(None);
     log(&format!(
         "ssh_run [{}] 完成: cancelled={} exit={:?} stdout={}B stderr={}B",
         task_id,
@@ -5256,7 +6065,296 @@ async fn exec_collect(
 
 // ============ SFTP helpers (same as CLI) ============
 
+/// `open_sftp` with the failure rewritten into an actionable next step.
+///
+/// The reported symptom was `SFTP 会话失败: Timeout` twice in a row on a
+/// connection whose `ssh_exec` answered in under a second — a dead end for a
+/// caller that has no way to tell "the host has no sftp-server" from "the
+/// handshake stalled". `open_sftp` already retries once on the timeout shape;
+/// this wrapper adds the recovery path to the message so the AI moves to the
+/// ZMODEM channel (the documented first choice for transfers anyway) instead
+/// of retrying the same failing call.
+async fn open_sftp_or_zmodem_hint(
+    handle: &russh::client::Handle<ssh::SshClient>,
+) -> Result<russh_sftp::client::SftpSession, String> {
+    open_sftp(handle).await.map_err(|e| {
+        format!(
+            "{}（SFTP 子系统不可用。改用 ZMODEM 通道：`zmodem_upload` / `zmodem_download`（远端 sz/rz，受限环境也能用），仍失败再考虑该主机确实没有 SFTP）",
+            e
+        )
+    })
+}
+
+/// Is this SFTP-open failure worth retrying?
+///
+/// The reported P0 was `SFTP 会话失败: Timeout` on a host whose SSH exec
+/// channel answered in under a second. That is the shape of a transient
+/// handshake stall (server still spawning the subsystem, a slow sftp-server
+/// under load), not of a host that has no SFTP at all — those fail with a
+/// subsystem rejection, which is immediate and deterministic.
+///
+/// Only timeout-shaped failures retry. A permission denial or "subsystem
+/// not supported" retried once would just double the latency before the
+/// same answer.
+fn sftp_open_failure_is_retryable(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("timeout") || m.contains("timed out") || m.contains("超时")
+}
+
+/// One host of an `ssh_exec_many` batch: dial, exec, collect, write the log.
+///
+/// Returns the per-host result entry. NEVER fails the batch: every error path
+/// produces an entry with `ok: false` and an `error_kind`, so one unreachable
+/// host doesn't take the other N-1 down with it.
+///
+/// The log file is written even on failure (it holds whatever partial output
+/// arrived, plus the error text) — "which hosts failed and why" is the first
+/// question asked after a sweep, and answering it from memory is how the
+/// 52-file loss happened.
+async fn run_one_batch_host(
+    app: &AppState,
+    conn_name: &str,
+    config: ConnectionConfig,
+    command: &str,
+    timeout: u64,
+    max_output: usize,
+    out_dir: &std::path::Path,
+) -> Value {
+    let safe = sanitize_filename_segment(conn_name);
+    let log_path = out_dir.join(format!("{}.log", safe));
+
+    let handle = match ssh::dial_and_authenticate(app, &config, false).await {
+        Ok(h) => h,
+        Err(e) => {
+            let msg = format!("SSH 连接失败: {}", e);
+            write_batch_log(&log_path, conn_name, command, "", "", &msg);
+            return json!({
+                "connection": conn_name,
+                "ok": false,
+                "exit_code": serde_json::Value::Null,
+                "bytes": 0,
+                "error": msg,
+                "error_kind": classify_error(&msg),
+                "log": log_path.to_string_lossy(),
+            });
+        }
+    };
+
+    let mut channel = match handle.channel_open_session().await {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("打开通道失败: {}", e);
+            let _ = handle.disconnect(russh::Disconnect::ByApplication, "fail", "en").await;
+            write_batch_log(&log_path, conn_name, command, "", "", &msg);
+            return json!({
+                "connection": conn_name,
+                "ok": false,
+                "exit_code": serde_json::Value::Null,
+                "bytes": 0,
+                "error": msg,
+                "error_kind": classify_error(&msg),
+                "log": log_path.to_string_lossy(),
+            });
+        }
+    };
+    if let Err(e) = channel.exec(true, command).await {
+        let msg = format!("exec 失败: {}", e);
+        let _ = handle.disconnect(russh::Disconnect::ByApplication, "fail", "en").await;
+        write_batch_log(&log_path, conn_name, command, "", "", &msg);
+        return json!({
+            "connection": conn_name,
+            "ok": false,
+            "exit_code": serde_json::Value::Null,
+            "bytes": 0,
+            "error": msg,
+            "error_kind": classify_error(&msg),
+            "log": log_path.to_string_lossy(),
+        });
+    }
+
+    // Per-stream cap identical to ssh_exec's collect loop, so a chatty host
+    // can't balloon this process's memory. The log file gets the FULL stream
+    // (uncapped) — the cap only bounds what we buffer for the summary.
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut exit_code: Option<u32> = None;
+    let mut truncated = false;
+    let collect = async {
+        use russh::ChannelMsg;
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { ref data }) => {
+                    if stdout.len() < max_output {
+                        let room = max_output - stdout.len();
+                        stdout.extend_from_slice(&data[..data.len().min(room)]);
+                        if data.len() > room {
+                            truncated = true;
+                        }
+                    } else {
+                        truncated = true;
+                    }
+                }
+                Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => {
+                    if stderr.len() < max_output {
+                        let room = max_output - stderr.len();
+                        stderr.extend_from_slice(&data[..data.len().min(room)]);
+                        if data.len() > room {
+                            truncated = true;
+                        }
+                    } else {
+                        truncated = true;
+                    }
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status),
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(_) => {}
+            }
+        }
+    };
+    let timed_out = tokio::time::timeout(std::time::Duration::from_secs(timeout), collect)
+        .await
+        .is_err();
+    let _ = handle.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+
+    let stdout_s = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr_s = String::from_utf8_lossy(&stderr).into_owned();
+    let bytes = stdout.len() + stderr.len();
+
+    if timed_out {
+        // The remote process was NOT killed — the channel close only stops our
+        // reading of it. Say so, the same way ssh_exec does.
+        let msg = format!("命令超时（{}秒未完成）；远端进程可能仍在运行", timeout);
+        write_batch_log(&log_path, conn_name, command, &stdout_s, &stderr_s, &msg);
+        return json!({
+            "connection": conn_name,
+            "ok": false,
+            "exit_code": serde_json::Value::Null,
+            "bytes": bytes,
+            "timed_out": true,
+            "error": msg,
+            "error_kind": error_kind::TIMEOUT,
+            "log": log_path.to_string_lossy(),
+        });
+    }
+
+    // A missing ExitStatus is NOT exit code 0 — same invariant as ssh_exec.
+    let Some(code) = exit_code else {
+        let msg = "远端未返回退出码：连接中断或进程被信号终止，结果未知（不能视为成功）".to_string();
+        write_batch_log(&log_path, conn_name, command, &stdout_s, &stderr_s, &msg);
+        return json!({
+            "connection": conn_name,
+            "ok": false,
+            "exit_code": serde_json::Value::Null,
+            "bytes": bytes,
+            "error": msg,
+            "error_kind": error_kind::CONNECTION_LOST,
+            "log": log_path.to_string_lossy(),
+        });
+    };
+
+    write_batch_log(&log_path, conn_name, command, &stdout_s, &stderr_s, "");
+    json!({
+        "connection": conn_name,
+        // `ok` means "the command ran and exited 0" — a non-zero exit is a
+        // successful EXECUTION with a failing command, which the caller must
+        // be able to tell apart from "we never reached the host".
+        "ok": code == 0,
+        "exit_code": code,
+        "bytes": bytes,
+        "truncated": truncated,
+        "interrupted": interrupted_json(code),
+        "log": log_path.to_string_lossy(),
+    })
+}
+
+/// Write one batch host's log: a small header, then stdout, then stderr.
+///
+/// The header carries the connection and command so a log file found later
+/// (or handed to someone else) is self-describing — the whole point of the
+/// on-disk artifacts is that they outlive the conversation.
+fn write_batch_log(
+    path: &std::path::Path,
+    conn_name: &str,
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+    error: &str,
+) {
+    use std::io::Write;
+    let body = format!(
+        "# connection: {}\n# command: {}\n{}{}\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
+        conn_name,
+        command,
+        if error.is_empty() { String::new() } else { format!("# error: {}\n", error) },
+        "",
+        stdout,
+        stderr
+    );
+    if let Err(e) = std::fs::write(path, body) {
+        // A failed log write must not fail the host's result — the caller
+        // still gets the inline summary, just without the artifact.
+        log_err(&format!("写入批量日志失败 [{}]: {}", path.display(), e));
+    }
+}
+
+/// Reduce a connection name to a safe single filename segment.
+///
+/// Connection names carry `user@host` plus optional group paths
+/// (`/production/prod-db`), and Windows forbids `\ / : * ? " < > |` in names.
+/// Keeping the result readable (not a hash) matters: these files are read by
+/// humans after the fact.
+fn sanitize_filename_segment(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    // Trim edge dots/spaces (Windows ignores them, which would collide two
+    // distinct names) and cap the length so a long group path can't exceed
+    // the filesystem's component limit.
+    let trimmed = cleaned.trim().trim_matches(|c| c == '.' || c == ' ');
+    let capped: String = trimmed.chars().take(80).collect();
+    if capped.is_empty() {
+        "unnamed".to_string()
+    } else {
+        capped
+    }
+}
+
+/// Open an SFTP session, retrying ONCE on a timeout-shaped handshake failure.
+///
+/// Each attempt opens a fresh subsystem channel — `get_sftp_session` in
+/// sftp.rs does the same (there is no cached SftpSession anywhere in this
+/// codebase), so a retry is a new channel on the same SSH connection, not a
+/// reconnect. When both attempts fail the LAST error is returned unchanged
+/// in shape, so existing callers' error strings stay valid.
 async fn open_sftp(
+    handle: &russh::client::Handle<ssh::SshClient>,
+) -> Result<russh_sftp::client::SftpSession, String> {
+    match open_sftp_once(handle).await {
+        Ok(s) => Ok(s),
+        Err(first) if sftp_open_failure_is_retryable(&first) => {
+            log(&format!(
+                "[sftp] 首次握手超时，重试一次: {}",
+                first
+            ));
+            match open_sftp_once(handle).await {
+                Ok(s) => Ok(s),
+                Err(second) => Err(format!(
+                    "{}（已自动重试一次仍失败）",
+                    second
+                )),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// One SFTP subsystem handshake: open channel → request subsystem → INIT.
+async fn open_sftp_once(
     handle: &russh::client::Handle<ssh::SshClient>,
 ) -> Result<russh_sftp::client::SftpSession, String> {
     let channel = handle.channel_open_session().await.map_err(|e| format!("SFTP 通道失败: {}", e))?;

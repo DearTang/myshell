@@ -2,7 +2,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { MyButton, MyIcon, MyIconButton, MySection, MySegmented, MySlider, MyToggle } from "myui";
 import { importWallpaper } from "@/api";
 import {
@@ -13,6 +12,8 @@ import {
   setBgImage,
   setSolidity,
   setAccentHue,
+  setScreenshotStyleId,
+  wallpaperUrl,
 } from "@/store/appearance";
 import {
   ui,
@@ -32,7 +33,7 @@ import {
   readGpuDisabled,
   type RendererBackend,
 } from "@/composables/useRendererPref";
-import { PRESETS, type BackgroundMode, type ColorPalette } from "@/themes";
+import { PRESETS, SCREENSHOT_STYLES, type BackgroundMode, type ColorPalette } from "@/themes";
 import FontField from "@/components/FontField.vue";
 import CustomPaletteDialog from "./CustomPaletteDialog.vue";
 import {
@@ -219,8 +220,9 @@ function onOpacityChange(v: number | number[]): void {
   setBgImage({ ...appearance.bgImage, opacity: Math.min(0.8, Math.max(0.05, percent / 100)) });
 }
 
-/** 选图 → Rust 导入自管目录 → convertFileSrc 生成 asset URL。
- *  导入而非直读的原因（asset scope / URL 缓存 / 原图被移）见 wallpaper.rs。 */
+/** 选图 → Rust 导入自管目录 → wallpaperUrl 生成带版本戳的 asset URL。
+ *  导入而非直读的原因（asset scope / 文件被移）见 wallpaper.rs；
+ *  版本戳的原因（同一 URL 不重取图）见 wallpaperUrl。 */
 async function pickBgImage(): Promise<void> {
   bgImageBusy.value = true;
   try {
@@ -234,7 +236,7 @@ async function pickBgImage(): Promise<void> {
       const stored = await importWallpaper(selected);
       setBgImage({
         mode: "image",
-        image: convertFileSrc(stored),
+        image: wallpaperUrl(stored),
         opacity: appearance.bgImage.opacity,
       });
     }
@@ -600,6 +602,37 @@ function onRendererChange(v: string | number | boolean): void {
       @save="saveCustomPalette"
       @close="showCustomDialog = false"
     />
+  </MySection>
+
+  <!-- 截图样式：只影响「📷 截图」导出的 PNG，不影响真实终端显示。
+       与「终端配色」分开是因为两者服务不同场景 —— 用户可能喜欢终端用
+       Tokyo Night，但截图贴进工单/文档时更习惯 PuTTY 的经典配色。 -->
+  <MySection
+    title="截图样式"
+    description="仅影响「📷 截图」导出的 PNG；真实终端显示仍跟随上方「终端配色」。"
+  >
+    <div class="preset-grid">
+      <MyButton
+        v-for="style in SCREENSHOT_STYLES"
+        :key="style.id"
+        class="preset-card"
+        variant="secondary"
+        :class="{ active: appearance.screenshotStyleId === style.id }"
+        :title="style.name"
+        @click="setScreenshotStyleId(style.id)"
+      >
+        <span class="preset-body">
+          <span class="preset-dot" :style="{ background: style.terminal.background }">
+            <span class="preset-dot-bar" :style="{ background: style.terminal.cursor }" />
+          </span>
+          <span class="preset-name">{{ style.name }}</span>
+        </span>
+      </MyButton>
+    </div>
+    <div class="font-hint">
+      PuTTY：复刻 PuTTY 出厂默认配色（黑底 187,187,187 前景 + 经典 16 色 ANSI）与 Courier New 字体，适合贴进工单与文档。
+      跟随终端：PNG 颜色与当前终端配色一致（透明底会解析为实际可见的底色），适合留档当前会话画面。
+    </div>
   </MySection>
 
 

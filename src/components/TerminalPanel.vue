@@ -552,7 +552,14 @@ function cancelNativeUpload(): void {
 
 /** Capture the terminal viewport and save it to the attachment directory.
  * Bound to the 📷 button in CommandBar. No-op if the xterm instance isn't
- * mounted yet (rare race during tab open). */
+ * mounted yet (rare race during tab open).
+ *
+ * NOTE: the MCP `screenshot_terminal` bridge does NOT route through here —
+ * it captures via `getTerminal(sessionId)` in useMcpBridge (same
+ * `captureTerminalToDataUrl` + `saveScreenshot` pipeline, so the PNG is
+ * identical). One shared pipeline, two thin call sites: routing MCP through
+ * this component would need a return channel through the action registry for
+ * no gain. */
 async function handleScreenshot(): Promise<void> {
   const t = term;
   if (!t) {

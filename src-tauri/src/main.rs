@@ -1861,10 +1861,19 @@ fn set_attachment_dir(dir: String) -> Result<String, String> {
 ///
 /// `data_url` is a `data:image/png;base64,...` URL (what canvas.toDataURL
 /// produces). `connection_name` is used to build a human-friendly filename.
+/// `label` is an optional caller-supplied tag that leads the filename — the
+/// MCP screenshot tool uses it so a jump-host capture can name the TARGET
+/// machine instead of the connection identity (a capture of 135.32.64.201
+/// taken through a connection named ias@135.32.64.34 used to be filed as
+/// `截图_ias@135.32.64.34_...png`, which is simply wrong to read later).
+///
+/// Filename: `截图_<label|conn>_<conn>_<YYYYMMDD-HHmmss.fff>.png` — the
+/// connection identity is KEPT even when a label is given, so the source of
+/// the capture stays answerable from the filename alone.
 ///
 /// Returns the absolute path of the saved file.
 #[tauri::command]
-fn save_screenshot(data_url: String, connection_name: String) -> Result<String, String> {
+fn save_screenshot(data_url: String, connection_name: String, label: Option<String>) -> Result<String, String> {
     use base64::Engine as _;
 
     // Strip the `data:image/png;base64,` prefix.
@@ -1881,21 +1890,34 @@ fn save_screenshot(data_url: String, connection_name: String) -> Result<String, 
     let dir = std::path::Path::new(&dir_str);
     std::fs::create_dir_all(dir).map_err(|e| format!("附件目录不存在且无法创建: {e}"))?;
 
-    // Build filename: 截图_<conn>_<YYYYMMDD-HHmmss>.png
-    // Sanitize connection_name — Windows forbids \ / : * ? " < > |
-    let safe_name: String = connection_name
-        .chars()
-        .map(|c| match c {
-            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => c,
-        })
-        .collect();
+    // Build filename: 截图_[<label>_]<conn>_<YYYYMMDD-HHmmss>.png
+    // Sanitize both segments — Windows forbids \ / : * ? " < > |
+    let safe_name = |s: &str| -> String {
+        s.chars()
+            .map(|c| match c {
+                '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                _ => c,
+            })
+            .collect()
+    };
+    let safe_conn = safe_name(&connection_name);
+    // An empty / whitespace-only label is treated as absent: a filename like
+    // `截图___conn_...png` (double underscore from an empty segment) is noise.
+    let label = label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(safe_name);
+    let stem = match &label {
+        Some(l) => format!("{}_{}", l, safe_conn),
+        None => safe_conn,
+    };
     // %Y%m%d-%H%M%S%.3f = YYYYMMDD-HHMMSS.fff (3 millisecond digits). The
     // fractional part prevents filename collisions when the user rapid-fires
     // the 📷 button — multiple screenshots within the same second would
     // otherwise overwrite each other.
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f");
-    let filename = format!("截图_{}_{}.png", safe_name, ts);
+    let filename = format!("截图_{}_{}.png", stem, ts);
     let filepath = dir.join(filename);
 
     std::fs::write(&filepath, &png_bytes).map_err(|e| format!("写入截图文件失败: {e}"))?;
@@ -5874,6 +5896,7 @@ pub fn run() {
             forward_stop,
             wallpaper::import_wallpaper,
             wallpaper::import_wallpaper_data,
+            wallpaper::current_wallpaper,
             ssh_connect,
             ssh_send,
             ssh_resize,
@@ -6646,10 +6669,18 @@ fn handle_ipc_connection(
                             // MCP asks the GUI to capture a screenshot of a
                             // terminal tab. Emits an event to the frontend,
                             // which finds the terminal for this connection,
-                            // captures the xterm buffer to a PNG data URL, and
-                            // calls mcp_exec_result with the data URL. Blocks
-                            // until the frontend responds (same pattern as
+                            // captures the xterm buffer to a PNG data URL, saves
+                            // it to the attachment directory, and calls
+                            // mcp_exec_result with the file path. Blocks until
+                            // the frontend responds (same pattern as
                             // exec_in_tab).
+                            //
+                            // Deliberately NO window.show()/set_focus(): a
+                            // screenshot is a read-only capture of the tab's
+                            // buffer, so it does not need the user's eyes on
+                            // the window. exec_in_tab dropped the same focus
+                            // call after users reported the window yanking
+                            // itself to the foreground on every MCP call.
                             "screenshot_terminal" => {
                                 let conn_id = cmd["connection_id"].as_str().unwrap_or("").to_string();
                                 if conn_id.is_empty() {
@@ -6662,14 +6693,13 @@ fn handle_ipc_connection(
                                     let mut pending = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
                                     pending.insert(request_id.clone(), tx);
                                 }
-                                if let Some(window) = ipc_handle.get_webview_window("main") {
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                }
                                 let payload = serde_json::json!({
                                     "action": "screenshot_terminal",
                                     "request_id": request_id,
                                     "connection_id": conn_id,
+                                    // Optional filename tag from the MCP caller
+                                    // (jump-host captures name the TARGET machine).
+                                    "label": cmd["label"].as_str().unwrap_or(""),
                                 });
                                 if let Err(e) = ipc_handle.emit("mcp-gui-command", payload) {
                                     let mut pending = PENDING_EXEC.lock().unwrap_or_else(|e| e.into_inner());
@@ -6681,7 +6711,16 @@ fn handle_ipc_connection(
                                 // exec_in_tab pattern, so a slow screenshot capture
                                 // (e.g. a tab that's still connecting) doesn't stall
                                 // the accept loop and block other IPC requests.
-                                let timeout_secs_sc = 20u64;
+                                //
+                                // 45s, NOT 20s: the frontend may have to open a NEW
+                                // tab and wait for the SSH connection to finish
+                                // before it can capture anything (up to 30s of
+                                // polling), and the MCP client's read timeout is
+                                // 50s — but a timeout here returns a STRUCTURED
+                                // error, which is worse than a slightly longer
+                                // wait. 45s covers the frontend's 30s budget plus
+                                // capture + IPC round-trip with margin.
+                                let timeout_secs_sc = 45u64;
                                 let writer = match reader.get_ref().try_clone() {
                                     Ok(w) => w,
                                     Err(e) => {
@@ -6738,6 +6777,33 @@ fn handle_ipc_connection(
                                         }
                                     }
                                 });
+                            }
+
+                            // MCP reports a background `ssh_run` task's phase so
+                            // the GUI can badge the connection's terminal tab.
+                            // Fire-and-forget on the MCP side, so this just
+                            // re-emits to the frontend and acks — a missing tab
+                            // is not an error (the user may have closed it).
+                            "exec_task_progress" => {
+                                let payload = serde_json::json!({
+                                    "action": "exec_task_progress",
+                                    "connection_id": cmd["connection_id"].as_str().unwrap_or(""),
+                                    // null = clear the badge; a short phase
+                                    // string otherwise.
+                                    "label": cmd["label"].clone(),
+                                });
+                                match ipc_handle.emit("mcp-gui-command", payload) {
+                                    Ok(_) => {
+                                        let _ = writeln!(reader.get_mut(), "{{\"ok\":true}}");
+                                    }
+                                    Err(e) => {
+                                        let _ = writeln!(
+                                            reader.get_mut(),
+                                            "{{\"ok\":false,\"error\":\"emit failed: {}\"}}",
+                                            e
+                                        );
+                                    }
+                                }
                             }
 
                             _ => {
